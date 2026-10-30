@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # for the SPDX `license` expression below
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "vibehash"
 version = "0.5.1"
 description = "Vibe Hash: earn VIBE by training AI models on everyday computers (testnet)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "cryptography>=42"]
 keywords = ["proof-of-useful-work", "distributed-training", "cryptocurrency", "testnet"]
@@ -17,6 +19,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://vibehash.org"
+Source = "https://github.com/AlphaChad5000/vibehash"
 
 [project.scripts]
 vibehash = "vibehash.cli:main"

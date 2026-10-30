@@ -375,3 +375,8 @@ the remaining work:
 
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.
+
+## License
+
+MIT. See [LICENSE](LICENSE): use, change and share it freely, keeping the copyright notice.
+

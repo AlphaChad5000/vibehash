@@ -7,7 +7,7 @@ next. Read this first, then `README.md` (how to run it) and `DESIGN.md`
 ## ⚠️ Do this first
 
 The project lives in `C:\Users\Schlo\OneDrive\Documents\vibehash`, under git
-since 2026-10-29, with a public GitHub repo (public since 2026-10-30, no license chosen yet) at
+since 2026-10-29, with a public GitHub repo (public since 2026-10-30, MIT licensed) at
 `https://github.com/AlphaChad5000/vibehash` (branch `main`). Commit and push
 your work there. `dist/` holds stale local builds and is ignored. Pushing a
 `v*` tag publishes to PyPI (README, "Publishing a release").
@@ -124,7 +124,7 @@ Blockers before inviting anyone onto a public testnet:
 
 - [x] Put the OneDrive folder under git (see top).
 - [ ] Items 1–5 above.
-- [ ] **Choose a license** (there is none, so others legally can't use or modify the code). This is the owner's decision.
+- [x] **License:** MIT, chosen by the owner 2026-10-30 (`LICENSE`, and `license = "MIT"` in pyproject, which needs setuptools 77+).
 - [ ] **Faucet.** New users can't get VIBE to stake except through genesis or a transfer. Add a rate-limited testnet faucet (endpoint or CLI) or newcomers can't join. `setup` already tells newcomers to ask the operator for VIBE; a faucet would let it stake for them.
 - [x] **Publish to PyPI:** 0.4.0 is out (2026-10-29). Later releases: bump the version and push a `v*` tag (README, "Publishing a release").
 - [ ] **Node hardening:** ~~TLS; per-IP rate limits; connection caps; transaction fees~~ done 2026-10-29 (DESIGN §10: `tls.py`, `ratelimit.py`, `fees.py`). Still open: a per-address dataset quota (anyone with ≥1 VIBE can upload 20 GB datasets repeatedly); public blob GETs can be abused for bandwidth; a block size limit and replace-by-fee.
