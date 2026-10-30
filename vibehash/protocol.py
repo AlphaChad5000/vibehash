@@ -1,7 +1,9 @@
 """In-process network driver for simulations and tests.
 
 Runs the same Coordinator a real node runs, but with simulated workers called
-directly and a simulated clock, so hundreds of rounds take seconds.
+directly and a simulated clock, so hundreds of rounds take seconds. It also
+runs sharded jobs' teams (shards.py), whose members hand each other edge
+tensors in this one process, which nodes' workers can't do yet.
 """
 from __future__ import annotations
 
@@ -9,7 +11,8 @@ from collections import defaultdict
 
 import numpy as np
 
-from .coordinator import Coordinator, CoordinatorConfig, RoundReport
+from . import shards as sh
+from .coordinator import CellTask, Coordinator, CoordinatorConfig, RoundReport
 from .crypto import KeyPair
 from .ledger import SYSTEM, Chain, Tx
 from .blobs import array_id
@@ -40,6 +43,7 @@ class Checkpoints:
 class Protocol:
     def __init__(self, chain: Chain, workers: list[Worker], config: CoordinatorConfig | None = None, seed: int = 0):
         self.coord = Coordinator(chain, None, config)
+        self.coord.runs_teams = True  # run_round passes sharded units' tensors between teammates itself
         self.workers = {w.address: w for w in workers}
         self.rng = np.random.default_rng(seed + 1)  # simulated outages only; the coordinator draws from the chain
         self.checkpoints = Checkpoints()
@@ -104,35 +108,82 @@ class Protocol:
                 c.register(addr, w.hardware.flops_per_sec, w.hardware.memory_mb, envelope=self._signed(w, "register", body))
 
         c.start_compute()
-        for addr, unit_ids in list(r.assignments.items()):
-            w = self.workers[addr]
-            if self.rng.random() > w.hardware.reliability:
-                continue  # dropped offline / ran out of time
-            for uid in unit_ids:
-                c.commit(w.compute(r.units[uid], job, r.start))
+        if job.sharded:
+            self._train_teams(job)
+        else:
+            for addr, unit_ids in list(r.assignments.items()):
+                w = self.workers[addr]
+                if self.rng.random() > w.hardware.reliability:
+                    continue  # dropped offline / ran out of time
+                for uid in unit_ids:
+                    c.commit(w.compute(r.units[uid], job, r.start))
 
         beacon = c.start_reveal()
-        published: dict[str, list[Reveal]] = defaultdict(list)
-        # Honest workers reveal first so a copycat has something to try copying.
-        keys = sorted(r.commitments, key=lambda k: self.workers[k[1]].behavior == "copycat")
-        for uid, addr in keys:
-            rv = self.workers[addr].reveal(r.units[uid], job, beacon, self.config.challenge_segments, published[uid])
-            if rv is not None:
-                c.reveal(rv, wire=self._wire(rv, job))
-                published[uid].append(rv)
+        if job.sharded:
+            self._reveal_teams(job, beacon)
+        else:
+            published: dict[str, list[Reveal]] = defaultdict(list)
+            # Honest workers reveal first so a copycat has something to try copying.
+            keys = sorted(r.commitments, key=lambda k: self.workers[k[1]].behavior == "copycat")
+            for uid, addr in keys:
+                rv = self.workers[addr].reveal(r.units[uid], job, beacon, self.config.challenge_segments, published[uid])
+                if rv is not None:
+                    c.reveal(rv, wire=self._wire(rv, job))
+                    published[uid].append(rv)
 
         c.start_verify()
         for addr, w in self.workers.items():
             for t in c.tasks_for(addr):
-                ok, bad = w.verify(job, t.unit, t.openings, t.segments)
+                if isinstance(t, CellTask):
+                    ok, bad = w.check_cell(job, t)
+                else:
+                    ok, bad = w.verify(job, t.unit, t.openings, t.segments)
                 body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
                 c.submit_verdict(addr, t.task_id, ok, bad, envelope=self._signed(w, "verdict", body))
 
         report = c.finalize(proposer_keys=self._proposer(beacon), timestamp=report_ts(self.chain))
         for w in self.workers.values():
-            for uid in list(w._work):
+            for uid in [*w._work, *w._shards]:
                 w.forget(uid)
         return report
+
+    def _train_teams(self, job: TrainingJob) -> None:
+        """Each team trains its units as a pipeline (shards.train_sharded), every tensor a member sends signed by it
+        and kept by the teammate it went to; then each member commits to its own trace. A member that drops offline
+        never commits: its teammates' units then can't be checked at that edge, and go unpaid but unblamed."""
+        c, r = self.coord, self.coord.r
+        parts = sh.split(job.spec, job.shards)
+        for team in r.teams:
+            members = [self.workers[a] for a in team.members]
+            gone = {w.address for w in members if self.rng.random() > w.hardware.reliability}
+            cheats = {k: w.shard_cheat for k, w in enumerate(members) if w.shard_cheat}
+            for uid in team.units:
+                unit = r.units[uid]
+                traces = sh.train_sharded(job.spec, parts, job.data, r.start, unit.seed, job.steps_per_unit,
+                                          job.checkpoint_every, job.lr, job.batch_size, cheats,
+                                          sign=[w.edge_signer(self.chain.chain_id, r.round_no, uid) for w in members])
+                for w, trace in zip(members, traces):
+                    if w.address not in gone:
+                        c.commit(w.commit_trace(unit, trace))
+
+    def _reveal_teams(self, job: TrainingJob, beacon: bytes) -> None:
+        """Members reveal what the beacon asks of their shards; then the receiver at each edge whose two commitments
+        disagree shows the message its neighbour signed for what it sent, which says who lied."""
+        c, r = self.coord, self.coord.r
+        put = lambda a: self.checkpoints.put(a, job)  # noqa: E731
+        for team in r.teams:
+            for uid in team.units:
+                for addr in team.members:
+                    if (uid, addr) in r.commitments:
+                        rv = self.workers[addr].reveal_cells(r.units[uid], job, beacon, self.config.challenge_segments, team.members)
+                        if rv is not None:
+                            c.reveal_shard(rv, wire=sh.reveal_out(rv, put))
+        for d in c.edge_disputes():
+            w = self.workers[d.receiver]
+            message = w.edge_evidence(d.unit_id, d.step, d.kind)
+            if message is not None:
+                body = {"round": r.round_no, "unit_id": d.unit_id, "step": d.step, "kind": d.kind, **message}
+                c.submit_edge_evidence(d.receiver, d.unit_id, d.step, d.kind, message, envelope=self._signed(w, "edge", body))
 
 
 def report_ts(chain: Chain) -> int:

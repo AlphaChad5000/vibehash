@@ -12,6 +12,10 @@ field by field. It checks:
     (records from version 2; older ones replay by their own version's rules);
   * each worker's share of the units, the secretly duplicated units, the beacon,
     the challenged segments, who checked whom, and the planted fakes;
+  * for a sharded job (record version 3): its teams, the cells and edge hashes
+    each member had to open, every edge where neighbours disagreed and the
+    signed edge message that said who lied, who checked each cell, and the
+    canaries made of cells;
   * every verdict, slash, missed deadline and payment share.
 
 Given the round's checkpoints (`checkpoints`: something with .array(blob_id,
@@ -25,6 +29,7 @@ receipts (receipts.py) cover those.
 """
 from __future__ import annotations
 
+from . import shards as sh
 from .coordinator import Coordinator, CoordinatorConfig, ProtocolError
 from .crypto import h256
 from .ledger import Block, Chain, canonical
@@ -63,8 +68,16 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
         for d in record["commitments"]:
             c.commit(commitment_in(d))
         c.start_reveal()
-        for d in record["reveals"]:
-            c.reveal(Reveal(str(d["unit_id"]), str(d["worker"]), bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"]), None, {}), wire=d)
+        if c.job(c.r.job_id).sharded:
+            for d in record["reveals"]:
+                c.reveal_shard(sh.reveal_in(d), wire=d)
+            for env in record["evidence"]:
+                addr, body = _sender(env, "edge", chain, c.r.round_no)
+                c.submit_edge_evidence(addr, str(body["unit_id"]), int(body["step"]), str(body["kind"]),
+                                       {"hash": body["hash"], "sig": body["sig"]}, envelope=env)
+        else:
+            for d in record["reveals"]:
+                c.reveal(Reveal(str(d["unit_id"]), str(d["worker"]), bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"]), None, {}), wire=d)
         c.start_verify()
         for env in record["verdicts"]:
             addr, body = _sender(env, "verdict", chain, c.r.round_no)
