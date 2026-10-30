@@ -7,7 +7,7 @@ next. Read this first, then `README.md` (how to run it) and `DESIGN.md`
 ## ⚠️ Do this first
 
 The project lives in `C:\Users\Schlo\OneDrive\Documents\vibehash`, under git
-since 2026-10-29, with a private GitHub repo at
+since 2026-10-29, with a public GitHub repo (public since 2026-10-30, no license chosen yet) at
 `https://github.com/AlphaChad5000/vibehash` (branch `main`). Commit and push
 your work there. `dist/` holds stale local builds and is ignored. Pushing a
 `v*` tag publishes to PyPI (README, "Publishing a release").
