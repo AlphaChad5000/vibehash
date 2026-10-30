@@ -95,6 +95,7 @@ class Node:
         self.chain = self.store.open_chain(genesis)
         self.genesis = genesis
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
+        self.coord.timing = lambda job: self.times_for(job).compute_s * 0.8  # capacity leaves slack, as above
         self.blobs: BlobStore = self.store.blobs
         self.start_blob: str | None = None
         self.uploads: dict[str, set[str]] = {}  # per-worker blob ids this round (quota)
@@ -112,7 +113,7 @@ class Node:
                              validators=lambda: self.chain.state.validator_set(), validate=self._validate,
                              commit=self._decided, broadcast=lambda m: self.peers.broadcast("/consensus", m),
                              has_work=self._has_work, behind=lambda height: self.wake_sync.set(),
-                             persist=lambda state: self.store.save_meta("consensus", state))
+                             persist=lambda state: self.store.save_meta("consensus", state), propose_wait=self._propose_wait)
         self.proposed: dict[str, tuple] = {}  # block id -> (weights, scores, record) for blocks we proposed at this height
         self.commit_lock = threading.Lock()
         self.wake_sync = threading.Event()
@@ -216,14 +217,30 @@ class Node:
         log.info("block %d sealed: %d units accepted, %d fraud, val acc %.1f%%, pool %.3f VIBE",
                  rep.block.height, rep.block.summary.accepted_units, fraud, 100 * rep.val_acc, rep.pool / SYN_PER_VIBE)
 
+    def times_for(self, job) -> PhaseTimes:
+        """A round's phase lengths for `job`: this node's, or longer where the job's size needs it (or the job asks
+        for a longer compute phase). See TrainingJob.phase_lengths."""
+        t, need = self.times, job.phase_lengths()
+        return PhaseTimes(t.register_s, max(t.compute_s, need["compute"]), max(t.reveal_s, need["reveal"]),
+                          max(t.verify_s, need["verify"]), t.idle_s)
+
+    def _propose_wait(self) -> float:
+        """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
+        own rounds the longest job with budget left runs, since its leader may be running that one."""
+        s = self.chain.state
+        longest = max((self.times_for(s.job(j)).round_s for j, v in s.escrow.items() if v > 0), default=0.0)
+        return self.engine.timeouts.propose + 1.5 * max(0.0, longest - self.times.round_s)
+
     def _run_round(self, still=None) -> bool:
         """Drive an open round through its phases. False if it was given up: we're stopping, or `still()` says the
         round's no longer wanted (another block was decided at its height)."""
-        c, t = self.coord, self.times
+        c = self.coord
         with c.lock:
             job = c.job(c.r.job_id)
             self.start_blob = self.blobs.put_array(c.r.start, job.wire_dtype)
-        log.info("round %d open for job %s", c.r.round_no, c.r.job_id)
+        t = self.times_for(job)
+        longer = f" ({t.round_s:.0f} s rounds for its size)" if t.round_s > self.times.round_s + 0.5 else ""
+        log.info("round %d open for job %s%s", c.r.round_no, c.r.job_id, longer)
         if not self._wait(t.register_s, still):
             return False
         c.start_compute()

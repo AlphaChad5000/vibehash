@@ -14,7 +14,7 @@ class Net:
     """N validators wired together through a message queue with a fixed delay. Tests drop, delay or forge messages
     by replacing `link` (from, to, message) -> message or None."""
 
-    def __init__(self, n=4, stakes=None, timeouts=None, has_work=lambda: True, build_s=1.0):
+    def __init__(self, n=4, stakes=None, timeouts=None, has_work=lambda: True, build_s=1.0, propose_wait=None):
         self.keys = [KeyPair.generate(f"validator-{i}".encode()) for i in range(n)]
         self.vals = {k.address: (stakes[i] if stakes else 10) for i, k in enumerate(self.keys)}
         self.index = {k.address: i for i, k in enumerate(self.keys)}
@@ -28,7 +28,7 @@ class Net:
         self.engines = [Engine(CHAIN, k, t, validators=lambda: dict(self.vals), validate=self.validate,
                                commit=lambda h, v, c, i=i: self.committed[i].append((h, v["block"]["id"], c)),
                                broadcast=lambda m, i=i: self.send(i, m), has_work=has_work,
-                               block_id=lambda v: v["block"]["id"]) for i, k in enumerate(self.keys)]
+                               block_id=lambda v: v["block"]["id"], propose_wait=propose_wait) for i, k in enumerate(self.keys)]
         for e in self.engines:
             e.start(0, self.now)
 
@@ -236,6 +236,15 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(min(net.heights()), 1)
         self.assertFalse([m for m in sent if m["height"] == 0 and m["round"] == 0], "no second vote in round 0")
         net.assert_agree(self)
+
+    def test_validators_wait_longer_for_a_job_with_long_rounds(self):
+        net = Net(4, propose_wait=lambda: 30.0)  # its leader may be running a 20-second training round
+        net.down.add(net.index[net.engines[0].proposer(0)])
+        net.run(25)
+        self.assertEqual(net.heights(), [0, 0, 0], "still waiting for the first leader")
+        net.run(30, until=lambda: min(net.heights()) >= 1)
+        self.assertEqual(min(net.heights()), 1, "then the next one took over")
+        self.assertEqual(net.committed[next(i for i in range(4) if i not in net.down)][0][2]["round"], 1)
 
     def test_one_validator_alone_finalises_immediately(self):
         net = Net(1)

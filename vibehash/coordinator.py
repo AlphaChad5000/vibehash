@@ -190,6 +190,7 @@ class Coordinator:
         self.store = store
         self.replaying = replay
         self.recheck = recheck if replay else None
+        self.timing = None  # job -> seconds of compute a live round of it gets (node.py); None: config.compute_s
         self.disputes: list[str] = []  # recorded results a recheck contradicted
         self.rechecked = self.unchecked = 0
         self.jobs: dict[str, TrainingJob] = {}
@@ -398,8 +399,12 @@ class Coordinator:
             self.r.record["version"] = self.replaying.get("version", RECORD_VERSION)
             if "attempt" in self.replaying:
                 self.r.record["attempt"] = self.replaying["attempt"]
+            # The rules exactly as recorded: a record made before a rule existed must hash the same on replay.
+            self.r.record["rules"] = dict(self.replaying.get("rules", self.r.record["rules"]))
         else:
             self.r.record["attempt"] = os.urandom(8).hex()
+            if self.timing is not None:  # the compute phase this job's round actually gets (node.py)
+                self.r.record["rules"]["compute_s"] = float(self.timing(job))
         self.phase = Phase.REGISTER
         return True
 
@@ -433,7 +438,8 @@ class Coordinator:
         # unknowable before it, and the same for anyone who replays the round.
         draw = Draw(b"assign", self.chain.tip.hash, r.round_no.to_bytes(8, "big"),
                     *sorted(canonical(e) for e in r.record["registrations"]))
-        capacity = {a: self.capacity(a, int(reg.flops_per_sec * self.config.compute_s), job) for a, reg in r.regs.items()}
+        compute_s = r.record["rules"]["compute_s"]  # this round's, which a job sized for big models makes longer
+        capacity = {a: self.capacity(a, int(reg.flops_per_sec * compute_s), job) for a, reg in r.regs.items()}
         used = {a: 0 for a in capacity}
         order = draw.shuffle(sorted(capacity))
 

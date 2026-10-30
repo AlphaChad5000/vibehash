@@ -319,7 +319,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <section id="round">
       <h2>A round</h2>
-      <p>The network runs in rounds. With default settings a round takes about 38 seconds and ends with one new block. The bar is drawn to scale, in the colours the worker's dashboard uses for each phase.</p>
+      <p>The network runs in rounds. With default settings a round takes about 38 seconds and ends with one new block. The bar is drawn to scale, in the colours the worker's dashboard uses for each phase. Jobs with big models get longer rounds, sized so an ordinary computer on a home connection can still download the model, train a unit and upload its snapshots in time. A model with 34 million weights, for example, gets rounds of about 17 minutes.</p>
       <div class="timeline" aria-hidden="true">
         <div class="bar"><div class="ph-register"></div><div class="ph-compute"></div><div class="ph-reveal"></div><div class="ph-verify"></div></div>
         <div class="axis"><span>0 s</span><span>3 s</span><span>23 s</span><span><span>28 s</span><span>38 s</span></span></div>
@@ -463,6 +463,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
             <tr><td><code>memory_mb</code></td><td>1–1,000,000</td><td>Machines with less memory won't be given or asked to check this job: graphics memory on a GPU, RAM on a CPU</td></tr>
             <tr><td><code>tolerance</code></td><td>up to 0.01</td><td>How closely a replay must match. Use 0.0001 for float32 jobs, so a GPU's result checks out on a CPU, and 0.000001 for float64.</td></tr>
             <tr><td><code>max_update_ratio</code></td><td>up to 10</td><td>Largest change one unit may make to the model</td></tr>
+            <tr><td><code>compute_s</code></td><td>optional, 5–3600</td><td>A longer compute phase for this job's rounds, in seconds, for bigger units. Without it, rounds are sized from the model automatically.</td></tr>
           </tbody>
         </table>
       </div>

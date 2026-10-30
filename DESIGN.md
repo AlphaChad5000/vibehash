@@ -50,9 +50,32 @@ a small but **steady** income, with no need for a mining pool.
    units, not bigger ones. Units whose memory requirement exceeds a rig's RAM
    are never assigned to it. A random fraction of units is secretly
    **replicated** to a second worker. Capacity comes from the worker's own
-   benchmark, but is capped at 1.5× the speed the coordinator has *observed*
-   from that worker, and brand-new workers get at most a few units, so
+   benchmark over the round's compute phase, but can grow by at most 2× a
+   round when it delivered everything, falls back to what it delivered when
+   it missed a deadline, and starts at a few units for new workers. So
    overstating your speed to grab work and then failing doesn't pay.
+
+   **Round length follows the job.** A job's checkpoints have to move:
+   the starting weights down to every worker, each unit's checkpoints up,
+   and the challenged ones down to its checkers. That grows with the model.
+   So each job's phases are at least what `TrainingJob.phase_lengths` says
+   a modest computer on a home connection needs (an old laptop's CPU at
+   2 GFLOP/s, 20 Mbit/s up, 100 Mbit/s down; the constants are in
+   `tasks.py`):
+   - **compute:** download the weights, train one unit, and upload its
+     checkpoints, with 25% to spare;
+   - **reveal:** resend two checkpoints;
+   - **verify:** fetch and replay the challenged segments of two units.
+
+   A job file can also ask for a longer compute phase (`compute_s`, 5–3600 s),
+   for bigger units. Nodes run each round for the longer of their own phase
+   lengths and the job's. The compute phase a round actually had is written
+   into its record's rules, since capacity depends on it. Validators wait for
+   a proposal as long as the longest funded job's round needs. A small job
+   keeps the 38-second default; the GPU template (270k weights) still fits
+   in it. A model of three 4096-wide layers (34M weights, 134 MB per
+   checkpoint) gets about 17-minute rounds: 12 minutes of compute, most of
+   it spent uploading 8 checkpoints per unit at 20 Mbit/s.
 2. **Compute.** The worker trains, saving checkpoints `C_0 … C_k`. It builds a
    **Merkle tree** over the checkpoint hashes.
 3. **Commit.** Before the deadline the worker publishes a signed commitment
@@ -506,10 +529,12 @@ Being explicit about what this is and isn't:
 - **Workloads.** Workers train multi-layer perceptrons on CPU or GPU (§8).
   Transformers and convolutional networks need their own backend kernels,
   plus per-architecture tolerance calibration across GPU vendors.
-- **Model size.** Checkpoints are chunked binary blobs of up to 1 GiB (§8).
-  The next limit is bandwidth: each verify task downloads about 2q
-  checkpoints, and the node keeps every opened checkpoint for its challenge
-  window, so its disk use grows with model size × `--keep-rounds`.
+- **Model size.** Checkpoints are chunked binary blobs of up to 1 GiB (§8),
+  and rounds lengthen with a job's size (§3), so big models fit the
+  schedule. They're still costly to move: a worker uploads every checkpoint
+  of each unit, each verify task downloads about 2q of them, and the node
+  keeps every opened one for its challenge window. Next: upload only the
+  checkpoints the beacon challenges, and send them at 16-bit precision.
 - **Security review.** None of this has been audited. Don't put real value
   on it, and get legal advice before issuing a token anyone can buy.
 

@@ -46,8 +46,10 @@ class Timeouts:
     grow: float = 1.0  # each later round at the same height waits this much longer, so a slow network catches up
     regossip: float = 2.0  # how often our messages at this height are sent again, for peers that missed them
 
-    def wait(self, step: Step, round_: int) -> float:
-        return (self.propose if step == Step.PROPOSE else self.vote) + round_ * self.grow
+    def wait(self, step: Step, round_: int, propose: float | None = None) -> float:
+        """`propose` replaces the propose wait when it depends on the round's job (Engine's propose_wait)."""
+        base = (self.propose if propose is None else propose) if step == Step.PROPOSE else self.vote
+        return base + round_ * self.grow
 
 
 def quorum(power: int, total: int) -> bool:
@@ -146,17 +148,21 @@ class Engine:
         persist(state)            save {height, round, locked_id, locked_round} before each of our votes goes out, so a
                                   validator that restarts mid-height resumes past the rounds it voted in (pass it to
                                   start()) instead of voting in them twice
+        propose_wait() -> float   optional: how long to wait for a proposal, when it depends on the chain (a job
+                                  sized for a big model runs longer rounds); otherwise timeouts.propose
 
     When it's our turn to propose a new block, `wanted` is set to (height, round); node.py builds the block (which can
     take a whole training round) and calls propose().
     """
 
     def __init__(self, chain_id: str, keys: KeyPair | None, timeouts: Timeouts, *, validators, validate, commit, broadcast,
-                 has_work=lambda: True, behind=lambda height: None, persist=lambda state: None, block_id=_block_id):
+                 has_work=lambda: True, behind=lambda height: None, persist=lambda state: None, block_id=_block_id,
+                 propose_wait=None):
         self.chain_id, self.keys, self.timeouts = chain_id, keys, timeouts
         self.me = keys.address if keys else None
         self._validators, self._validate, self._commit, self._broadcast = validators, validate, commit, broadcast
         self._has_work, self._behind, self._persist, self._id = has_work, behind, persist, block_id
+        self._propose_wait = propose_wait
         self.lock = threading.RLock()
         self.now = 0.0
         self.height = -1
@@ -269,7 +275,8 @@ class Engine:
             self._schedule(Step.PROPOSE, r)
 
     def _schedule(self, step: Step, round_: int) -> None:
-        self.timers.append((self.now + self.timeouts.wait(step, round_), step.value, round_))
+        propose = self._propose_wait() if step == Step.PROPOSE and self._propose_wait else None
+        self.timers.append((self.now + self.timeouts.wait(step, round_, propose), step.value, round_))
 
     def _send(self, msg: dict) -> None:
         self.mine.append(msg)

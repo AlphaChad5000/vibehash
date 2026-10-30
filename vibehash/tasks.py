@@ -15,6 +15,13 @@ SYN_PER_VIBE = 100_000_000
 MAX_SPEC_BYTES = 4096
 _JOB_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 MAX_CHECKPOINT_BYTES = 2**30  # 1 GiB of weights (~268M float32); sent as chunked binary blobs
+# What a job's rounds are sized for, so a modest computer on a home connection can always finish a unit in time:
+# an old laptop's CPU running the reference model (about 2 GFLOP/s), and 20 Mbit/s up, 100 Mbit/s down.
+REF_FLOPS = 2e9
+REF_UPLOAD = 2.5e6  # bytes/s
+REF_DOWNLOAD = 12.5e6  # bytes/s
+CHECKED_SEGMENTS = 3  # segments of a unit the beacon challenges (CoordinatorConfig.challenge_segments)
+MAX_COMPUTE_S = 3600.0
 
 
 class InvalidJob(ValueError):
@@ -38,6 +45,7 @@ class TrainingJob:
     memory_mb: int = 1024  # minimum RAM/VRAM a rig needs to take or verify a unit
     tolerance: float = 1e-6  # relative distance allowed between replay and claim
     max_update_ratio: float = 0.5  # |final - start| / |start| must stay below this
+    compute_s: float = 0.0  # a compute phase the job asks for, in seconds; 0: sized from the job (phase_lengths)
     _data: Dataset | None = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -46,7 +54,7 @@ class TrainingJob:
     # --- on-chain spec -------------------------------------------------------
 
     def to_spec(self) -> dict:
-        return {
+        spec = {
             "id": self.job_id, "fee_per_round": self.fee_per_round,
             "model": {"n_in": self.spec.n_in, "n_out": self.spec.n_out,
                       "n_hidden": self.spec.n_hidden if isinstance(self.spec.n_hidden, int) else list(self.spec.n_hidden)},
@@ -56,6 +64,9 @@ class TrainingJob:
             "checkpoint_every": self.checkpoint_every, "units_per_round": self.units_per_round,
             "memory_mb": self.memory_mb, "tolerance": self.tolerance, "max_update_ratio": self.max_update_ratio,
         }
+        if self.compute_s:  # left out otherwise, so specs posted before it existed are unchanged
+            spec["compute_s"] = self.compute_s
+        return spec
 
     def spec_json(self) -> str:
         return json.dumps(self.to_spec(), sort_keys=True, separators=(",", ":"))
@@ -76,7 +87,7 @@ class TrainingJob:
                 batch_size=int(d["batch_size"]), steps_per_unit=int(d["steps_per_unit"]),
                 checkpoint_every=int(d["checkpoint_every"]), units_per_round=int(d["units_per_round"]),
                 memory_mb=int(d["memory_mb"]), tolerance=float(d["tolerance"]),
-                max_update_ratio=float(d["max_update_ratio"]),
+                max_update_ratio=float(d["max_update_ratio"]), compute_s=float(d.get("compute_s", 0)),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
             raise InvalidJob(f"malformed job spec: {e}") from e
@@ -99,6 +110,8 @@ class TrainingJob:
         need(1 <= self.units_per_round <= 10_000 and 1 <= self.memory_mb <= 1_000_000, "units / memory out of range")
         need(0 < self.tolerance <= 1e-2 and 0 < self.max_update_ratio <= 10, "tolerance out of range")
         need(self.fee_per_round >= 0 and self.budget >= 0, "negative fee or budget")
+        need(self.compute_s == 0 or 5 <= self.compute_s <= MAX_COMPUTE_S,
+             f"compute_s is 0 (sized from the job) or 5-{MAX_COMPUTE_S:.0f} seconds")
         kind = self.data_source.get("kind")
         if kind == "synthetic":
             need(isinstance(self.data_source.get("seed"), int), "synthetic data needs an integer seed")
@@ -136,6 +149,21 @@ class TrainingJob:
     @property
     def n_segments(self) -> int:
         return self.steps_per_unit // self.checkpoint_every
+
+    @property
+    def checkpoint_bytes(self) -> int:
+        return self.spec.n_params * np.dtype(self.wire_dtype).itemsize
+
+    def phase_lengths(self) -> dict[str, float]:
+        """The shortest phases this job's rounds can have, in seconds, so the reference computer (REF_*) can do its
+        part: in compute, fetch the weights, train one unit and upload its checkpoints; in reveal, resend a couple
+        of checkpoints whose upload failed; in verify, fetch and replay the challenged segments of two units. A job
+        can ask for a longer compute phase (compute_s), for bigger units. Nodes use these or their own phase
+        lengths, whichever are longer."""
+        b = self.checkpoint_bytes
+        unit = b / REF_DOWNLOAD + self.unit_flops / REF_FLOPS + self.n_segments * b / REF_UPLOAD
+        check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / REF_FLOPS
+        return {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
 
 
 @dataclass(frozen=True)
