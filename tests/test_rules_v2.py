@@ -380,3 +380,41 @@ class RelayPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProposalVersionTests(unittest.TestCase):
+    """Validators vote only for blocks and round records of the current versions (Node._validate), so a leader can't
+    propose under the old rules to get round a fix. Older ones still apply when syncing or verifying a chain."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from vibehash.node import Node
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        genesis = {"chain_id": "rules-v2", "allocations": {REQ.address: 1000 * VIBE},
+                   "validators": {V.address: "http://127.0.0.1:1"}, "bootstrap": {V.address: 10 * VIBE}}
+        self.node = Node(Path(tmp.name) / "node", genesis, V, port=0)
+        self.addCleanup(self.node.store.close)
+        self.addCleanup(self.node.peers.close)
+        self.addCleanup(self.node.server.server_close)
+
+    def proposal(self, version: int, summary_=None, record=None) -> dict:
+        c = self.node.chain
+        block, _ = c.build_block(summary_, [tx(c, REQ, "transfer", W.address, VIBE)], c.tip.timestamp + 1, version=version)
+        block.sign(V)
+        return {"block": block.to_dict(), "record": record}
+
+    def test_only_current_version_blocks_get_a_vote(self):
+        self.assertTrue(self.node._validate(self.proposal(VERSION)))
+        with self.assertLogs("vibehash.node", "WARNING") as logs:
+            self.assertFalse(self.node._validate(self.proposal(1)))
+        self.assertIn(f"must be version {VERSION}", logs.output[0])
+
+    def test_only_current_version_records_get_a_vote(self):
+        from vibehash.coordinator import RECORD_VERSION
+
+        with self.assertLogs("vibehash.node", "WARNING") as logs:
+            self.assertFalse(self.node._validate(self.proposal(VERSION, summary(V), {"version": 1})))
+        self.assertIn(f"record must be version {RECORD_VERSION}", logs.output[0])

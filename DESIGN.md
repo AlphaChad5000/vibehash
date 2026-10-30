@@ -545,6 +545,11 @@ Being explicit about what this is and isn't:
   of each unit, each verify task downloads about 2q of them, and the node
   keeps every opened one for its challenge window. Next: upload only the
   checkpoints the beacon challenges, and send them at 16-bit precision.
+  Beyond what one computer holds, [SHARDING.md](SHARDING.md) splits a model
+  into shards trained by a team of workers as a pipeline. Each shard's work
+  is checked one cell (one shard over one segment) at a time, so no worker,
+  checker or arbitrating node ever runs the whole model. That document has
+  the design, and `shards.py` a tested prototype of its core.
 - **Security review.** None of this has been audited. Don't put real value
   on it, and get legal advice before issuing a token anyone can buy.
 

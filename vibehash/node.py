@@ -49,9 +49,9 @@ from . import receipts
 from .blobs import CHUNK, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
-from .coordinator import Coordinator, CoordinatorConfig, Phase, ProtocolError
+from .coordinator import RECORD_VERSION, Coordinator, CoordinatorConfig, Phase, ProtocolError
 from .crypto import KeyPair, address_of, verify
-from .ledger import Block, InvalidBlock, Tx, apply_block, canonical
+from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import evaluate, params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits
@@ -302,6 +302,13 @@ class Node:
         rewards its summary implies), and its summary follows from its round's signed messages."""
         try:
             block = Block.from_dict(value["block"])
+            # Older blocks and records still apply and replay (syncing, chain verify), but a new block must follow
+            # today's rules: a leader can't propose under the old ones to get round a fix.
+            if block.version != VERSION:
+                raise InvalidBlock(f"a new block must be version {VERSION}, not {block.version}")
+            record = value.get("record")
+            if block.summary is not None and isinstance(record, dict) and record.get("version") != RECORD_VERSION:
+                raise InvalidBlock(f"a new round's record must be version {RECORD_VERSION}, not {record.get('version')!r}")
             with self.coord.lock:
                 tip = self.chain.tip
                 if block.height != tip.height + 1 or block.prev_hash != tip.hash:

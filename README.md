@@ -362,6 +362,7 @@ SLIP-0010 test vectors.
 | `vibehash/settings.py` | `~/.vibehash`: the default wallet, and the node address and its TLS trust that `setup` saves |
 | `vibehash/gpusetup.py` | GPU detection before PyTorch is installed; picks and installs the PyTorch build for the card |
 | `vibehash/protocol.py` | In-process driver for simulations |
+| `vibehash/shards.py` | Prototype, not yet used by the protocol: a model split into shards across workers, checked one shard at a time ([SHARDING.md](SHARDING.md)) |
 
 ## Status
 
@@ -371,7 +372,8 @@ the remaining work:
   disputes;
 - slashing double-signing validators;
 - replicating fraud evidence;
-- model types beyond MLPs.
+- model types beyond MLPs, and models bigger than one computer
+  ([SHARDING.md](SHARDING.md) has the design).
 
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.
