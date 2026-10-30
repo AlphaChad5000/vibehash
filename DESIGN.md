@@ -199,6 +199,38 @@ round it completes work instead of almost never, as in lottery mining.
 - **Unstaking** moves coins into a 20-round unbonding queue where they can
   still be slashed, so a cheater can't pull their stake out before the
   verdict lands.
+- **A fair start.** Bitcoin needed no stake: a hash proves itself, so anyone
+  with a CPU could mine from block one. Training can only be spot-checked,
+  so a stake is what a cheater stands to lose. But if every stake has to be
+  handed out in the genesis, the first coins are a premine. Two genesis
+  rules (`genesis create` and `testnet` turn both on) let a network start
+  with nothing given away:
+  - **Earn-in** (`"earn_in": true`). Anyone may register without stake. Pay
+    to a worker below the 5 VIBE minimum goes into its stake until it
+    reaches the minimum, and only the rest into its balance. So a
+    newcomer's bond grows with what it has earned, and a fraud slash or a
+    forfeited round costs it that. While earning in, a worker is held to the
+    newcomer limit (4 units). It only gets units staked workers didn't need,
+    so newcomers can't crowd them out. It never checks others' work, so a
+    swarm of free identities can't wave each other's fakes through: their
+    work is checked by staked workers, or by the coordinator's own replay.
+    At most `max_newcomers` (64) register per round. On the mainnet
+    schedule, with about 100 workers sharing 3.125 VIBE a round, earning in
+    takes a couple of hours. A faked unit is still unprofitable without a
+    stake: the beacon checks 3 of a unit's 8 segments, so faking a share f
+    of a unit is caught with probability ≥ f and costs the whole round's
+    pay.
+  - **Bootstrap stake** (`"bootstrap": {addr: VIBE}`). It gives the first
+    validators votes when nobody has earned anything yet. It counts as stake
+    for voting and for proposing, but it can never be unstaked, and it's
+    burned when its validator leaves the set, so it never becomes spendable
+    money. As others earn stake and join as validators, it gets outweighed.
+
+  The genesis hash commits to both. Genesis files without them keep their
+  hash, and every worker must be given stake, as before. `vibehash testnet`
+  now starts this way: its validators have only bootstrap stake, and its
+  workers start with nothing. The demo requester is the one account handed
+  coins, to pay for the demo jobs.
 - System transactions (`slash`, `fee_release`, `reward`) are never trusted
   from the proposer. Every node re-derives them from the block's round
   summary and the current state, so a proposer can't pay itself extra, skip a
@@ -451,7 +483,8 @@ Being explicit about what this is and isn't:
      the 5% proposer share of the rounds it leads. Any account with the worker
      minimum stake can join the set, and changes take effect at the next
      height. A mainnet needs double-sign slashing, a higher validator stake,
-     and a delay before set changes apply.
+     and a delay before set changes apply. Bootstrap stake (§6) should be
+     spread across several independent first validators, not one operator.
 - **Consensus at scale.** Votes go straight to every validator, which suits
   tens of validators, not thousands, and there's no light-client protocol
   yet. Timeouts are sized for testnets. Pure proof-of-useful-work consensus

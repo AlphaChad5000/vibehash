@@ -483,7 +483,7 @@ class Node:
                 "challenge_segments": c.config.challenge_segments, "min_stake": econ.MIN_STAKE,
                 "mempool": len(c.mempool), "chunk_bytes": CHUNK, "keeps_checkpoints_for": self.keep_rounds,
                 "economics": self.chain.state.economics.to_dict(), "subsidy": self.chain.state.subsidy(self.chain.tip.height + 1),
-                "min_fee": c.config.min_fee,
+                "min_fee": c.config.min_fee, "earn_in": self.chain.state.earn_in,
             }
         if consensus is not None:
             # Workers do the round with its leader, the validator whose turn it is to propose: None means this node.
@@ -497,7 +497,7 @@ class Node:
 
     def account(self, addr: str) -> dict:
         s = self.chain.state
-        return {"address": addr, "balance": s.balance(addr), "stake": s.stake(addr),
+        return {"address": addr, "balance": s.balance(addr), "stake": s.stake(addr), "bootstrap": s.locked.get(addr, 0),
                 "unbonding": s.unbonding.get(addr, []), "nonce": s.nonces.get(addr, 0), "reputation": s.rep(addr)}
 
     def job_info(self, job_id: str) -> dict:
@@ -645,7 +645,7 @@ def _handler(node: Node):
     stores = {"blob": node.blobs, "dataset": node.store.datasets}
 
     class Handler(GuardedHandler):
-        server_version = "vibehash-node/0.4"
+        server_version = "vibehash-node/0.5"
 
         def log_message(self, fmt, *args):
             log.debug("%s %s", self.address_string(), fmt % args)

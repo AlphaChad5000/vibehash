@@ -163,10 +163,10 @@ python -m vibehash wallet create --out alice.json
 python -m vibehash wallet create --out requester.json
 ```
 
-2. Write a genesis file that funds and stakes them (use the addresses printed above). `--validator` names the node as a validator, with the address other machines reach it at. `--economics mainnet` picks the long issuance schedule (3.125 VIBE a round, halving about every 4 years, 21M VIBE at most) instead of the fast testnet one. The genesis hash commits to it.
+2. Write a genesis file (use the addresses printed above). `--validator` names the node as a validator, with the address other machines reach it at, and `--bootstrap` gives it **bootstrap stake**: enough to vote on block one, but it can never be withdrawn or spent, and it's burned if the validator leaves. Workers need nothing. By default they start with no stake and **earn it in**: their first 5 VIBE of pay goes into their stake, and until then they get small batches of work and don't check anyone else's. So every spendable coin starts from work. `--no-earn-in` makes workers be given stake instead (`--stake`). `--economics mainnet` picks the long issuance schedule (3.125 VIBE a round, halving about every 4 years, 21M VIBE at most) instead of the fast testnet one. The genesis hash commits to all of it. Here only the requester is handed coins, to pay for training:
 
 ```bash
-python -m vibehash genesis create --chain-id my-testnet-1 --out genesis.json --stake NODE_ADDR=10 --validator NODE_ADDR=http://192.168.1.20:8545 --alloc ALICE_ADDR=20 --alloc REQUESTER_ADDR=500
+python -m vibehash genesis create --chain-id my-testnet-1 --out genesis.json --bootstrap NODE_ADDR=10 --validator NODE_ADDR=http://192.168.1.20:8545 --alloc REQUESTER_ADDR=500
 ```
 
 3. Start the node. Use `--host 0.0.0.0` to accept workers from other machines.
@@ -186,10 +186,10 @@ python -m vibehash node --genesis genesis.json --wallet bob.json --data-dir bob-
 
    A node whose wallet isn't a validator, started with `--peer`, follows the chain: it checks and serves every block, and points workers at whichever validator is leading. `vibehash validator list` shows the validators and their share of the votes.
 
-4. Each worker runs setup with the node's address and their wallet, staking from the VIBE genesis gave them, then starts contributing.
+4. Each worker runs setup with the node's address and their wallet, then starts contributing. With earn-in there's nothing to stake first.
 
 ```bash
-python -m vibehash setup --node http://127.0.0.1:8545 --wallet alice.json --stake 10
+python -m vibehash setup --node http://127.0.0.1:8545 --wallet alice.json
 ```
 ```bash
 python -m vibehash worker

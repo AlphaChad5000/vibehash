@@ -32,6 +32,8 @@ BURN = "burn"
 UNBONDING_ROUNDS = 20  # unstaked coins stay slashable this long
 VALIDATOR = "validator "  # genesis memo naming a validator: "validator <url>"
 ECONOMICS_MEMO = "economics:"  # a genesis tx with this memo fixes the network's issuance schedule
+EARN_IN = "earn-in"  # genesis memo: workers may start with no stake and earn it (see State.earn_in)
+BOOTSTRAP = "bootstrap"  # genesis memo: stake that votes but can never be withdrawn (see State.locked)
 
 
 class InvalidBlock(Exception):
@@ -170,6 +172,12 @@ class State:
     job_owner: dict[str, str] = field(default_factory=dict)
     reputation: dict[str, float] = field(default_factory=dict)
     validators: dict[str, str] = field(default_factory=dict)  # addr -> the address other nodes reach it at
+    # Bootstrap stake: what the genesis gives its first validators so someone can vote on block one. It counts as
+    # stake but can never be unstaked, and it's burned when its validator leaves, so it never becomes spendable.
+    locked: dict[str, int] = field(default_factory=dict)
+    # Earn-in: anyone may take work without stake, and their pay goes into their stake until it reaches the
+    # minimum, so every spendable coin starts from work. Set by the genesis; older chains don't have it.
+    earn_in: bool = False
     genesis: int = 0
     minted: int = 0
     burned: int = 0
@@ -189,6 +197,10 @@ class State:
 
     def stake(self, addr: str) -> int:
         return self.stakes.get(addr, 0)
+
+    def staked(self, addr: str) -> bool:
+        """Has the minimum stake: can check others' work, propose and validate, not just earn in."""
+        return self.stake(addr) >= econ.MIN_STAKE
 
     def unbonding_total(self, addr: str) -> int:
         return sum(a for a, _ in self.unbonding.get(addr, []))
@@ -258,8 +270,9 @@ def _reward_txs(s: State, summary: RoundSummary, height: int, chain_id: str) -> 
 def _check_summary(s: State, summary: RoundSummary, proposer: str) -> None:
     if summary.proposer != proposer:
         raise InvalidBlock("summary names a different proposer")
-    paid = set(summary.worker_flops) | set(summary.verifier_flops) | set(summary.accepted)
-    if any(s.stake(a) < econ.MIN_STAKE for a in paid):
+    # Checkers must be staked. Workers too, unless the chain lets them earn their stake in.
+    paid = set(summary.verifier_flops) | (set() if s.earn_in else set(summary.worker_flops) | set(summary.accepted))
+    if any(not s.staked(a) for a in paid):
         raise InvalidBlock("rewards to an address without minimum stake")
     if any(v < 0 for v in [*summary.worker_flops.values(), *summary.verifier_flops.values()]):
         raise InvalidBlock("negative flops")
@@ -302,6 +315,8 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str) -> None:
     elif tx.kind == "unstake":
         if s.stake(tx.sender) < tx.amount:
             raise InvalidBlock("unstake exceeds stake")
+        if s.stake(tx.sender) - tx.amount < s.locked.get(tx.sender, 0):
+            raise InvalidBlock("bootstrap stake can't be withdrawn")
         s.stakes[tx.sender] -= tx.amount
         s.unbonding.setdefault(tx.sender, []).append([tx.amount, height + UNBONDING_ROUNDS])
     elif tx.kind == "post_job":
@@ -336,6 +351,9 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str) -> None:
             if len(s.validators) == 1:
                 raise InvalidBlock("the last validator can't leave: nobody would be left to agree on blocks")
             del s.validators[tx.sender]
+            bootstrap = s.locked.pop(tx.sender, 0)  # it was only ever there to vote with
+            s.stakes[tx.sender] = s.stake(tx.sender) - bootstrap
+            s.burned += bootstrap
 
 
 def valid_endpoint(url: str) -> bool:
@@ -363,6 +381,8 @@ def _apply_system_tx(s: State, tx: Tx) -> int:
             rest -= t
         if rest:
             raise InvalidBlock("slash exceeds stake")
+        if tx.sender in s.locked:  # a slash takes withdrawable stake first, then bootstrap stake
+            s.locked[tx.sender] = min(s.locked[tx.sender], s.stake(tx.sender))
         if tx.recipient == BURN:
             s.burned += tx.amount
         else:
@@ -374,7 +394,11 @@ def _apply_system_tx(s: State, tx: Tx) -> int:
         s.escrow[tx.memo] -= tx.amount
         return tx.amount
     if tx.kind == "reward":
-        s._credit(tx.recipient, tx.amount)
+        # Earn-in: pay tops up a worker's stake to the minimum first. (Without earn-in, everyone paid is staked.)
+        into_stake = min(tx.amount, max(0, econ.MIN_STAKE - s.stake(tx.recipient))) if s.earn_in else 0
+        if into_stake:
+            s.stakes[tx.recipient] = s.stake(tx.recipient) + into_stake
+        s._credit(tx.recipient, tx.amount - into_stake)
         return -tx.amount
     raise InvalidBlock(f"unknown system tx {tx.kind}")
 
@@ -412,6 +436,8 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
         raise InvalidBlock("block is for a different chain")
 
     if block.height == 0:
+        if prev is not None:
+            raise InvalidBlock("a chain has only one genesis block")
         for tx in block.txs:
             if tx.kind != "genesis" or tx.amount < 0:
                 raise InvalidBlock("genesis block may only contain genesis allocations")
@@ -419,6 +445,13 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
                 s.validators[tx.recipient] = tx.memo[len(VALIDATOR):]
             elif tx.memo == "stake":
                 s.stakes[tx.recipient] = s.stake(tx.recipient) + tx.amount
+            elif tx.memo == BOOTSTRAP:
+                s.stakes[tx.recipient] = s.stake(tx.recipient) + tx.amount
+                s.locked[tx.recipient] = s.locked.get(tx.recipient, 0) + tx.amount
+            elif tx.memo == EARN_IN:
+                if tx.amount or tx.recipient != SYSTEM:
+                    raise InvalidBlock("the earn-in rule can't move coins")
+                s.earn_in = True
             elif tx.memo.startswith(ECONOMICS_MEMO):
                 s.economics = _economics_of(tx)
             else:
@@ -435,7 +468,7 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
     if not verify(block.proposer_pubkey, block.header(), block.signature):
         raise InvalidBlock("bad proposer signature")
     proposer = address_of(block.proposer_pubkey)
-    if s.stake(proposer) < econ.MIN_STAKE:
+    if not s.staked(proposer):
         raise InvalidBlock("proposer is not staked")
     if s.validators and proposer not in s.validator_set():
         raise InvalidBlock("proposer is not a validator")
@@ -477,12 +510,16 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
 class Chain:
     def __init__(self, allocations: dict[str, int], stakes: dict[str, int] | None = None,
                  chain_id: str = DEFAULT_CHAIN_ID, genesis_time: int = 0, economics: econ.Economics | None = None,
-                 validators: dict[str, str] | None = None):
+                 validators: dict[str, str] | None = None, bootstrap: dict[str, int] | None = None, earn_in: bool = False):
+        """`bootstrap`: stake for the first validators that votes but can never be withdrawn or spent. `earn_in`:
+        workers may start with no stake and earn it. Genesis files without them keep their genesis hash."""
         self.chain_id = chain_id
         txs = [Tx("genesis", SYSTEM, a, v, chain_id=chain_id) for a, v in sorted(allocations.items())]
         txs += [Tx("genesis", SYSTEM, a, v, memo="stake", chain_id=chain_id) for a, v in sorted((stakes or {}).items())]
         txs += _economics_tx(economics, chain_id)
         txs += [Tx("genesis", SYSTEM, a, 0, memo=VALIDATOR + url, chain_id=chain_id) for a, url in sorted((validators or {}).items())]
+        txs += [Tx("genesis", SYSTEM, a, v, memo=BOOTSTRAP, chain_id=chain_id) for a, v in sorted((bootstrap or {}).items())]
+        txs += [Tx("genesis", SYSTEM, SYSTEM, 0, memo=EARN_IN, chain_id=chain_id)] if earn_in else []
         genesis = Block(0, b"\x00" * 32, genesis_time, None, txs, chain_id)
         self.state = apply_block(State(), genesis, chain_id, None)
         self.blocks: list[Block] = [genesis]
@@ -491,7 +528,8 @@ class Chain:
     def from_genesis(cls, g: dict) -> "Chain":
         return cls({k: int(v) for k, v in g["allocations"].items()}, {k: int(v) for k, v in g.get("stakes", {}).items()},
                    g["chain_id"], int(g.get("timestamp", 0)), econ.Economics.from_genesis(g),
-                   {k: str(v) for k, v in g.get("validators", {}).items()})
+                   {k: str(v) for k, v in g.get("validators", {}).items()},
+                   {k: int(v) for k, v in g.get("bootstrap", {}).items()}, bool(g.get("earn_in", False)))
 
     @property
     def tip(self) -> Block:

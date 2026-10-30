@@ -72,7 +72,8 @@ class CoordinatorConfig:
     canaries_per_round: int = 2  # known-fake submissions slipped to verifiers
     agreement_tolerance: float = 1e-4  # whole-unit comparisons (noise compounds over a unit)
     compute_s: float = 10.0  # length of the compute phase; sizes each worker's capacity
-    newcomer_units: int = 4  # cap for workers with no recent delivered work on chain
+    newcomer_units: int = 4  # cap for workers with no recent delivered work on chain, and for those still earning in
+    max_newcomers: int = 64  # workers without stake (earning it in) admitted per round, so they can't crowd the round
     max_mempool: int = 10_000
     min_fee: int = 0  # syn a tx must pay to be relayed; `vibehash node` sets fees.DEFAULT_MIN_FEE
 
@@ -80,7 +81,7 @@ class CoordinatorConfig:
         """The settings a round's outcome depends on, recorded with it so a replay uses the same ones."""
         return {"replication_rate": self.replication_rate, "challenge_segments": self.challenge_segments,
                 "canaries_per_round": self.canaries_per_round, "agreement_tolerance": self.agreement_tolerance,
-                "compute_s": self.compute_s, "newcomer_units": self.newcomer_units}
+                "compute_s": self.compute_s, "newcomer_units": self.newcomer_units, "max_newcomers": self.max_newcomers}
 
 
 @dataclass
@@ -269,7 +270,7 @@ class Coordinator:
         newcomer cap if it's new (or withheld, or was slashed), and never more than it says it can do."""
         newcomer = self.config.newcomer_units * job.unit_flops
         record = self.track_record(addr)
-        if record is None:
+        if record is None or not self.chain.state.staked(addr):  # new, or still earning its stake in
             return min(claimed_flops, newcomer)
         delivered, missed = record
         return min(claimed_flops, max(newcomer, delivered if missed else RAMP * delivered))
@@ -293,7 +294,8 @@ class Coordinator:
         self.mempool = fees.by_fee([*pool, tx])
 
     def eligible(self, addr: str) -> bool:
-        return self.chain.state.stake(addr) >= econ.MIN_STAKE
+        """May take work: staked, or on a chain where workers earn their stake in."""
+        return self.chain.state.staked(addr) or self.chain.state.earn_in
 
     def _need(self, phase: Phase) -> _Round:
         if self.phase != phase or self.r is None:
@@ -412,6 +414,9 @@ class Coordinator:
             raise ProtocolError(f"stake at least {econ.MIN_STAKE} syn to take work")
         if not (0 < flops_per_sec < 1e18 and 0 < memory_mb < 1e9):
             raise ProtocolError("implausible hardware report")
+        staked = self.chain.state.staked
+        if not staked(addr) and sum(not staked(a) for a in r.regs) >= self.config.max_newcomers:
+            raise ProtocolError("this round has all the workers without stake it takes; try the next one")
         r.regs[addr] = Registration(addr, float(flops_per_sec), int(memory_mb))
         entry = envelope if envelope is not None else {"address": addr, "flops_per_sec": float(flops_per_sec), "memory_mb": int(memory_mb)}
         r.record["registrations"].append(entry)
@@ -432,10 +437,13 @@ class Coordinator:
         used = {a: 0 for a in capacity}
         order = draw.shuffle(sorted(capacity))
 
+        staked = self.chain.state.staked
+
         def pick(unit: WorkUnit, exclude: set[str]) -> str | None:
+            # Staked workers first: those earning their stake in only get what's left, so they can't crowd them out.
             fits = [a for a in order if a not in exclude and r.regs[a].memory_mb >= unit.memory_mb
                     and used[a] + unit.flops <= capacity[a]]
-            return min(fits, key=lambda a: (used[a] + unit.flops) / capacity[a]) if fits else None
+            return min(fits, key=lambda a: (not staked(a), (used[a] + unit.flops) / capacity[a])) if fits else None
 
         for unit in r.units.values():
             holders = []
@@ -546,8 +554,10 @@ class Coordinator:
         draw = Draw(b"verify", r.beacon)
 
         def pool(exclude: set[str]) -> list[str]:
-            return [a for a, reg in sorted(r.regs.items())
-                    if a not in exclude and a not in offenders and reg.memory_mb >= job.memory_mb]
+            # Only staked workers check others: a worker still earning in has little to lose by waving work
+            # through, and a crowd of them could otherwise check each other's fakes.
+            return [a for a, reg in sorted(r.regs.items()) if a not in exclude and a not in offenders
+                    and reg.memory_mb >= job.memory_mb and self.chain.state.staked(a)]
 
         def task_id(uid, submitter, verifier) -> str:
             return h256(r.beacon, uid.encode(), submitter.encode(), verifier.encode()).hex()[:20]

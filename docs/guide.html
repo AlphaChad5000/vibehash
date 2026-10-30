@@ -232,7 +232,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     <div class="topbar">
       <a class="brand" href="#overview" aria-label="Vibe Hash">
         <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
-        <b>Vibe Hash</b><span class="tag">Testnet · 0.4</span>
+        <b>Vibe Hash</b><span class="tag">Testnet · 0.5</span>
       </a>
       <nav class="topnav" aria-label="Sections">
         <a href="#setup">Get started</a><a href="#round">How it works</a><a href="#jobspec">Reference</a><a href="#troubleshooting">Troubleshooting</a>
@@ -261,7 +261,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <dl class="specs">
       <div><dt>Round</dt><dd>about 38 s</dd></div>
-      <div><dt>Minimum stake</dt><dd>5 VIBE</dd></div>
+      <div><dt>Stake</dt><dd>5 VIBE, earned by working</dd></div>
       <div><dt>Block subsidy</dt><dd>50 VIBE, halving every 210 rounds</dd></div>
       <div><dt>A block is final</dt><dd>once validators with over ⅔ of the stake sign it</dd></div>
       <div><dt>Base unit</dt><dd>1 VIBE = 100,000,000 syn</dd></div>
@@ -283,7 +283,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <p>Bitcoin miners spend electricity on hashes nobody uses, and only one lucky winner per block gets paid. Vibe Hash replaces the hashes with <strong>training steps on a real model</strong> that someone has paid to have trained. There's no lottery: everyone whose work passes the checks is paid in proportion to how much they did.</p>
       <p>There are two ways to take part, and you can do both from the same computer.</p>
       <ul>
-        <li><strong>Worker.</strong> Stake a little VIBE and let your computer train and check models. This is the mining.</li>
+        <li><strong>Worker.</strong> Let your computer train and check models. This is the mining. You can start with no VIBE at all: your first 5 VIBE of pay becomes your stake.</li>
         <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows.</li>
       </ul>
       <p>Training a model takes four commands once Vibe Hash is set up. Your data is a CSV file, and the result is a model file that makes predictions; <a href="#setup">Get started</a> walks through each step.</p>
@@ -325,7 +325,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <div class="axis"><span>0 s</span><span>3 s</span><span>23 s</span><span><span>28 s</span><span>38 s</span></span></div>
       </div>
       <ul class="phases">
-        <li style="--key: var(--ph-register)"><strong>Register</strong><span>3 s</span><p>Workers check in with their measured speed and memory. You need at least 5 VIBE staked.</p></li>
+        <li style="--key: var(--ph-register)"><strong>Register</strong><span>3 s</span><p>Workers check in with their measured speed and memory. Those with 5 VIBE staked get work first; newcomers still earning their stake get small batches from what's left.</p></li>
         <li style="--key: var(--ph-compute)"><strong>Compute</strong><span>20 s</span><p>The work is split into small units sized so a slow laptop can finish one in time; faster machines get more units, not bigger ones. Each worker trains its units and sends a sealed fingerprint of each result before the deadline.</p></li>
         <li style="--key: var(--ph-reveal)"><strong>Reveal</strong><span>5 s</span><p>A random number that nobody could know earlier picks which parts of each unit get checked. Workers reveal their results and those parts.</p></li>
         <li style="--key: var(--ph-verify)"><strong>Verify, then seal</strong><span>10 s</span><p>Other workers re-run the chosen parts and report whether they match; checking is paid work too. Passing results are averaged into the model, and payments and penalties go into a block, with a record of the round's signed messages that anyone can replay to check every decision. The network's validators vote on the block before it counts.</p></li>
@@ -438,7 +438,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
           </tbody>
         </table>
       </div>
-      <p>Half of any slashed stake goes to whoever caught the problem and the other half is burned. When you unstake, the coins wait 20 rounds before you can spend them, and they can still be slashed in that time. Two slashes take a 10 VIBE stake below the 5 VIBE minimum, and that wallet stops getting work.</p>
+      <p>Half of any slashed stake goes to whoever caught the problem and the other half is burned. When you unstake, the coins wait 20 rounds before you can spend them, and they can still be slashed in that time. A wallet whose stake falls below the 5 VIBE minimum goes back to earning it in: small batches of work, no checking others, and its pay refills the stake first.</p>
+      <h3>Starting with nothing</h3>
+      <p>Bitcoin needed no stake, because a hash proves itself. Training can only be spot-checked, so the stake is what a cheater stands to lose. To keep that without anyone handing out coins, a new worker <strong>earns its stake in</strong>. Its first 5 VIBE of pay goes into its stake instead of its wallet, so what it could lose by cheating grows with what it has earned. Until then it's held to small batches, gets units only after staked workers have theirs, and never checks other workers' results. Its own results are always checked by a staked worker. The network's first validators vote with <strong>bootstrap stake</strong>, which can never be withdrawn or spent and is burned if they leave. So every spendable coin starts from work.</p>
     </section>
 
     <section id="jobspec">
@@ -478,7 +480,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else.</p></div></details>
         <details><summary>no node address / no wallet: run `vibehash setup`</summary><div class="answer"><p>Commands use the node address and wallet that setup saved. Run setup once, or add <code>--node</code> or <code>--wallet</code> to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
         <details><summary>can't reach node at http://…</summary><div class="answer"><p>Check the node address with whoever runs the network. The node may also be offline for a moment; the worker keeps retrying on its own, so you can leave it running.</p></div></details>
-        <details><summary>stake at least 500000000 syn to take work</summary><div class="answer"><p>Your stake is under the 5 VIBE minimum (500,000,000 syn). Stake more VIBE. If you've been slashed twice, your stake has dropped below the minimum.</p></div></details>
+        <details><summary>stake at least 500000000 syn to take work</summary><div class="answer"><p>This network was set up to require stake, rather than letting workers earn it in, and yours is under the 5 VIBE minimum (500,000,000 syn). Ask whoever runs it for some VIBE, then stake it as Get started shows.</p></div></details>
         <details><summary>message timestamp too far from node clock</summary><div class="answer"><p>Your computer's clock is more than 2 minutes off. Turn on automatic time sync in your system settings.</p></div></details>
         <details><summary>node switched networks (genesis changed); refusing to continue</summary><div class="answer"><p>The address you're connected to now runs a different network. Check you have the right node address, then start the worker again.</p></div></details>
         <details><summary>this wallet is encrypted; a password is required</summary><div class="answer"><p>Run the command in a normal terminal window so it can ask for your password. To run unattended, set <code>VIBEHASH_PASSWORD</code> in that terminal first.</p></div></details>
@@ -487,14 +489,14 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <details><summary>GPU training needs PyTorch / device … not found</summary><div class="answer"><p>You asked for a GPU with <code>--device</code>, but PyTorch can't see one. Run <code>vibehash devices</code> to see what's available, or leave out <code>--device</code> to fall back to the CPU automatically.</p></div></details>
         <details><summary>censored: round 12: the node signed a receipt for your commit but sealed the round without it</summary><div class="answer"><p>The node accepted one of your messages, promised in a signed receipt to record it, then sealed the round without it, which can cost you that round's pay and reputation. Your receipts are proof: they're saved in <code>receipts.jsonl</code> in your worker's folder under <code>~/.vibehash/cache</code>. Anyone can check that file with <code>vibehash chain verify --receipts receipts.jsonl</code>, so share it with whoever runs the network, and with other workers deciding whether to trust that node.</p></div></details>
         <details><summary>The dashboard looks garbled, or I want plain log lines</summary><div class="answer"><p>Add <code>--plain</code> to <code>worker</code> or <code>testnet</code>. Logs redirected to a file get plain lines automatically, and setting <code>NO_COLOR</code> turns the colours off.</p></div></details>
-        <details><summary>I'm registered but never get any units</summary><div class="answer"><p>Check three things. Your memory must be at least the job's <code>memory_mb</code>: graphics memory for jobs that run on your GPU, system RAM otherwise (add <code>--memory-mb</code> if it's detected wrong). Your stake must be at least 5 VIBE. And new workers get at most 4 units until they've delivered once, so the first round is small.</p></div></details>
+        <details><summary>I'm registered but never get any units</summary><div class="answer"><p>Check three things. Your memory must be at least the job's <code>memory_mb</code>: graphics memory for jobs that run on your GPU, system RAM otherwise (add <code>--memory-mb</code> if it's detected wrong). New workers get at most 4 units until they've delivered once, so the first round is small. And while you're still earning your stake, you only get units staked workers didn't need, so on a busy network the first rounds can pass with none; that changes once your first 5 VIBE is in.</p></div></details>
       </div>
     </section>
   </article>
 </div>
 
 <footer>
-  <div class="wrap"><span>Vibe Hash 0.4 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.4</span></div>
+  <div class="wrap"><span>Vibe Hash 0.5 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.5</span></div>
 </footer>
 
 <script>
@@ -537,7 +539,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
   };
   var roleFields = { worker: ["node"], train: ["node", "data"], local: [] };
   var intros = {
-    worker: "Put your computer's spare time to work on someone's network. You'll need its node address and a few VIBE from whoever runs it.",
+    worker: "Put your computer's spare time to work on someone's network. You only need its node address: on most networks you start with no VIBE and earn your stake as you go.",
     train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
     local: "Run a complete network on this computer: a node, two workers and a training job. Nothing to fill in and nobody else involved."
   };
@@ -565,7 +567,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         install(),
         { title: "Set up", note: "One guided command for everything else. It saves the node address, creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run setup again any time; it keeps what's already done.",
           cmds: [vh("setup" + nodeArg)] },
-        { title: "Get VIBE and stake", note: "To be given work you need at least 5 VIBE staked; this stakes 10. Send your vibe1 address to whoever runs the network so they can send you some, then stake it. Like every transaction, it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more than you'll stake. Stake is only at risk if you cheat; crashes never touch it. It takes effect in the next block, within about a minute.",
+        { title: "Stake (usually not needed)", note: "Most networks let you start with nothing: your first 5 VIBE of pay becomes your stake, and setup tells you so. Then skip this step. If setup says this network needs stake first, send your vibe1 address to whoever runs it so they can send you some, then stake it; this stakes 10. Like every transaction it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more. Stake is only at risk if you cheat; crashes never touch it.",
           cmds: [vh("stake --amount 10")] },
         { title: "Start working", note: "The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. GPU-sized jobs train on the graphics card; small float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
           cmds: [vh("worker")] },

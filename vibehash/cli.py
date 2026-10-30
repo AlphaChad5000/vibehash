@@ -217,15 +217,23 @@ def cmd_wallet_show(a):
 
 def cmd_genesis_create(a):
     g = {"chain_id": a.chain_id, "timestamp": int(time.time()), "allocations": _kv(a.alloc), "stakes": _kv(a.stake)}
+    if a.bootstrap:
+        g["bootstrap"] = _kv(a.bootstrap)
     if a.validator:
         g["validators"] = _validators(a.validator)
-        unstaked = [v for v in g["validators"] if g["stakes"].get(v, 0) < econ.MIN_STAKE]
+        stake = lambda v: g["stakes"].get(v, 0) + g.get("bootstrap", {}).get(v, 0)  # noqa: E731
+        unstaked = [v for v in g["validators"] if stake(v) < econ.MIN_STAKE]
         if unstaked:
-            sys.exit(f"validators need a stake of at least {fmt(econ.MIN_STAKE)} in the genesis (--stake): {', '.join(unstaked)}")
+            sys.exit(f"validators need a stake of at least {fmt(econ.MIN_STAKE)} in the genesis (--bootstrap or --stake): "
+                     f"{', '.join(unstaked)}")
+    if a.earn_in:
+        g["earn_in"] = True
     g["economics"] = econ.SCHEDULES[a.economics].to_dict()
     hash_ = Chain.from_genesis(g).genesis_hash  # also checks the allocations fit under the supply cap
     Path(a.out).write_text(json.dumps(g, indent=2))
     print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(econ.SCHEDULES[a.economics])}")
+    if a.earn_in:
+        print(f"workers can start with no stake: their first {fmt(econ.MIN_STAKE)} of pay becomes their stake")
 
 
 def _describe_economics(e: econ.Economics) -> str:
@@ -294,10 +302,18 @@ def cmd_worker(a):
         w = WorkerClient(url, load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir)
     except RuntimeError as e:
         sys.exit(f"error: {e}")
-    acct, need = w.node.account(w.keys.address), w.node.status()["min_stake"]
-    low = f"stake is {fmt(acct['stake'])}; stake at least {fmt(need)} to get work" if acct["stake"] < need else None
+    status = w.node.status()
+    acct, need = w.node.account(w.keys.address), status["min_stake"]
+    low = earning = None
+    if acct["stake"] < need and status.get("earn_in"):
+        earning = (f"earning your stake: your next {fmt(need - acct['stake'])} of pay becomes stake. Until then you get "
+                   "small batches of work and don't check other workers'")
+    elif acct["stake"] < need:
+        low = f"stake is {fmt(acct['stake'])}; stake at least {fmt(need)} to get work"
     if not minerui.supported(a.plain):
         print(f"worker {w.keys.address} training on {w.backend.describe()} ({hardware.describe()})")
+        if earning:
+            print(earning)
         if low:
             print(f"warning: {low}", file=sys.stderr)
         try:
@@ -306,6 +322,8 @@ def cmd_worker(a):
             pass
         return
     dash = minerui.MinerDashboard([("you", w)], url)
+    if earning:
+        dash.note(earning, logging.INFO + 1)
     if low:
         dash.note(f"{low}: {prog()} stake --amount {need // SYN_PER_VIBE}", logging.WARNING)
     stop = threading.Event()
@@ -431,6 +449,10 @@ def cmd_setup(a):
         if not short:
             staked = True
             print(f"   staked {fmt(acct['stake'])}: ready to take work")
+        elif status.get("earn_in") and acct["balance"] < short + fee:
+            staked = True  # nothing to do: the work itself pays the stake in
+            print(f"   no stake needed to start: this network lets you earn it. Your first {fmt(short)} of pay\n"
+                  "   becomes your stake; until then you get small batches of work")
         elif acct["balance"] < short + fee:
             print(f"   balance {fmt(acct['balance'])}; staking needs at least {fmt(need)}. Ask the node's operator to send\n"
                   f"   VIBE to {address}, then run setup again (or: {prog()} stake --amount {need // SYN_PER_VIBE})")
@@ -453,6 +475,8 @@ def cmd_balance(a):
     node = NodeClient(node_of(a))
     acct = node.account(addr)
     print(f"address:    {addr}\nbalance:    {fmt(acct['balance'])}\nstake:      {fmt(acct['stake'])}")
+    if acct.get("bootstrap"):
+        print(f"            of which {fmt(acct['bootstrap'])} is bootstrap stake: it votes, but can't be withdrawn")
     for amount, height in acct["unbonding"]:
         print(f"unbonding:  {fmt(amount)} (spendable at block {height})")
     print(f"reputation: {acct['reputation']:.2f}")
@@ -937,12 +961,14 @@ def cmd_testnet(a):
             wallets.save(KeyPair.generate(), d / f"{name}.json", None)
         keys[name] = wallets.load(d / f"{name}.json", None)
     if existing is None:
-        # Validators run the chain, even just one: each listens on the address the genesis gives it.
+        # Validators run the chain, even just one: each listens on the address the genesis gives it. They vote with
+        # bootstrap stake, which can't be spent; the workers start with nothing and earn their stake. Only the
+        # requester is handed coins, to pay for the demo jobs.
         public = _lan_ip() if a.host == "0.0.0.0" else "127.0.0.1" if a.host in ("127.0.0.1", "localhost") else a.host
         ports = _free_ports(count) if a.port == 0 else [a.port + i for i in range(count)]
         genesis = {"chain_id": f"vibehash-local-{secrets.token_hex(3)}", "timestamp": int(time.time()),
-                   "allocations": {keys["requester"].address: 10_000 * SYN_PER_VIBE},
-                   "stakes": {keys[n].address: 10 * SYN_PER_VIBE for n in [*validators, *worker_names]},
+                   "allocations": {keys["requester"].address: 10_000 * SYN_PER_VIBE}, "stakes": {},
+                   "bootstrap": {keys[v].address: 10 * SYN_PER_VIBE for v in validators}, "earn_in": True,
                    "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)}}
         (d / "genesis.json").write_text(json.dumps(genesis, indent=2))
     genesis = json.loads((d / "genesis.json").read_text())
@@ -1139,6 +1165,10 @@ def main(argv=None):
     p.add_argument("--out", required=True); p.set_defaults(fn=cmd_genesis_create)
     p.add_argument("--economics", choices=sorted(econ.SCHEDULES), default="testnet",
                    help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year halvings)")
+    p.add_argument("--bootstrap", action="append", metavar="ADDR=VIBE",
+                   help="stake for a first validator that votes but can never be withdrawn or spent; burned if it leaves")
+    p.add_argument("--no-earn-in", dest="earn_in", action="store_false",
+                   help="require workers to be given stake; by default they can start with none and earn it")
 
     p = sub.add_parser("node", help="run a node")
     p.add_argument("--genesis", required=True); p.add_argument("--wallet", required=True); p.add_argument("--data-dir", required=True)

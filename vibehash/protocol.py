@@ -74,7 +74,7 @@ class Protocol:
         return self.coord.eligible(addr)
 
     def _proposer(self, seed: bytes) -> KeyPair:
-        stakers = sorted(a for a in self.workers if self.eligible(a))
+        stakers = sorted(a for a in self.workers if self.chain.state.staked(a))  # not those still earning in
         weights = np.array([self.chain.state.stake(a) for a in stakers], dtype=float)
         pick = np.random.default_rng(int.from_bytes(seed[:8], "big")).choice(len(stakers), p=weights / weights.sum())
         return self.workers[stakers[pick]].keys
