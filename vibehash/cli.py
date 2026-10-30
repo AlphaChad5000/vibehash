@@ -670,6 +670,7 @@ def cmd_example(a):
     """Write the sample data, so training can be tried before you have data of your own."""
     from importlib import resources
 
+    Path(a.dir).mkdir(parents=True, exist_ok=True)
     for name, what in (("fruit.csv", "320 measured fruit with their names, to train on"),
                        ("fruit-new.csv", "12 more without names, to predict")):
         out = Path(a.dir) / name
