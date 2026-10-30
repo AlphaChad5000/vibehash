@@ -261,7 +261,7 @@ def cmd_node(a):
     context = tls.server_context(a.tls_cert, a.tls_key) if a.tls_cert else None
     node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                 keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
-                announce=normalise_url(a.announce) if a.announce else None).start()
+                announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20)).start()
     if context:
         fp = tls.cert_fingerprint(a.tls_cert)
         print(f"serving HTTPS; certificate sha256 fingerprint {fp}\n"
@@ -1182,6 +1182,9 @@ def main(argv=None):
     p.add_argument("--dataset", action="append", help="add an .npz dataset to this node's store")
     p.add_argument("--keep-rounds", type=int, default=10,
                    help="rounds whose opened checkpoints stay downloadable, so anyone can re-run their checks (default 10)")
+    p.add_argument("--max-job-mb", type=float, default=64.0, metavar="MB",  # node.MAX_JOB_BYTES, which says why
+                   help="relay only jobs whose model, one checkpoint at the job's precision, is at most this big (default "
+                        "64, which a 2 GB server can run; jobs may be up to 1024)")
     for name, default in (("register-s", 3.0), ("compute-s", 20.0), ("reveal-s", 5.0), ("verify-s", 10.0)):
         p.add_argument(f"--{name}", type=float, default=default)
     p.set_defaults(fn=cmd_node)

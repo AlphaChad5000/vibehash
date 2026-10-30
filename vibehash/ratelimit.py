@@ -33,7 +33,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import urlparse
 
 log = logging.getLogger("vibehash.node")
 
@@ -51,12 +51,20 @@ MAX_DRAIN = 2**20  # unread request bytes a 429 reads first, so closing doesn't 
 MAX_TURNED_AWAY = 1024  # connections answered 503 and waiting to be closed (beyond that, they're closed at once)
 
 
+def path_parts(path: str) -> list[str]:
+    """A request path's segments, read the way the node routes it: urlparse drops a scheme and host, the query, and
+    ';params' after the last segment. The rate limit must read it the same way, or `/tx;x` would be counted as
+    "other" and still reach /tx."""
+    return [p for p in urlparse(path).path.split("/") if p]
+
+
 def bucket_of(method: str, path: str) -> str:
     if method in ("GET", "HEAD"):
         return "read"
     if method == "PUT":
         return "upload"
-    return ROUTES.get(urlsplit(path).path.strip("/").split("/")[0], "other")
+    parts = path_parts(path)
+    return ROUTES.get(parts[0] if parts else "", "other")
 
 
 def is_loopback(ip: str) -> bool:

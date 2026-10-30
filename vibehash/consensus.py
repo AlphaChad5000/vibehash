@@ -25,12 +25,17 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from .crypto import Draw, KeyPair, address_of, verify
+from .crypto import Draw, KeyPair, address_of, h256, verify
 from .ledger import Block, canonical
 
 log = logging.getLogger("vibehash.consensus")
-MAX_FUTURE = 10_000  # messages for later heights kept until we catch up
 MAX_ROUNDS_AHEAD = 1_000  # later rounds than this are ignored (an attacker's memory bomb, not a slow network)
+# Validators' messages for later heights are kept until we catch up, so we can vote as soon as we get there: only the
+# next few heights' (sync fetches the blocks further ahead, and validators re-send what's current every few seconds),
+# and at most this many messages, and bytes of them, from any one validator.
+FUTURE_HEIGHTS = 4
+FUTURE_PER_SENDER = 64
+FUTURE_BYTES = 2**26
 
 
 class Step(str, Enum):
@@ -132,6 +137,14 @@ def _block_id(value: dict) -> str:
     return Block.from_dict(value["block"]).hash.hex()
 
 
+def _value_key(value: dict) -> str:
+    """What a proposal's checks are cached under: its whole value, not its block id. Whoever relays a proposal can
+    change it and keep both the id and the proposer's signature: the proposer signs only the block id, the record isn't
+    part of the block, and the transaction root's Merkle tree repeats an odd level's last node, so a copy with its last
+    transaction repeated has the same root."""
+    return h256(canonical(value)).hex()
+
+
 # --- the state machine ----------------------------------------------------------------------
 
 class Engine:
@@ -171,7 +184,7 @@ class Engine:
         self.wanted: tuple[int, int] | None = None
         self.validators: dict[str, int] = {}
         self.total, self.order, self.locked_round, self.waiting = 0, [], -1, False
-        self.future: list[dict] = []
+        self.future: dict[tuple, tuple[dict, int]] = {}  # (sender, kind, height, round) -> (message, its size)
         self.evidence: list[tuple[dict, dict]] = []  # pairs of conflicting messages from one validator: grounds for slashing
 
     # --- inputs ------------------------------------------------------------------------------
@@ -245,16 +258,16 @@ class Engine:
         self.order = proposer_order(self.validators, height) if self.total else []
         self.locked_value = self.locked_id = self.valid_value = self.valid_id = None
         self.locked_round = self.valid_round = -1
-        self.proposals: dict[int, tuple[str, dict, int]] = {}  # round -> (block id, value, valid round)
+        self.proposals: dict[int, tuple[str, dict, int, str]] = {}  # round -> (block id, value, valid round, _value_key)
         self.votes: dict[str, dict[int, dict[str, tuple[str | None, dict]]]] = {"prevote": {}, "precommit": {}}
         self.timers: list[tuple[float, str, int]] = []
         self.fired: set[tuple[str, int]] = set()  # rules that act only the first time they hold in a round
-        self.checked: dict[str, bool] = {}
+        self.checked: dict[str, bool] = {}  # _value_key -> whether that value passed validate()
         self.mine: list[dict] = []
         self.gossiped = self.now
         self._start_round(0)
-        later, self.future = self.future, []
-        for m in later:
+        later, self.future = self.future, {}
+        for m, _ in later.values():
             self._on_message(m)
 
     def _start_round(self, round_: int) -> None:
@@ -295,40 +308,49 @@ class Engine:
                 return
         except (KeyError, TypeError, ValueError):
             return
-        if height < self.height:
-            return
-        if height > self.height:
-            if len(self.future) < MAX_FUTURE:
-                self.future.append(msg)
-            self._behind(height)
-            return
-        if not 0 <= round_ <= self.round + MAX_ROUNDS_AHEAD:
+        # A later height's messages are checked like this height's, signer included (it must be one of the validators
+        # we know), before they're kept or make us look for blocks: anyone can send them.
+        if height < self.height or not 0 <= round_ <= (self.round if height == self.height else 0) + MAX_ROUNDS_AHEAD:
             return
         try:
             pub, sig = bytes.fromhex(msg["pubkey"]), bytes.fromhex(msg["sig"])
+            addr = address_of(pub)
+            if addr not in self.validators:  # before working out a proposal's block id, which takes a while
+                return
             if kind == "proposal":
+                valid_round = int(msg["valid_round"])
+                if height == self.height and (addr != self.proposer(round_) or not -1 <= valid_round < round_):
+                    return
                 value = {"block": msg["block"], "record": msg.get("record")}
-                block_id, valid_round = self._id(value), int(msg["valid_round"])
+                block_id = self._id(value)
                 signed = _signed_part(self.chain_id, kind, height, round_, block_id, valid_round)
             else:
                 block_id = msg["block"]
                 if block_id is not None and not isinstance(block_id, str):
                     return
                 signed = _signed_part(self.chain_id, kind, height, round_, block_id)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, AttributeError):
             return
-        addr = address_of(pub)
-        if addr not in self.validators or not verify(pub, signed, sig):
+        if not verify(pub, signed, sig):
+            return
+        if height > self.height:
+            self._keep((addr, kind, height, round_), msg)
+            self._behind(height)
             return
         if kind == "proposal":
-            if addr != self.proposer(round_) or not -1 <= valid_round < round_:
+            have = self.proposals.get(round_)
+            if have is not None and have[0] != block_id:
+                self.evidence.append(({"type": "proposal", "height": height, "round": round_, "block": have[0]}, msg))
+                log.warning("proposer %s proposed two blocks in round %d at height %d", addr, round_, height)
                 return
-            if round_ in self.proposals:
-                if self.proposals[round_][0] != block_id:
-                    self.evidence.append(({"type": "proposal", "height": height, "round": round_, "block": self.proposals[round_][0]}, msg))
-                    log.warning("proposer %s proposed two blocks in round %d at height %d", addr, round_, height)
+            if have is not None and self.checked.get(have[3]) is not False:
+                return  # the same block again (proposers re-send theirs), and our copy passed or isn't checked yet
+            key = _value_key(value)
+            if have is not None and (key == have[3] or self.checked.get(key) is False):
                 return
-            self.proposals[round_] = (block_id, value, valid_round)
+            # The round's first proposal, or a different copy of one whose copy we have failed its checks: a relay may
+            # have altered that one (see _value_key), and this may be the proposer's own.
+            self.proposals[round_] = (block_id, value, valid_round, key)
             return
         votes = self.votes[kind].setdefault(round_, {})
         if addr in votes:
@@ -337,6 +359,17 @@ class Engine:
                 log.warning("validator %s sent conflicting %ss in round %d at height %d", addr, kind, round_, height)
             return
         votes[addr] = (block_id, msg)
+
+    def _keep(self, key: tuple, msg: dict) -> None:
+        """Hold a validator's message for a later height until we get there, within the FUTURE_* bounds. `key` is
+        (sender, kind, height, round): one message each, since validators re-send theirs every few seconds."""
+        sender, _, height, _ = key
+        if height > self.height + FUTURE_HEIGHTS or key in self.future:
+            return
+        theirs = [size for k, (_, size) in self.future.items() if k[0] == sender]
+        size = len(canonical(msg))
+        if len(theirs) < FUTURE_PER_SENDER and sum(theirs) + size <= FUTURE_BYTES:
+            self.future[key] = (msg, size)
 
     def _power(self, kind: str, round_: int, block_id=...) -> int:
         """Stake behind `kind` votes in a round: for `block_id` (None means a vote for nothing), or for anything."""
@@ -349,14 +382,16 @@ class Engine:
             out.add(self.proposer(round_))
         return out
 
-    def _valid(self, block_id: str, value: dict) -> bool:
-        if block_id not in self.checked:
+    def _valid(self, prop: tuple) -> bool:
+        """Whether a proposal (an entry of self.proposals) passes validate(): checked once per distinct value."""
+        _, value, _, key = prop
+        if key not in self.checked:
             try:
-                self.checked[block_id] = bool(self._validate(value))
+                self.checked[key] = bool(self._validate(value))
             except Exception:  # noqa: BLE001 - a proposal we can't even evaluate is an invalid one
                 log.exception("checking a proposed block failed")
-                self.checked[block_id] = False
-        return self.checked[block_id]
+                self.checked[key] = False
+        return self.checked[key]
 
     def _first(self, rule: str, round_: int) -> bool:
         if (rule, round_) in self.fired:
@@ -373,9 +408,9 @@ class Engine:
     def _rule(self) -> bool:
         """Applies the first rule that holds. True if it changed anything."""
         r, step, q = self.round, self.step, lambda p: quorum(p, self.total)
-        for pr, (bid, value, _) in sorted(self.proposals.items()):  # 49: a block is decided, in whatever round
-            if q(self._power("precommit", pr, bid)) and self._valid(bid, value):
-                self._decide(pr, bid, value)
+        for pr, p in sorted(self.proposals.items()):  # 49: a block is decided, in whatever round
+            if q(self._power("precommit", pr, p[0])) and self._valid(p):
+                self._decide(pr, p[0], p[1])
                 return True
         later = [x for x in {*self.proposals, *self.votes["prevote"], *self.votes["precommit"]} if x > r]
         for x in sorted(later, reverse=True):  # 55: over a third of the stake is in a later round, so we're late
@@ -384,12 +419,20 @@ class Engine:
                 return True
         prop = self.proposals.get(r)
         if step == Step.PROPOSE and prop:
-            bid, value, vr = prop
+            bid, _, vr, _ = prop
             if vr == -1:  # 22: a new block
-                ok = self._valid(bid, value) and (self.locked_round == -1 or self.locked_id == bid)
+                ok = self._valid(prop) and (self.locked_round == -1 or self.locked_id == bid)
             elif q(self._power("prevote", vr, bid)):  # 28: a block more than two thirds prevoted for in round vr
-                ok = self._valid(bid, value) and (self.locked_round <= vr or self.locked_id == bid)
+                ok = self._valid(prop) and (self.locked_round <= vr or self.locked_id == bid)
             else:
+                ok = None
+            if ok is False and not self._valid(prop):
+                # It failed its checks, but our copy may be one a relay altered (see _value_key), and proposers re-send
+                # theirs every few seconds: give a good copy that long to replace it before voting nil (the timer
+                # votes, unless the propose timeout comes first).
+                if self._first("bad-proposal", r):
+                    self.timers.append((self.now + 2 * self.timeouts.regossip, Step.PROPOSE.value, r))
+                    return True
                 ok = None
             if ok is not None:
                 self.step = Step.PREVOTE
@@ -398,9 +441,9 @@ class Engine:
         if step == Step.PREVOTE and q(self._power("prevote", r)) and self._first("prevote-wait", r):  # 34
             self._schedule(Step.PREVOTE, r)
             return True
-        if (step != Step.PROPOSE and prop and q(self._power("prevote", r, prop[0])) and self._valid(prop[0], prop[1])
+        if (step != Step.PROPOSE and prop and q(self._power("prevote", r, prop[0])) and self._valid(prop)
                 and self._first("polka", r)):  # 36: more than two thirds prevoted for this round's block
-            bid, value, _ = prop
+            bid, value, _, _ = prop
             if step == Step.PREVOTE:
                 self.locked_value, self.locked_id, self.locked_round = value, bid, r
                 self.step = Step.PRECOMMIT
