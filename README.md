@@ -14,31 +14,20 @@ what's still needed before a mainnet (§9).
 
 ## Install
 
-Python 3.10+. Vibe Hash **isn't on PyPI yet**, so `pip install vibehash`
-says "No matching distribution found" until a release is published (see
-"Publishing a release" below). Until then, build a wheel with
-`python -m build` in the project folder and install the file it writes to
-`dist/`, which you can send to anyone. Run this in the folder where the file
-is:
+Python 3.10+. Vibe Hash is on PyPI:
 
 ```bash
-python -m pip install --upgrade vibehash-0.4.0-py3-none-any.whl
+python -m pip install --upgrade vibehash
 ```
 
-Or, to work on the source, install the project folder in editable mode so
+To work on the source instead, install the project folder in editable mode so
 your changes apply without reinstalling. Run this in the project folder:
 
 ```bash
 python -m pip install -e .
 ```
 
-Once it's published, anyone can install it with:
-
-```bash
-python -m pip install --upgrade vibehash
-```
-
-Each adds a `vibehash` command (also available as `python -m vibehash`) and
+Either adds a `vibehash` command (also available as `python -m vibehash`) and
 pulls in NumPy and `cryptography`.
 
 ## Quick start
@@ -139,14 +128,14 @@ trusted publisher for `vibehash` names owner `AlphaChad5000`, repository
 `vibehash`, workflow `publish.yml` and environment `pypi`.
 
 1. Bump `version` in `pyproject.toml` (PyPI never accepts the same version
-   twice), commit it, and push.
+   twice; 0.4.0 is out), commit it, and push.
 2. Tag the commit with that version and push the tag. This publishes it:
 
 ```bash
-git tag v0.4.0
+git tag v0.4.1
 ```
 ```bash
-git push origin v0.4.0
+git push origin v0.4.1
 ```
 
 Follow the run under the repository's Actions tab. To try a build locally
