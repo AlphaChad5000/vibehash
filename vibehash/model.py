@@ -95,8 +95,34 @@ class Dataset:
         return h256(self.x_train.tobytes(), self.y_train.tobytes(), self.x_val.tobytes(), self.y_val.tobytes())
 
     @classmethod
-    def from_npz(cls, path) -> "Dataset":
-        """Loads x_train, y_train, x_val, y_val. Never unpickles: the file may come from anyone."""
+    def from_npz(cls, path, max_bytes: int | None = None) -> "Dataset":
+        """Loads x_train, y_train, x_val, y_val. Never unpickles: the file may come from anyone. Nor does it unpack
+        anything before reading the arrays' headers: they must be arrays of numbers that take at most `max_bytes` once
+        loaded (default: 64 times the file's size, or 64 MB if that's more; compressed uint8 images take ~35 times),
+        since a few hundred KB of compressed zeros would otherwise unpack into gigabytes."""
+        import math
+        import os
+        import zipfile
+
+        limit = max(2**26, 64 * os.path.getsize(path)) if max_bytes is None else max_bytes
+        need = 0
+        try:
+            with zipfile.ZipFile(path) as z:
+                members = set(z.namelist())
+                for name, target in (("x_train", np.float64), ("y_train", np.int64), ("x_val", np.float64), ("y_val", np.int64)):
+                    with z.open(name if name in members else f"{name}.npy") as m:  # the member np.load would read
+                        version = np.lib.format.read_magic(m)
+                        read = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+                        shape, _, dtype = read(m)
+                    if dtype.kind not in "biuf":
+                        raise ValueError(f"{name} isn't an array of numbers")
+                    n = math.prod(shape)
+                    need += n * 8 + (0 if dtype == target else n * dtype.itemsize)  # loaded, then converted
+        except (zipfile.BadZipFile, KeyError) as e:
+            raise ValueError(f"not a dataset (.npz with x_train, y_train, x_val, y_val): {e}") from e
+        if need > limit:
+            raise ValueError(f"the dataset would take {need / 2**20:,.0f} MB of memory once loaded, over the "
+                             f"{limit / 2**20:,.0f} MB allowed for a file its size")
         with np.load(path, allow_pickle=False) as f:
             return cls(
                 np.ascontiguousarray(f["x_train"], dtype=np.float64), np.ascontiguousarray(f["y_train"], dtype=np.int64),

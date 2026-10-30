@@ -16,19 +16,25 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from . import hardware, receipts, settings, tls
-from .blobs import CHUNK, BlobStore, file_sha256
+from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
 from .ledger import Block, Tx, canonical
 from .model import Dataset, params_hash
-from .tasks import TrainingJob
+from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob
 from .wire import blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
 from .worker import HardwareProfile, Worker
 
 log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
+# The most of a reply we read, so a node can't feed us gigabytes: the biggest JSON a node sends is a round record or
+# a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
+MAX_REPLY = 128 * 2**20
+MAX_ERROR = 2**16  # of an error reply
 
 
 class NodeError(Exception):
@@ -52,14 +58,19 @@ class NodeClient:
         self._status: dict | None = None
         self._opener = tls.opener_for(self.url, ca_file, fingerprint)
 
-    def _req(self, method: str, path: str, data: bytes | None = None, headers: dict | None = None) -> bytes:
+    def _req(self, method: str, path: str, data: bytes | None = None, headers: dict | None = None, limit: int | None = None) -> bytes:
+        """The reply's body, if it's at most `limit` bytes (default MAX_REPLY; NodeError if it's more)."""
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers or {})
+        limit = MAX_REPLY if limit is None else limit
         try:
             with self._open(req) as resp:
-                return resp.read()
+                body = resp.read(limit + 1)
+                if len(body) > limit:
+                    raise NodeError(f"{method} {path}: the node's reply is larger than {limit:,} bytes", resp.status)
+                return body
         except urllib.error.HTTPError as e:
             try:
-                msg = json.loads(e.read()).get("error", str(e))
+                msg = json.loads(e.read(MAX_ERROR)).get("error", str(e))
             except Exception:
                 msg = str(e)
             raise NodeError(f"{method} {path}: {msg}", e.code) from None
@@ -81,10 +92,10 @@ class NodeClient:
                 time.sleep(wait)
 
     def get(self, path: str):
-        return json.loads(self._req("GET", path))
+        return _json(self._req("GET", path), f"GET {path}")
 
     def post(self, path: str, body: dict):
-        return json.loads(self._req("POST", path, json.dumps(body).encode(), {"Content-Type": "application/json"}))
+        return _json(self._req("POST", path, json.dumps(body).encode(), {"Content-Type": "application/json"}), f"POST {path}")
 
     def status(self) -> dict:
         self._status = self.get("/status")
@@ -137,8 +148,12 @@ class NodeClient:
                     raise
                 time.sleep(1 + attempt)
 
-    def download(self, kind: str, blob_id: str, store: BlobStore) -> Path:
-        """Fetch a file in chunks into `store`, resuming a partial copy. The store checks the hash."""
+    def download(self, kind: str, blob_id: str, store: BlobStore, size: int | None = None, check=None) -> Path:
+        """Fetch a file in chunks into `store`, resuming a partial copy. The store checks the hash, and `check` (if
+        given) what's in it, before keeping it. The node's word for the size isn't enough (one that lied could fill
+        the disk): it must be `size` if the caller knows it (a checkpoint's is its job's), and at most what a node
+        would store otherwise."""
+        limit = MAX_DATASET if kind == "dataset" else MAX_CHECKPOINT_BYTES
         for attempt in range(RETRIES):
             try:
                 if store.has(blob_id):
@@ -147,11 +162,13 @@ class NodeClient:
                 if not st["complete"]:
                     raise NodeError(f"node doesn't have {kind} {blob_id[:12]}…")
                 total, offset = st["size"], store.received(blob_id)
+                if type(total) is not int or not 0 < total <= limit or size not in (None, total):  # (asking again won't help)
+                    raise NodeError(f"the node says {kind} {blob_id[:12]}… is {total!r} bytes, which it can't be", 200)
                 while offset < total:
-                    chunk = self._req("GET", f"/{kind}/{blob_id}?offset={offset}")
+                    chunk = self._req("GET", f"/{kind}/{blob_id}?offset={offset}", limit=min(CHUNK, total - offset))
                     if not chunk:
                         raise NodeError("download ended early")
-                    offset = store.write_chunk(blob_id, offset, chunk, total)
+                    offset = store.write_chunk(blob_id, offset, chunk, total, check=check)
                 return store.path(blob_id)
             except NodeError as e:
                 if not e.retryable or attempt == RETRIES - 1:
@@ -159,13 +176,27 @@ class NodeClient:
                 time.sleep(1 + attempt)
         raise NodeError("download failed")
 
-    def download_model(self, job_id: str) -> tuple[dict, bytes]:
-        """A job's latest trained weights, checked against the hash the node reports. Returns (job info, raw bytes)."""
+    def download_model(self, job_id: str, job: TrainingJob | None = None, untrained: bool = True) -> tuple[dict, bytes]:
+        """A job's latest trained weights, checked against the hash the node reports. Returns (job info, raw bytes).
+        Their size is the job's: `job`'s, if the caller has it, else that of the spec the node reports. Nodes don't
+        serve an untrained job's weights, since they follow from its spec: they're built here instead (or, with
+        `untrained=False`, NodeError). Nodes from before 0.5.2 serve them, and they download as usual."""
         for _ in range(RETRIES):
             info = self.get(f"/job/{job_id}")
-            want, data = info["model"], bytearray()
-            while len(data) < want["bytes"]:
-                chunk = self._req("GET", f"/job/{job_id}/model?offset={len(data)}")
+            try:
+                job = job or TrainingJob.from_spec_json(json.dumps(info["spec"]), str(info["owner"]), 0)
+                want, size = info["model"], job.checkpoint_bytes
+                if want.get("sha256") is None:
+                    if not untrained:
+                        raise NodeError(f"job {job_id} hasn't been trained yet")
+                    return info, np.asarray(job.spec.init_params(job.init_seed), dtype=job.wire_dtype).tobytes()
+                if want["bytes"] != size:
+                    raise NodeError(f"the node says job {job_id}'s model is {want['bytes']!r} bytes; its spec makes it {size}")
+            except (InvalidJob, KeyError, TypeError, AttributeError) as e:
+                raise NodeError(f"the node's description of job {job_id} is malformed: {e}") from None
+            data = bytearray()
+            while len(data) < size:
+                chunk = self._req("GET", f"/job/{job_id}/model?offset={len(data)}", limit=min(CHUNK, size - len(data)))
                 if not chunk:
                     raise NodeError("the model download ended early")
                 data += chunk
@@ -180,6 +211,13 @@ class NodeClient:
         sha = file_sha256(path)
         self.upload(keys, "dataset", path, sha)
         return sha
+
+
+def _json(raw: bytes, what: str):
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError) as e:  # (nested thousands deep)
+        raise NodeError(f"{what}: the node's reply isn't JSON: {type(e).__name__}") from None
 
 
 def _backoff(retry_after: str | None, attempt: int) -> float:
@@ -312,6 +350,7 @@ class WorkerClient:
             job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
             if job.data_source["kind"] == "npz":
                 sha = job.data_source["sha256"]
+                self.datasets.prune_partial(keep={sha})  # other datasets' downloads that never finished
                 path = self.node.download("dataset", sha, self.datasets)  # hash-checked on arrival
                 job.attach_data(Dataset.from_npz(path), sha)
             self.jobs[job_id] = job
@@ -387,7 +426,7 @@ class WorkerClient:
                 st.activity = "no units for us this round" if st.rounds else "joining at the next round"
             if units:
                 p = self.node.get("/round/params")
-                self.node.download("blob", p["blob"], self.blobs)
+                self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
                 start = self.blobs.load(p["blob"], job.wire_dtype, job.spec.n_params)
                 if params_hash(start) != units[0].start_hash:
                     raise NodeError("node served weights that don't match the unit's start hash")
@@ -434,7 +473,7 @@ class WorkerClient:
                     unit = unit_in(t["unit"])
                     openings = {}
                     for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
-                        self.node.download("blob", bid, self.blobs)
+                        self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
                         openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
                     ok, bad = self.worker.verify(job, unit, openings, t["segments"])
                     self._try(self._signed, "verdict", {"round": rnd, "task_id": t["task_id"], "ok": bool(ok), "bad_segment": bad})

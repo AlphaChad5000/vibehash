@@ -46,7 +46,7 @@ import numpy as np
 
 from . import economics as econ
 from . import receipts
-from .blobs import CHUNK, BlobError, BlobStore, check_id
+from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
 from .coordinator import Coordinator, CoordinatorConfig, Phase, ProtocolError
@@ -54,16 +54,40 @@ from .crypto import KeyPair, address_of, verify
 from .ledger import Block, InvalidBlock, Tx, apply_block, canonical
 from .model import evaluate, params_hash
 from .p2p import Peers
-from .ratelimit import GuardedHandler, GuardedServer, Limits
+from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
 from .storage import Store
-from .tasks import SYN_PER_VIBE, InvalidJob, Reveal
+from .tasks import SYN_PER_VIBE, InvalidJob, Reveal, TrainingJob
 from .wire import MAX_CLOCK_SKEW_S, WireError, blob_openings_in, blob_openings_out, commitment_in, commitment_out, open_envelope
 
 log = logging.getLogger("vibehash.node")
 MAX_JSON = 4 * 2**20  # every JSON message is small now; weights travel as blobs
-MAX_DATASET = 20 * 2**30
+# ...except a proposal: a block and its round record, about 4 KB a unit at the default 8 segments, so this takes
+# ~16,000 units (a job may ask for 10,000 a round, plus replicas) unless they have thousands of segments each. Only
+# validators of a chain with others take one, and only MAX_BIG_BODIES at once, since each is parsed into a few times
+# its size in memory.
+MAX_PROPOSAL = 64 * 2**20
+MAX_BIG_BODIES = 2
+# A /blocks reply stops taking blocks once it's this big (it always has one). A block may carry 1 MiB of user
+# transactions (ledger.MAX_BLOCK_TX_BYTES, on v2 blocks), so 100 of them could make 100 MiB.
+MAX_BLOCKS_REPLY = 4 * 2**20
+# A worker's signed messages, as wire.seal makes them, and the size an honest one can have: a few hundred bytes, or
+# up to ~10 KB for a reveal's Merkle proofs. Registrations and verdicts go into the round record exactly as sent, so
+# anything more would be junk that every validator stores and every proposal carries.
+ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
+BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"round"}, "commit": {"round", "commitment"},
+          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment"}}
+MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
+# The biggest model this node relays a post_job for (--max-job-mb), as one checkpoint at the job's precision. Measured:
+# a float32 model's starting weights take ~7 times its checkpoint size to build (float64 copies), ~460 MB at 64 MB, and
+# a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
+# ~0.5 GB node keeps its head above water. The 1 GiB jobs tasks.py allows would need ~7 GB.
+MAX_JOB_BYTES = 64 * 2**20
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
+
+
+class Busy(Exception):
+    """The node can't take this request now (503): the client waits and resends."""
 
 
 @dataclass
@@ -83,11 +107,14 @@ class Node:
     def __init__(self, data_dir, genesis: dict, keys: KeyPair, host="127.0.0.1", port=8545,
                  times: PhaseTimes | None = None, config: CoordinatorConfig | None = None, keep_rounds: int = 10,
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
-                 peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None):
+                 peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
+                 max_job_bytes: int = MAX_JOB_BYTES):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
-        `announce`: the address other nodes reach this one at, if it isn't the one it listens on."""
+        `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
+        `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job."""
         self.times = times or PhaseTimes()
         self.keep_rounds = keep_rounds  # rounds whose checkpoints stay available to re-check (the challenge window)
+        self.max_job_bytes = max_job_bytes
         cfg = config or CoordinatorConfig()
         cfg.compute_s = self.times.compute_s * 0.8  # leave slack for network and polling
         self.keys = keys
@@ -119,6 +146,7 @@ class Node:
         self.wake_sync = threading.Event()
         self.leader_hint: str | None = None  # the current leader, as a validator told us (for nodes that don't vote)
         self.blobs.prune(self._evidence())  # keep recent rounds' evidence; the rest belongs to an abandoned round
+        self.store.datasets.prune_partial(older_than=STALE_PART_S)  # uploads and downloads abandoned part way
 
     @property
     def url(self) -> str:
@@ -184,6 +212,7 @@ class Node:
         with self.coord.lock:
             self.start_blob, self.uploads, self._blob_of = None, {}, {}
         self.blobs.prune(self._evidence())
+        self.store.datasets.prune_partial(older_than=STALE_PART_S)
 
     def _rounds(self) -> None:
         c, t = self.coord, self.times
@@ -323,7 +352,8 @@ class Node:
         """The validators agreed on block `height` (called by the engine)."""
         block = Block.from_dict(value["block"])
         mine = self.proposed.get(block.hash.hex())
-        self._commit(block, value.get("record"), cert, mine)
+        # A block without a round has no record; whatever a relay put in that unsigned field isn't kept.
+        self._commit(block, value.get("record") if block.summary is not None else None, cert, mine)
         self.proposed.clear()
 
     def _commit(self, block: Block, record: dict | None, cert: dict | None, mine: tuple | None = None) -> bool:
@@ -364,7 +394,8 @@ class Node:
 
     def _sync(self) -> None:
         """Fetch blocks we're missing from any peer that's ahead, trusting none of them: each one must apply,
-        replay from its record, and carry a valid commit certificate."""
+        replay from its record, and carry a valid commit certificate. A peer whose replies make no sense, or that
+        sends a block we refuse or nothing new, is left for the next."""
         for url in self.peers.urls():
             peer = self.peers.client(url)
             try:
@@ -373,16 +404,21 @@ class Node:
                 if st.get("genesis_hash") != self.chain.genesis_hash:
                     continue
                 if self.keys.address not in self.chain.state.validator_set() and "consensus" in st:
-                    self.leader_hint = st.get("leader") or url  # None: the peer is leading itself
+                    hint = st.get("leader") or url  # None: the peer is leading itself
+                    # Our workers go wherever this points, so only to a validator the chain lists.
+                    if isinstance(hint, str) and hint.rstrip("/") in {u.rstrip("/") for u in self.chain.state.validators.values()}:
+                        self.leader_hint = hint
                 while st["height"] > self.chain.tip.height:
                     lo = self.chain.tip.height + 1
-                    batch = peer.get(f"/blocks?from={lo}&to={lo + 99}")
-                    if not batch:
-                        break
-                    for d in batch:
-                        if not self._take(peer, d):
-                            return
-            except NodeError as e:
+                    try:
+                        batch = peer.get(f"/blocks?from={lo}&to={lo + 99}")
+                    except NodeError as e:
+                        if e.status != 200:
+                            raise
+                        batch = peer.get(f"/blocks?from={lo}&to={lo}")  # too big to take 100 at once
+                    if not batch or not all(self._take(peer, d) for d in batch) or self.chain.tip.height < lo:
+                        break  # one we refused, or none we lacked (a peer serving old blocks forever)
+            except (NodeError, InvalidBlock, KeyError, TypeError, ValueError, AttributeError) as e:
                 log.debug("sync from %s: %s", url, e)
         if self.engine.height < self.chain.tip.height + 1:
             self.engine.start(self.chain.tip.height + 1)
@@ -423,8 +459,8 @@ class Node:
         if params_hash(have if have is not None else job.spec.init_params(job.init_seed)) == want:
             return True
         for url in self.peers.urls():
-            try:
-                _, raw = self.peers.client(url, timeout=60).download_model(job_id)
+            try:  # (the size is our job's; a peer that hasn't trained it has nothing we lack)
+                _, raw = self.peers.client(url, timeout=60).download_model(job_id, job, untrained=False)
             except NodeError:
                 continue
             weights = np.frombuffer(raw, dtype=job.wire_dtype).astype(np.float64)
@@ -468,20 +504,31 @@ class Node:
                     peer = self.peers.client(url, timeout=60)
                     if not peer.get(f"/dataset/{src['sha256']}/status")["complete"]:
                         continue
-                    peer.download("dataset", src["sha256"], self.store.datasets)
-                    self.store.check_uploaded_dataset(src["sha256"])
+                    peer.download("dataset", src["sha256"], self.store.datasets, check=self.store.check_dataset)
                     log.info("fetched job %s's dataset from %s", job_id, url)
                     break
-                except (NodeError, InvalidJob, BlobError) as e:
+                except (NodeError, InvalidJob, BlobError, KeyError, TypeError) as e:
                     log.debug("dataset %s from %s: %s", src["sha256"][:12], url, e)
 
-    def submit_tx(self, tx: Tx, body: dict) -> None:
+    def submit_tx(self, tx: Tx) -> None:
+        if tx.kind == "post_job":  # relay policy, not a rule: a block with a bigger job is as valid as before
+            size = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount).checkpoint_bytes
+            if size > self.max_job_bytes:
+                raise ProtocolError(f"this node relays jobs whose models are at most {self.max_job_bytes / 2**20:g} MB "
+                                    f"a checkpoint (--max-job-mb); this one's are {size / 2**20:.1f} MB")
         self.coord.submit_tx(tx)
-        self.peers.broadcast("/tx", body)  # on to whoever proposes next; peers that have it already say no
+        # On to whoever proposes next (peers that have it already say no): as parsed, so only what the tx is goes on.
+        self.peers.broadcast("/tx", tx.to_dict())
 
     def receive(self, msg: dict) -> None:
         if self.bft:
             self.engine.receive(msg)
+
+    def proposal_limit(self) -> int:
+        """The biggest /consensus body we read. Only a validator votes on proposals, and only another one sends it a
+        big one: a chain's sole validator (like the public node), or a node that doesn't vote, never needs to."""
+        vals = self.chain.state.validator_set()
+        return MAX_PROPOSAL if self.keys.address in vals and len(vals) > 1 else MAX_JSON
 
     # --- read-only views ---------------------------------------------------------------
 
@@ -521,19 +568,26 @@ class Node:
         s = self.chain.state
         if job_id not in s.jobs:
             raise KeyError(job_id)
-        height, data, sha = self._model_bytes(job_id)
+        if not self.store.params_height(job_id):  # untrained: its size is its spec's, and there's nothing to hash
+            model = {"height": 0, "bytes": s.job(job_id).checkpoint_bytes, "sha256": None}
+        else:
+            height, data, sha = self._model_bytes(job_id)
+            model = {"height": height, "bytes": len(data), "sha256": sha}
         return {"spec": json.loads(s.jobs[job_id]), "owner": s.job_owner[job_id], "escrow": s.escrow.get(job_id, 0),
-                "rounds": self.store.job_rounds(job_id), "model": {"height": height, "bytes": len(data), "sha256": sha}}
+                "rounds": self.store.job_rounds(job_id), "model": model}
 
     def _model_bytes(self, job_id: str) -> tuple[int, bytes, str]:
-        """The job's latest weights at its precision, serialised once per round. Untrained jobs serve their
-        starting weights. Workers get the weights every round anyway, so serving them openly hides nothing."""
+        """The job's latest trained weights at its precision, serialised once per round. Workers get the weights every
+        round anyway, so serving them openly hides nothing. An untrained job's aren't served: they follow from its
+        spec, so its poster can build them (client.download_model does), and building them here for anyone who asks
+        took gigabytes."""
         height = self.store.params_height(job_id)
         with self._model_lock:
             if self._model_cache[0] != (job_id, height):
                 job = self.chain.state.job(job_id)
                 params = self.store.load_params(job_id)
-                params = job.spec.init_params(job.init_seed) if params is None else params
+                if params is None:
+                    raise KeyError(f"job {job_id} hasn't been trained yet; its starting weights follow from its spec")
                 data = np.asarray(params, dtype=job.wire_dtype).tobytes()
                 self._model_cache = ((job_id, height), data, hashlib.sha256(data).hexdigest())
             return height, self._model_cache[1], self._model_cache[2]
@@ -572,6 +626,14 @@ class Node:
 
     def handle(self, kind: str, env: dict) -> dict:
         c = self.coord
+        # Only what wire.seal sends, and no bigger than an honest message (see ENVELOPE): replay and receipts take a
+        # registration or verdict exactly as sent, so nothing can be stripped from those, only refused.
+        if not isinstance(env, dict) or not set(env) <= ENVELOPE or not isinstance(env.get("body"), dict):
+            raise WireError("malformed envelope")
+        if not set(env["body"]) <= BODIES.get(kind, set()):
+            raise WireError(f"a {kind} message has only {', '.join(sorted(BODIES.get(kind, ())))}")
+        if len(canonical(env)) > (MAX_REVEAL if kind == "reveal" else MAX_MESSAGE):
+            raise WireError(f"{kind} message too large")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
         with c.lock:
             r = c.r
@@ -587,21 +649,32 @@ class Node:
                 cm = commitment_in(body["commitment"])
                 if cm.worker != addr:
                     raise ProtocolError("can only commit for yourself")
+                if len(cm.digest) != 32:
+                    raise WireError("a commitment's digest is a SHA-256")
                 c.commit(cm)
                 return {"ok": True, "receipt": self._receipt(kind, commitment_out(cm))}
             if kind == "reveal":
                 d = body["reveal"]
                 try:
                     openings = blob_openings_in(d["openings"], job.n_segments)
-                    rv = Reveal(str(d["unit_id"]), str(d["worker"]), bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"]),
-                                self._load_blob(check_id(d["final"]), job),
+                    final, root, salt = check_id(d["final"]), bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"])
+                    # No more than an honest reveal holds: a 32-byte root, a short salt, the first and last checkpoints
+                    # and both ends of each challenged segment, each proven as deep as the unit's Merkle tree goes.
+                    if (len(root) != 32 or len(salt) > 64 or len(openings) > 2 * c.config.challenge_segments + 2
+                            or any(len(pr) > job.n_segments.bit_length() for _, pr in openings.values())):
+                        raise WireError("more in it than a reveal has")
+                    rv = Reveal(str(d["unit_id"]), str(d["worker"]), root, salt, self._load_blob(final, job),
                                 {i: (self._load_blob(bid, job), pr) for i, (bid, pr) in openings.items()})
-                except (KeyError, TypeError, ValueError) as e:
+                except (KeyError, TypeError, ValueError, AttributeError) as e:
                     raise WireError(f"bad reveal: {e}") from e
                 if rv.worker != addr:
                     raise ProtocolError("can only reveal for yourself")
-                verdict = c.reveal(rv, wire=d)
-                return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, d)}
+                # Recorded as parsed, not as sent, so the record holds only what a reveal is (an honest worker's is the
+                # same either way, so its receipt still vouches for what it sent).
+                wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(), "salt": rv.salt.hex(),
+                        "final": final, "openings": blob_openings_out(openings)}
+                verdict = c.reveal(rv, wire=wire)
+                return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "tasks":
                 return {"tasks": [{"task_id": t.task_id, "unit": t.unit.to_dict(), "segments": t.segments, "dtype": job.wire_dtype,
                                    "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
@@ -658,8 +731,20 @@ class Node:
         return addr
 
 
+def _number(text, what: str) -> int:
+    """A count or offset from a query or header: a whole number that SQLite and seek() can take, else a 400."""
+    try:
+        n = int(text)
+    except (TypeError, ValueError):
+        n = -1
+    if not 0 <= n < 2**63:
+        raise WireError(f"bad {what}: expected a whole number from 0")
+    return n
+
+
 def _handler(node: Node):
     stores = {"blob": node.blobs, "dataset": node.store.datasets}
+    big = threading.BoundedSemaphore(MAX_BIG_BODIES)
 
     class Handler(GuardedHandler):
         server_version = "vibehash-node/0.5"
@@ -675,11 +760,39 @@ def _handler(node: Node):
             self.end_headers()
             self.wfile.write(body)
 
+        def _length(self) -> int:
+            n = self.headers.get("Content-Length") or "0"
+            if not (n.isascii() and n.isdigit()):  # int() takes "-1", and read(-1) reads until the client hangs up
+                raise WireError("bad Content-Length")
+            return int(n)
+
         def _body(self, limit: int) -> bytes:
-            n = int(self.headers.get("Content-Length") or 0)
+            n = self._length()
             if n > limit:
                 raise WireError("request too large")
             return self.rfile.read(n)
+
+        def _json(self, limit: int):
+            try:
+                return json.loads(self._body(limit) or b"{}")
+            except RecursionError:  # nested thousands deep
+                raise WireError("malformed JSON") from None
+
+        def _proposal(self):
+            """A /consensus body, which can be a proposal up to node.proposal_limit(). Bigger than MAX_JSON, it's read
+            only MAX_BIG_BODIES at a time; past that, the sender is told to come back (503), after its body is read
+            and dropped, so it gets the answer instead of a reset."""
+            n = self._length()
+            if n <= MAX_JSON or n > node.proposal_limit():
+                return self._json(MAX_JSON)
+            if not big.acquire(blocking=False):
+                while n > 0 and (got := len(self.rfile.read(min(n, 2**16)))):
+                    n -= got
+                raise Busy("busy with other large messages")
+            try:
+                return self._json(n)
+            finally:
+                big.release()
 
         def _guard(self, fn, raw: bool = False):
             try:
@@ -687,15 +800,17 @@ def _handler(node: Node):
                 self._send(200, result, "application/octet-stream" if raw else "application/json")
             except KeyError as e:
                 self._send(404, {"error": f"not found: {e}"})
-            except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError) as e:
+            except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
                 self._send(400, {"error": str(e)})
+            except Busy as e:
+                self._send(503, {"error": f"{e}; retry shortly"})
             except Exception as e:  # pragma: no cover
                 log.exception("request failed")
                 self._send(500, {"error": type(e).__name__})
 
         def do_GET(self):
             url = urlparse(self.path)
-            parts = [p for p in url.path.split("/") if p]
+            parts = path_parts(self.path)  # as the rate limit sorted it
             q = parse_qs(url.query)
 
             if len(parts) in (2, 3) and parts[0] in stores:
@@ -704,10 +819,10 @@ def _handler(node: Node):
                     self._guard(lambda: {"received": store.received(check_id(bid), q.get("from", [""])[0]),
                                          "complete": store.has(bid), "size": store.size(bid)})
                 else:
-                    self._guard(lambda: store.read_chunk(check_id(bid), int(q.get("offset", ["0"])[0]), CHUNK), raw=True)
+                    self._guard(lambda: store.read_chunk(check_id(bid), _number(q.get("offset", ["0"])[0], "offset"), CHUNK), raw=True)
                 return
             if len(parts) == 3 and parts[0] == "job" and parts[2] == "model":
-                self._guard(lambda: node.job_model(parts[1], max(0, int(q.get("offset", ["0"])[0]))), raw=True)
+                self._guard(lambda: node.job_model(parts[1], _number(q.get("offset", ["0"])[0], "offset")), raw=True)
                 return
 
             def route():
@@ -716,11 +831,16 @@ def _handler(node: Node):
                 if parts == ["genesis"]:
                     return node.genesis
                 if parts == ["blocks"]:
-                    lo = int(q.get("from", ["0"])[0])
-                    hi = min(int(q.get("to", [str(lo + 99)])[0]), lo + 99, node.chain.tip.height)
+                    lo = _number(q.get("from", ["0"])[0], "from")
+                    hi = min(_number(q.get("to", [str(lo + 99)])[0], "to"), lo + 99, node.chain.tip.height)
                     certs = node.store.certificates(lo, hi)
-                    return [b.to_dict() | ({"certificate": certs[b.height]} if b.height in certs else {})
-                            for b in node.chain.blocks[lo:hi + 1]]
+                    page, size = [], 0
+                    for b in node.chain.blocks[lo:hi + 1]:  # a short page just means another request
+                        if size >= MAX_BLOCKS_REPLY:
+                            break
+                        page.append(b.to_dict() | ({"certificate": certs[b.height]} if b.height in certs else {}))
+                        size += len(json.dumps(page[-1]))
+                    return page
                 if len(parts) == 2 and parts[0] == "account":
                     return node.account(parts[1])
                 if parts == ["validators"]:
@@ -732,7 +852,7 @@ def _handler(node: Node):
                 if parts == ["round", "params"]:
                     return node.round_params()
                 if len(parts) == 3 and parts[0] == "round" and parts[2] == "record":
-                    record = node.store.load_record(int(parts[1]))
+                    record = node.store.load_record(_number(parts[1], "height"))
                     if record is None:
                         raise KeyError(f"no record for block {parts[1]}")
                     return record
@@ -741,38 +861,42 @@ def _handler(node: Node):
             self._guard(route)
 
         def do_PUT(self):
-            parts = [p for p in urlparse(self.path).path.split("/") if p]
+            parts = path_parts(self.path)
 
             def route():
                 if len(parts) != 2 or parts[0] not in stores:
                     raise KeyError(self.path)
                 kind, bid = parts[0], check_id(parts[1])
-                offset, total = int(self.headers.get("X-Offset", "-1")), int(self.headers.get("X-Total", "0"))
+                offset, total = _number(self.headers.get("X-Offset"), "X-Offset"), _number(self.headers.get("X-Total"), "X-Total")
                 if kind == "blob":
                     uploader = node.authorize_blob(bid, total, self.headers)
                 else:
                     uploader = node.authorize_dataset(bid, total, self.headers)
                 chunk = self._body(CHUNK)
-                received = stores[kind].write_chunk(bid, offset, chunk, total, uploader)
-                if kind == "dataset" and received == total:
-                    node.store.check_uploaded_dataset(bid)
-                return {"received": received, "complete": received == total}
+                # A dataset is checked by the write that completes it, before it's kept (not on a PUT to one that's
+                # already complete, which would load it all again for anyone who asked).
+                received = stores[kind].write_chunk(bid, offset, chunk, total, uploader,
+                                                    check=node.store.check_dataset if kind == "dataset" else None)
+                return {"received": received, "complete": stores[kind].has(bid)}
 
             self._guard(route)
 
         def do_POST(self):
-            parts = [p for p in urlparse(self.path).path.split("/") if p]
+            parts = path_parts(self.path)
 
             def route():
-                body = json.loads(self._body(MAX_JSON) or b"{}")
+                if parts == ["consensus"]:
+                    node.receive(self._proposal())
+                    return {"ok": True}
+                worker = len(parts) == 1 and parts[0] in BODIES
+                body = self._json(MAX_REVEAL if worker else MAX_JSON)
+                if not isinstance(body, dict):
+                    raise WireError("expected a JSON object")
                 if parts == ["tx"]:
                     tx = Tx.from_dict(body)
-                    node.submit_tx(tx, body)
+                    node.submit_tx(tx)
                     return {"ok": True, "txid": tx.txid.hex()}
-                if parts == ["consensus"]:
-                    node.receive(body)
-                    return {"ok": True}
-                if len(parts) == 1 and parts[0] in ("register", "assignment", "commit", "reveal", "tasks", "verdict"):
+                if worker:
                     return node.handle(parts[0], body)
                 raise KeyError(self.path)
 
