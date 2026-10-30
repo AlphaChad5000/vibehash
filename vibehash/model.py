@@ -51,6 +51,8 @@ class ModelSpec:
         return np.asarray(theta, dtype=self.dtype).astype(np.float64)
 
     def init_params(self, seed: int) -> np.ndarray:
+        # A job's starting weights (expected_start_hash) come from numpy's stream, which numpy doesn't promise to keep
+        # across versions; tests/test_record_v2.py pins it, so a numpy that changed it fails the tests.
         rng = np.random.default_rng(seed)
         parts = []
         for a, b in zip(self.widths, self.widths[1:]):
@@ -78,7 +80,7 @@ class Dataset:
     @classmethod
     def synthetic(cls, spec: ModelSpec, seed: int, n_train: int = 4096, n_val: int = 1024) -> "Dataset":
         """Gaussian clusters with a nonlinear twist, so the MLP has something to learn."""
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(seed)  # pinned by tests/test_record_v2.py, like batch_indices: every node trains on it
         centers = rng.normal(0, 2.0, (spec.n_out, spec.n_in))
 
         def make(n):
@@ -150,6 +152,8 @@ def _gradient(spec: ModelSpec, theta: np.ndarray, x: np.ndarray, y: np.ndarray) 
 
 def batch_indices(unit_seed: int, step: int, n: int, batch_size: int) -> np.ndarray:
     """Batch for a given step depends only on (seed, step), so any segment can be replayed alone."""
+    # Workers and checkers must draw the same batches, from a numpy stream numpy doesn't promise to keep across
+    # versions; tests/test_record_v2.py pins it, so a numpy that changed it fails the tests.
     return np.random.default_rng([unit_seed, step]).integers(0, n, batch_size)
 
 
