@@ -55,6 +55,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. |
 | `gpusetup.py` | GPU detection without PyTorch (nvidia-smi, OS device list, ROCm). Picks PyTorch builds by driver CUDA version and compute capability, **probes PyTorch's index** (`pip index versions`) for what's published, installs, and self-tests in a fresh subprocess (Windows locks loaded DLLs). The build table needs updating when CUDA versions change. |
 | `protocol.py` | In-process driver for `simulate.py` and the tests. |
+| `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Not wired into jobs yet (FINETUNING.md). |
 | `shards.py` | Prototype, not wired in: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard. See `SHARDING.md`. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
