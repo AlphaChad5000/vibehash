@@ -192,7 +192,12 @@ chain state and is derived from round summaries, so every node agrees on it.
 
 **Slashing** takes 50 % of the offender's stake (including coins still
 unbonding). Half goes to whoever caught it as a bounty, half is burned. An
-offender is slashed at most once per round and forfeits that round's earnings.
+offender is slashed at most once per round and forfeits that round's earnings,
+including the proposer's share if it proposed that round's block. A slash
+takes withdrawable stake first, then unbonding coins, then bootstrap stake
+(§6), and the part that comes from bootstrap stake is always burned, never
+paid as a bounty, so a validator can't turn it into spendable coins by having
+its own second identity catch it.
 
 All amounts are integers in **syn** (1 VIBE = 10^8 syn), and leftovers from
 rounding are burned, so supply is exactly
@@ -213,15 +218,20 @@ round it completes work instead of almost never, as in lottery mining.
   installed, otherwise a slow pure-Python fallback). User transactions are
   `transfer`, `stake`, `unstake`, `post_job` (escrow a budget; the job spec is
   stored on chain and validated), `cancel_job` (refund what's left of the
-  escrow) and `validator` (announce the address a staked account's validator
-  node is reachable at, or leave the set). Only a chain whose genesis names
-  validators can add more, so nobody can take over a one-node chain by
-  announcing themselves, and the last validator can't leave.
+  escrow, after the fee the block's own round owes, so cancelling in the
+  middle of a round doesn't get that round's work for free) and `validator`
+  (announce the address a staked account's validator node is reachable at, or
+  leave the set). Only a chain whose genesis names validators can add more, so
+  nobody can take over a one-node chain by announcing themselves. Neither
+  leaving nor unstaking may leave the chain with no validator that has a vote,
+  since then nobody could propose a block. (A slash can't be refused, so it
+  still can.)
   Each needs a valid signature, the sender's next nonce, and the right
   **chain id**.
 - **Unstaking** moves coins into a 20-round unbonding queue where they can
   still be slashed, so a cheater can't pull their stake out before the
-  verdict lands.
+  verdict lands. Coins whose 20 rounds end at a block are released after that
+  block's slashes, so they can't slip out in the very block that slashes them.
 - **A fair start.** Bitcoin needed no stake: a hash proves itself, so anyone
   with a CPU could mine from block one. Training can only be spot-checked,
   so a stake is what a cheater stands to lose. But if every stake has to be
@@ -586,9 +596,15 @@ before recovery words load as they are.
   pending transaction's nonce can't be reused.
 - Worker protocol messages (register, commit, reveal, verdict) aren't
   transactions and stay free. Stake and the rate limits bound them.
-- Blocks still take the whole mempool, so today fee order sets the order
-  inside a block. Once blocks have a size limit, the cut falls at the lowest
-  fees.
+- **Block size.** A block's user transactions may take at most 1 MiB as JSON
+  (`ledger.MAX_BLOCK_TX_BYTES`), which leaves room for the round record in the
+  4 MiB proposal a leader sends. A block takes the mempool in fee order until
+  the next transaction wouldn't fit, so the lowest fees wait for a later block.
+- **Relay policy.** On top of what makes a transaction valid, a node relays
+  none over 16 KiB, no `transfer`, `stake` or `unstake` memo over 256 bytes
+  (it's only a note), and no `post_job` whose budget can't pay for one round.
+  Blocks don't enforce these; they keep what a node holds, and so what it
+  proposes, to sensible sizes.
 
 ### Issuance schedule (`economics.Economics`)
 
@@ -706,10 +722,37 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
   recovery words. `vibehash testnet`'s throwaway wallets are still plain
   random keys.
 
+### Block versions (`ledger.VERSION`)
+
+Fixing a ledger rule changes which blocks are valid, but a node re-applies
+every block on disk from genesis when it starts, and `chain verify` does the
+same. So blocks carry a version, and a rule applies only to blocks of the
+version that brought it and later. Version 1 blocks (everything 0.5.1 and
+earlier made) hash, serialise and settle exactly as before; from version 2
+the proposer signs the version, and it's in the block's JSON. A block's
+version can't be lower than its parent's or higher than the node knows, and
+validators only vote for blocks of the current version, so once a chain has
+a version 2 block it stays on version 2. Every validator must run a release
+that knows a version before any block of it appears: older nodes refuse it.
+
+Version 2 brought the block size limit above, and these fixes:
+- a transaction may appear only once in a block (`crypto.merkle_root` pads an
+  odd level by repeating its last node, so a block with its last transaction
+  repeated had the same hash and signature as the real one);
+- bootstrap stake is slashed last and only ever burned (§5);
+- coins finishing unbonding are released after the block's slashes (§6);
+- a `cancel_job` leaves the fee its job owes the block's own round (§6);
+- a proposer slashed in its own round isn't paid for proposing it (§5);
+- the last validator with a vote can't leave or unstake below the minimum
+  (§6);
+- the pool is split in exact fractions. Floats could round a payout up by a
+  syn, which a round with no verifiers then didn't catch.
+
 ### Still open
 
-- A block size limit (fees then decide what waits), replace-by-fee, and fee
-  estimation.
+- Replace-by-fee and fee estimation.
+- Transaction signatures name the chain id but not the genesis hash, so a
+  transaction could be replayed on a new network that reuses a chain id.
 - `check_tx` re-verifies every pending transaction for each new one, so
   admission is O(mempool). The `tx` bucket bounds that per address, but not
   across many addresses.
