@@ -56,6 +56,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `gpusetup.py` | GPU detection without PyTorch (nvidia-smi, OS device list, ROCm). Picks PyTorch builds by driver CUDA version and compute capability, **probes PyTorch's index** (`pip index versions`) for what's published, installs, and self-tests in a fresh subprocess (Windows locks loaded DLLs). The build table needs updating when CUDA versions change. |
 | `protocol.py` | In-process driver for `simulate.py` and the tests. |
 | `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Not wired into jobs yet (FINETUNING.md). |
+| `moe.py` | Mixture-of-experts feed-forward block (DeepSeek style: top-k router, routed and shared SwiGLU experts, optional LoRA), NumPy reference. Workers commit their routing; checkers replay with it and accept it only if no left-out expert beat a chosen one by more than a tie margin (1e-4 in logits), so rounding can't fail an honest worker. Experts are checkable one at a time. SHARDING.md §7. Not wired in yet. |
 | `shards.py` | Prototype, not wired in: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard. See `SHARDING.md`. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
