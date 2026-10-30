@@ -289,6 +289,10 @@ class WorkerClient:
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
         self.unaudited: list[dict] = []  # receipts for rounds not yet sealed
         self.censored: list[str] = []  # what the audit found: rounds the node sealed without our messages
+        # The hash of each round's secret as /status showed it when the round opened, by (round, attempt). The record
+        # reveals the secret when the round is sealed; a leader that swapped it (and so picked the beacon after seeing
+        # the commitments) would have to change the commitment in the record too, and this is where that shows.
+        self.secret_commits: dict[tuple[int, str], str] = {}
 
     @property
     def keys(self) -> KeyPair:
@@ -325,6 +329,12 @@ class WorkerClient:
                 record = self.node.get(f"/round/{rnd}/record")
             except NodeError:
                 record = None
+            seen = self.secret_commits.pop((rnd, record.get("attempt")), None) if isinstance(record, dict) else None
+            if seen and record.get("beacon_commit") != seen:
+                detail = (f"round {rnd}: the leader's round secret isn't the one it committed to when the round "
+                          "opened, so it could have picked the beacon")
+                self.censored.append(detail)
+                log.error("censored: %s", detail)
             for r in mine:
                 status, detail = receipts.audit(r, block, record)
                 if status == "censored":
@@ -404,6 +414,10 @@ class WorkerClient:
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join
+        if rnd is not None and s.get("beacon_commit"):
+            self.secret_commits.setdefault((rnd, s.get("attempt")), s["beacon_commit"])
+            for old in [k for k in self.secret_commits if k[0] < rnd - 100]:  # rounds we never sent anything in
+                del self.secret_commits[old]
         if rnd is None or key in self.done:
             return
         if st.round != rnd:

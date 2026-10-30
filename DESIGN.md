@@ -82,8 +82,18 @@ a small but **steady** income, with no need for a mining pool.
    `H(unit_id ‖ pubkey ‖ merkle_root ‖ salt)`. Nothing about the result is
    revealed yet, so other workers cannot copy it.
 4. **Beacon.** After the deadline, the round's randomness is
-   `beacon = H(prev_block_hash ‖ all commitments)`. Nobody can know it before
-   committing, so nobody can predict which segments will be checked.
+   `beacon = H(prev_block_hash ‖ round secret ‖ all commitments)`. Nobody can
+   know it before committing, so nobody can predict which segments will be
+   checked. The round secret is drawn by the round's leader when it opens the
+   round. It publishes the secret's hash in `/status` (`beacon_commit`) right
+   away and the secret itself only in the sealed round's record. Without the
+   secret, a worker that knew every commitment could re-salt its own until the
+   checks missed what it faked: a worker alone in a round, say. A worker
+   managed 4 half-faked units in 4 seconds. Workers check the record's
+   commitment against the one they saw, so the leader can't swap the secret
+   after seeing the commitments either. A leader that also mines in a round
+   it leads still knows the secret; the rounds other validators lead are
+   safe from it.
 5. **Reveal.** Workers reveal `merkle_root`, `salt`, the final weights, and
    the checkpoints the beacon selected (first, last, and both ends of each
    challenged segment) with Merkle proofs. A reveal that doesn't match its
@@ -112,7 +122,19 @@ a small but **steady** income, with no need for a mining pool.
    agree. On disagreement, a full replay decides who lied.
 9. **Verifier audits.** The protocol slips **canary** submissions (known-fake)
    into verifiers' queues. A verifier that approves a canary is lazy and is
-   slashed. Verifiers can't tell canaries from real work.
+   slashed. Verifiers can't tell canaries from real work. A canary is a copy
+   of a real task with one segment's update rescaled by 15–25%:
+   - it fails a replay;
+   - it keeps the structure and size of honest training, unlike random
+     noise, which shows without one (honest updates to a softmax layer's
+     biases sum to zero);
+   - it goes to a checker that holds neither the unit nor a real task on it;
+   - its task id is drawn, like every task id, from the round secret.
+
+   Before that secret existed, canary ids followed from the public beacon,
+   and a checker that replayed nothing picked out every canary (176 of 176
+   tasks in a simulation) and was paid in full. A round needs three staked
+   workers able to check before it can plant a canary.
 10. **Aggregate.** Accepted updates are averaged into `W_{r+1}` (local-SGD /
     federated averaging). Validation loss is tracked so the requester sees
     their model improve.
@@ -146,9 +168,9 @@ tiny amount of work, so it's not worth the risk either.
 | Do half the steps and interpolate | Replay spot-check, redundancy |
 | Copy another worker's answer | Commit–reveal bound to pubkey; units have unique seeds |
 | Boost / poison the update | Final must equal last checkpoint; norm bound; replay |
-| Rubber-stamp as a verifier | Canary submissions; slashing |
+| Rubber-stamp as a verifier | Canary submissions that look like real work and whose ids come from a secret; slashing |
 | Sybil (split one big rig into many identities to farm bonuses) | No per-identity bonus exists; pay is per verified FLOP; each identity needs stake; new identities start with lower reputation |
-| Predict which segments get checked | Beacon depends on all commitments, published after the deadline |
+| Predict which segments get checked | Beacon depends on all commitments and the leader's committed round secret, published after the deadline |
 | Commit, see the challenge, then withdraw | Forfeits the whole round; unprofitable whenever mining is profitable (see §3 step 5) |
 | Hog units and never deliver | Withholding resets capacity to the newcomer cap; reputation drops |
 | Unstake right before getting caught | Unstaked coins sit in a 20-round unbonding queue and stay slashable |
@@ -286,12 +308,20 @@ round it completes work instead of almost never, as in lottery mining.
   choice from public seeds:
   - which units each worker gets and which are duplicated: the previous block
     and the round's signed registrations;
-  - who checks whom and the planted fakes: the beacon;
+  - who checks whom and the planted fakes: the beacon and the round secret
+    (step 4), which the record reveals once every verdict is in;
   - how much each worker may take: its delivered work on chain;
   - which job runs: the job after the last round's.
 
   It uses a hash-based generator (`crypto.Draw`) that gives the same draws on
-  every machine and library version. `replay.py` re-runs the round from the
+  every machine and library version. Three draws still come from NumPy's
+  generators: the challenged segments, each step's batch and a job's starting
+  weights. NumPy doesn't promise those stay the same across versions, so
+  `tests/test_record_v2.py` pins their outputs, and a NumPy that changed them
+  fails the tests rather than splitting the network. Records carry a version:
+  version 2 brought the round secret, and a replay follows each record's own
+  version, so older rounds replay as they were run. Validators vote only for
+  proposals whose record is the current version. `replay.py` re-runs the round from the
   record with the same `Coordinator` code and compares every field of the
   summary. Nodes serve records at `GET /round/<height>/record`.
 - **Receipts.** The node answers each accepted registration, commitment,
@@ -694,6 +724,34 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
 - **Timeouts.** 20 s per read while the request line and headers arrive,
   against slow-loris, then 120 s per operation for bodies and replies. An
   8 MB checkpoint chunk takes a while on a slow home link.
+- **Message sizes.** A request body needs a plain decimal `Content-Length`
+  (anything else, a negative one included, gets `400`).
+  - A worker message may carry only the fields its kind has, at most 4 KiB
+    (64 KiB for a reveal). The round record keeps those fields, rebuilt from
+    what was parsed, so nobody can pad records.
+  - A `/consensus` proposal may be up to 64 MiB on a validator of a chain
+    with several validators, since a large round's record is big. At most
+    two such bodies are read at once.
+  - Votes and proposals for later heights are queued only once their
+    signature checks out and their signer is a validator, at most 4 heights
+    ahead and 64 messages per sender.
+  - `/blocks` pages stop at about 4 MiB.
+  - Out-of-range numbers in paths and queries get `400`, not a traceback.
+- **Memory.** `vibehash node --max-job-mb N` (64 by default) refuses to
+  relay jobs whose checkpoints are larger. Building a job's starting weights
+  takes about seven times a checkpoint's size, and a round holds a few
+  copies, so 64 MB keeps a 2 GB server well clear.
+  - `/job/<id>` doesn't build the weights of a job that hasn't trained yet:
+    it reports their size, and `/job/<id>/model` answers 404 until there's a
+    trained model.
+  - A dataset's arrays are checked from their headers before loading, and
+    one that would unpack to more than 64 times its file size (or 64 MB, if
+    larger) is refused. Only the upload that completes a dataset checks it,
+    and a check never deletes one already accepted.
+- **Peers.** Sync gives up on a peer whose page adds nothing or whose block
+  it refuses, and moves on past a malformed reply. Clients cap what they read:
+  128 MiB of JSON, one chunk of binary, downloads at the size the job allows.
+  A follower only takes a leader hint that's a validator's address on chain.
 - **This computer is never limited by default.** Tests and local testnets run
   a node, up to 8 workers and several validators all from 127.0.0.1. Behind
   a reverse proxy every client looks local, so limit at the proxy, or pass

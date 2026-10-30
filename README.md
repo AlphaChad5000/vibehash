@@ -292,7 +292,7 @@ socket timeouts that cut off slow-loris clients. Over budget, a node answers
 429, and clients wait and retry. Clients on the node's own computer are
 never limited, so a local testnet is never throttled. Behind a reverse proxy
 every client looks local, so limit at the proxy or add `--rate-limit-local`.
-`--rate-limit off` turns the budgets off, `--rate-limit tx=1/10,read=100`
+`--max-job-mb` (64 by default) stops a node relaying jobs too big for its memory. `--rate-limit off` turns the budgets off, `--rate-limit tx=1/10,read=100`
 changes some (requests a second and burst; the buckets are read, worker, tx,
 upload and other), and `--max-connections N` sets the overall cap. DESIGN.md
 §10 has the numbers.
