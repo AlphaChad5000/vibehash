@@ -26,6 +26,8 @@ def check_reveal(c: Commitment, r: Reveal) -> bool:
 
 def challenge_segments(beacon: bytes, unit_id: str, worker: str, n_segments: int, q: int) -> list[int]:
     seed = int.from_bytes(h256(beacon, unit_id.encode(), worker.encode())[:8], "big")
+    # numpy doesn't promise this stream stays the same across versions, and workers, checkers and every replay must
+    # agree on it; tests/test_record_v2.py pins its output, so a numpy that changed it fails the tests.
     rng = np.random.default_rng(seed)
     return sorted(rng.choice(n_segments, size=min(q, n_segments), replace=False).tolist())
 
@@ -81,6 +83,63 @@ def replay_segment(job: TrainingJob, unit: WorkUnit, seg: int, before: np.ndarra
     c = job.checkpoint_every
     expected = train_segment(job.spec, job.data, before, unit.seed, seg * c, c, job.lr, job.batch_size, backend)
     return reproduces(after, expected, before, job.tolerance, job.spec)
+
+
+# How far a canary (coordinator.py) moves one segment's update away from what the training did: 15-25%, so 15 to 25
+# times UPDATE_TOLERANCE and every honest replay rejects it, yet no further than honest segments' updates vary in size
+# from one segment to the next (about ±20% at batch size 32), so its size doesn't give it away. Near full-batch jobs,
+# whose neighbouring segments differ by ~2%, it can still show; but so would any fake far enough off to fail safely.
+CANARY_SCALE = (0.15, 0.25)
+
+
+def plant_canary(job: TrainingJob, openings: dict, segments: list[int], draw) -> dict:
+    """A canary's openings: a real reveal's for its challenged `segments`, with one segment's update rescaled. Version 1
+    planted a lazy worker's fake, whose isotropic noise shows without a replay: honest updates to the output layer's
+    biases sum to ~0 (each softmax gradient row does), noise doesn't. A rescaled honest update keeps that structure.
+    The forged checkpoint ends a challenged segment and starts none, so only one segment is off. No training, so it's
+    cheap for the coordinator: a vector sum and one hash. `draw` is a crypto.Draw from the round secret."""
+    ends = [s for s in segments if s + 1 not in segments]
+    bad = ends[draw.below(len(ends))]
+    lo, hi = CANARY_SCALE
+    scale, sign = lo + (hi - lo) * draw.below(2**20) / 2**20, 1 if draw.chance(0.5) else -1
+    after = np.asarray(openings[bad + 1][0], dtype=np.float64)
+    step = after - openings[bad][0]  # in place from here on: models can be a GiB a checkpoint
+    size = np.linalg.norm(step)
+    if not size:  # it didn't move at all: any direction will do
+        step, size = np.ones_like(after), np.sqrt(after.size)
+    # A difference under a rounding step of the job's precision passes as rounding (reproduces()), so a segment that
+    # barely moved the weights is pushed at least four steps, or an honest checker would approve it and be slashed.
+    step *= sign * max(scale * size, 4 * np.finfo(job.spec.dtype).eps * np.linalg.norm(after)) / size
+    step += after
+    forged = job.spec.round(step)
+    proofs = _swap_leaf({i: openings[i][1] for s in segments for i in (s, s + 1)}, bad + 1, params_hash(forged), job.n_segments + 1)
+    return {i: (forged if i == bad + 1 else openings[i][0], proof) for i, proof in proofs.items()}
+
+
+def _swap_leaf(proofs: dict[int, list], index: int, leaf: bytes, n_leaves: int) -> dict[int, list]:
+    """Merkle proofs of the same openings once leaf `index` is replaced by `leaf`: every sibling on that leaf's path to
+    the root takes its new hash, so they all still prove against one root (a new one) and a checker who compares them
+    sees nothing amiss. Proofs are bottom-up (crypto.merkle_proof); `n_leaves` tells where a level was padded."""
+    def on_path(i: int, level: int, width: int) -> bool:  # is i's sibling at `level` the swapped leaf's ancestor?
+        j = (i >> level) ^ 1
+        if j >= width:  # merkle_root pads an odd level with a copy of its last node, which is then its own sibling
+            j = i >> level
+        return j == index >> level
+
+    path, node, width = [], h256(b"leaf", leaf), n_leaves
+    for level, (sibling, is_left) in enumerate(proofs[index]):
+        path.append(node)
+        sibling = node if on_path(index, level, width) else sibling
+        node = h256(b"node", sibling, node) if is_left else h256(b"node", node, sibling)
+        width = (width + 1) // 2
+    out = {}
+    for i, proof in proofs.items():
+        new, width = [], n_leaves
+        for level, (sibling, is_left) in enumerate(proof):
+            new.append((path[level] if level < len(path) and on_path(i, level, width) else sibling, is_left))
+            width = (width + 1) // 2
+        out[i] = new
+    return out
 
 
 def replay_cost(job: TrainingJob, n_segments: int) -> int:

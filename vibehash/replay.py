@@ -8,6 +8,8 @@ field by field. It checks:
   * every registration and verdict carries its sender's valid signature, and
     every commitment its worker's;
   * the round trained a job that still had budget, from that job's latest model;
+  * the round secret is the one the leader committed to when it opened the round
+    (records from version 2; older ones replay by their own version's rules);
   * each worker's share of the units, the secretly duplicated units, the beacon,
     the challenged segments, who checked whom, and the planted fakes;
   * every verdict, slash, missed deadline and payment share.

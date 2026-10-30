@@ -497,6 +497,9 @@ class Node:
                 "round": r.round_no if r else None, "job_id": r.job_id if r else None,
                 "attempt": r.record.get("attempt") if r else None,
                 "beacon": r.beacon.hex() if r and r.beacon else None,
+                # The hash of the round's secret, public from the moment the round opens: the leader can't pick the
+                # secret (and with it the beacon) after seeing the commitments. The record reveals it (coordinator.py).
+                "beacon_commit": r.record.get("beacon_commit") if r else None,
                 "challenge_segments": c.config.challenge_segments, "min_stake": econ.MIN_STAKE,
                 "mempool": len(c.mempool), "chunk_bytes": CHUNK, "keeps_checkpoints_for": self.keep_rounds,
                 "economics": self.chain.state.economics.to_dict(), "subsidy": self.chain.state.subsidy(self.chain.tip.height + 1),

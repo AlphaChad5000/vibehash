@@ -7,9 +7,11 @@ everything else â€” eligibility, phase, assignment, commitments, Merkle proofs â
 is checked here.
 
 Every choice it makes follows from the chain and the round's own signed
-messages, never from private randomness or its own clock: which job runs, how
-much work each worker may take, which units each gets and which are secretly
-duplicated, who checks whom, and the planted fakes. Each block commits to a
+messages, never from its own clock: which job runs, how much work each worker
+may take, which units each gets and which are secretly duplicated, who checks
+whom, and the planted fakes. Its one private input is a secret the leader
+commits to when it opens the round and reveals in the record, so checkers can't
+work out which of their tasks are planted fakes. Each block commits to a
 record of those messages, plus the results of the checks that need the model's
 weights, so anyone can re-run the round with this same code (replay.py) and
 must reach the same summary.
@@ -39,6 +41,7 @@ from .verification import (
     check_reveal,
     check_sanity,
     full_replay,
+    plant_canary,
     replay_cost,
     replay_openings,
     replay_segment,
@@ -48,9 +51,17 @@ from .verification import (
 from .wire import WireError, blob_openings_in, commitment_out
 from .worker import HardwareProfile, Worker
 
-RECORD_VERSION = 1
+# Records say which rules made them, and a replay follows the record's version, so every round still replays exactly as
+# it was run. 1 (0.4.0-0.5.1): the beacon, who checks whom, task ids and canaries all came from public data. 2: they
+# also hash in a secret the leader commits to when it opens the round, and canaries are copies of real work.
+RECORD_VERSION = 2
 RAMP = 2  # a worker's capacity can grow this much each round it delivers in full, up to what it says it can do
 LOOKBACK = 50  # blocks searched for a worker's most recent round
+
+
+def secret_commitment(secret: bytes) -> bytes:
+    """What a leader publishes of its round secret when it opens the round (/status `beacon_commit`, and the record)."""
+    return h256(b"round secret", secret)
 
 
 class ProtocolError(Exception):
@@ -146,6 +157,7 @@ class _Round:
     assignments: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     holders: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     commitments: dict[tuple[str, str], Commitment] = field(default_factory=dict)
+    secret: bytes = b""  # record version 2's round secret (open_round); empty when replaying a version 1 record
     beacon: bytes = b""
     reveals: dict[tuple[str, str], Reveal] = field(default_factory=dict)
     results: dict[tuple[str, str], UnitResult] = field(default_factory=dict)
@@ -374,6 +386,8 @@ class Coordinator:
                 raise ProtocolError(f"job {job_id} had no budget left")
             if self.replaying["round"] != round_no:
                 raise ProtocolError(f"the record is for round {self.replaying['round']}, not {round_no}")
+            if self.replaying.get("version", RECORD_VERSION) not in (1, 2):
+                raise ProtocolError(f"the record is version {self.replaying.get('version')!r}, which this code doesn't know")
         else:
             job_id = self.active_job_id()
             if job_id is None:
@@ -405,6 +419,19 @@ class Coordinator:
             self.r.record["attempt"] = os.urandom(8).hex()
             if self.timing is not None:  # the compute phase this job's round actually gets (node.py)
                 self.r.record["rules"]["compute_s"] = float(self.timing(job))
+        if self.r.record["version"] >= 2:
+            # The round's secret: hashed into the beacon (start_reveal), who checks whom, the task ids and the canaries
+            # (start_verify). Its hash is public from now on (/status `beacon_commit`), so the leader can't pick it
+            # once it has seen the commitments. The secret itself goes into the record only when the round is settled
+            # (_settle), and records are only served once their block is sealed.
+            if self.replaying:
+                secret = bytes.fromhex(self.replaying["secret"])
+                if secret_commitment(secret).hex() != self.replaying.get("beacon_commit"):
+                    raise ProtocolError("the record's round secret doesn't match the commitment the round opened with")
+            else:
+                secret = os.urandom(32)
+            self.r.secret = secret
+            self.r.record["beacon_commit"] = secret_commitment(secret).hex()
         self.phase = Phase.REGISTER
         return True
 
@@ -495,8 +522,12 @@ class Coordinator:
             for uid in unit_ids:
                 if (uid, addr) not in r.commitments:
                     r.results[(uid, addr)] = UnitResult(r.units[uid], addr, Verdict.MISSED_DEADLINE)
-        # Unknowable until every commitment is in, so nobody can pick work that dodges the check.
-        r.beacon = h256(self.chain.tip.hash, r.round_no.to_bytes(8, "big"), *sorted(c.digest for c in r.commitments.values()))
+        # Unknowable until every commitment is in, so nobody can pick work that dodges the check. Version 2 hashes in the
+        # round secret too: a worker who knew every commitment (alone in a round, say) could otherwise re-salt its own
+        # until the challenge missed the segments it faked. A leader that mines in its own rounds knows the secret, so
+        # it still can; only other leaders' rounds are safe from it.
+        secret = (r.secret,) if r.secret else ()
+        r.beacon = h256(self.chain.tip.hash, r.round_no.to_bytes(8, "big"), *secret, *sorted(c.digest for c in r.commitments.values()))
         self.phase = Phase.REVEAL
         return r.beacon
 
@@ -557,7 +588,11 @@ class Coordinator:
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.WITHHELD, None, "committed but never revealed")
                 r.forfeit.add(key[1])
         offenders = {s[0] for s in r.slashes}
-        draw = Draw(b"verify", r.beacon)
+        # Version 1 seeded who checks whom, the task ids and the canaries with the beacon alone. It's public, so a checker
+        # could work out which of its tasks were canaries (their ids, keys and place in the shuffle) without replaying
+        # anything. Version 2 adds the round secret, which nobody but the leader sees until the block is sealed.
+        seed = (r.beacon, r.secret) if r.secret else (r.beacon,)
+        draw = Draw(b"verify", *seed)
 
         def pool(exclude: set[str]) -> list[str]:
             # Only staked workers check others: a worker still earning in has little to lose by waving work
@@ -566,32 +601,65 @@ class Coordinator:
                     and reg.memory_mb >= job.memory_mb and self.chain.state.staked(a)]
 
         def task_id(uid, submitter, verifier) -> str:
-            return h256(r.beacon, uid.encode(), submitter.encode(), verifier.encode()).hex()[:20]
+            return h256(*seed, uid.encode(), submitter.encode(), verifier.encode()).hex()[:20]
 
-        tasks = []
+        tasks, checkers = [], defaultdict(set)
         for (uid, addr), rv in r.reveals.items():
             segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
             openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
             candidates = pool(set(r.holders[uid]))
             verifier = candidates[draw.below(len(candidates))] if candidates else ""
+            checkers[uid].add(verifier)
             tasks.append(VerifyTask(task_id(uid, addr, verifier), verifier, r.units[uid], addr, segs, openings))
 
-        candidates = pool(set())
-        unit_list = list(r.units.values())
-        for n in range(self.config.canaries_per_round if candidates else 0):
-            fake = Worker("canary", KeyPair.generate(r.beacon + bytes([n])), HardwareProfile("canary", 1, 1), "lazy")
-            unit = unit_list[n % len(unit_list)]
-            segs = challenge_segments(r.beacon, unit.unit_id, fake.address, job.n_segments, q)
-            openings = {}
-            if r.start is not None and not self.replaying:  # a replay needs who checks the fake, not the fake itself
-                fake.compute(unit, job, r.start)
-                rv = fake.reveal(unit, job, r.beacon, q)
-                openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
-            verifier = candidates[draw.below(len(candidates))]
-            tasks.append(VerifyTask(task_id(unit.unit_id, fake.address, verifier), verifier, unit, fake.address, segs, openings, canary=True))
+        if r.secret:
+            tasks += self._canaries(job, draw, pool, task_id, checkers)
+        else:  # version 1's: a lazy worker's fake of a unit, which anyone who had the beacon could pick out
+            candidates = pool(set())
+            unit_list = list(r.units.values())
+            for n in range(self.config.canaries_per_round if candidates else 0):
+                fake = Worker("canary", KeyPair.generate(r.beacon + bytes([n])), HardwareProfile("canary", 1, 1), "lazy")
+                unit = unit_list[n % len(unit_list)]
+                segs = challenge_segments(r.beacon, unit.unit_id, fake.address, job.n_segments, q)
+                openings = {}
+                if r.start is not None and not self.replaying:  # a replay needs who checks the fake, not the fake itself
+                    fake.compute(unit, job, r.start)
+                    rv = fake.reveal(unit, job, r.beacon, q)
+                    openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
+                verifier = candidates[draw.below(len(candidates))]
+                tasks.append(VerifyTask(task_id(unit.unit_id, fake.address, verifier), verifier, unit, fake.address, segs, openings, canary=True))
 
         r.tasks = {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
         self.phase = Phase.VERIFY
+
+    def _canaries(self, job: TrainingJob, draw: Draw, pool, task_id, checkers: dict[str, set[str]]) -> list[VerifyTask]:
+        """Version 2's planted fakes, each a copy of a real reveal's task with one segment's update rescaled
+        (verification.plant_canary): it fails a replay, but its checkpoints are honest training's, so it can't be
+        picked out without one. Each also goes to a checker that could have been given the real task: never one that
+        holds the unit (real tasks never go to their unit's holders) or checks a real task on it (it would see the same
+        checkpoints twice, one set changed), and at most one canary a unit. So a round needs at least three staked
+        workers for a canary: a holder, its checker and a third. A replay only needs who checks which canary and its
+        segments, which follow from the record; the planted checkpoints are made live only, and never replayed.
+        Residual tell: a checker given two tasks on one unit (both replicas of it) knows neither is a canary; those
+        are the units whose replicas are compared with each other anyway."""
+        r, q = self.r, self.config.challenge_segments
+        planted, used = [], set()
+        for uid, addr in draw.shuffle(sorted(r.reveals)):
+            if len(planted) == self.config.canaries_per_round:
+                break
+            candidates = [] if uid in used else pool(set(r.holders[uid]) | checkers[uid])
+            if not candidates:
+                continue
+            used.add(uid)
+            n = len(planted).to_bytes(8, "big")
+            fake = KeyPair.generate(r.secret + n).address
+            segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)  # the real task's, as a checker would expect
+            verifier = candidates[draw.below(len(candidates))]
+            openings = {}
+            if not self.replaying:  # no training, so cheap under the lock: a vector sum and one hash
+                openings = plant_canary(job, r.reveals[(uid, addr)].openings, segs, Draw(b"canary", r.secret, n))
+            planted.append(VerifyTask(task_id(uid, fake, verifier), verifier, r.units[uid], fake, segs, openings, canary=True))
+        return planted
 
     @_locked
     def tasks_for(self, addr: str) -> list[VerifyTask]:
@@ -701,6 +769,8 @@ class Coordinator:
             new_params = _mean(list(updates.values()), job) if updates else r.start
             return params_hash(new_params).hex()
         model_hash = self._claim("model", "params_hash", average)
+        if r.secret:  # only now: every verdict is in, so it can't give a canary away any more
+            r.record["secret"] = r.secret.hex()
 
         summary = RoundSummary(
             job_id=r.job_id,
