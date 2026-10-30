@@ -12,7 +12,8 @@ transactions and stay free.
 
 Nodes only relay transactions paying at least their minimum fee (`--min-fee`),
 keep the mempool in fee order (`by_fee`) so blocks take the best-paying
-transactions first, and when it's full drop the cheapest one nothing else in it
+transactions first (a block holds up to ledger.MAX_BLOCK_TX_BYTES of them; the
+rest wait), and when it's full drop the cheapest one nothing else in it
 depends on (`evictable`).
 """
 from __future__ import annotations

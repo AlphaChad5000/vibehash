@@ -229,7 +229,9 @@ class FeeTests(unittest.TestCase):
         self.assertNotIn("fee", tx.to_dict())
         self.assertEqual(Tx.from_dict(tx.to_dict()), tx)
         chain = Chain.from_genesis(COMPAT_GENESIS)
-        block, _ = chain.build_block(None, [Tx.signed(ALICE, "transfer", BOB.address, 40 * VIBE, 0, "", "compat-net")], 1700000100)
+        # A version 1 block, as every block was then (ledger.VERSION): newer versions sign their version too.
+        block, _ = chain.build_block(None, [Tx.signed(ALICE, "transfer", BOB.address, 40 * VIBE, 0, "", "compat-net")], 1700000100,
+                                     version=1)
         block.sign(ALICE)
         chain.append(block)
         self.assertEqual(block.hash.hex(), COMPAT_BLOCK1_HASH)
