@@ -49,7 +49,7 @@ from . import receipts
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
-from .coordinator import RECORD_VERSION, Coordinator, CoordinatorConfig, Phase, ProtocolError
+from .coordinator import RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator, CoordinatorConfig, Phase, ProtocolError
 from .crypto import KeyPair, address_of, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import evaluate, params_hash
@@ -336,8 +336,11 @@ class Node:
             if block.version != VERSION:
                 raise InvalidBlock(f"a new block must be version {VERSION}, not {block.version}")
             record = value.get("record")
-            if block.summary is not None and isinstance(record, dict) and record.get("version") != RECORD_VERSION:
-                raise InvalidBlock(f"a new round's record must be version {RECORD_VERSION}, not {record.get('version')!r}")
+            if block.summary is not None and isinstance(record, dict):
+                job = self.chain.state.jobs.get(block.summary.job_id)
+                want = SHARDED_RECORD_VERSION if job and self.chain.state.job(block.summary.job_id).sharded else RECORD_VERSION
+                if record.get("version") != want:
+                    raise InvalidBlock(f"a new round's record must be version {want}, not {record.get('version')!r}")
             with self.coord.lock:
                 tip = self.chain.tip
                 if block.height != tip.height + 1 or block.prev_hash != tip.hash:

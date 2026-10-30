@@ -318,7 +318,7 @@ round it completes work instead of almost never, as in lottery mining.
   generators: the challenged segments, each step's batch and a job's starting
   weights. NumPy doesn't promise those stay the same across versions, so
   `tests/test_record_v2.py` pins their outputs, and a NumPy that changed them
-  fails the tests rather than splitting the network. Records carry a version:
+  fails the tests rather than splitting the network. Sharded jobs' rounds (SHARDING.md) are recorded as version 3, which adds the teams and the signed edge evidence; nodes don't run those yet. Records carry a version:
   version 2 brought the round secret, and a replay follows each record's own
   version, so older rounds replay as they were run. Validators vote only for
   proposals whose record is the current version. `replay.py` re-runs the round from the

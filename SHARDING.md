@@ -1,11 +1,23 @@
 # Sharded units: models bigger than one computer
 
-**Status: design, with a working prototype of the core.** `vibehash/shards.py`
-splits a model into shards, trains a unit as a pipeline across them, commits
-to every shard's work, and checks one cell at a time. `tests/test_shards.py`
-shows the properties below hold. The protocol doesn't use any of it yet: the
-coordinator, the workers' transport and the job format still assume one
-worker holds the whole model (§5 lists what has to change).
+**Status: works in the round protocol, in-process; not yet on the network.**
+- **The core** (`vibehash/shards.py`, `tests/test_shards.py`): it splits a
+  model into shards, trains a unit as a pipeline across them, commits to every
+  shard's work and checks one cell at a time.
+- **The coordinator** (`tests/test_sharded_rounds.py`, `python simulate.py
+  --shards 3`) runs sharded jobs whose job spec has a `shards` field:
+  - it forms teams from the round's registrations;
+  - the beacon picks cells, and staked checkers who hold no shard of that unit
+    check them;
+  - canaries look like real cells;
+  - signed edge messages settle which neighbour lied;
+  - each member is paid for its own shard of a unit once its cells and edges
+    pass;
+  - updates are averaged per shard;
+  - rounds are recorded as version 3 and replay.
+- **Not built yet:** nodes don't run sharded jobs (`Coordinator.runs_teams`
+  is off, and `/status` says why the job waits), and workers have no transport
+  between teammates. §5 lists what's left.
 
 ---
 
