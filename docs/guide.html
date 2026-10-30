@@ -113,8 +113,8 @@ code, kbd { font-family: var(--font-mono); font-size: 0.84em; }
 .toc a:hover { color: var(--ink); }
 .toc a.active { color: var(--ink); font-weight: 600; border-left: 2px solid var(--gold); padding-left: 12px; }
 
-article { min-width: 0; display: grid; gap: 96px; }
-section { display: grid; gap: 20px; min-width: 0; scroll-margin-top: 24px; align-content: start; }
+article { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 96px; }
+section { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; min-width: 0; scroll-margin-top: 24px; align-content: start; }
 section > p, section > ul, section > ol, .measure { max-width: 68ch; }
 section > ul, section > ol { margin: 0; padding-left: 1.15em; display: grid; gap: 8px; }
 section > ol { padding-left: 1.4em; }
@@ -163,10 +163,10 @@ section > ol { padding-left: 1.4em; }
 
 /* a round, to scale */
 .timeline { display: grid; gap: 10px; }
-.bar { display: grid; grid-template-columns: 3fr 20fr 5fr 10fr; height: 34px; border-radius: 5px; overflow: hidden; gap: 2px; }
+.bar { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 20fr) minmax(0, 5fr) minmax(0, 10fr); height: 34px; border-radius: 5px; overflow: hidden; gap: 2px; }
 .ph-register { background: var(--ph-register); } .ph-compute { background: var(--ph-compute); }
 .ph-reveal { background: var(--ph-reveal); } .ph-verify { background: var(--ph-verify); }
-.axis { display: grid; grid-template-columns: 3fr 20fr 5fr 10fr; font: 0.74rem var(--font-mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.axis { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 20fr) minmax(0, 5fr) minmax(0, 10fr); font: 0.74rem var(--font-mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .axis span { min-width: 0; overflow: hidden; white-space: nowrap; }
 .axis span:last-child { display: flex; justify-content: space-between; }
 .phases { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px 28px; }
