@@ -115,8 +115,9 @@ code, kbd { font-family: var(--font-mono); font-size: 0.84em; }
 
 article { min-width: 0; display: grid; gap: 96px; }
 section { display: grid; gap: 20px; min-width: 0; scroll-margin-top: 24px; align-content: start; }
-section > p, section > ul, .measure { max-width: 68ch; }
-section > ul { margin: 0; padding-left: 1.15em; display: grid; gap: 8px; }
+section > p, section > ul, section > ol, .measure { max-width: 68ch; }
+section > ul, section > ol { margin: 0; padding-left: 1.15em; display: grid; gap: 8px; }
+section > ol { padding-left: 1.4em; }
 .note { color: var(--ink-2); font-size: 0.95rem; }
 .note strong { color: var(--ink); }
 
@@ -231,7 +232,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     <div class="topbar">
       <a class="brand" href="#overview" aria-label="Vibe Hash">
         <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
-        <b>Vibe Hash</b><span class="tag">Testnet · 0.3</span>
+        <b>Vibe Hash</b><span class="tag">Testnet · 0.4</span>
       </a>
       <nav class="topnav" aria-label="Sections">
         <a href="#setup">Get started</a><a href="#round">How it works</a><a href="#jobspec">Reference</a><a href="#troubleshooting">Troubleshooting</a>
@@ -262,6 +263,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <div><dt>Round</dt><dd>about 38 s</dd></div>
       <div><dt>Minimum stake</dt><dd>5 VIBE</dd></div>
       <div><dt>Block subsidy</dt><dd>50 VIBE, halving every 210 rounds</dd></div>
+      <div><dt>A block is final</dt><dd>once validators with over ⅔ of the stake sign it</dd></div>
       <div><dt>Base unit</dt><dd>1 VIBE = 100,000,000 syn</dd></div>
       <div><dt>Trains on</dt><dd>NVIDIA, Intel Arc, Apple, AMD or CPU</dd></div>
     </dl>
@@ -271,7 +273,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 <div class="wrap page">
   <nav class="toc" aria-label="Contents">
     <div class="toc-group"><p>Guide</p><ul><li><a href="#overview">What Vibe Hash is</a></li><li><a href="#setup">Get started</a></li></ul></div>
-    <div class="toc-group"><p>How it works</p><ul><li><a href="#round">A round</a></li><li><a href="#checks">Checking the work</a></li><li><a href="#gpus">CPUs and GPUs</a></li><li><a href="#payment">Payment</a></li><li><a href="#penalties">Penalties</a></li></ul></div>
+    <div class="toc-group"><p>How it works</p><ul><li><a href="#round">A round</a></li><li><a href="#validators">Who runs the network</a></li><li><a href="#checks">Checking the work</a></li><li><a href="#gpus">CPUs and GPUs</a></li><li><a href="#payment">Payment</a></li><li><a href="#penalties">Penalties</a></li></ul></div>
     <div class="toc-group"><p>Reference</p><ul><li><a href="#jobspec">Job file</a></li><li><a href="#troubleshooting">Troubleshooting</a></li></ul></div>
   </nav>
 
@@ -326,8 +328,20 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <li style="--key: var(--ph-register)"><strong>Register</strong><span>3 s</span><p>Workers check in with their measured speed and memory. You need at least 5 VIBE staked.</p></li>
         <li style="--key: var(--ph-compute)"><strong>Compute</strong><span>20 s</span><p>The work is split into small units sized so a slow laptop can finish one in time; faster machines get more units, not bigger ones. Each worker trains its units and sends a sealed fingerprint of each result before the deadline.</p></li>
         <li style="--key: var(--ph-reveal)"><strong>Reveal</strong><span>5 s</span><p>A random number that nobody could know earlier picks which parts of each unit get checked. Workers reveal their results and those parts.</p></li>
-        <li style="--key: var(--ph-verify)"><strong>Verify, then seal</strong><span>10 s</span><p>Other workers re-run the chosen parts and report whether they match; checking is paid work too. Passing results are averaged into the model, and payments and penalties go into a signed block, with a record of the round's signed messages that anyone can replay to check every decision.</p></li>
+        <li style="--key: var(--ph-verify)"><strong>Verify, then seal</strong><span>10 s</span><p>Other workers re-run the chosen parts and report whether they match; checking is paid work too. Passing results are averaged into the model, and payments and penalties go into a block, with a record of the round's signed messages that anyone can replay to check every decision. The network's validators vote on the block before it counts.</p></li>
       </ul>
+    </section>
+
+    <section id="validators">
+      <h2>Who runs the network</h2>
+      <p>No single computer is in charge. The network is run by <strong>validators</strong>: nodes with VIBE staked that take turns leading rounds, in an order weighted by stake and fixed in advance.</p>
+      <ol>
+        <li><strong>The leader runs the round.</strong> Workers do the round with whichever validator is leading it. They find it on their own, so nothing changes for you.</li>
+        <li><strong>The others check its block.</strong> Each validator replays the round from its record of signed messages, and votes against any block whose payments, penalties or choices don't follow from them.</li>
+        <li><strong>Two thirds make it final.</strong> A block counts once validators holding more than two thirds of the stake have signed it. Those signatures travel with the block, so anyone can check them.</li>
+      </ol>
+      <p>A leader that pays itself extra, favours a worker or drops someone's work is voted down, and the next validator runs the round again. If a validator goes offline, the others carry on without it, and it catches up when it's back. Two different blocks can never both be final unless more than a third of the stake signs both, and a validator that votes two ways leaves signed proof behind.</p>
+      <p>Anyone can check all of this without trusting a node: <code>vibehash chain verify</code> replays every round and checks every block's signatures, and a node started with <code>--peer</code> syncs the chain and refuses any block that fails those checks. A staked account can become a validator with <code>vibehash validator join</code>, and <code>vibehash validator list</code> shows who votes.</p>
     </section>
 
     <section id="checks">
@@ -458,7 +472,8 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <p>The messages you're most likely to see, and what to do about each.</p>
       <div class="faq">
         <details><summary>'python' is not recognized / command not found</summary><div class="answer"><p>Python isn't installed, or isn't on your PATH. On Windows, run the python.org installer again and tick “Add python.exe to PATH”. On macOS and Linux, use <code>python3</code>; the “Your computer” setting in Get started does this for you.</p></div></details>
-        <details><summary>No matching distribution found for vibehash</summary><div class="answer"><p>Vibe Hash isn't published on PyPI yet, so pip can't download it by name. Ask whoever runs your network for <code>vibehash-0.3.0-py3-none-any.whl</code> and install that file, as the first step in Get started shows.</p></div></details>
+        <details><summary>No matching distribution found for vibehash</summary><div class="answer"><p>Vibe Hash is on PyPI, so this means pip couldn't use it. Usually your Python is older than 3.10: <code>python --version</code> shows which you have, and python.org has the current one. Otherwise update pip with <code>python -m pip install --upgrade pip</code>, check you're online, and run the install command again.</p></div></details>
+        <details><summary>I lost my wallet file</summary><div class="answer"><p>Rebuild it from the 24 recovery words setup showed you when it created the wallet: <code>vibehash wallet restore</code> asks for them and saves a new wallet file with the same address and coins. Wallets made before recovery words existed (before version 0.4) have no words, so for those the backed-up file is the only copy.</p></div></details>
         <details><summary>row 12, column 'colour': 'red' isn't a number</summary><div class="answer"><p>Every input column must hold numbers. Leave text columns out of the file, or turn them into numbers, such as small = 1, medium = 2, large = 3. The column you're predicting can hold names; if it isn't the last column, name it with <code>--label</code>.</p></div></details>
         <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else.</p></div></details>
         <details><summary>no node address / no wallet: run `vibehash setup`</summary><div class="answer"><p>Commands use the node address and wallet that setup saved. Run setup once, or add <code>--node</code> or <code>--wallet</code> to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
@@ -479,7 +494,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 </div>
 
 <footer>
-  <div class="wrap"><span>Vibe Hash 0.3 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.3</span></div>
+  <div class="wrap"><span>Vibe Hash 0.4 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.4</span></div>
 </footer>
 
 <script>
@@ -506,8 +521,6 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
   document.getElementById("hero-copy").addEventListener("click", function () { copyText(this, heroCmd.textContent, heroCmd); });
 
   // ---------- command builder ----------
-  var PUBLISHED = false;  // true once a release is on PyPI: installs then come from there instead of a wheel file
-  var WHEEL = "vibehash-0.3.0-py3-none-any.whl";
   function detectOs() {
     var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
     return /win/i.test(p) ? "windows" : "unix";
@@ -534,11 +547,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
   function vh(args) { return py() + " -m vibehash " + args; }
 
   function install() {
-    return { title: "Install Vibe Hash", note: (PUBLISHED
-        ? "Downloads Vibe Hash and the two libraries it uses from PyPI, the standard Python package index. Run it again any time to update."
-        : "Vibe Hash isn't on PyPI yet, so this installs the " + WHEEL + " file you were given, plus the two libraries it uses. Open the terminal in the folder where you saved the file, or put its full path in the command.") +
-        " The second command checks it worked by listing the available commands.",
-      cmds: [py() + " -m pip install --upgrade " + (PUBLISHED ? "vibehash" : WHEEL), vh("--help")] };
+    return { title: "Install Vibe Hash", note: "Downloads Vibe Hash and the two libraries it uses from PyPI, the standard Python package index. " +
+        "Run it again any time to update. The second command checks it worked by listing the available commands.",
+      cmds: [py() + " -m pip install --upgrade vibehash", vh("--help")] };
   }
 
   function home(file) { return (state.os === "unix" ? "~/.vibehash/" : "$HOME\\.vibehash\\") + file.replace(/\//g, state.os === "unix" ? "/" : "\\"); }
@@ -552,21 +563,21 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     if (role === "worker") {
       return [
         install(),
-        { title: "Set up", note: "One guided command for everything else. It saves the node address, creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. Back up the wallet file it creates, " + home("wallet.json") + ": losing it means losing your coins. Run setup again any time; it keeps what's already done.",
+        { title: "Set up", note: "One guided command for everything else. It saves the node address, creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run setup again any time; it keeps what's already done.",
           cmds: [vh("setup" + nodeArg)] },
-        { title: "Get VIBE and stake", note: "To be given work you need at least 5 VIBE staked; this stakes 10. Send your vibe1 address to whoever runs the network so they can send you some, then stake it. Stake is only at risk if you cheat; crashes never touch it. It takes effect in the next block, within about a minute.",
+        { title: "Get VIBE and stake", note: "To be given work you need at least 5 VIBE staked; this stakes 10. Send your vibe1 address to whoever runs the network so they can send you some, then stake it. Like every transaction, it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more than you'll stake. Stake is only at risk if you cheat; crashes never touch it. It takes effect in the next block, within about a minute.",
           cmds: [vh("stake --amount 10")] },
         { title: "Start working", note: "The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. GPU-sized jobs train on the graphics card; small float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
           cmds: [vh("worker")] },
         { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, and your reputation.", cmds: [vh("balance")] },
-        { title: "Withdraw when you're done", note: "Unstaked coins wait 20 rounds before you can spend them, and they can still be slashed until then.", cmds: [vh("unstake --amount 10")] }
+        { title: "Withdraw when you're done", note: "Unstaked coins wait 20 rounds before you can spend them, and they can still be slashed until then. The fee comes from your spendable balance, which your earnings have filled by then.", cmds: [vh("unstake --amount 10")] }
       ];
     }
     if (role === "train") {
       var file = s.data.trim() || "my-data.csv", stem = file.replace(/^.*[\\/]/, "").replace(/\.[^.]*$/, "") || "my-data";
       return [
         install(),
-        { title: "Set up", note: "Saves the node address and creates your wallet: choose a password, and it prints your vibe1 address. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support. Back up the wallet file, " + home("wallet.json") + ".",
+        { title: "Set up", note: "Saves the node address and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support.",
           cmds: [vh("setup" + nodeArg + " --gpu skip")] },
         { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some; 100 VIBE is plenty for a first model. This shows when it has arrived.",
           cmds: [vh("balance")] },
@@ -589,7 +600,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         { title: "Add GPU support (optional)", note: "Finds your graphics card and installs the PyTorch build that runs on it, a 1–3 GB download. It tells you if your card or driver can't be used. Skip it and the test network trains on the CPU instead.", cmds: [vh("install-gpu")] },
         { title: "Start a test network", note: "Runs a node, two workers and a sample training job on this computer, and shows the mining dashboard with a row for each worker. Leave it running and stop it with Ctrl+C. Running it again carries on where it stopped; add --reset to start over. Its wallets are throwaway test keys.",
           cmds: [vh("testnet")] },
-        { title: "Look around", note: "In a second terminal while it runs: check a worker's balance, then download every block and replay every round yourself, which shows each payment and penalty follows from the workers' signed messages.",
+        { title: "Run it with validators", note: "Stop the test network, then start it again with four validator nodes instead of one. They take turns leading rounds, check each other's blocks by replaying them, and vote: a block is final once validators holding more than two thirds of the stake have signed it. The log names which validator led each round. The number of validators is fixed when a test network is first made, so --reset starts a fresh one.",
+          cmds: [vh("testnet --validators 4 --reset")] },
+        { title: "Look around", note: "In a second terminal while it runs: check a worker's balance, then download every block and replay every round yourself. That shows each payment and penalty follows from the workers' signed messages, and each block carries enough validator signatures to be final.",
           cmds: [vh("balance" + local + " --wallet " + home("testnet/worker-1.json")), vh("chain verify" + local + " --genesis " + home("testnet/genesis.json"))] },
         { title: "Train a model on it", note: "Also in a second terminal: write the fruit sample and train on it, paying with your test network's requester wallet, which holds 10,000 test VIBE. The job takes turns with the demo job; follow and download it as the Train a model tab shows.",
           cmds: [vh("example"), vh("train fruit.csv" + local + " --wallet " + home("testnet/requester.json"))] },
