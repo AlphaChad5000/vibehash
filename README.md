@@ -381,6 +381,9 @@ the remaining work:
 - model types beyond MLPs, and models bigger than one computer
   ([SHARDING.md](SHARDING.md) has the design).
 
+[FINETUNING.md](FINETUNING.md) describes where this is heading: fine-tuning open models from Hugging Face
+with one `train --base` command, and workers that fetch and train only their share of a model.
+
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.
 
