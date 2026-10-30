@@ -79,13 +79,21 @@ class SettingsTests(unittest.TestCase):
             os.environ.pop(var, None)
         self.home = Path(tmp.name)
 
-    def test_flag_beats_environment_beats_saved(self):
-        self.assertIsNone(settings.node_url())
+    def test_flag_beats_environment_beats_saved_beats_the_public_node(self):
+        self.assertEqual(settings.node_url(), settings.PUBLIC_NODE)
+        self.assertIsNone(settings.chosen_node())
+        settings.save(node="http://NODE-ADDRESS:8545")  # the old guide's placeholder, saved by mistake, isn't a choice
+        self.assertEqual(settings.node_url(), settings.PUBLIC_NODE)
         settings.save(node="http://saved:8545")
         self.assertEqual(settings.node_url(), "http://saved:8545")
         os.environ["VIBEHASH_NODE"] = "http://env:8545"
         self.assertEqual(settings.node_url(), "http://env:8545")
         self.assertEqual(settings.node_url("http://flag:8545"), "http://flag:8545")
+
+    def test_typing_the_public_nodes_name_gets_its_https_address(self):
+        from vibehash.cli import normalise_url
+        self.assertEqual(normalise_url("node.vibehash.org"), settings.PUBLIC_NODE)
+        self.assertEqual(normalise_url("192.168.1.20"), "http://192.168.1.20:8545")
 
     def test_default_wallet_only_once_it_exists(self):
         self.assertIsNone(settings.wallet_path())

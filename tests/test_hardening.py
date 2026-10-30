@@ -521,6 +521,16 @@ class TlsTests(Cli, unittest.TestCase):
 
     def test_fingerprints(self):
         self.assertEqual(tls.cert_fingerprint(self.cert), self.fp)
+        # A CA's fullchain.pem (Let's Encrypt's, say) holds the site's certificate and then its issuer's: the
+        # fingerprint is the site's, and a node serves the whole chain.
+        other_cert, other_key = self.home / "issuer.pem", self.home / "issuer-key.pem"
+        tls.make_self_signed(other_cert, other_key, ["issuer.example"])
+        chain = self.home / "fullchain.pem"
+        chain.write_text(self.cert.read_text() + other_cert.read_text())
+        self.assertEqual(tls.cert_fingerprint(chain), self.fp)
+        tls.server_context(chain, self.key)
+        with self.assertRaisesRegex(tls.TLSError, "isn't a PEM certificate"):
+            tls.cert_fingerprint(self.key)
         colons = ":".join(self.fp[i:i + 2] for i in range(0, 64, 2)).upper()
         self.assertEqual(tls.normalize_fingerprint(colons), self.fp)
         self.assertEqual(tls.normalize_fingerprint(f"SHA256 Fingerprint={colons}"), self.fp)  # as openssl prints it

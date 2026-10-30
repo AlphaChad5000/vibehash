@@ -93,10 +93,8 @@ def ask(question: str, assume_yes: bool = False) -> bool:
 
 
 def node_of(a) -> str:
-    url = settings.node_url(a.node)
-    if not url:
-        sys.exit(f"no node address: run `{prog()} setup`, or add --node URL")
-    return url
+    """--node, the node setup saved, or the public network's."""
+    return settings.node_url(a.node)
 
 
 def wallet_of(a) -> str:
@@ -111,6 +109,8 @@ def normalise_url(text: str, https: bool = False) -> str:
     text = text.strip().rstrip("/")
     if "://" in text:
         return text
+    if text == urlsplit(settings.PUBLIC_NODE).hostname:  # the public node serves HTTPS on the usual port
+        return settings.PUBLIC_NODE
     scheme = "https" if https else "http"
     return f"{scheme}://{text}" if urlsplit(f"http://{text}").port else f"{scheme}://{text}:8545"
 
@@ -394,11 +394,13 @@ def cmd_install_gpu(a):
 def cmd_setup(a):
     """Everything a new worker needs, in order. Safe to re-run: finished steps are kept."""
     print(f"Vibe Hash setup. Your settings and wallet are kept in {settings.home()}\n\n1. Node")
-    url = settings.node_url(a.node)
+    url = settings.chosen_node(a.node)
     if not url and sys.stdin.isatty():
-        url = input("   Node address (like 192.168.1.20 or http://node.example:8545; blank to skip): ")
+        url = input(f"   Press Enter to join the public network ({urlsplit(settings.PUBLIC_NODE).hostname}),\n"
+                    "   or type the address of another network's node (like 192.168.1.20): ").strip()
+    url = url or settings.PUBLIC_NODE
     status = None
-    if url and url.strip():
+    if url:
         url = normalise_url(url, https=bool(a.tls_fingerprint or a.tls_ca))
         settings.save(node=url)
         if a.tls_fingerprint or a.tls_ca:
@@ -598,7 +600,7 @@ def _job_of(a) -> str:
 def _job_node(a, job_id: str) -> NodeClient:
     """The node a job lives on: --node, the saved one, or the one `train` posted it to."""
     receipt = _job_home(job_id) / "job.json"
-    if not (a.node or settings.node_url()) and receipt.exists():
+    if not settings.chosen_node(a.node) and receipt.exists():
         return NodeClient(json.loads(receipt.read_text())["node"])
     return NodeClient(node_of(a))
 

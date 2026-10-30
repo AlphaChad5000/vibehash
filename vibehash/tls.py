@@ -45,9 +45,13 @@ def fingerprint(der: bytes) -> str:
 
 
 def cert_fingerprint(path: str | Path) -> str:
-    """SHA-256 of a PEM certificate's DER bytes: what `openssl x509 -fingerprint -sha256` prints, without colons."""
+    """SHA-256 of a PEM certificate's DER bytes: what `openssl x509 -fingerprint -sha256` prints, without colons.
+    For a chain (a CA's fullchain.pem: the site's certificate, then its issuers), the first one: the site's."""
     try:
-        return fingerprint(ssl.PEM_cert_to_DER_cert(Path(path).read_text()))
+        first = re.search(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", Path(path).read_text(), re.S)
+        if first is None:
+            raise ValueError("no certificate in it")
+        return fingerprint(ssl.PEM_cert_to_DER_cert(first.group(0)))
     except ValueError as e:
         raise TLSError(f"{path} isn't a PEM certificate") from e
 

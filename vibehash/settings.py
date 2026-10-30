@@ -3,7 +3,7 @@
 Everything lives in one folder, ~/.vibehash (or $VIBEHASH_HOME): the default
 wallet, config.json, the worker cache and local testnets. Commands look up
 --node and --wallet in this order: the flag, $VIBEHASH_NODE / $VIBEHASH_WALLET,
-config.json, then the default wallet file. For https nodes, config.json also
+config.json, then the public network's node / the default wallet file. For https nodes, config.json also
 keeps what to trust: a pinned certificate fingerprint and/or a CA file, per
 node address ($VIBEHASH_TLS_FINGERPRINT / $VIBEHASH_TLS_CA override it).
 """
@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+
+PUBLIC_NODE = "https://node.vibehash.org"  # the public network: where commands go until you choose another node
 
 
 def home() -> Path:
@@ -39,8 +41,15 @@ def save(**updates) -> None:
     config_path().write_text(json.dumps(cfg, indent=2) + "\n")
 
 
-def node_url(flag: str | None = None) -> str | None:
-    return flag or os.environ.get("VIBEHASH_NODE") or load().get("node")
+def chosen_node(flag: str | None = None) -> str | None:
+    """The node you picked: --node, $VIBEHASH_NODE or the one setup saved. None if you haven't picked one."""
+    chosen = flag or os.environ.get("VIBEHASH_NODE") or load().get("node")
+    return None if not chosen or "NODE-ADDRESS" in chosen else chosen  # (an older guide's placeholder, saved by mistake)
+
+
+def node_url(flag: str | None = None) -> str:
+    """The node commands talk to: the one you picked, else the public network's."""
+    return chosen_node(flag) or PUBLIC_NODE
 
 
 def tls_trust(url: str) -> tuple[str | None, str | None]:

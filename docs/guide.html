@@ -291,7 +291,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 <span class="prompt">&gt; </span><code>vibehash job status</code>                       <span class="prompt"># rounds done, accuracy, budget left</span>
 <span class="prompt">&gt; </span><code>vibehash job download</code>                     <span class="prompt"># saves my-data-model.npz</span>
 <span class="prompt">&gt; </span><code>vibehash predict new-rows.csv</code>             <span class="prompt"># a prediction for every row</span></pre></div>
-      <p>Every network has a node address, such as <code>203.0.113.7</code>. Get it from whoever invited you, or run your own network with <code>vibehash testnet</code>.</p>
+      <p>Most people join the public network, run at <code>node.vibehash.org</code>, and <code>vibehash setup</code> connects to it by itself. To join a different network, you need its node address, such as <code>203.0.113.7</code>: get it from whoever runs it, or run your own with <code>vibehash testnet</code>.</p>
       <p class="note"><strong>Test network.</strong> VIBE has no cash value, so don't buy or sell it. The software hasn't been audited.</p>
     </section>
 
@@ -528,19 +528,20 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
     return /win/i.test(p) ? "windows" : "unix";
   }
-  var defaults = { os: detectOs(), node: "NODE-ADDRESS", data: "my-data.csv" };
+  var defaults = { os: detectOs(), node: "", data: "my-data.csv" };
   var state = {};
   Object.keys(defaults).forEach(function (k) { var v = store.get("vibehash-guide-" + k); state[k] = v === null ? defaults[k] : v; });
+  if (state.node === "NODE-ADDRESS") state.node = "";  // the placeholder older versions of this page filled in
   state.role = store.get("vibehash-guide-role") || "worker";
   if (state.role === "requester") state.role = "train";  // the tab's name before it learned to train from a CSV
 
   var fields = {
-    node: { label: "Node address (from whoever runs the network)" },
+    node: { label: "Node address (leave empty to join the public network)" },
     data: { label: "Your data file (a CSV)" }
   };
   var roleFields = { worker: ["node"], train: ["node", "data"], local: [] };
   var intros = {
-    worker: "Put your computer's spare time to work on someone's network. You only need its node address: on most networks you start with no VIBE and earn your stake as you go.",
+    worker: "Put your computer's spare time to work. It joins the public network unless you give another network's node address, and you start with no VIBE: you earn your stake as you go.",
     train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
     local: "Run a complete network on this computer: a node, two workers and a training job. Nothing to fill in and nobody else involved."
   };
@@ -566,7 +567,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     if (role === "worker") {
       return [
         install(),
-        { title: "Set up", note: "One guided command for everything else. It saves the node address, creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run setup again any time; it keeps what's already done.",
+        { title: "Set up", note: "One guided command for everything else. It connects to the network (the public one, unless you gave another node's address), creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run setup again any time; it keeps what's already done.",
           cmds: [vh("setup" + nodeArg)] },
         { title: "Stake (usually not needed)", note: "Most networks let you start with nothing: your first 5 VIBE of pay becomes your stake, and setup tells you so. Then skip this step. If setup says this network needs stake first, send your vibe1 address to whoever runs it so they can send you some, then stake it; this stakes 10. Like every transaction it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more. Stake is only at risk if you cheat; crashes never touch it.",
           cmds: [vh("stake --amount 10")] },
@@ -580,7 +581,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       var file = s.data.trim() || "my-data.csv", stem = file.replace(/^.*[\\/]/, "").replace(/\.[^.]*$/, "") || "my-data";
       return [
         install(),
-        { title: "Set up", note: "Saves the node address and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support.",
+        { title: "Set up", note: "Connects to the network (the public one, unless you gave another node's address) and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support.",
           cmds: [vh("setup" + nodeArg + " --gpu skip")] },
         { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some; 100 VIBE is plenty for a first model. This shows when it has arrived.",
           cmds: [vh("balance")] },

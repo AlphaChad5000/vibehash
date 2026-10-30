@@ -50,15 +50,20 @@ testnet is first made:
 python -m vibehash testnet --validators 4
 ```
 
-To join someone else's network as a worker, run the guided setup with their
-node's address, then start working:
+To join the public network as a worker, run the guided setup, then start
+working. Setup connects to the public network's node, `node.vibehash.org`, by
+itself, and you start with no VIBE: your first 5 VIBE of pay becomes your
+stake.
 
 ```bash
-python -m vibehash setup --node 192.168.1.20
+python -m vibehash setup
 ```
 ```bash
 python -m vibehash worker
 ```
+
+To join a different network instead, give setup its node's address, such as
+`python -m vibehash setup --node 192.168.1.20`.
 
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
@@ -140,6 +145,37 @@ git push origin v0.5.1
 
 Follow the run under the repository's Actions tab. To try a build locally
 first, `python -m build` writes the packages to `dist/`.
+
+## Run a public node
+
+`deploy/setup-node.sh` turns a fresh Ubuntu 24.04 server into a network's
+public node:
+- it installs Vibe Hash from PyPI and creates the node's wallet (write down
+  the recovery words it shows);
+- it writes the genesis: this node as the first validator, with bootstrap
+  stake, and workers earning their stake in;
+- it gets a Let's Encrypt certificate and serves HTTPS on port 443, with the
+  node's own per-client rate limits;
+- it runs the node as a service that restarts itself.
+
+This is how `node.vibehash.org` runs, on a small DigitalOcean server (2 GB).
+First point the domain's **A** record at the server's IPv4 address. The node
+listens on IPv4 only, so give it no AAAA record. Then copy the script over and
+run it:
+
+```bash
+scp deploy/setup-node.sh root@SERVER-IP:
+```
+```bash
+ssh root@SERVER-IP bash setup-node.sh --domain node.vibehash.org --fund YOUR-WALLET-ADDRESS=10000
+```
+
+`--fund` gives one wallet test VIBE to post the first training jobs, since
+with earn-in nobody else starts with any. Running the script again upgrades
+Vibe Hash and restarts the node, keeping its wallet and chain. Read the log
+with `journalctl -u vibehash-node -f`. The node's files are in
+`/var/lib/vibehash`, and its wallet password is in `/etc/vibehash/env`:
+include both in backups.
 
 ## Run a network for other people
 
