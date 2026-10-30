@@ -606,8 +606,9 @@ def _job_node(a, job_id: str) -> NodeClient:
 
 
 def cmd_train(a):
-    """A CSV file in, a training job on the network out, with sensible model settings chosen for it."""
-    from . import tabular
+    """A CSV file in, a training job on the network out, with sensible model settings chosen for it. On a terminal
+    it then follows the job on the live training dashboard."""
+    from . import tabular, trainui
     from .blobs import file_sha256
 
     src = Path(a.data)
@@ -644,7 +645,8 @@ def cmd_train(a):
     url = node_of(a)
     (home / "job.json").write_text(json.dumps({
         "job_id": job_id, "node": url, "source": str(src.resolve()), "label": table.label, "features": table.features,
-        "classes": classes, "mean": mean, "std": std, "train_rows": len(data.y_train), "val_rows": len(data.y_val)}, indent=2))
+        "classes": classes, "mean": mean, "std": std, "train_rows": len(data.y_train), "val_rows": len(data.y_val),
+        "budget": a.budget, "fee": a.fee}, indent=2))
     keys, node = load_wallet(wallet_of(a)), NodeClient(url)
     try:
         node.upload_dataset(keys, npz)
@@ -661,9 +663,12 @@ def cmd_train(a):
           f"  inputs    {len(table.features)} columns: {shown}\n"
           f"  predicts  {table.label or 'class'}: {', '.join(classes[:8])}{' …' if len(classes) > 8 else ''}\n"
           f"  model     {widths}, float32 ({job.spec.n_params:,} weights)\n"
-          f"  budget    {fmt(a.budget)}: up to {rounds} rounds at {fmt(a.fee)} each, paid only for work that passes its checks\n\n"
-          f"Follow it:          {prog()} job status\n"
-          f"When it's trained:  {prog()} job download")
+          f"  budget    {fmt(a.budget)}: up to {rounds} rounds at {fmt(a.fee)} each, paid only for work that passes its checks")
+    if trainui.supported(a.plain):  # follow it live, as the network trains it
+        _follow(job_id, url, budget=a.budget, posted=True)
+    else:
+        print(f"\nWatch it train:     {prog()} job watch\n"
+              f"When it's trained:  {prog()} job download")
 
 
 def cmd_example(a):
@@ -713,6 +718,50 @@ def cmd_job_status(a):
     left = f", about {escrow // fee} more rounds" if training and fee else ""
     print(f"  budget     {fmt(escrow)} left{left}")
     print(f"\n{'Download the model so far' if training else 'Download the model'}: {prog()} job download {job_id}")
+    if training:
+        print(f"Watch it train live: {prog()} job watch {job_id}")
+
+
+def _follow(job_id: str, url: str, budget: int | None = None, posted: bool = False, plain: bool = False) -> None:
+    """Follow a training job until its budget is spent, or Ctrl+C: the live dashboard on a terminal, else a log line
+    per event. Then say where it stands, and what's next."""
+    from . import trainui
+
+    watch = trainui.JobWatch(job_id, url, budget=budget, posted=posted)
+    try:
+        if trainui.supported(plain):
+            trainui.TrainDashboard(watch).run()
+        else:
+            trainui.follow_plain(watch)
+    except KeyboardInterrupt:
+        pass
+    p, job = prog(), watch.job
+    print(f"\n{watch.summary()}")
+    if job is not None and job.rounds:
+        print(f"{'Download the model' if watch.finished_at is not None else 'Download the model so far'}:  "
+              f"{p} job download {job_id}")
+    if watch.finished_at is None:
+        print(f"Watch it again:  {p} job watch {job_id}")
+
+
+def cmd_job_watch(a):
+    """A training job, live: accuracy and loss climbing round by round, the budget left, whose turn it is."""
+    from . import trainui
+
+    job_id = _job_of(a)
+    url = _job_node(a, job_id).url
+    receipt = _job_home(job_id) / "job.json"
+    posted = json.loads(receipt.read_text()) if receipt.exists() else {}
+    if not posted:  # not posted from this computer: check the node has heard of it, rather than wait on a typo
+        try:
+            trainui.Reader(url).get(f"/job/{job_id}")
+        except NodeError as e:
+            if e.status == 404:
+                sys.exit(f"error: {url} has no job called {job_id}")
+        except ValueError:
+            pass  # an answer that isn't JSON: the dashboard shows what's wrong, and keeps asking
+    budget = posted.get("budget")
+    _follow(job_id, url, budget=budget if isinstance(budget, int) else None, posted=bool(posted), plain=a.plain)
 
 
 def cmd_job_download(a):
@@ -738,7 +787,8 @@ def cmd_job_download(a):
     source = json.loads(receipt_path.read_text()).get("source") if receipt_path.exists() else None
     out = Path(a.out or (f"{Path(source).stem}-model.npz" if source else f"{job_id}.npz"))  # my-data.csv -> my-data-model.npz
     tabular.save_model(out, job.spec, weights, features, classes, mean, std,
-                       {"job_id": job_id, "label": label, "height": info["model"]["height"], "rounds": len(rounds), "val_acc": acc})
+                       {"job_id": job_id, "label": label, "height": (info.get("model") or {}).get("height"), "rounds": len(rounds),
+                        "val_acc": acc})
     settings.save(last_model=str(out.resolve()))
     score = f", {acc:.1%} right on held-back rows" if acc is not None else " (not trained yet: these are its starting weights)"
     print(f"saved {out}: {n_in} inputs → {label or 'class'} ({', '.join(classes[:6])}{' …' if len(classes) > 6 else ''}), "
@@ -1248,6 +1298,8 @@ def main(argv=None):
     p.add_argument("--hidden", default="128,128", help="hidden layer widths (default 128,128)")
     p.add_argument("--id", help="job name (default: from the file name)")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+    p.add_argument("--plain", action="store_true", help="print the plan and return, instead of following the job on the "
+                   "live training dashboard (piped output does this anyway)")
     p.set_defaults(fn=cmd_train)
 
     p = sub.add_parser("predict", help="use a downloaded model on new rows of a CSV file")
@@ -1261,6 +1313,11 @@ def main(argv=None):
     p = j.add_parser("status", help="how a training job is going: rounds, accuracy, budget left")
     p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--node", help=NODE)
     p.set_defaults(fn=cmd_job_status)
+    p = j.add_parser("watch", help="follow a training job live, until its budget is spent: accuracy climbing round by "
+                     "round, budget left, events")
+    p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--node", help=NODE)
+    p.add_argument("--plain", action="store_true", help="print a line per event instead of the live dashboard")
+    p.set_defaults(fn=cmd_job_watch)
     p = j.add_parser("download", help="save a job's trained model to use with `predict`")
     p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--out", help="file to save (default JOB.npz)")
     p.add_argument("--node", help=NODE); p.set_defaults(fn=cmd_job_download)
