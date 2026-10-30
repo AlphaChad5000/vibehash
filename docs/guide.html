@@ -1,0 +1,924 @@
+<title>Vibe Hash Guide</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&display=swap">
+<style>
+/* Layout: a dark terminal band opens the page with the live miner dashboard as its hero; below, one documentation column beside a grouped contents rail. */
+:root {
+  --paper: #ffffff;        /* page */
+  --stone: #f4f3f0;        /* quiet fills: tab strip, table heads, inputs */
+  --ink: #1d1b19;
+  --ink-2: #5b554e;        /* secondary text */
+  --rule: #e3dfd9;
+  --gold: #995a05;         /* links, focus, VIBE: the ore in the dashboard */
+  --gold-wash: #f6ead5;
+  --good: #2c7836; --good-wash: #e2f0e3;
+  --bad: #ae352a; --bad-wash: #f8e2df;
+  --ph-register: #4a78cc; --ph-compute: #cc8214; --ph-reveal: #8f55cc; --ph-verify: #21907c;  /* the dashboard's phase colours */
+  /* the terminal band is dark in both themes */
+  --band: #151311; --band-ink: #eeebe6; --band-ink-2: #a39c93; --band-rule: #2b2824;
+  --term: #0c0b0a; --term-bar: #1b1916; --term-ink: #cdd4dc; --term-dim: #7f8995;
+  --signal: #f1b23c; --on-signal: #1d1406;
+  --shadow: 0 28px 60px -32px rgb(0 0 0 / 0.7);
+  --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Source Sans 3", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
+    --gold: #efb041; --gold-wash: #322510;
+    --good: #80cf88; --good-wash: #15301a; --bad: #f18a7f; --bad-wash: #3a1915;
+    --ph-register: #78a8ff; --ph-compute: #ffb43c; --ph-reveal: #c47dff; --ph-verify: #5adcb4;
+    --band: #0b0a09; --band-rule: #25221f; --term: #070606; --term-bar: #151311;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
+  --gold: #efb041; --gold-wash: #322510;
+  --good: #80cf88; --good-wash: #15301a; --bad: #f18a7f; --bad-wash: #3a1915;
+  --ph-register: #78a8ff; --ph-compute: #ffb43c; --ph-reveal: #c47dff; --ph-verify: #5adcb4;
+  --band: #0b0a09; --band-rule: #25221f; --term: #070606; --term-bar: #151311;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.62 var(--font-body); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 1200px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (min-width: 720px) { .wrap { padding-left: max(32px, env(safe-area-inset-left, 0px)); padding-right: max(32px, env(safe-area-inset-right, 0px)); } }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+h2 { font-size: 1.9rem; font-weight: 680; font-stretch: 108%; line-height: 1.15; letter-spacing: -0.015em; }
+h3 { font-size: 1.15rem; font-weight: 640; font-stretch: 104%; line-height: 1.3; }
+p { margin: 0; }
+a { color: var(--gold); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 3px; }
+code, kbd { font-family: var(--font-mono); font-size: 0.84em; }
+:not(pre) > code { background: var(--stone); border: 1px solid var(--rule); padding: 0.04em 0.34em; border-radius: 4px; overflow-wrap: anywhere; }
+.num { font-variant-numeric: tabular-nums; }
+.quiet { color: var(--ink-2); }
+
+/* ---------- terminal band ---------- */
+.band { background: var(--band); color: var(--band-ink); }
+.band :not(pre) > code { background: var(--term-bar); border-color: var(--band-rule); color: var(--band-ink); }
+.band .wrap { padding-block: 0 56px; display: grid; gap: 40px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 16px; border-bottom: 1px solid var(--band-rule); }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--band-ink); text-decoration: none; }
+.brand svg { width: 15px; height: 20px; color: var(--signal); flex: none; }
+.brand b { font: 720 1.12rem var(--font-display); font-stretch: 115%; letter-spacing: -0.01em; }
+.tag { font: 500 0.7rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--band-ink-2); border: 1px solid var(--band-rule); border-radius: 4px; padding: 2px 7px; }
+.topnav { display: flex; gap: 24px; }
+.topnav a { color: var(--band-ink-2); text-decoration: none; font-size: 0.95rem; }
+.topnav a:hover { color: var(--band-ink); }
+@media (max-width: 760px) { .topnav a:not(:first-child) { display: none; } }
+
+.intro { display: grid; gap: 20px; padding-top: 44px; max-width: 47rem; }
+.intro h1 { font-size: clamp(2.25rem, 5.4vw, 3.7rem); font-weight: 760; font-stretch: 110%; line-height: 1.03; letter-spacing: -0.028em; }
+.intro .lede { font-size: 1.2rem; line-height: 1.55; color: var(--band-ink-2); max-width: 41rem; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; padding-top: 4px; }
+.button { display: inline-flex; align-items: center; gap: 8px; background: var(--signal); color: var(--on-signal); font: 700 1rem var(--font-body); text-decoration: none; padding: 11px 18px; border-radius: 7px; }
+.button:hover { filter: brightness(1.06); }
+.runline { display: flex; align-items: center; gap: 12px; min-width: 0; background: var(--term); border: 1px solid var(--band-rule); border-radius: 7px; padding: 6px 6px 6px 14px; }
+.runline pre { margin: 0; font: 0.9rem var(--font-mono); color: var(--term-ink); white-space: pre; overflow-x: auto; min-width: 0; }
+.runline .prompt { color: var(--term-dim); user-select: none; }
+.cta-note { font-size: 0.92rem; color: var(--band-ink-2); }
+
+.term { margin: 0; display: grid; gap: 12px; min-width: 0; }
+.term-window { background: var(--term); border: 1px solid var(--band-rule); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); min-width: 0; }
+.term-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 14px; background: var(--term-bar); border-bottom: 1px solid var(--band-rule); font: 0.8rem var(--font-mono); color: var(--term-dim); white-space: nowrap; overflow: hidden; }
+.term-bar .prompt { color: var(--term-dim); }
+.term-bar b { color: var(--term-ink); font-weight: 400; }
+.term-screen { background: var(--term); padding: 12px; display: flex; justify-content: center; overflow: hidden; }
+#term-canvas { display: block; max-width: 100%; height: auto; }
+.term figcaption { font-size: 0.9rem; color: var(--band-ink-2); }
+
+.specs { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 18px 28px; margin: 0; padding-top: 22px; border-top: 1px solid var(--band-rule); }
+.specs div { min-width: 0; }
+.specs dt { font: 500 0.7rem var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--band-ink-2); }
+.specs dd { margin: 5px 0 0; font: 640 1.02rem/1.35 var(--font-display); font-stretch: 104%; font-variant-numeric: tabular-nums; }
+
+/* ---------- documentation ---------- */
+.page { display: grid; gap: 48px; padding-block: 64px 96px; }
+.toc { display: none; }
+@media (min-width: 1000px) {
+  .page { grid-template-columns: 200px minmax(0, 1fr); gap: 72px; }
+  .toc { display: grid; gap: 22px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 28px); align-self: start; }
+}
+.toc-group { display: grid; gap: 6px; }
+.toc-group > p { font: 600 0.7rem var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.toc ul { list-style: none; margin: 0; padding: 0; display: grid; }
+.toc a { display: block; padding: 4px 0 4px 13px; border-left: 1px solid var(--rule); color: var(--ink-2); text-decoration: none; font-size: 0.95rem; }
+.toc a:hover { color: var(--ink); }
+.toc a.active { color: var(--ink); font-weight: 600; border-left: 2px solid var(--gold); padding-left: 12px; }
+
+article { min-width: 0; display: grid; gap: 96px; }
+section { display: grid; gap: 20px; min-width: 0; scroll-margin-top: 24px; align-content: start; }
+section > p, section > ul, .measure { max-width: 68ch; }
+section > ul { margin: 0; padding-left: 1.15em; display: grid; gap: 8px; }
+.note { color: var(--ink-2); font-size: 0.95rem; }
+.note strong { color: var(--ink); }
+
+/* command builder */
+.builder { border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; min-width: 0; }
+.tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--stone); border-bottom: 1px solid var(--rule); }
+.tab { font: 600 0.95rem/1.3 var(--font-body); color: var(--ink-2); background: transparent; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: 13px 10px; cursor: pointer; }
+.tab:hover { color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); background: var(--paper); border-bottom-color: var(--gold); }
+.panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 20px; padding: 18px 20px 0; }
+.panel-intro { color: var(--ink-2); font-size: 0.96rem; max-width: 62ch; }
+.os { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; flex: none; }
+.os button { font: 600 0.8rem var(--font-body); color: var(--ink-2); background: var(--paper); border: 0; padding: 6px 11px; cursor: pointer; }
+.os button + button { border-left: 1px solid var(--rule); }
+.os button[aria-pressed="true"] { background: var(--stone); color: var(--ink); }
+.controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 18px; padding: 16px 20px 20px; border-bottom: 1px solid var(--rule); }
+.controls:empty { padding: 0 0 18px; }
+.sample { overflow-x: auto; min-width: 0; margin-top: 6px; }
+.sample table { font: 0.8rem/1.4 var(--font-mono); border-top: 0; width: auto; }
+.sample th, .sample td { padding: 5px 18px 5px 0; }
+.sample th { font: 600 0.78rem var(--font-mono); letter-spacing: 0; text-transform: none; color: var(--ink); }
+.sample td:last-child, .sample th:last-child { color: var(--gold); }
+.field { display: grid; gap: 5px; min-width: 0; }
+.field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-2); }
+.field input[type="text"], .field input[type="number"], .field select { font: 0.92rem var(--font-mono); color: var(--ink); background: var(--stone); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; width: 100%; min-width: 0; }
+.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+.steps > li { counter-increment: step; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 6px 16px; padding: 22px 20px; border-bottom: 1px solid var(--rule); }
+.steps > li:last-child { border-bottom: 0; }
+.steps > li > * { grid-column: 2; min-width: 0; }
+.steps > li::before { content: counter(step); grid-column: 1; grid-row: 1 / span 4; font: 600 0.8rem/26px var(--font-mono); text-align: center; color: var(--ink); width: 26px; height: 26px; border: 1px solid var(--rule); border-radius: 50%; background: var(--stone); }
+.steps h3 { font-size: 1.06rem; }
+.steps .note { max-width: 66ch; }
+.cmds { display: grid; gap: 8px; margin-top: 6px; min-width: 0; }
+.cmd { position: relative; background: var(--term); color: var(--term-ink); border-radius: 7px; min-width: 0; }
+.cmd pre { margin: 0; padding: 11px 84px 11px 14px; overflow-x: auto; font: 0.86rem/1.55 var(--font-mono); white-space: pre; }
+.prompt { color: var(--term-dim); user-select: none; }
+.cmd.flow { max-width: 68ch; }
+.cmd.flow pre { padding-right: 14px; }
+.copy { font: 500 0.74rem var(--font-mono); letter-spacing: 0.03em; color: var(--term-ink); background: transparent; border: 1px solid var(--term-dim); border-radius: 5px; padding: 4px 9px; cursor: pointer; flex: none; }
+.cmd .copy { position: absolute; top: 7px; right: 7px; }
+.copy:hover { border-color: var(--term-ink); }
+.copy.done { color: var(--signal); border-color: var(--signal); }
+
+/* a round, to scale */
+.timeline { display: grid; gap: 10px; }
+.bar { display: grid; grid-template-columns: 3fr 20fr 5fr 10fr; height: 34px; border-radius: 5px; overflow: hidden; gap: 2px; }
+.ph-register { background: var(--ph-register); } .ph-compute { background: var(--ph-compute); }
+.ph-reveal { background: var(--ph-reveal); } .ph-verify { background: var(--ph-verify); }
+.axis { display: grid; grid-template-columns: 3fr 20fr 5fr 10fr; font: 0.74rem var(--font-mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.axis span { min-width: 0; overflow: hidden; white-space: nowrap; }
+.axis span:last-child { display: flex; justify-content: space-between; }
+.phases { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px 28px; }
+.phases li { display: grid; gap: 4px; border-top: 2px solid var(--key); padding-top: 10px; min-width: 0; }
+.phases strong { font: 640 1rem var(--font-display); font-stretch: 104%; }
+.phases span { font: 0.78rem var(--font-mono); color: var(--ink-2); }
+.phases p { color: var(--ink-2); font-size: 0.95rem; line-height: 1.5; }
+
+/* checks */
+.layers { list-style: none; margin: 0; padding: 0; display: grid; border-top: 1px solid var(--ink); }
+.layers li { display: grid; grid-template-columns: minmax(0, 12rem) minmax(0, 1fr); gap: 6px 24px; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+.layers b { font: 640 1rem var(--font-display); font-stretch: 104%; }
+.layers span { color: var(--ink-2); font-size: 0.96rem; }
+@media (max-width: 560px) { .layers li { grid-template-columns: 1fr; } }
+.odds { border: 1px solid var(--rule); border-radius: 10px; padding: 22px; display: grid; gap: 18px; background: var(--paper); }
+.odds-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px 28px; }
+.odds input[type="range"] { width: 100%; accent-color: var(--gold); }
+.odds-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 28px; align-items: end; }
+.odds-out .label { font: 600 0.7rem var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.odds-out .big { font: 700 2.4rem/1.05 var(--font-display); font-stretch: 106%; font-variant-numeric: tabular-nums; }
+.big.caught { color: var(--good); } .big.escape { color: var(--bad); }
+.meter { height: 8px; border-radius: 4px; background: var(--bad-wash); overflow: hidden; }
+.meter > div { height: 100%; background: var(--good); transition: width 0.2s ease; }
+
+/* payment split, to scale */
+.split { display: grid; gap: 10px; }
+.split-bar { display: grid; grid-template-columns: 80fr 15fr 5fr; height: 34px; gap: 2px; border-radius: 5px; overflow: hidden; }
+.split-bar div:nth-child(1) { background: var(--gold); } .split-bar div:nth-child(2) { background: var(--ph-verify); } .split-bar div:nth-child(3) { background: var(--ink-2); }
+.split-key { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 28px; margin: 0; padding: 0; list-style: none; }
+.split-key li { display: grid; grid-template-columns: 10px minmax(0, 1fr); gap: 2px 10px; align-items: baseline; }
+.split-key i { width: 10px; height: 10px; border-radius: 2px; background: var(--k); }
+.split-key b { font: 700 1.25rem var(--font-display); font-stretch: 106%; font-variant-numeric: tabular-nums; }
+.split-key span { grid-column: 2; color: var(--ink-2); font-size: 0.93rem; }
+
+/* tables */
+.table-wrap { overflow-x: auto; min-width: 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; border-top: 1px solid var(--ink); }
+th, td { text-align: left; padding: 10px 16px 10px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 600 0.7rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-2); white-space: nowrap; }
+td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; padding-right: 0; padding-left: 16px; }
+td code { white-space: nowrap; }
+.pill { display: inline-block; font: 500 0.76rem var(--font-mono); padding: 1px 8px; border-radius: 4px; white-space: nowrap; }
+.pill.good { background: var(--good-wash); color: var(--good); }
+.pill.bad { background: var(--bad-wash); color: var(--bad); }
+
+/* troubleshooting */
+.faq { display: grid; border-top: 1px solid var(--ink); }
+.faq details { border-bottom: 1px solid var(--rule); }
+.faq summary { cursor: pointer; padding: 13px 0; font: 0.88rem/1.5 var(--font-mono); list-style: none; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::before { content: "+"; color: var(--gold); font-weight: 600; }
+.faq details[open] summary::before { content: "\2212"; }
+.faq .answer { padding: 0 0 16px 26px; display: grid; gap: 8px; font-size: 0.96rem; max-width: 72ch; }
+
+footer { border-top: 1px solid var(--rule); }
+footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; color: var(--ink-2); font-size: 0.9rem; }
+
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+</style>
+
+<header class="band">
+  <div class="wrap">
+    <div class="topbar">
+      <a class="brand" href="#overview" aria-label="Vibe Hash">
+        <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
+        <b>Vibe Hash</b><span class="tag">Testnet · 0.3</span>
+      </a>
+      <nav class="topnav" aria-label="Sections">
+        <a href="#setup">Get started</a><a href="#round">How it works</a><a href="#jobspec">Reference</a><a href="#troubleshooting">Troubleshooting</a>
+      </nav>
+    </div>
+
+    <div class="intro">
+      <h1>Mining that trains real AI models</h1>
+      <p class="lede">Vibe Hash is a proof-of-useful-work test network. Your computer trains small, checkable pieces of a model someone has paid to have trained, on its graphics card if it has one. Every piece that passes its checks is paid at the same rate per unit of work, on an old laptop or a gaming rig.</p>
+      <div class="cta">
+        <a class="button" href="#setup">Get started</a>
+        <div class="runline"><pre><span class="prompt">&gt; </span><code id="hero-cmd">python -m vibehash testnet</code></pre><button class="copy" type="button" id="hero-copy" aria-label="Copy command">Copy</button></div>
+      </div>
+      <p class="cta-note">That one command runs a node, two workers and a training job on your own computer.</p>
+    </div>
+
+    <figure class="term">
+      <div class="term-window">
+        <div class="term-bar"><span><span class="prompt">&gt; </span><b>python -m vibehash worker</b></span><span>PowerShell</span></div>
+        <div class="term-screen" id="term-screen">
+          <canvas id="term-canvas" width="960" height="574" role="img" aria-label="The vibehash worker dashboard: a drill bores through layered rock along a timbered tunnel with an ore cart behind it. Below it, round 42 in its compute phase, training unit 4 of 7 on an RTX 4070 SUPER at 288 GFLOP/s, the wallet balance and session earnings, and recent events such as paid +4.21 VIBE in block 41."></canvas>
+        </div>
+      </div>
+      <figcaption>What <code>vibehash worker</code> shows while it mines: the drill digs while your GPU trains, slows while it checks other workers' results, and the cart fills with every unit you commit. An example session on an RTX 4070 SUPER; your numbers depend on your hardware and the network.</figcaption>
+    </figure>
+
+    <dl class="specs">
+      <div><dt>Round</dt><dd>about 38 s</dd></div>
+      <div><dt>Minimum stake</dt><dd>5 VIBE</dd></div>
+      <div><dt>Block subsidy</dt><dd>50 VIBE, halving every 210 rounds</dd></div>
+      <div><dt>Base unit</dt><dd>1 VIBE = 100,000,000 syn</dd></div>
+      <div><dt>Trains on</dt><dd>NVIDIA, Intel Arc, Apple, AMD or CPU</dd></div>
+    </dl>
+  </div>
+</header>
+
+<div class="wrap page">
+  <nav class="toc" aria-label="Contents">
+    <div class="toc-group"><p>Guide</p><ul><li><a href="#overview">What Vibe Hash is</a></li><li><a href="#setup">Get started</a></li></ul></div>
+    <div class="toc-group"><p>How it works</p><ul><li><a href="#round">A round</a></li><li><a href="#checks">Checking the work</a></li><li><a href="#gpus">CPUs and GPUs</a></li><li><a href="#payment">Payment</a></li><li><a href="#penalties">Penalties</a></li></ul></div>
+    <div class="toc-group"><p>Reference</p><ul><li><a href="#jobspec">Job file</a></li><li><a href="#troubleshooting">Troubleshooting</a></li></ul></div>
+  </nav>
+
+  <article>
+    <section id="overview">
+      <h2>What Vibe Hash is</h2>
+      <p>Bitcoin miners spend electricity on hashes nobody uses, and only one lucky winner per block gets paid. Vibe Hash replaces the hashes with <strong>training steps on a real model</strong> that someone has paid to have trained. There's no lottery: everyone whose work passes the checks is paid in proportion to how much they did.</p>
+      <p>There are two ways to take part, and you can do both from the same computer.</p>
+      <ul>
+        <li><strong>Worker.</strong> Stake a little VIBE and let your computer train and check models. This is the mining.</li>
+        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows.</li>
+      </ul>
+      <p>Training a model takes four commands once Vibe Hash is set up. Your data is a CSV file, and the result is a model file that makes predictions; <a href="#setup">Get started</a> walks through each step.</p>
+      <div class="cmd flow"><pre><span class="prompt">&gt; </span><code>vibehash train my-data.csv --budget 100</code>   <span class="prompt"># posts the job; the network trains it</span>
+<span class="prompt">&gt; </span><code>vibehash job status</code>                       <span class="prompt"># rounds done, accuracy, budget left</span>
+<span class="prompt">&gt; </span><code>vibehash job download</code>                     <span class="prompt"># saves my-data-model.npz</span>
+<span class="prompt">&gt; </span><code>vibehash predict new-rows.csv</code>             <span class="prompt"># a prediction for every row</span></pre></div>
+      <p>Every network has a node address, such as <code>203.0.113.7</code>. Get it from whoever invited you, or run your own network with <code>vibehash testnet</code>.</p>
+      <p class="note"><strong>Test network.</strong> VIBE has no cash value, so don't buy or sell it. The software hasn't been audited.</p>
+    </section>
+
+    <section id="setup">
+      <h2>Get started</h2>
+      <p>You need Python 3.10 or newer, free from <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>. On Windows, tick “Add python.exe to PATH” while installing it. Choose what you want to do, then paste the commands into PowerShell on Windows or Terminal on macOS.</p>
+      <div class="builder">
+        <div class="tabs" role="tablist" aria-label="What you want to do">
+          <button class="tab" role="tab" id="tab-worker" data-role="worker" aria-selected="true" aria-controls="builder-panel">Earn as a worker</button>
+          <button class="tab" role="tab" id="tab-train" data-role="train" aria-selected="false" aria-controls="builder-panel">Train a model</button>
+          <button class="tab" role="tab" id="tab-local" data-role="local" aria-selected="false" aria-controls="builder-panel">Try it locally</button>
+        </div>
+        <div role="tabpanel" id="builder-panel" aria-labelledby="tab-worker">
+          <div class="panel-head">
+            <p class="panel-intro" id="panel-intro"></p>
+            <div class="os" role="group" aria-label="Commands for">
+              <button type="button" id="os-windows" data-os="windows">Windows</button><button type="button" id="os-unix" data-os="unix">macOS / Linux</button>
+            </div>
+          </div>
+          <div class="controls" id="controls"></div>
+          <ol class="steps" id="steps"></ol>
+        </div>
+      </div>
+    </section>
+
+    <section id="round">
+      <h2>A round</h2>
+      <p>The network runs in rounds. With default settings a round takes about 38 seconds and ends with one new block. The bar is drawn to scale, in the colours the worker's dashboard uses for each phase.</p>
+      <div class="timeline" aria-hidden="true">
+        <div class="bar"><div class="ph-register"></div><div class="ph-compute"></div><div class="ph-reveal"></div><div class="ph-verify"></div></div>
+        <div class="axis"><span>0 s</span><span>3 s</span><span>23 s</span><span><span>28 s</span><span>38 s</span></span></div>
+      </div>
+      <ul class="phases">
+        <li style="--key: var(--ph-register)"><strong>Register</strong><span>3 s</span><p>Workers check in with their measured speed and memory. You need at least 5 VIBE staked.</p></li>
+        <li style="--key: var(--ph-compute)"><strong>Compute</strong><span>20 s</span><p>The work is split into small units sized so a slow laptop can finish one in time; faster machines get more units, not bigger ones. Each worker trains its units and sends a sealed fingerprint of each result before the deadline.</p></li>
+        <li style="--key: var(--ph-reveal)"><strong>Reveal</strong><span>5 s</span><p>A random number that nobody could know earlier picks which parts of each unit get checked. Workers reveal their results and those parts.</p></li>
+        <li style="--key: var(--ph-verify)"><strong>Verify, then seal</strong><span>10 s</span><p>Other workers re-run the chosen parts and report whether they match; checking is paid work too. Passing results are averaged into the model, and payments and penalties go into a signed block, with a record of the round's signed messages that anyone can replay to check every decision.</p></li>
+      </ul>
+    </section>
+
+    <section id="checks">
+      <h2>Checking the work</h2>
+      <p>Re-doing all the work would double its cost, so Vibe Hash re-runs small random pieces and makes cheating a losing bet. Each unit of training is split into 8 segments, with a saved snapshot of the model between each one. These are the checks, cheapest first.</p>
+      <ol class="layers">
+        <li><b>Sealed answer</b><span>Workers send a fingerprint of their result before anyone reveals anything. Copying someone else's answer can't match your own fingerprint.</span></li>
+        <li><b>Proven snapshots</b><span>Every snapshot a worker reveals must match the fingerprint, so nobody can swap in different ones after seeing which parts get checked.</span></li>
+        <li><b>Sanity check</b><span>Training must start from this round's model and end where the worker says it did, and the change must be a sensible size. That stops boosted updates that would wreck the model.</span></li>
+        <li><b>Spot-check replay</b><span>A randomly chosen worker re-runs 3 random segments and compares. A result must be within the job's tolerance and within 1% of what that segment of training actually changed, which absorbs rounding differences between chips but not skipped work.</span></li>
+        <li><b>Duplicate units</b><span>About 1 in 5 units secretly goes to two workers. If their answers differ, the whole unit is re-run to see who was wrong.</span></li>
+        <li><b>Planted fakes</b><span>Two known-fake results per round are slipped to checkers. A checker who approves one is caught being lazy; a checker who rejects honest work is caught too, because every rejection is re-run.</span></li>
+        <li><b>Checking the node</b><span>Every choice the node makes in a round follows from the round's signed messages, which its block commits to, so anyone can replay the round. It keeps recent rounds' checkpoints, so anyone can also re-run its checks on the actual results. And it signs a receipt for every message it accepts, so a worker whose message goes missing from the round can prove it.</span></li>
+      </ol>
+
+      <div class="odds" aria-labelledby="odds-title">
+        <h3 id="odds-title">Would faking part of the work pay off?</h3>
+        <p class="note">A worker skips some segments and makes up the snapshots. The spot-check picks segments at random.</p>
+        <div class="odds-controls">
+          <div class="field">
+            <label for="fake">Share of a unit faked: <span id="fake-out" class="num">50%</span></label>
+            <input type="range" id="fake" min="5" max="100" step="5" value="50">
+          </div>
+          <div class="field">
+            <label for="q">Segments checked per unit</label>
+            <select id="q"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+          </div>
+        </div>
+        <div class="odds-out">
+          <div><div class="label">Caught</div><div class="big caught" id="caught">87.5%</div></div>
+          <div><div class="label">Gets away with it</div><div class="big escape" id="escape">12.5%</div></div>
+        </div>
+        <div class="meter" aria-hidden="true"><div id="meter" style="width:87.5%"></div></div>
+        <p class="note">Getting caught costs half your stake and the whole round's pay, and the duplicate-unit check is a second chance to catch you. Faking less saves less work but still risks the stake.</p>
+      </div>
+    </section>
+
+    <section id="gpus">
+      <h2>CPUs and GPUs</h2>
+      <p>AI is trained on graphics cards, and Vibe Hash uses them. A worker with an NVIDIA, Intel Arc, AMD (on Linux) or Apple GPU trains on it through PyTorch, which <code>vibehash setup</code> installs for your card. Without one, it trains on the CPU. Both run exactly the same maths in the same order, so any worker can check any other worker's result.</p>
+      <ul>
+        <li><strong>GPUs get more of the work.</strong> Each worker measures its real training speed and the network hands out units in proportion once it has delivered: a new worker starts with a few units and can take up to twice as many each round it delivers in full, dropping back to what it managed if it misses a deadline. A GPU that's 20 times faster ends up with about 20 times the units and 20 times the pay. Pay per unit of work is the same for everyone.</li>
+        <li><strong>Memory decides which jobs you can take.</strong> For GPU jobs the worker reports your graphics memory, and you're only given jobs that fit in it.</li>
+        <li><strong>GPU jobs use float32,</strong> the number format GPUs are built for. Many consumer GPUs, including Intel Arc and Apple, can't do float64 at all, so float64 jobs always run on the CPU.</li>
+        <li><strong>Checking works across devices.</strong> Chips round numbers very slightly differently, so a GPU's result and a CPU's replay never match bit for bit. The replay rule above allows for that without letting skipped training through, even late in training when each step barely moves the model.</li>
+        <li><strong>Shortcuts are off.</strong> Workers disable GPU modes that trade accuracy for speed, such as NVIDIA's TF32, and use deterministic kernels. Otherwise replays on another device wouldn't match.</li>
+      </ul>
+      <p class="note" id="gpu-measured">Measured on an NVIDIA RTX 4070 SUPER against a CPU: results differed by at most 8e-8, more than a thousand times inside the 0.0001 tolerance, and by under 0.1% of what each segment of training changed. The same GPU gave identical results every run. On a 2.2-million-weight model the GPU ran each step about 10 times faster than a 28-thread CPU.</p>
+    </section>
+
+    <section id="payment">
+      <h2>Payment</h2>
+      <p>Each round creates a pool of VIBE: new coins from the block subsidy (50 VIBE, halving every 210 rounds, as in Bitcoin) plus the job poster's fee for the units that passed. Job posters pay nothing for work that failed. The pool is split three ways, drawn to scale here.</p>
+      <div class="split">
+        <div class="split-bar" aria-hidden="true"><div></div><div></div><div></div></div>
+        <ul class="split-key">
+          <li style="--k: var(--gold)"><i></i><b>80%</b><span>Workers, by verified training work × reputation</span></li>
+          <li style="--k: var(--ph-verify)"><i></i><b>15%</b><span>Checkers, by re-run work × reputation</span></li>
+          <li style="--k: var(--ink-2)"><i></i><b>5%</b><span>Block producer, only if work was verified</span></li>
+        </ul>
+      </div>
+      <p>Anything nobody earned is burned, so nobody gains by rejecting good work. Everyone is paid at the same rate per unit of work, so a laptop earns less in total but gets paid every round it contributes. You don't need a mining pool.</p>
+      <h3>Worked example: one round</h3>
+      <p class="note">Subsidy 50 VIBE + job fee 10 VIBE = a 60 VIBE pool. 22 units passed, everyone at full reputation.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Who</th><th>Did</th><th class="r">Share</th><th class="r">Paid</th></tr></thead>
+          <tbody>
+            <tr><td>Old laptop</td><td>2 units</td><td class="r">2 / 22 of 48 VIBE</td><td class="r">4.36 VIBE</td></tr>
+            <tr><td>Office desktop</td><td>5 units</td><td class="r">5 / 22 of 48 VIBE</td><td class="r">10.91 VIBE</td></tr>
+            <tr><td>RTX 3060 rig</td><td>15 units</td><td class="r">15 / 22 of 48 VIBE</td><td class="r">32.73 VIBE</td></tr>
+            <tr><td>Checkers</td><td>re-ran segments</td><td class="r">15% of pool</td><td class="r">9.00 VIBE</td></tr>
+            <tr><td>Block producer</td><td>sealed the block</td><td class="r">5% of pool</td><td class="r">3.00 VIBE</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Every worker gets 2.18 VIBE per unit, the same rate on every machine. <strong>Reputation</strong> scales your share between 0.5× and 1.0×. New wallets start at 0.8×, gain 0.02 each round they deliver verified work, and lose 0.05 for missing a deadline. It moves per round rather than per unit, so a laptop builds reputation as fast as a big rig.</p>
+    </section>
+
+    <section id="penalties">
+      <h2>Penalties</h2>
+      <p>Crashes and dropped connections cost you only that round's pay. Your stake is at risk only for things an honest machine never does.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What happened</th><th>Stake</th><th>Pay</th><th>Reputation</th></tr></thead>
+          <tbody>
+            <tr><td>Unit passed its checks</td><td><span class="pill good">kept</span></td><td>paid for the unit</td><td>+0.02 for the round</td></tr>
+            <tr><td>Didn't finish before the compute deadline</td><td><span class="pill good">kept</span></td><td>that unit unpaid</td><td>−0.05</td></tr>
+            <tr><td>Crashed or went offline after sending a sealed answer</td><td><span class="pill good">kept</span></td><td>whole round unpaid</td><td>−0.05, and back to the new-worker limit of 4 units</td></tr>
+            <tr><td>Didn't answer a checking task</td><td><span class="pill good">kept</span></td><td>no checking pay</td><td>−0.05</td></tr>
+            <tr><td>Result failed a replay, sanity or duplicate check, or didn't match its fingerprint</td><td><span class="pill bad">−50%</span></td><td>whole round unpaid</td><td>reset to 0.5</td></tr>
+            <tr><td>Approved a planted fake while checking</td><td><span class="pill bad">−50%</span></td><td>whole round unpaid</td><td>reset to 0.5</td></tr>
+            <tr><td>Rejected honest work while checking</td><td><span class="pill bad">−50%</span></td><td>whole round unpaid</td><td>reset to 0.5</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Half of any slashed stake goes to whoever caught the problem and the other half is burned. When you unstake, the coins wait 20 rounds before you can spend them, and they can still be slashed in that time. Two slashes take a 10 VIBE stake below the 5 VIBE minimum, and that wallet stops getting work.</p>
+    </section>
+
+    <section id="jobspec">
+      <h2>Job file</h2>
+      <p><code>vibehash train</code> writes and posts the job for you from a CSV, choosing these settings to fit your data. To control every setting yourself, <code>vibehash job template</code> writes a job file to edit and <code>vibehash post-job</code> posts it. The network checks every field when a job is posted and rejects anything out of range.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Allowed</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>1–64 chars: a–z 0–9 . _ -</td><td>Unique name for the job</td></tr>
+            <tr><td><code>fee_per_round</code></td><td>whole syn, ≥ 0</td><td>What you pay for a round where every unit passes. 1 VIBE = 100,000,000 syn.</td></tr>
+            <tr><td><code>model.n_in / n_out</code></td><td>1–4096 / 2–1000</td><td>Number of inputs and number of classes</td></tr>
+            <tr><td><code>model.n_hidden</code></td><td>one width, or a list of 1–8 widths up to 8192</td><td>Hidden layers. <code>[512, 512]</code> is two layers of 512.</td></tr>
+            <tr><td><code>precision</code></td><td><code>float32</code> or <code>float64</code></td><td><code>float32</code> runs on GPUs. <code>float64</code> always runs on the CPU, because many GPUs can't do it.</td></tr>
+            <tr><td><code>data</code></td><td><code>synthetic</code> + seed, or <code>npz</code> + sha256</td><td><code>post-job --dataset</code> fills in the npz hash for you</td></tr>
+            <tr><td><code>lr</code>, <code>batch_size</code></td><td>0–10, 1–4096</td><td>Training settings</td></tr>
+            <tr><td><code>steps_per_unit</code></td><td>up to 100,000</td><td>Training steps in one unit of work</td></tr>
+            <tr><td><code>checkpoint_every</code></td><td>must divide steps_per_unit</td><td>Steps per checked segment</td></tr>
+            <tr><td><code>units_per_round</code></td><td>1–10,000</td><td>How much work each round hands out</td></tr>
+            <tr><td><code>memory_mb</code></td><td>1–1,000,000</td><td>Machines with less memory won't be given or asked to check this job: graphics memory on a GPU, RAM on a CPU</td></tr>
+            <tr><td><code>tolerance</code></td><td>up to 0.01</td><td>How closely a replay must match. Use 0.0001 for float32 jobs, so a GPU's result checks out on a CPU, and 0.000001 for float64.</td></tr>
+            <tr><td><code>max_update_ratio</code></td><td>up to 10</td><td>Largest change one unit may make to the model</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>A dataset is an <code>.npz</code> file with four arrays: <code>x_train</code>, <code>y_train</code>, <code>x_val</code> and <code>y_val</code>. It's loaded without running any code inside it, and every worker checks its hash against the job before using it.</p>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <p>The messages you're most likely to see, and what to do about each.</p>
+      <div class="faq">
+        <details><summary>'python' is not recognized / command not found</summary><div class="answer"><p>Python isn't installed, or isn't on your PATH. On Windows, run the python.org installer again and tick “Add python.exe to PATH”. On macOS and Linux, use <code>python3</code>; the “Your computer” setting in Get started does this for you.</p></div></details>
+        <details><summary>No matching distribution found for vibehash</summary><div class="answer"><p>Vibe Hash isn't published on PyPI yet, so pip can't download it by name. Ask whoever runs your network for <code>vibehash-0.3.0-py3-none-any.whl</code> and install that file, as the first step in Get started shows.</p></div></details>
+        <details><summary>row 12, column 'colour': 'red' isn't a number</summary><div class="answer"><p>Every input column must hold numbers. Leave text columns out of the file, or turn them into numbers, such as small = 1, medium = 2, large = 3. The column you're predicting can hold names; if it isn't the last column, name it with <code>--label</code>.</p></div></details>
+        <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else.</p></div></details>
+        <details><summary>no node address / no wallet: run `vibehash setup`</summary><div class="answer"><p>Commands use the node address and wallet that setup saved. Run setup once, or add <code>--node</code> or <code>--wallet</code> to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
+        <details><summary>can't reach node at http://…</summary><div class="answer"><p>Check the node address with whoever runs the network. The node may also be offline for a moment; the worker keeps retrying on its own, so you can leave it running.</p></div></details>
+        <details><summary>stake at least 500000000 syn to take work</summary><div class="answer"><p>Your stake is under the 5 VIBE minimum (500,000,000 syn). Stake more VIBE. If you've been slashed twice, your stake has dropped below the minimum.</p></div></details>
+        <details><summary>message timestamp too far from node clock</summary><div class="answer"><p>Your computer's clock is more than 2 minutes off. Turn on automatic time sync in your system settings.</p></div></details>
+        <details><summary>node switched networks (genesis changed); refusing to continue</summary><div class="answer"><p>The address you're connected to now runs a different network. Check you have the right node address, then start the worker again.</p></div></details>
+        <details><summary>this wallet is encrypted; a password is required</summary><div class="answer"><p>Run the command in a normal terminal window so it can ask for your password. To run unattended, set <code>VIBEHASH_PASSWORD</code> in that terminal first.</p></div></details>
+        <details><summary>dataset … not available on this node</summary><div class="answer"><p>The job expects a dataset the network doesn't have. Post the job with the dataset file filled in, which uploads it with the job.</p></div></details>
+        <details><summary>vibehash devices only lists the CPU</summary><div class="answer"><p>GPU support isn't installed, or was installed without support for your card (a plain <code>pip install torch</code> on Windows does that). Run <code>vibehash install-gpu</code>: it finds your card, installs the PyTorch build that runs on it, and tests it. If it says your driver is too old, update it from your card maker's website and run it again.</p></div></details>
+        <details><summary>GPU training needs PyTorch / device … not found</summary><div class="answer"><p>You asked for a GPU with <code>--device</code>, but PyTorch can't see one. Run <code>vibehash devices</code> to see what's available, or leave out <code>--device</code> to fall back to the CPU automatically.</p></div></details>
+        <details><summary>censored: round 12: the node signed a receipt for your commit but sealed the round without it</summary><div class="answer"><p>The node accepted one of your messages, promised in a signed receipt to record it, then sealed the round without it, which can cost you that round's pay and reputation. Your receipts are proof: they're saved in <code>receipts.jsonl</code> in your worker's folder under <code>~/.vibehash/cache</code>. Anyone can check that file with <code>vibehash chain verify --receipts receipts.jsonl</code>, so share it with whoever runs the network, and with other workers deciding whether to trust that node.</p></div></details>
+        <details><summary>The dashboard looks garbled, or I want plain log lines</summary><div class="answer"><p>Add <code>--plain</code> to <code>worker</code> or <code>testnet</code>. Logs redirected to a file get plain lines automatically, and setting <code>NO_COLOR</code> turns the colours off.</p></div></details>
+        <details><summary>I'm registered but never get any units</summary><div class="answer"><p>Check three things. Your memory must be at least the job's <code>memory_mb</code>: graphics memory for jobs that run on your GPU, system RAM otherwise (add <code>--memory-mb</code> if it's detected wrong). Your stake must be at least 5 VIBE. And new workers get at most 4 units until they've delivered once, so the first round is small.</p></div></details>
+      </div>
+    </section>
+  </article>
+</div>
+
+<footer>
+  <div class="wrap"><span>Vibe Hash 0.3 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.3</span></div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var store = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  };
+
+  // ---------- copy buttons ----------
+  function copyText(button, text, selectEl) {
+    var reset = function (label) { setTimeout(function () { button.textContent = "Copy"; button.classList.remove("done"); }, 1600); button.textContent = label; };
+    var fallback = function () {
+      var range = document.createRange(); range.selectNodeContents(selectEl);
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      reset("Selected");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { button.classList.add("done"); reset("Copied"); }, fallback);
+    } else fallback();
+  }
+  var heroCmd = document.getElementById("hero-cmd");
+  document.getElementById("hero-copy").addEventListener("click", function () { copyText(this, heroCmd.textContent, heroCmd); });
+
+  // ---------- command builder ----------
+  var PUBLISHED = false;  // true once a release is on PyPI: installs then come from there instead of a wheel file
+  var WHEEL = "vibehash-0.3.0-py3-none-any.whl";
+  function detectOs() {
+    var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
+    return /win/i.test(p) ? "windows" : "unix";
+  }
+  var defaults = { os: detectOs(), node: "NODE-ADDRESS", data: "my-data.csv" };
+  var state = {};
+  Object.keys(defaults).forEach(function (k) { var v = store.get("vibehash-guide-" + k); state[k] = v === null ? defaults[k] : v; });
+  state.role = store.get("vibehash-guide-role") || "worker";
+  if (state.role === "requester") state.role = "train";  // the tab's name before it learned to train from a CSV
+
+  var fields = {
+    node: { label: "Node address (from whoever runs the network)" },
+    data: { label: "Your data file (a CSV)" }
+  };
+  var roleFields = { worker: ["node"], train: ["node", "data"], local: [] };
+  var intros = {
+    worker: "Put your computer's spare time to work on someone's network. You'll need its node address and a few VIBE from whoever runs it.",
+    train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
+    local: "Run a complete network on this computer: a node, two workers and a training job. Nothing to fill in and nobody else involved."
+  };
+
+  function q(s) { return /[\s"'$`&|;<>()]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s; }
+  function py() { return state.os === "unix" ? "python3" : "python"; }
+  function vh(args) { return py() + " -m vibehash " + args; }
+
+  function install() {
+    return { title: "Install Vibe Hash", note: (PUBLISHED
+        ? "Downloads Vibe Hash and the two libraries it uses from PyPI, the standard Python package index. Run it again any time to update."
+        : "Vibe Hash isn't on PyPI yet, so this installs the " + WHEEL + " file you were given, plus the two libraries it uses. Open the terminal in the folder where you saved the file, or put its full path in the command.") +
+        " The second command checks it worked by listing the available commands.",
+      cmds: [py() + " -m pip install --upgrade " + (PUBLISHED ? "vibehash" : WHEEL), vh("--help")] };
+  }
+
+  function home(file) { return (state.os === "unix" ? "~/.vibehash/" : "$HOME\\.vibehash\\") + file.replace(/\//g, state.os === "unix" ? "/" : "\\"); }
+
+  var SAMPLE = [["weight_g", "length_cm", "width_cm", "sweetness", "colour_hue", "fruit"],
+                ["140", "21.0", "3.5", "18.9", "56", "banana"], ["195", "8.1", "8.0", "10.7", "36", "orange"],
+                ["93", "5.9", "6.3", "2.1", "53", "lemon"], ["175", "6.7", "7.5", "11.6", "40", "apple"]];  // rows of fruit.csv
+
+  function stepsFor(role) {
+    var s = state, nodeArg = s.node.trim() ? " --node " + q(s.node.trim()) : "";
+    if (role === "worker") {
+      return [
+        install(),
+        { title: "Set up", note: "One guided command for everything else. It saves the node address, creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. Back up the wallet file it creates, " + home("wallet.json") + ": losing it means losing your coins. Run setup again any time; it keeps what's already done.",
+          cmds: [vh("setup" + nodeArg)] },
+        { title: "Get VIBE and stake", note: "To be given work you need at least 5 VIBE staked; this stakes 10. Send your vibe1 address to whoever runs the network so they can send you some, then stake it. Stake is only at risk if you cheat; crashes never touch it. It takes effect in the next block, within about a minute.",
+          cmds: [vh("stake --amount 10")] },
+        { title: "Start working", note: "The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. GPU-sized jobs train on the graphics card; small float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
+          cmds: [vh("worker")] },
+        { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, and your reputation.", cmds: [vh("balance")] },
+        { title: "Withdraw when you're done", note: "Unstaked coins wait 20 rounds before you can spend them, and they can still be slashed until then.", cmds: [vh("unstake --amount 10")] }
+      ];
+    }
+    if (role === "train") {
+      var file = s.data.trim() || "my-data.csv", stem = file.replace(/^.*[\\/]/, "").replace(/\.[^.]*$/, "") || "my-data";
+      return [
+        install(),
+        { title: "Set up", note: "Saves the node address and creates your wallet: choose a password, and it prints your vibe1 address. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support. Back up the wallet file, " + home("wallet.json") + ".",
+          cmds: [vh("setup" + nodeArg + " --gpu skip")] },
+        { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some; 100 VIBE is plenty for a first model. This shows when it has arrived.",
+          cmds: [vh("balance")] },
+        { title: "Get your data ready", note: "A CSV file, such as a spreadsheet saved as CSV: a header row naming the columns, then one row per example. Every column is an input and must hold numbers, except the last one, which is what the model learns to predict, as names like these or as numbers. No data yet? The command writes this sample, fruit.csv, to try.",
+          sample: SAMPLE, cmds: [vh("example")] },
+        { title: "Train", note: "Uploads your data, sizes a model to fit it, and posts the job. Before spending anything it prints what it will train and what it costs: 100 VIBE pays for up to 10 rounds, charged only for work that passes its checks. A fifth of your rows are held back and never trained on, so the accuracy you see is honest.",
+          cmds: [vh("train " + q(file) + " --budget 100")] },
+        { title: "Watch it learn", note: "Shows the rounds done, the accuracy on the held-back rows as it climbs, and the budget left. Each round takes under a minute.",
+          cmds: [vh("job status")] },
+        { title: "Download the model", note: "Saves the trained model as one file, " + stem + "-model.npz. You can download it part-way through and again later; the file is replaced with the newer model.",
+          cmds: [vh("job download")] },
+        { title: "Use it", note: "Predicts each row of a new CSV with the same columns; the column to predict can be left out. Add --out predictions.csv to save every row with its prediction and how sure the model is.",
+          cmds: [vh("predict new-rows.csv")] }
+      ];
+    }
+    if (role === "local") {
+      var local = " --node http://127.0.0.1:8545";
+      return [
+        install(),
+        { title: "Add GPU support (optional)", note: "Finds your graphics card and installs the PyTorch build that runs on it, a 1–3 GB download. It tells you if your card or driver can't be used. Skip it and the test network trains on the CPU instead.", cmds: [vh("install-gpu")] },
+        { title: "Start a test network", note: "Runs a node, two workers and a sample training job on this computer, and shows the mining dashboard with a row for each worker. Leave it running and stop it with Ctrl+C. Running it again carries on where it stopped; add --reset to start over. Its wallets are throwaway test keys.",
+          cmds: [vh("testnet")] },
+        { title: "Look around", note: "In a second terminal while it runs: check a worker's balance, then download every block and replay every round yourself, which shows each payment and penalty follows from the workers' signed messages.",
+          cmds: [vh("balance" + local + " --wallet " + home("testnet/worker-1.json")), vh("chain verify" + local + " --genesis " + home("testnet/genesis.json"))] },
+        { title: "Train a model on it", note: "Also in a second terminal: write the fruit sample and train on it, paying with your test network's requester wallet, which holds 10,000 test VIBE. The job takes turns with the demo job; follow and download it as the Train a model tab shows.",
+          cmds: [vh("example"), vh("train fruit.csv" + local + " --wallet " + home("testnet/requester.json"))] },
+        { title: "Let other computers join", note: "Starts the test network open to your local network. Newcomers join with the worker steps, and the dashboard shows how to send them VIBE to stake.", cmds: [vh("testnet --host 0.0.0.0")] }
+      ];
+    }
+    return stepsFor("worker");
+  }
+
+  // rendering: textContent only, so typed values never become markup
+  var controls = document.getElementById("controls"), stepsEl = document.getElementById("steps");
+
+  function renderControls() {
+    controls.textContent = "";
+    roleFields[state.role].forEach(function (key) {
+      var wrap = document.createElement("div"), id = "in-" + key, input = document.createElement("input");
+      wrap.className = "field";
+      var lab = document.createElement("label"); lab.htmlFor = id; lab.textContent = fields[key].label;
+      input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.id = id; input.value = state[key];
+      input.addEventListener("input", function () { update(key, input.value); });
+      wrap.append(lab, input);
+      controls.appendChild(wrap);
+    });
+  }
+
+  var osButtons = Array.prototype.slice.call(document.querySelectorAll(".os button"));
+  function renderOs() { osButtons.forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.os === state.os ? "true" : "false"); }); }
+  osButtons.forEach(function (b) { b.addEventListener("click", function () { update("os", b.dataset.os); renderOs(); }); });
+
+  function sampleTable(rows) {
+    var wrap = document.createElement("div"), table = document.createElement("table");
+    wrap.className = "sample";
+    rows.forEach(function (row, i) {
+      var tr = document.createElement("tr");
+      row.forEach(function (cell) { var c = document.createElement(i ? "td" : "th"); c.textContent = cell; tr.appendChild(c); });
+      table.appendChild(tr);
+    });
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function renderSteps() {
+    stepsEl.textContent = "";
+    stepsFor(state.role).forEach(function (st) {
+      var li = document.createElement("li");
+      var h = document.createElement("h3"); h.textContent = st.title;
+      var n = document.createElement("p"); n.className = "note"; n.textContent = st.note;
+      li.append(h, n);
+      if (st.sample) li.appendChild(sampleTable(st.sample));
+      if (st.cmds.length) {
+        var box = document.createElement("div"); box.className = "cmds";
+        st.cmds.forEach(function (c) {
+          var wrap = document.createElement("div"); wrap.className = "cmd";
+          var pre = document.createElement("pre");
+          var p = document.createElement("span"); p.className = "prompt"; p.textContent = state.os === "unix" ? "$ " : "> ";
+          var code = document.createElement("code"); code.textContent = c;
+          pre.append(p, code);
+          var b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy command");
+          b.addEventListener("click", function () { copyText(b, c, code); });
+          wrap.append(pre, b);
+          box.appendChild(wrap);
+        });
+        li.appendChild(box);
+      }
+      stepsEl.appendChild(li);
+    });
+  }
+
+  function update(key, value) { state[key] = value; store.set("vibehash-guide-" + key, value); renderSteps(); }
+
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+  function selectRole(role) {
+    state.role = role; store.set("vibehash-guide-role", role);
+    tabs.forEach(function (t) { var on = t.dataset.role === role; t.setAttribute("aria-selected", on ? "true" : "false"); t.tabIndex = on ? 0 : -1; });
+    document.getElementById("builder-panel").setAttribute("aria-labelledby", "tab-" + role);
+    document.getElementById("panel-intro").textContent = intros[role];
+    renderControls(); renderOs(); renderSteps();
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener("click", function () { selectRole(t.dataset.role); });
+    t.addEventListener("keydown", function (e) {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      var next = tabs[(i + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+      next.focus(); selectRole(next.dataset.role);
+    });
+  });
+  selectRole(roleFields[state.role] ? state.role : "worker");
+
+  // ---------- detection odds ----------
+  var fake = document.getElementById("fake"), qSel = document.getElementById("q");
+  function odds() {
+    var f = fake.value / 100, n = +qSel.value, p = 1 - Math.pow(1 - f, n);
+    var pct = function (x) { return (Math.round(x * 1000) / 10).toFixed(1) + "%"; };
+    document.getElementById("fake-out").textContent = Math.round(f * 100) + "%";
+    document.getElementById("caught").textContent = pct(p);
+    document.getElementById("escape").textContent = pct(1 - p);
+    document.getElementById("meter").style.width = (p * 100) + "%";
+  }
+  fake.addEventListener("input", odds); qSel.addEventListener("change", odds); odds();
+
+  // ---------- contents highlight ----------
+  var links = Array.prototype.slice.call(document.querySelectorAll(".toc a"));
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting) links.forEach(function (a) { a.classList.toggle("active", a.getAttribute("href") === "#" + en.target.id); });
+      });
+    }, { rootMargin: "-20% 0px -70% 0px" });
+    document.querySelectorAll("article > section").forEach(function (s) { io.observe(s); });
+  }
+
+  // ---------- the terminal dashboard, drawn the way vibehash/minerui.py draws it ----------
+  (function () {
+    var canvas = document.getElementById("term-canvas"), screenEl = document.getElementById("term-screen");
+    if (!canvas || !canvas.getContext) return;
+    var ctx = canvas.getContext("2d");
+    var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var MONO = '"JetBrains Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace';
+    function rgb(c, k) { k = k || 1; return "rgb(" + c.map(function (v) { return Math.min(255, Math.round(v * k)); }).join(",") + ")"; }
+    function noise(x, y) {
+      var n = (Math.imul(x, 374761393) + Math.imul(y, 668265263)) >>> 0;
+      n = Math.imul(n ^ (n >>> 13), 1274126177) >>> 0;
+      return (n ^ (n >>> 16)) >>> 0;
+    }
+    var DIM = rgb([125, 135, 148]), TEXT = rgb([205, 212, 220]), WHITE = rgb([240, 244, 248]), GOLD = rgb([255, 200, 50]),
+        GREEN = rgb([95, 225, 130]), RAIL = rgb([150, 152, 165]), TIE = rgb([110, 86, 62]), CART = rgb([176, 116, 60]),
+        TIMBER = rgb([168, 112, 58]), LAMP = rgb([255, 214, 120]), DRILL = rgb([80, 200, 255]), DRILL_DIM = rgb([60, 110, 140]),
+        TIP = rgb([225, 245, 255]);
+    var SPARKS = [[255, 225, 130], [255, 160, 60], [255, 250, 225], [255, 110, 40]].map(function (c) { return rgb(c); });
+    var PHASE = { register: rgb([120, 170, 255]), compute: rgb([255, 180, 60]), reveal: rgb([200, 125, 255]), verify: rgb([90, 220, 180]) };
+    var GRAD = [[255, 205, 60], [255, 150, 70], [255, 95, 150], [180, 110, 255]].map(function (c) { return rgb(c); });
+    var ROCK = [];
+    [[96, 66, 50], [128, 90, 62], [158, 118, 82], [116, 104, 94], [82, 76, 74]].forEach(function (c) {
+      [1.1, 0.95, 0.78].forEach(function (k) { ROCK.push(rgb(c, k)); });  // lit by a lantern, near one, between them
+    });
+    var BOLD = {}; [WHITE, GOLD, GREEN, TIP, LAMP, PHASE.register, PHASE.compute, PHASE.reveal, PHASE.verify].forEach(function (c) { BOLD[c] = true; });
+    var BANNER = ["█ █ █ █▄▄ █▀▀   █ █ ▄▀█ █▀ █ █", "▀▄▀ █ █▄█ ██▄   █▀█ █▀█ ▄█ █▀█"];
+    var ADDRESS = "vibe17b0d8bce54f6eab50df24fd44e5a408a9525", UNIT_FLOPS = 1.6547e10, ROWS = 28;
+    var D = { register: 3, compute: 9, reveal: 3, verify: 5 };  // seconds per phase in this example
+
+    // An example session, already a few rounds in: mid-compute, training unit 4 of 7.
+    var s = { phase: "compute", left: 5.2, round: 42, height: 41, assigned: 7, trained: 3, committed: 3, tasks: 0, checked: 0,
+              prog: 0.2, units: 34, checks: 102, rounds: 19, balance: 79.19, start: 15, scroll: 0, frame: 0, busy: true,
+              popup: null, activity: "training unit 4 of 7", feed: [] };
+    function say(text, color) { s.feed.push([Date.now(), text, color || TEXT]); if (s.feed.length > 8) s.feed.shift(); }
+    var t0 = Date.now();
+    [["round 40: verified 5 tasks"], ["paid +3.98 VIBE in block 40", GOLD], ["round 41: computed 7 units, committed 7"],
+     ["round 41: verified 6 tasks"], ["paid +4.21 VIBE in block 41", GOLD], ["round 42: registered"]].forEach(function (e, i, all) {
+      s.feed.push([t0 - (all.length - i) * 2600, e[0], e[1] || TEXT]);
+    });
+
+    function advance(dt) {
+      s.left -= dt;
+      var per;
+      if (s.phase === "compute" && s.trained < s.assigned) {
+        per = D.compute * 0.8 / s.assigned; s.prog += dt;
+        if (s.prog >= per) { s.prog -= per; s.trained++; s.committed++; s.units++; }
+        s.busy = s.trained < s.assigned;
+        s.activity = s.busy ? (s.prog < per * 0.75 ? "training" : "uploading") + " unit " + (s.trained + 1) + " of " + s.assigned
+                            : "committed " + s.committed + " units; waiting for the reveal";
+        if (!s.busy) say("round " + s.round + ": computed " + s.assigned + " units, committed " + s.committed);
+      } else if (s.phase === "verify" && s.checked < s.tasks) {
+        per = D.verify * 0.6 / s.tasks; s.prog += dt;
+        if (s.prog >= per) { s.prog -= per; s.checked++; s.checks++; }
+        s.busy = s.checked < s.tasks;
+        s.activity = s.busy ? "checking other workers' results (" + (s.checked + 1) + " of " + s.tasks + ")" : "round done; waiting for the block";
+        if (!s.busy) say("round " + s.round + ": verified " + s.tasks + " tasks");
+      }
+      s.scroll += dt * (s.busy ? (s.phase === "compute" ? 12 : 4.2) : 0);
+      if (s.left > 0) return;
+      if (s.phase === "register") {
+        s.phase = "compute"; s.left = D.compute; s.assigned = 6 + noise(s.round, 1) % 3; s.trained = s.committed = 0; s.prog = 0; s.busy = true;
+      } else if (s.phase === "compute") {
+        s.phase = "reveal"; s.left = D.reveal; s.busy = false; s.activity = "revealing the checkpoints the beacon picked";
+      } else if (s.phase === "reveal") {
+        s.phase = "verify"; s.left = D.verify; s.tasks = 5 + noise(s.round, 2) % 3; s.checked = 0; s.prog = 0; s.busy = true;
+      } else {  // the block is sealed: paid, and on to the next round
+        var pay = s.committed * 0.52 + s.checked * 0.045 + (noise(s.round, 3) % 40) / 100;
+        s.balance += pay; s.height++; s.popup = [performance.now(), pay];
+        say("paid +" + pay.toFixed(2) + " VIBE in block " + s.height, GOLD);
+        s.round++; s.rounds++; s.phase = "register"; s.left = D.register; s.busy = false; s.activity = "registered; waiting for work";
+        say("round " + s.round + ": registered");
+      }
+    }
+
+    function repeat(ch, n) { return n > 0 ? new Array(n + 1).join(ch) : ""; }
+    function plural(n, noun) { return n.toLocaleString("en-US") + " " + noun + (n === 1 ? "" : "s"); }
+    function vibe(x) { return x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " VIBE"; }
+    function si(n, unit) {
+      var scales = [[1e12, "T"], [1e9, "G"], [1e6, "M"]];
+      for (var i = 0; i < scales.length; i++) if (n >= scales[i][0]) return (n / scales[i][0]).toFixed(2) + " " + scales[i][1] + unit;
+      return Math.round(n) + " " + unit;
+    }
+    function clock(t) { var d = new Date(t); return [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (v) { return (v < 10 ? "0" : "") + v; }).join(":"); }
+
+    function build(cols) {
+      var g = [], r, c, i;
+      for (r = 0; r < ROWS; r++) { g.push([]); for (c = 0; c < cols; c++) g[r].push(null); }
+      var w = cols - 1;  // like the terminal: one column spare on the right
+      function line(row, segs) {
+        var col = 1;
+        segs.forEach(function (sg) { for (var k = 0; k < sg[0].length && col < w; k++) g[row][col++] = [sg[0][k], sg[1]]; });
+      }
+      // banner
+      var room = w - 1 - BANNER[0].length - 3;
+      var tails = ["useful-work miner  ·  vibehash-testnet-1", ADDRESS.length <= room ? ADDRESS : ADDRESS.slice(0, 10) + "…" + ADDRESS.slice(-4)];
+      if (tails[0].length > room) tails[0] = "vibehash-testnet-1";
+      BANNER.forEach(function (text, row) {
+        var segs = [];
+        for (var j = 0; j < text.length; j++) segs.push([text[j], GRAD[Math.min(3, Math.floor(j * 4 / text.length))]]);
+        segs.push(["   ", DIM], [tails[row].slice(0, Math.max(0, room)), DIM]);
+        line(row, segs);
+      });
+      // the mine: rows 3-9
+      var bw = w - 2, dx = Math.max(16, Math.floor(bw * 0.45)), off = Math.floor(s.scroll), f = s.frame, busy = s.busy, B = 3;
+      function put(row, col, text, color) { for (var k = 0; k < text.length; k++) if (col + k >= 0 && col + k < bw) g[B + row][1 + col + k] = [text[k], color]; }
+      for (r = 0; r < 7; r++) for (c = 0; c < bw; c++) {
+        var x = off + c, mined = c <= dx, m = ((x - 6) % 24 + 24) % 24, lamp = Math.min(m, 24 - m), cell = null;
+        if (mined && r >= 2 && r <= 4) {
+          if (r === 4) cell = x % 4 === 0 ? ["╪", TIE] : ["═", RAIL];
+          else if (x % 12 === 0) cell = ["║", TIMBER];
+          else if (r === 2 && lamp === 0) cell = ["¤", LAMP];
+        } else if (mined && r === 1 && [11, 0, 1].indexOf(x % 12) >= 0) {
+          cell = ["═", TIMBER];
+        } else {
+          var v = noise(x, r) % 100;
+          if (!mined && v < (r >= 2 && r <= 4 ? 4 : 1)) cell = ["♦", GOLD];
+          else {
+            var layer = (r + noise(Math.floor(x / 9), 99) % 3 + (noise(Math.floor(x / 4), r) % 7 === 0 ? 1 : 0)) % 5;
+            var lit = mined ? (lamp <= 3 ? 0 : lamp <= 7 ? 1 : 2) : 1;
+            cell = [v < 60 ? "█" : v < 88 ? "▓" : "▒", ROCK[layer * 3 + lit]];
+          }
+        }
+        g[B + r][1 + c] = cell;
+      }
+      var load = ""; for (i = 0; i < 4; i++) load += i < Math.min(s.committed, 4) ? "♦" : "·";
+      var cx = dx - 13;
+      put(3, cx, "▐", CART); put(3, cx + 1, load, s.committed ? GOLD : DIM); put(3, cx + 5, "▌", CART); put(3, cx + 6, "───", RAIL);
+      var wheel = busy ? "oO"[Math.floor(s.scroll / 2) % 2] : "o";
+      put(4, cx + 1, wheel, TEXT); put(4, cx + 4, wheel, TEXT);
+      var dstyle = busy || s.round ? DRILL : DRILL_DIM, body = "";
+      for (i = 0; i < 4; i++) body += (i + (busy ? f : 0)) % 3 ? "█" : "▓";
+      put(2, dx - 4, "▄▄▄▄", dstyle); put(4, dx - 4, "▀▀▀▀", dstyle); put(3, dx - 4, body, dstyle);
+      put(3, dx, busy ? "►»>"[f % 3] : "►", busy ? TIP : dstyle);
+      var paid = s.popup && performance.now() - s.popup[0] < 2500;
+      if (busy || paid) for (i = 0; i < (busy ? 7 : 4); i++) {
+        var n = noise(f, i), rr = 1 + n % 5, cc = dx + 1 + (n >>> 4) % 4;
+        if (paid && i % 2) put(rr, cc, "●", GOLD); else put(rr, cc, "*+·'`"[(n >>> 8) % 5], SPARKS[(n >>> 12) % 4]);
+      }
+      if (paid) { var label = " +" + s.popup[1].toFixed(2) + " VIBE "; put(0, Math.max(0, dx - Math.floor(label.length / 2)), label, GOLD); }
+      // status panel
+      var nbar = Math.max(10, Math.min(32, w - 46)), fill = Math.floor(Math.min(1, 1 - Math.max(0, s.left) / D[s.phase]) * nbar);
+      var left = String(Math.max(0, Math.round(s.left))); while (left.length < 4) left = " " + left;
+      var label8 = s.phase.toUpperCase(); while (label8.length < 8) label8 += " ";
+      line(11, [["ROUND " + s.round + " ", WHITE], [" " + label8 + " ", PHASE[s.phase]], [repeat("█", fill), PHASE[s.phase]], [repeat("░", nbar - fill), DIM],
+                [" " + left + "s left", TEXT], ["    block " + s.height, DIM]]);
+      line(12, [[(busy ? "►»>"[f % 3] : "►") + " ", PHASE[s.phase]], [s.activity, TEXT]]);
+      line(14, [["rig       ", DIM], ["NVIDIA GeForce RTX 4070 SUPER (CUDA)", WHITE]]);
+      line(15, [["speed     ", DIM], ["288.00 GFLOP/s", WHITE], ["  on demo-1 (269,316 float32 weights)", DIM]]);
+      line(16, [["round     ", DIM], [String(s.assigned), WHITE], [" assigned · ", DIM], [String(s.trained), WHITE], [" trained · ", DIM],
+                [String(s.committed), WHITE], [" committed · ", DIM], [String(s.checked), WHITE], [" checked", DIM]]);
+      line(17, [["session   ", DIM], [plural(s.units, "unit"), WHITE], [" · ", DIM], [plural(s.checks, "check"), WHITE], [" · ", DIM],
+                [plural(s.rounds, "round"), WHITE], [" · ", DIM], [si(s.units * UNIT_FLOPS, "FLOP"), WHITE], [" trained", DIM]]);
+      line(19, [["wallet    ", DIM], [vibe(s.balance), GOLD], ["   ", DIM], ["+" + vibe(s.balance - s.start) + " this session", GREEN]]);
+      line(20, [["stake     ", DIM], [vibe(10), WHITE], ["   reputation ", DIM], [repeat("█", 8), GREEN], [repeat("░", 2), DIM], [" 0.92", TEXT]]);
+      s.feed.slice(-4).forEach(function (e, k) { line(22 + k, [[clock(e[0]) + "  ", DIM], [e[1], e[2]]]); });
+      line(27, [["Ctrl+C to stop", DIM], ["   ·   node http://203.0.113.7:8545", DIM]]);
+      return g;
+    }
+
+    var dpr = 1, cw = 8, ch = 16, fs = 13, cols = 96, pad = 4, termBg = "#000";
+    function fit() {
+      dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      var avail = Math.max(240, screenEl.clientWidth - 24);
+      cols = Math.max(40, Math.min(96, Math.floor(avail / 7.2)));
+      cw = Math.max(4, Math.floor(Math.min(10, avail / cols) * dpr));
+      ch = Math.round(cw * 2.05); fs = Math.round(cw * 1.62); pad = Math.round(4 * dpr);
+      canvas.width = cols * cw + 2 * pad; canvas.height = ROWS * ch + 2 * pad;
+      canvas.style.width = (canvas.width / dpr) + "px";
+      termBg = getComputedStyle(screenEl).backgroundColor || termBg;
+    }
+    function draw(g) {
+      ctx.globalAlpha = 1; ctx.fillStyle = termBg; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      var lw = Math.max(1, Math.round(ch * 0.08)), half = Math.round(ch / 2), hw = Math.round(cw / 2), font = "";
+      for (var r = 0; r < ROWS; r++) for (var c = 0; c < cols; c++) {
+        var cell = g[r][c]; if (!cell || cell[0] === " ") continue;
+        var t = cell[0], x = pad + c * cw, y = pad + r * ch;
+        ctx.fillStyle = cell[1];
+        switch (t) {
+          case "█": ctx.fillRect(x, y, cw, ch); break;
+          case "▓": ctx.globalAlpha = 0.78; ctx.fillRect(x, y, cw, ch); ctx.globalAlpha = 1; break;
+          case "▒": ctx.globalAlpha = 0.52; ctx.fillRect(x, y, cw, ch); ctx.globalAlpha = 1; break;
+          case "░": ctx.globalAlpha = 0.28; ctx.fillRect(x, y, cw, ch); ctx.globalAlpha = 1; break;
+          case "▀": ctx.fillRect(x, y, cw, half); break;
+          case "▄": ctx.fillRect(x, y + ch - half, cw, half); break;
+          case "▌": ctx.fillRect(x, y, hw, ch); break;
+          case "▐": ctx.fillRect(x + cw - hw, y, hw, ch); break;
+          case "─": ctx.fillRect(x, y + half - Math.floor(lw / 2), cw, lw); break;
+          case "═": ctx.fillRect(x, y + Math.round(ch * 0.4) - lw, cw, lw); ctx.fillRect(x, y + Math.round(ch * 0.6), cw, lw); break;
+          case "╪": ctx.fillRect(x, y + Math.round(ch * 0.4) - lw, cw, lw); ctx.fillRect(x, y + Math.round(ch * 0.6), cw, lw); ctx.fillRect(x + hw - Math.floor(lw / 2), y, lw, ch); break;
+          case "║": ctx.fillRect(x + Math.round(cw * 0.3), y, lw, ch); ctx.fillRect(x + Math.round(cw * 0.7) - lw, y, lw, ch); break;
+          case "♦": ctx.beginPath(); ctx.moveTo(x + hw, y + ch * 0.28); ctx.lineTo(x + cw * 0.86, y + half); ctx.lineTo(x + hw, y + ch * 0.72); ctx.lineTo(x + cw * 0.14, y + half); ctx.closePath(); ctx.fill(); break;
+          case "●": ctx.beginPath(); ctx.arc(x + hw, y + half, cw * 0.34, 0, Math.PI * 2); ctx.fill(); break;
+          case "►": ctx.beginPath(); ctx.moveTo(x + cw * 0.15, y + ch * 0.3); ctx.lineTo(x + cw * 0.9, y + half); ctx.lineTo(x + cw * 0.15, y + ch * 0.7); ctx.closePath(); ctx.fill(); break;
+          default:
+            var want = (BOLD[cell[1]] ? "600 " : "400 ") + fs + "px " + MONO;
+            if (want !== font) { ctx.font = want; font = want; }
+            ctx.fillText(t, x + hw, y + half + 1);
+        }
+      }
+    }
+    function render() { draw(build(cols)); }
+
+    fit(); render();
+    if (document.fonts && document.fonts.load) document.fonts.load("600 16px \"JetBrains Mono\"").then(render, function () {});
+    var resizeTimer = 0;
+    window.addEventListener("resize", function () { clearTimeout(resizeTimer); resizeTimer = setTimeout(function () { fit(); render(); }, 120); });
+    if (still) return;  // reduced motion: keep the one example frame
+    var visible = true, last = performance.now();
+    if ("IntersectionObserver" in window) new IntersectionObserver(function (en) { visible = en[0].isIntersecting; }).observe(canvas);
+    function tick(now) {
+      requestAnimationFrame(tick);
+      if (!visible || document.hidden) { last = now; return; }
+      if (now - last < 1000 / 12) return;
+      var dt = Math.min(0.25, (now - last) / 1000); last = now;
+      advance(dt); s.frame++; render();
+    }
+    requestAnimationFrame(tick);
+  })();
+})();
+</script>

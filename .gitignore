@@ -1,0 +1,27 @@
+# Builds: the publishing workflow makes them fresh from a tag
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node data and keys: never commit a chain database or a wallet
+*.sqlite3
+*.sqlite3-*
+node-data/
+*-data/
+wallet.json
+*-cert.pem
+*-key.pem
+
+# Editors and the OS
+.vscode/
+.idea/
+.claude/settings.local.json
+Thumbs.db
+.DS_Store

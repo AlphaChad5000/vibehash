@@ -1,0 +1,22 @@
+{
+  "id": "demo-classifier",
+  "fee_per_round": 1000000000,
+  "model": {
+    "n_in": 8,
+    "n_hidden": 32,
+    "n_out": 4
+  },
+  "data": {
+    "kind": "synthetic",
+    "seed": 7
+  },
+  "init_seed": 11,
+  "lr": 0.1,
+  "batch_size": 32,
+  "steps_per_unit": 40,
+  "checkpoint_every": 5,
+  "units_per_round": 12,
+  "memory_mb": 1024,
+  "tolerance": 1e-06,
+  "max_update_ratio": 0.5
+}

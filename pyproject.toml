@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibehash"
+version = "0.4.0"
+description = "Vibe Hash: earn VIBE by training AI models on everyday computers (testnet)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "cryptography>=42"]
+keywords = ["proof-of-useful-work", "distributed-training", "cryptocurrency", "testnet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+vibehash = "vibehash.cli:main"
+
+[tool.setuptools]
+packages = ["vibehash"]
+
+[tool.setuptools.package-data]
+vibehash = ["data/*.csv", "data/*.txt"]  # the sample data `vibehash example` writes out; the BIP39 word list
