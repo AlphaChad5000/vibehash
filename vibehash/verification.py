@@ -100,20 +100,26 @@ def plant_canary(job: TrainingJob, openings: dict, segments: list[int], draw) ->
     cheap for the coordinator: a vector sum and one hash. `draw` is a crypto.Draw from the round secret."""
     ends = [s for s in segments if s + 1 not in segments]
     bad = ends[draw.below(len(ends))]
+    forged = rescale_update(job.spec, openings[bad][0], openings[bad + 1][0], draw)
+    proofs = _swap_leaf({i: openings[i][1] for s in segments for i in (s, s + 1)}, bad + 1, params_hash(forged), job.n_segments + 1)
+    return {i: (forged if i == bad + 1 else openings[i][0], proof) for i, proof in proofs.items()}
+
+
+def rescale_update(spec, before: np.ndarray, after: np.ndarray, draw) -> np.ndarray:
+    """`after` moved so that the update from `before` is CANARY_SCALE bigger or smaller: a canary's forged checkpoint,
+    for a whole unit's segment (plant_canary) or a sharded unit's cell (shards.plant_cell)."""
     lo, hi = CANARY_SCALE
     scale, sign = lo + (hi - lo) * draw.below(2**20) / 2**20, 1 if draw.chance(0.5) else -1
-    after = np.asarray(openings[bad + 1][0], dtype=np.float64)
-    step = after - openings[bad][0]  # in place from here on: models can be a GiB a checkpoint
+    after = np.asarray(after, dtype=np.float64)
+    step = after - before  # in place from here on: models can be a GiB a checkpoint
     size = np.linalg.norm(step)
     if not size:  # it didn't move at all: any direction will do
         step, size = np.ones_like(after), np.sqrt(after.size)
     # A difference under a rounding step of the job's precision passes as rounding (reproduces()), so a segment that
     # barely moved the weights is pushed at least four steps, or an honest checker would approve it and be slashed.
-    step *= sign * max(scale * size, 4 * np.finfo(job.spec.dtype).eps * np.linalg.norm(after)) / size
+    step *= sign * max(scale * size, 4 * np.finfo(spec.dtype).eps * np.linalg.norm(after)) / size
     step += after
-    forged = job.spec.round(step)
-    proofs = _swap_leaf({i: openings[i][1] for s in segments for i in (s, s + 1)}, bad + 1, params_hash(forged), job.n_segments + 1)
-    return {i: (forged if i == bad + 1 else openings[i][0], proof) for i, proof in proofs.items()}
+    return spec.round(step)
 
 
 def _swap_leaf(proofs: dict[int, list], index: int, leaf: bytes, n_leaves: int) -> dict[int, list]:

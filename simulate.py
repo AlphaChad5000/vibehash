@@ -1,6 +1,7 @@
 """Run a Vibe Hash network: honest low/mid-end rigs plus a handful of cheaters.
 
     python simulate.py --rounds 20
+    python simulate.py --shards 3    # a job split into 3 shards, trained by teams (SHARDING.md)
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from vibehash import crypto
 from vibehash.crypto import KeyPair
 from vibehash.ledger import BURN, Chain
 from vibehash.coordinator import CoordinatorConfig
+from vibehash.model import ModelSpec
 from vibehash.protocol import Protocol
 from vibehash.tasks import SYN_PER_VIBE, TrainingJob, Verdict
 from vibehash.verification import detection_probability
@@ -44,6 +46,29 @@ ROSTER = [
 ]
 
 
+# A sharded job's cast: every way a team member can cheat (shards.CHEATS lie in what they compute, EDGE_CHEATS in what
+# crossed an edge), the same lazy and false-accusing checkers, and a withholder, whose teammates then go unpaid for
+# that unit without being blamed. The netbook can't hold the whole model, but it can hold a shard.
+SHARDED_ROSTER = [
+    ("ana-laptop",       LOW_END_LAPTOP,  "honest",        "honest"),
+    ("ben-desktop",      OFFICE_DESKTOP,  "honest",        "honest"),
+    ("cho-minipc",       MINI_PC,         "honest",        "honest"),
+    ("dev-gtx1060",      GTX_1060,        "honest",        "honest"),
+    ("eli-rtx3060",      RTX_3060,        "honest",        "honest"),
+    ("fay-laptop",       LOW_END_LAPTOP,  "honest",        "honest"),
+    ("gus-netbook",      NETBOOK,         "honest",        "honest"),   # enough RAM for a shard
+    ("hal-desktop",      OFFICE_DESKTOP,  "honest",        "honest"),
+    ("noisy-gtx1060",    GTX_1060,        "noisy_output",  "honest"),
+    ("nograd-desktop",   OFFICE_DESKTOP,  "zero_gradient", "honest"),
+    ("frozen-minipc",    MINI_PC,         "frozen",        "honest"),
+    ("fibber-laptop",    LOW_END_LAPTOP,  "lies_sent",     "honest"),
+    ("spoofer-desktop",  OFFICE_DESKTOP,  "lies_received", "honest"),
+    ("rubberstamp-pc",   OFFICE_DESKTOP,  "honest",        "lazy"),
+    ("accuser-gtx1060",  GTX_1060,        "honest",        "false_accuser"),
+    ("withhold-minipc",  MINI_PC,         "withholder",    "honest"),
+]
+
+
 def vibe(syn: int) -> str:
     return f"{syn / SYN_PER_VIBE:,.3f}"
 
@@ -52,9 +77,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rounds", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--shards", type=int, default=1, help="split the job's model into this many shards (2-4), each "
+                    "trained by one worker of a team; 1 (the default): whole units")
     args = ap.parse_args()
+    sharded = args.shards > 1
 
-    workers = [Worker(n, KeyPair.generate(n.encode()), hw, b, vb) for n, hw, b, vb in ROSTER]
+    workers = [Worker(n, KeyPair.generate(n.encode()), hw, b, vb) for n, hw, b, vb in (SHARDED_ROSTER if sharded else ROSTER)]
     requester = KeyPair.generate(b"acme-labs")
     stake = 10 * SYN_PER_VIBE
     chain = Chain(
@@ -64,19 +92,29 @@ def main() -> None:
     proto = Protocol(chain, workers, CoordinatorConfig(), seed=args.seed)
     names = {w.address: w.name for w in workers} | {requester.address: "acme-labs (requester)"}
 
-    job = TrainingJob("acme-classifier-v1", requester.address, budget=300 * SYN_PER_VIBE, fee_per_round=15 * SYN_PER_VIBE, units_per_round=40)
+    if sharded:  # four layers, so 2 to 4 shards
+        job = TrainingJob("acme-sharded-v1", requester.address, budget=300 * SYN_PER_VIBE, fee_per_round=15 * SYN_PER_VIBE,
+                          units_per_round=12, spec=ModelSpec(8, (16, 16, 16), 4), shards=args.shards)
+    else:
+        job = TrainingJob("acme-classifier-v1", requester.address, budget=300 * SYN_PER_VIBE, fee_per_round=15 * SYN_PER_VIBE, units_per_round=40)
     proto.post_job(requester, job)
 
     print(f"Vibe Hash simulation - {len(workers)} workers, job '{job.job_id}' "
-          f"({job.spec.n_params} params, {job.units_per_round} units/round, {job.steps_per_unit} SGD steps/unit)\n")
-    print(f"{'rnd':>3} {'units':>5} {'fraud':>5} {'miss':>4} {'val loss':>8} {'val acc':>7} {'pool VIBE':>9} {'burned':>7}  proposer")
+          f"({job.spec.n_params} params, {job.units_per_round} units/round, {job.steps_per_unit} SGD steps/unit"
+          f"{f', {job.shards} shards' if sharded else ''})\n")
+    print(f"{'rnd':>3} {'units':>5} {'fraud':>5} {'miss':>4} {'val loss':>8} {'val acc':>7} {'pool VIBE':>9} {'burned':>7}  proposer"
+          + ("  teams" if sharded else ""))
     for _ in range(args.rounds):
         r = proto.run_round(job.job_id)
-        n_ok = len({x.unit.unit_id for x in r.results if x.verdict == Verdict.ACCEPTED and x.worker in r.worker_flops})
+        if sharded:  # units whose every shard checked out, so their update joined the model
+            n_ok = r.block.summary.accepted_units
+        else:
+            n_ok = len({x.unit.unit_id for x in r.results if x.verdict == Verdict.ACCEPTED and x.worker in r.worker_flops})
         n_fraud = sum(x.verdict.is_fraud for x in r.results)
         n_miss = sum(x.verdict == Verdict.MISSED_DEADLINE for x in r.results)
         print(f"{r.round:>3} {n_ok:>2}/{job.units_per_round:<2} {n_fraud:>5} {n_miss:>4} {r.val_loss:>8.4f} {r.val_acc:>7.1%} "
-              f"{vibe(r.pool):>9} {vibe(r.burned):>7}  {names[r.proposer]}")
+              f"{vibe(r.pool):>9} {vibe(r.burned):>7}  {names[r.proposer]}"
+              + (f"  {len(r.teams)}" if sharded else "") + (f"  ({r.waiting})" if r.waiting else ""))
 
     # --- earnings, read back from the chain itself ---------------------------
     earned = defaultdict(lambda: defaultdict(int))
@@ -97,6 +135,10 @@ def main() -> None:
             if res.verdict == Verdict.ACCEPTED and res.worker in rep.worker_flops:
                 units[res.worker] += 1
 
+    if sharded:
+        print("\nThe last round's teams, one worker per shard")
+        for team in proto.history[-1].teams:
+            print("  " + " -> ".join(names[a] for a in team))
     print("\nWho got paid (VIBE)")
     print(f"{'worker':<17} {'hardware':<21} {'role':<22} {'units':>5} {'work':>8} {'verify':>7} {'propose':>7} "
           f"{'bounty':>7} {'slashed':>8} {'stake':>6} {'rep':>4} {'VIBE/MFLOP':>9}")
@@ -134,7 +176,11 @@ def main() -> None:
     q = proto.config.challenge_segments
     for f in (0.1, 0.25, 0.5, 1.0):
         print(f"  f={f:<4}  q={q}: {detection_probability(f, q):.1%}")
-    print(f"  (plus {proto.config.replication_rate:.0%} of units replicated, and slashing = {econ.SLASH_FRACTION:.0%} of stake)")
+    if sharded:
+        print(f"  (per shard of each unit: q cells of {job.n_segments}; neighbours' edges compared at every challenged step; "
+              f"slashing = {econ.SLASH_FRACTION:.0%} of stake)")
+    else:
+        print(f"  (plus {proto.config.replication_rate:.0%} of units replicated, and slashing = {econ.SLASH_FRACTION:.0%} of stake)")
 
 
 if __name__ == "__main__":
