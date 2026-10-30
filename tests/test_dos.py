@@ -1,5 +1,6 @@
 """Denial of service and robustness in the network layer: what an anonymous client, a lying peer or a relay can make a
 node or worker do. Each test reproduces one way in, mostly against a real node on a free localhost port."""
+import contextlib
 import copy
 import hashlib
 import json
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from vibehash import cli, consensus, node as node_module
+from vibehash import cli, consensus, ledger, node as node_module
 from vibehash.blobs import MAX_DATASET, BlobStore
 from vibehash.client import NodeClient, NodeError, WorkerClient
 from vibehash.consensus import Engine, Timeouts, proposal, proposer_order, vote
@@ -65,7 +66,11 @@ def raw(url: str, method: str, path: str, body: bytes = b"", headers: dict | Non
 
 
 def posted_job(test, api: NodeClient, node: Node, job: TrainingJob) -> None:
-    api.send_tx(REQ, "post_job", "system", job.budget, job.spec_json())
+    """A job on chain. Nodes don't relay a job whose budget can't pay for a round (ledger._relayable), but that's
+    relay policy, not a block rule: one can still arrive in a block another validator made. So an unfunded job, which
+    no round ever trains, gets past this node's relay check here, as it would reach the chain that way."""
+    with mock.patch.object(ledger, "_relayable", lambda tx: None) if not job.budget else contextlib.nullcontext():
+        api.send_tx(REQ, "post_job", "system", job.budget, job.spec_json())
     wait_for(lambda: job.job_id in node.chain.state.jobs)
 
 
