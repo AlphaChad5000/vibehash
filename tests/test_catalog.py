@@ -218,7 +218,7 @@ class ModelsCommandTests(CatalogTestCase):
         code, out, _ = self.run_cli("models")
         self.assertEqual(code, 0, out)
         self.assertIn("Status: \"ready\" models fine-tune with `", out)
-        self.assertIn("The public network trains small models sized to a CSV file", out)
+        self.assertIn("Today the public network trains small models sized to a CSV file", out)
         self.assertIn("Fine-tuning models that need a team of GPUs is coming.", out)
         self.assertRegex(out, r"name\s+Hugging Face\s+parameters\s+experts\s+weights\s+licence\s+gated\s+GPUs at 12 / 24 / 32 GB")
         self.assertRegex(out, r"tiny\s+acme/tiny\s+38,049\s+2 of 8\s+\S+ kB\s+mit\s+no\s+1 / 1 / 1")

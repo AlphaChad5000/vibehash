@@ -136,8 +136,9 @@ model maker's emblem in place of the blade (`scripts/preview_forge.py NAME`
 shows one now).
 
 **Fine-tuning** a model the list marks `ready` (one GPU holds it, and it's a
-Llama, Mistral, Qwen or SmolLM) works on a network whose node runs
-fine-tunes, which today means a local testnet, not the public network:
+Llama, Mistral, Qwen or SmolLM) works on any network whose node runs this
+version: workers train, check and score, and the node needs no GPU. That means
+a local testnet today, and the public network once its node is updated:
 
 ```bash
 pip install "vibehash[finetune]"          # the tokenizer and chat templates, for posting

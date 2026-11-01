@@ -1,7 +1,8 @@
 """Popular open-weight models to fine-tune, and what training each one would take.
 
 `vibehash train DATA --base NAME` fine-tunes a model one GPU holds, of a family finetune.py trains (`ready`), on a
-network whose node runs fine-tunes: a local `testnet` today, not yet the public node (FINETUNING.md). Models that need a
+network whose node runs this version (it needs no GPU: workers check and score the work): a local `testnet` today, the
+public network once its node is updated (FINETUNING.md). Models that need a
 team of GPUs are coming (DEEPSEEK.md). `vibehash models` lists them all, `vibehash train --base NAME` alone describes
 one and posts nothing, and the guide's command builder shows the same list, baked into the page
 (scripts/bake_models.py).
@@ -325,8 +326,9 @@ def checked_text(t: float) -> str:
 
 def status_line(prog: str = "vibehash") -> str:
     return (f"Status: \"ready\" models fine-tune with `{prog} train chats.jsonl --base NAME` on a network whose node runs "
-            f"fine-tunes (a local `{prog} testnet` today; not the public network yet). The public network trains "
-            f"{TODAY} (`{prog} train data.csv`). Fine-tuning models that need a team of GPUs is coming.")
+            f"this version (a local `{prog} testnet` today; the public network once its node is updated). Today the "
+            f"public network trains {TODAY} (`{prog} train data.csv`). Fine-tuning models that need a team of GPUs is "
+            "coming.")
 
 
 def to_json(facts: dict[str, Facts], errors: dict[str, str]) -> dict:
@@ -443,8 +445,8 @@ def preflight(ref: str, model: Model | None, f: Facts, data: Path | None = None,
         lines += ["", f"Ready: `{prog} train chats.jsonl --base {model.name if model else f.repo}` fine-tunes it on chats "
                   "(JSON lines of {\"messages\": [...]}) or text ({\"text\": ...}): a pre-flight, then one question "
                   "before anything is posted.",
-                  f"It runs on a network whose node runs fine-tunes: a local `{prog} testnet --job none` today, not the "
-                  f"public network yet. Nothing was posted and nothing was spent. More: {FINETUNING}"]
+                  f"It runs on a network whose node runs this version (no GPU needed there): a local `{prog} testnet --job "
+                  f"none` today, the public network once its node is updated. Nothing was posted and nothing was spent. More: {FINETUNING}"]
     else:
         lines += ["", "Not yet: fine-tuning this model isn't live on the network (it needs a team of GPUs, or an "
                   "architecture that isn't supported yet), so nothing was posted and nothing was spent.",

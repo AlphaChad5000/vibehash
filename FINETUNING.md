@@ -314,7 +314,30 @@ B (15M numbers for Qwen3-4B). It needs neither PyTorch nor the weights. A
 rechecking `chain verify` doesn't need them either.
 
 **Proven** on a local network whose node ran in a Python with no PyTorch
-installed: NODE_RUN
+installed:
+
+- **The setup:** a venv holding only numpy and cryptography, where importing the node's code loads no PyTorch, and
+  eight staked workers in another process sharing the 4070 SUPER. Four workers were honest, worker-5 rejected
+  everything it checked, worker-6 cheated (trained half of each unit and made up the rest), and workers 7 and 8 never
+  answered a check. Qwen3-0.6B, the same 2,379 chats cut at 192 tokens, posted with `train --base`.
+- **What the juries did:**
+
+  | Round | Accepted | What the juries did |
+  |---|---|---|
+  | 3 | 3 of 5 revealed | worker-5's false rejection of worker-8's unit upheld by a jury of three; worker-5 slashed |
+  | 4 | 5 | three more false rejections upheld (worker-5 slashed three times); worker-6's cheat, which both its silent checkers left unchecked, found bad by its jury (worker-6 slashed); one disputed claim whose jury was two-thirds silent left unchecked, unpaid, nobody slashed |
+  | 5 | 8 | worker-6's unit disagreed with its honest replica: a whole-unit jury slashed worker-6 (`failed_redundancy`) and upheld the replica |
+  | 6 | 8 | a claim neither checker answered, upheld by its jury |
+  | 7 | 8 | nothing contested |
+
+  Round 3 also lost three committed units to an older worker bug that the node's restart mid-round exposed, now fixed
+  (`RerunRoundTest`).
+- **Scores:** the held-back loss the scorers recorded fell 2.533 → 1.175 → 1.135 → 1.118 → 1.105. That's each round's
+  starting model, so the last is the model after round 6.
+- **The adapter:** `job download` at that point gave an adapter that transformers + PEFT measures at **1.1048**, the
+  scorers' number. The base model measures 2.5329, also theirs.
+- **The audit:** `chain verify` ran in the same PyTorch-free venv. It replayed every round from its record and redid
+  43 weight-based checks from the downloaded checkpoints: all match.
 
 What's left on the node is moving checkpoints and keeping them:
 

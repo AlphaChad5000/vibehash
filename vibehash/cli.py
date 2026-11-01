@@ -992,11 +992,14 @@ def _download_adapter(a, job, info: dict, weights, receipt_path: Path) -> None:
     loss = rounds[-1]["val_loss"] if rounds else None
     finetune.export_peft(spec, weights, out, {
         "job_id": job.job_id, "rounds trained": sum(1 for r in rounds if r.get("accepted_units")),
-        "held-back loss": f"{rounds[0]['val_loss']:.4f} after the first round, {loss:.4f} now" if rounds else None,
+        "held-back loss": f"{rounds[0]['val_loss']:.4f} for the model the first round started from, {loss:.4f} for "
+                          "the one the last scored round started from (a fine-tune's workers score each round's start)"
+                          if rounds else None,
         "data": f"sha256 {job.data_source['sha256']}", "model height": (info.get("model") or {}).get("height")})
     settings.save(last_model=str(out.resolve()))
     done = sum(1 for r in rounds if r.get("accepted_units"))
-    trained = f"trained in {done} round{'s' * (done != 1)}, held-back loss {loss:.4f}" if done else \
+    trained = (f"trained in {done} round{'s' * (done != 1)}; held-back loss {loss:.4f} as the last scored round began "
+               "(workers score each round's model in the job's next round)") if done else \
         "not trained yet: B is still zero, so it changes nothing"
     print(f"saved {out}/: a LoRA adapter for {spec.repo} at {spec.commit[:12]}, {trained}\n"
           "Use it with transformers and PEFT:\n\n"
