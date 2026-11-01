@@ -264,6 +264,12 @@ def cmd_node(a):
     if bool(a.tls_cert) != bool(a.tls_key):
         sys.exit("--tls-cert and --tls-key go together")
     context = tls.server_context(a.tls_cert, a.tls_key) if a.tls_cert else None
+    if a.device != "cpu":  # where the node replays the work nobody checked, and scores each round's model
+        from . import compute
+        try:
+            compute.use(compute.get_backend(a.device, logging.getLogger("vibehash.node")))
+        except RuntimeError as e:
+            sys.exit(f"error: {e}")
     node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                 keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
                 announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20)).start()
@@ -1255,6 +1261,8 @@ def cmd_testnet(a):
             n.server.server_close()
             n.store.close()
         sys.exit(f"error: {e}")
+    from . import compute
+    compute.use(clients[0][1].backend)  # the node checks what nobody else did, and scores fine-tunes, on the same device
     for n in nodes:
         n.start()
     api, s = NodeClient(node.url), node.chain.state
@@ -1271,7 +1279,7 @@ def cmd_testnet(a):
     def ensure_job():
         nonlocal posted
         s = node.chain.state
-        if any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
+        if a.job == "none" or any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
             return  # a job is running, or the one just posted hasn't reached a block yet
         job = template_job(f"demo-{len(s.jobs) + 1}", a.job == "gpu", keys["requester"].address, a.budget)
         if s.balance(keys["requester"].address) >= job.budget + node.coord.config.min_fee:
@@ -1385,7 +1393,8 @@ def parser() -> argparse.ArgumentParser:
                         "every block (default 1; fixed when the testnet is first made)")
     p.add_argument("--dir", help=f"where its wallets and chain live (default {settings.home() / 'testnet'})")
     p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 lets other computers join"); p.add_argument("--port", type=int, default=8545)
-    p.add_argument("--job", choices=["gpu", "small"], default="gpu", help="the job template to train (see `job template`)")
+    p.add_argument("--job", choices=["gpu", "small", "none"], default="gpu", help="the job template to train (see `job "
+                   "template`), or none: post your own, with `train --node` and the testnet's requester.json wallet")
     p.add_argument("--budget", type=to_syn, default="500", help="VIBE per job; a new job is posted when one runs out")
     p.add_argument("--device", default="auto", help="what the workers train on: auto, cpu, cuda, xpu, mps")
     p.add_argument("--rounds", type=int, help="stop after this many rounds (default: run until Ctrl+C)")
@@ -1431,6 +1440,8 @@ def parser() -> argparse.ArgumentParser:
                    help="another node to sync from and gossip to (validators find each other from the chain anyway)")
     p.add_argument("--announce", metavar="URL", help="the address other nodes reach this one at, if not --host:--port")
     p.add_argument("--dataset", action="append", help="add an .npz dataset to this node's store")
+    p.add_argument("--device", default="cpu", help="where the node checks work its checkers didn't and scores each round: "
+                   "cpu (default), auto, cuda, xpu or mps. Fine-tunes want a GPU here (and PyTorch)")
     p.add_argument("--keep-rounds", type=int, default=10,
                    help="rounds whose opened checkpoints stay downloadable, so anyone can re-run their checks (default 10)")
     p.add_argument("--max-job-mb", type=float, default=64.0, metavar="MB",  # node.MAX_JOB_BYTES, which says why

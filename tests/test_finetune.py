@@ -597,6 +597,101 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn(bad, segs)
 
 
+CHATML = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+          "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
+WORDS = "hello there how are you I am fine thanks what is the weather like today it is sunny and warm good".split()
+
+
+def word_tokenizer(vocab: int) -> bytes:
+    """tokenizer.json of a word-level tokenizer small enough for a tiny model's vocabulary, with ChatML's tokens."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+    tok = Tokenizer(models.WordLevel(unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.train_from_iterator([" ".join(WORDS + ["user", "assistant", "system"])] * 3,
+                            trainers.WordLevelTrainer(vocab_size=vocab, special_tokens=["[UNK]", "<|im_start|>", "<|im_end|>"]))
+    return tok.to_str().encode()
+
+
+@unittest.skipUnless(torch is not None and HAVE_TOKENIZERS, "needs PyTorch, tokenizers and jinja2")
+class LiveNetworkTests(unittest.TestCase):
+    """The whole thing over HTTP, offline: a fake Hugging Face (tests/test_hub.py) serving a tiny model and its
+    tokenizer, a node and three workers, `vibehash train chats.jsonl --base`, rounds, and `vibehash job download`."""
+
+    def test_post_train_and_download_an_adapter(self):
+        import contextlib
+        import io
+        import logging
+        from unittest import mock
+
+        from tests.test_hub import FakeHub
+        from tests.test_network import run_until, start_network
+        from vibehash import cli
+        from vibehash import wallet as wallets
+
+        d = tmpdir(self)
+        env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(d / "home"), "HF_HOME": str(d / "hf")})
+        env.start()
+        self.addCleanup(env.stop)
+        for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "VIBEHASH_NODE", "VIBEHASH_WALLET"):
+            os.environ.pop(k, None)
+        fake = FakeHub()
+        self.addCleanup(fake.close)
+        os.environ["HF_ENDPOINT"] = fake.endpoint
+        logging.disable(logging.INFO)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        ft.unload()
+        self.addCleanup(ft.unload)
+
+        tiny = TinyModel(d / "src")  # its own cache, under another home: the workers fetch from the fake Hub
+        files = {p.name: p.read_bytes() for p in tiny.folder.iterdir()}
+        files["tokenizer.json"] = word_tokenizer(tiny.vocab)
+        files["tokenizer_config.json"] = json.dumps({"chat_template": CHATML, "eos_token": "<|im_end|>"}).encode()
+        fake.add_commit("tiny/qwen3", files)
+        rng = np.random.default_rng(0)
+        chats = d / "chats.jsonl"
+        chats.write_text("\n".join(json.dumps({"messages": [
+            {"role": "user", "content": " ".join(rng.choice(WORDS, 4))},
+            {"role": "assistant", "content": "I am fine " + " ".join(rng.choice(WORDS, 3))}]}) for _ in range(60)))
+
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 3)
+        wallets.save(req, d / "requester.json", None)
+
+        def run(*argv) -> str:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                try:
+                    cli.main(list(argv))
+                except SystemExit as e:
+                    if e.code not in (None, 0):
+                        self.fail(f"vibehash {' '.join(argv)} exited with {e.code!r}\n{out.getvalue()}")
+            return out.getvalue()
+        said = run("train", str(chats), "--base", "tiny/qwen3", "--node", node.url, "--wallet", str(d / "requester.json"),
+                   "--yes", "--plain", "--budget", "100", "--fee", "10", "--units", "6", "--id", "chats-1")
+        self.assertIn("Model     tiny/qwen3", said)
+        self.assertIn("60 examples (60 chats", said)
+        self.assertIn("Posted job chats-1", said)
+
+        run_until(node, clients, stop, 4)  # the job's block and three rounds
+        info = api.get("/job/chats-1")
+        spec = TrainingJob.from_spec_json(json.dumps(info["spec"]), "", 0).spec
+        self.assertEqual(spec.repo, "tiny/qwen3")
+        self.assertGreaterEqual(len(info["rounds"]), 2)
+        self.assertTrue(all(r["accepted_units"] > 0 and np.isfinite(r["val_loss"]) for r in info["rounds"]))
+        self.assertLess(node.chain.state.escrow["chats-1"], 100 * VIBE)
+        self.assertTrue(any(node.chain.state.balance(w.address) for w in workers), "workers were paid")
+
+        out = d / "adapter"
+        said = run("job", "download", "chats-1", "--node", node.url, "--out", str(out))
+        self.assertIn("a LoRA adapter for tiny/qwen3", said)
+        from vibehash import hub
+        raw = (out / "adapter_model.safetensors").read_bytes()
+        header = hub.parse_header(raw[8:8 + int.from_bytes(raw[:8], "little")], len(raw))
+        self.assertEqual(len(header.tensors), 2 * len(spec.modules()))
+        self.assertIn("base_model.model.model.layers.1.self_attn.o_proj.lora_B.weight", header.tensors)
+        self.assertEqual(json.loads((out / "adapter_config.json").read_text())["revision"], spec.commit)
+
+
 @unittest.skipUnless(REAL and torch is not None, "set VIBEHASH_REAL_MODELS=1 to fetch and check Qwen3-0.6B")
 class RealModelTests(unittest.TestCase):
     """Qwen3-0.6B, fetched from Hugging Face through hub.py and checked against its manifest."""

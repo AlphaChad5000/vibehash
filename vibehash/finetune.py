@@ -55,7 +55,7 @@ MAX_VAL = 128  # sequences held back at most: the node scores them every round
 SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
-TOLERANCE = 1e-3
+TOLERANCE = 1e-4
 _BASE = re.compile(r"^hf:([A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?)@([0-9a-f]{40})$", re.ASCII)
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 
