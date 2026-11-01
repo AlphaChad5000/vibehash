@@ -218,6 +218,12 @@ class Config:
     def ratio(self, layer: int) -> int:
         return self.compress_ratios[layer]
 
+    def source(self, layer: int, kind: str) -> int | None:
+        """The layer whose compressed keys and index keys (kind "kv") or picks (kind "index") `layer` uses: the last
+        kv or index source at or before it."""
+        sources = self.kv_source_layers if kind == "kv" else self.index_source_layers
+        return max((i for i in sources if i <= layer), default=None)
+
     def rope_args(self, layer: int) -> tuple:
         """(dim, original_seq_len, base, factor, beta_fast, beta_slow) of a layer's rotary table: compressing layers
         use compress_rope_theta and YaRN, window-only ones the plain rope_theta."""
@@ -268,15 +274,42 @@ class Side:
 
 
 def choice_gap(scores: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
-    """Per row of scores [..., n] and chosen indices [..., k] (-1: none): how far the best score left out beats the
-    worst score chosen. At most 0 when the choice is a top-k of the scores; a checker accepts a committed choice if
-    this is within its tie margin."""
-    scores, n = scores.double(), scores.size(-1)
-    idx = torch.where(chosen >= 0, chosen, n).long()  # "none" goes to a spare column, dropped after
+    """Per row of scores [..., n] and chosen indices [..., k]: how far the best score left out beats the worst score
+    chosen. At most 0 when the choice is a top-k of the scores; a checker accepts a committed choice if this is within
+    its tie margin. -1 means "none", and is allowed only as padding: when fewer than k options have a finite score
+    (the indexer early in a sequence, or inside few candidate blocks). A row that names an option twice, names one
+    out of range, or leaves a slot empty while a finite-scored option is left out gets +inf: it's no top-k at all,
+    and would otherwise let a worker skip an expert's work by naming another one twice."""
+    scores, n, k = scores.double(), scores.size(-1), chosen.size(-1)
+    chosen = chosen.long()
+    bad = ((chosen < -1) | (chosen >= n)).any(-1)
+    ranked = chosen.sort(-1).values
+    bad |= ((ranked[..., 1:] == ranked[..., :-1]) & (ranked[..., 1:] >= 0)).any(-1)
+    idx = torch.where((chosen >= 0) & (chosen < n), chosen, n)  # "none" goes to a spare column, dropped after
     mask = torch.zeros(*scores.shape[:-1], n + 1, dtype=torch.bool, device=scores.device).scatter(-1, idx, True)[..., :n]
+    need = scores.isfinite().sum(-1).clamp(max=k)
+    return _mask_gap(scores, mask, need).masked_fill(bad, math.inf)
+
+
+def candidate_gap(score: torch.Tensor, visible: torch.Tensor, candidates: torch.Tensor, topk_blocks: int,
+                  block: int) -> torch.Tensor:
+    """choice_gap for committed candidate blocks ([b, s, n] bool, candidate_blocks' form), against the index scores
+    they were chosen from ([b, s, n], -inf where unreachable) and each query's visible count ([s, 1]). +inf for a
+    mask that isn't whole blocks, keeps more than topk_blocks, keeps an unreachable block or drops the pinned one."""
+    width = score.size(-1)
+    blocks = _block_scores(score.double(), visible, block)
+    kept = F.pad(candidates, (0, -width % block), value=False).unflatten(-1, (-1, block)).any(-1)
+    bad = (candidates != kept.repeat_interleave(block, dim=-1)[..., :width]).any(-1)
+    bad |= (kept.sum(-1) > topk_blocks) | (kept & (blocks == -math.inf)).any(-1)
+    need = (blocks > -math.inf).sum(-1).clamp(max=topk_blocks)
+    return _mask_gap(blocks, kept, need).masked_fill(bad, math.inf)
+
+
+def _mask_gap(scores, mask, need):
     worst = scores.masked_fill(~mask, math.inf).amin(-1)
     best = scores.masked_fill(mask, -math.inf).amax(-1)
-    return torch.where(best == -math.inf, -math.inf, best - worst)
+    gap = torch.where(best == -math.inf, -math.inf, best - worst)
+    return gap.masked_fill(mask.sum(-1) < need, math.inf)
 
 
 # --- quantisation ----------------------------------------------------------------------------------------------------
@@ -529,13 +562,46 @@ def candidate_blocks(score: torch.Tensor, visible: torch.Tensor, topk_blocks: in
     """The reference's select_candidate_blocks: score [b, s, n] (unreachable positions -inf) to a mask [b, s, n] of
     the topk_blocks blocks of `block` positions with the best best-position, the block holding each query's newest
     position always kept (it's only partly filled, so it could be outscored)."""
-    width = score.size(-1)
-    blocks = F.pad(score, (0, -width % block), value=-math.inf).unflatten(-1, (-1, block)).amax(-1)
-    n = blocks.size(-1)
-    blocks = blocks.masked_fill(torch.arange(n, device=score.device) == (visible - 1) // block, math.inf)
-    top = blocks.topk(min(topk_blocks, n), dim=-1)
+    blocks = _block_scores(score, visible, block)
+    top = blocks.topk(min(topk_blocks, blocks.size(-1)), dim=-1)
     keep = torch.zeros_like(blocks, dtype=torch.bool).scatter(-1, top.indices, top.values > -math.inf)
-    return keep.repeat_interleave(block, dim=-1)[..., :width]
+    return keep.repeat_interleave(block, dim=-1)[..., :score.size(-1)]
+
+
+def _block_scores(score, visible, block):
+    """Each block's best score, -inf padding the last one out, and the block with the newest visible position +inf."""
+    blocks = F.pad(score, (0, -score.size(-1) % block), value=-math.inf).unflatten(-1, (-1, block)).amax(-1)
+    return blocks.masked_fill(torch.arange(blocks.size(-1), device=score.device) == (visible - 1) // block, math.inf)
+
+
+def check_picks(picks: torch.Tensor, b: int, s: int, n: int, k: int, ratio: int, candidates=None) -> None:
+    """Refuse committed picks that aren't a top-k in form: [b, s, k] compressed positions a query can see, ascending
+    with any -1 ("none") after them, as the indexer makes them, and -1 only where fewer than k positions are open to
+    it (visible, and inside its candidate blocks when the layer uses them). Whether they're the *best* k is
+    choice_gap's question, which needs the scores."""
+    if tuple(picks.shape) != (b, s, k):
+        raise ValueError(f"picks are {list(picks.shape)}, not [{b}, {s}, {k}]")
+    visible = (torch.arange(1, s + 1, device=picks.device) // ratio).unsqueeze(-1)
+    valid = picks >= 0
+    open_ = visible.clamp(max=k).squeeze(-1).expand(b, s)
+    if candidates is not None:
+        seen = candidates[..., :n] & (torch.arange(n, device=picks.device) < visible)
+        open_ = seen.sum(-1).clamp(max=k)
+    ascending = ((picks[..., 1:] > picks[..., :-1]) | ~valid[..., 1:]).all(-1) & (valid[..., :-1] | ~valid[..., 1:]).all(-1)
+    if bool((picks < -1).any() | (picks >= visible).any() | ~ascending.all() | (valid.sum(-1) < open_).any()):
+        raise ValueError("picks must be distinct positions each query can see, ascending, with -1 (none) only after "
+                         "them and only where fewer than index_topk positions are open")
+
+
+def check_experts(chosen: torch.Tensor, tokens: int, cfg: "Config") -> None:
+    """Refuse committed routing that isn't k distinct experts a token, as moe.py does."""
+    k = cfg.n_activated_experts
+    if tuple(chosen.shape) != (tokens, k):
+        raise ValueError(f"routing is {list(chosen.shape)}, not [{tokens}, {k}]")
+    ranked = chosen.sort(-1).values
+    if bool((chosen < 0).any() | (chosen >= cfg.n_routed_experts).any() | (ranked[:, 1:] == ranked[:, :-1]).any()):
+        raise ValueError(f"routing must name {k} distinct experts of {cfg.n_routed_experts} a token: it sends a token "
+                         "to the same expert twice, or to one that doesn't exist")
 
 
 class Indexer(nn.Module):
@@ -690,22 +756,37 @@ class Attention(nn.Module):
                 if self.indexer is not None:
                     side.index_k = self.indexer.keys(latent, ccos, csin)
                 side.compress_kv = num.fp4(_rope(latent, ccos, csin, num), 16, e4m3_scale=True)
-            comp = side.compress_kv
+            comp = self._side(side, "compress_kv", (b, s // r))
             if self.indexer is not None:
                 picks = choices.picks.get(self.layer)
+                n = comp.size(1)
+                uses = 0 <= cfg.candidate_source_layer < self.layer
                 if picks is not None:
                     picks = picks.to(x.device, torch.long)
-                if comp.size(1) == 0:
+                    check_picks(picks, b, s, n, min(cfg.index_topk, n), r, choices.candidates if uses else None)
+                if n == 0:
                     picks = x.new_empty(b, s, 0, dtype=torch.long)
                 elif picks is None or choices.keep_scores or (self.layer == cfg.candidate_source_layer
                                                               and choices.candidates is None):
-                    picks = self.indexer(x, qr, side.index_k, cos, sin, choices, picks)
+                    index_k = self._side(side, "index_k", (b, n))
+                    picks = self.indexer(x, qr, index_k, cos, sin, choices, picks)
                 choices.picks[self.layer] = side.picks = picks
-            picks = side.picks
+            picks = self._side(side, "picks", (b, s))
         o = sparse_attention(q, kv, comp, picks, self.attn_sink, cfg.head_dim ** -0.5, cfg.window_size, num)
         o = _rope(o, cos, sin, num, inverse=True)  # takes the query's rotation back out of the values' RoPE tails
         o = o.flatten(2).unflatten(-1, (cfg.o_groups, -1))  # o_groups groups of n_heads / o_groups heads each
         return self.wo_b(self.wo_a(o).flatten(2))
+
+    def _side(self, side: Side, name: str, lead: tuple):
+        """A side channel this layer reuses, refused if it's missing or not for this sequence: a shard that starts
+        after a source layer must be handed what that layer made."""
+        t = getattr(side, name)
+        if t is None or tuple(t.shape[:2]) != lead:
+            kind = "kv" if name in ("compress_kv", "index_k") else "index"
+            src = self.cfg.source(self.layer, kind)
+            raise ValueError(f"layer {self.layer} reuses layer {src}'s {name} ({list(lead)} first), and "
+                             f"Side.{name} is {None if t is None else list(t.shape)}: pass it in from layer {src}")
+        return t
 
 
 class Expert(nn.Module):
@@ -762,6 +843,7 @@ class MoE(nn.Module):
         chosen = choices.experts.get(self.layer)
         if chosen is not None:
             chosen = chosen.to(x.device, torch.long)
+            check_experts(chosen, x.size(0), cfg)
         if chosen is None or choices.keep_scores:
             with torch.no_grad():
                 biased = scores + self.gate.bias.to(hi)
@@ -979,8 +1061,11 @@ class Block(nn.Module):
 
 class Model(nn.Module):
     """The embedding, a run of Blocks, and the head: the whole model when `layers` is all of them, a pipeline shard
-    otherwise (with the embedding only if it's the first, the head only if it's the last). State dict names are the
-    checkpoint's (layers.2.attn.wq_a.weight ...), so DeepSeek's safetensors load as they are (load_weights)."""
+    otherwise (with the embedding only if it's the first, the head only if it's the last). A shard must be given what
+    the layers before it hand on: the stream and pre_mix, the Side of the last kv and index sources before it (its
+    layers refuse to run without what they reuse), the Choices of the candidate source if a layer picks inside its
+    blocks, and the engram hashes. State dict names are the checkpoint's (layers.2.attn.wq_a.weight ...), so
+    DeepSeek's safetensors load as they are (load_weights)."""
 
     def __init__(self, cfg: Config, layers=None, num: Numerics = Numerics(), device=None, embed: bool = True,
                  head: bool = True, engram_table: bool = True):
