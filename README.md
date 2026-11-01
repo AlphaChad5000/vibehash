@@ -393,6 +393,7 @@ SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 | `vibehash/client.py` | HTTP client and the worker loop, with live `WorkerStats` |
 | `vibehash/minerui.py` | The terminal mining dashboard (plain ANSI, ASCII fallback) |
 | `vibehash/trainui.py` | The terminal training dashboard: a job followed live from the node, politely, with a log-line mode |
+| `vibehash/emblems.py` | Pixel-art emblems of the model makers, which the training dashboard forges instead of a blade for a fine-tune (`scripts/preview_forge.py NAME` plays one) |
 | `vibehash/termui.py` | What the two dashboards share: palette, the mine's rock, banner, phase bar, event feed, the alternate screen |
 | `vibehash/tabular.py` | CSV files to training datasets, and downloaded models to predictions |
 | `vibehash/catalog.py` | The open-weight models `models` lists and `train --base` describes: live facts from Hugging Face, cached, and the GPUs a team would need (the fine-tuning itself is coming). `scripts/bake_models.py` writes them into the guide |

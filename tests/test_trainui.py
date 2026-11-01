@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest import mock
 
-from vibehash import cli, trainui
+from vibehash import catalog, cli, emblems, trainui
 from vibehash.client import NodeError
 from vibehash.tasks import SYN_PER_VIBE as VIBE
 
@@ -112,6 +112,12 @@ def states():
     out.append(("many rounds", watching(node, budget=None)))
     node = FakeNode(job_reply(rounds=history(240), escrow=0))
     out.append(("finished, many rounds", watching(node, budget=None)))
+    node = FakeNode(job_reply(3))
+    w = watching(node, base="deepseek-ai/DeepSeek-V4.1-Flash")
+    node.job = job_reply(4)
+    w._job_at = 0
+    w.poll()
+    out.append(("a fine-tune", w))  # the model's emblem in the forge, glowing as a round lands
     return out
 
 
@@ -203,6 +209,53 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(lengths[0], lengths[1])
         self.assertLess(lengths[1], lengths[2])
 
+    def test_a_fine_tune_forges_its_models_emblem(self):
+        """Instead of a blade: the emblem of the model's maker, a generic one for makers without one, at every size."""
+        for base in ("deepseek-ai/DeepSeek-V4.1-Flash", "qwen3-0.6b", "hf:meta-llama/Llama-3.2-1B-Instruct@" + "a" * 40,
+                     "google/gemma-4-E2B-it", "openai/gpt-oss-20b", "microsoft/Phi-4-mini-instruct",
+                     "mistralai/Mistral-7B-Instruct-v0.3", "HuggingFaceTB/SmolLM3-3B", "zai-org/GLM-5.3"):
+            watch = watching(FakeNode(job_reply(4)), base=base)
+            for size in ((40, 20), (66, 34), (120, 50), (52, 14)):
+                for glyphs in (trainui.GLYPHS, trainui.ASCII):
+                    with self.subTest(base=base, size=size, ascii=glyphs is trainui.ASCII):
+                        dash = trainui.TrainDashboard(watch)
+                        dash.g = glyphs
+                        for frame in frames(dash, size):
+                            lines = frame.split("\n")
+                            self.assertLessEqual(len(lines), size[1])
+                            for line in lines:
+                                self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
+                            if glyphs is trainui.ASCII:
+                                ESCAPE.sub("", frame).encode("ascii")
+            text = text_of(watch)
+            self.assertNotIn("►", text)  # no blade
+            self.assertIn("79.3%", text)
+            self.assertIn(base.removeprefix("hf:").split("@")[0], text)  # what it fine-tunes, where a CSV job's shape goes
+        self.assertIn("► 79.3%", text_of(watching(FakeNode(job_reply(4)))))  # a model from a CSV keeps its blade
+
+    def test_the_emblem_takes_its_colours_as_accuracy_climbs(self):
+        filled = []
+        for n in (0, 1, 3, 8):
+            dash = trainui.TrainDashboard(watching(FakeNode(job_reply(n)), base="qwen3-8b"))
+            dash.g = trainui.GLYPHS
+            frames(dash, (120, 50), 30)  # long enough to finish filling
+            filled.append(dash.fill)
+        self.assertEqual(filled[0], 0.0)  # untrained: a dull cast
+        self.assertLess(filled[1], filled[2])
+        self.assertLess(filled[2], filled[3])
+        self.assertLessEqual(filled[3], emblems.EMBLEMS["qwen"].width)
+
+    def test_a_job_names_its_base_model_in_its_spec(self):
+        reply = job_reply(2)
+        reply["spec"]["base"] = "hf:Qwen/Qwen3-0.6B@" + "c" * 40
+        watch = watching(FakeNode(reply))
+        self.assertEqual(watch.base, reply["spec"]["base"])
+        self.assertEqual(emblems.for_base(watch.base).name, "qwen")
+        self.assertIn("Qwen/Qwen3-0.6B  ·  vibehash-local", text_of(watch))
+        for odd in (None, 7, "", "x" * 301, ["Qwen/Qwen3-0.6B"]):
+            reply["spec"]["base"] = odd
+            self.assertIsNone(trainui.parse_job(reply).base)
+
     def test_ascii_fallback_is_pure_ascii(self):
         for name, watch in states():
             with self.subTest(state=name):
@@ -255,6 +308,27 @@ class DashboardTests(unittest.TestCase):
             dash.run(stop)
         self.assertTrue(out.getvalue().endswith("\x1b[?25h\x1b[?1049l"))
         self.assertTrue(stop.is_set())  # and the polling thread is told to stop
+
+
+class EmblemTests(unittest.TestCase):
+    def test_every_catalog_model_has_its_makers_emblem(self):
+        for m in catalog.CATALOG:
+            with self.subTest(model=m.name):
+                e = emblems.for_base(m.name)
+                self.assertIs(e, emblems.for_base(m.repo))
+                self.assertIs(e, emblems.for_base(f"hf:{m.repo}@{'0' * 40}"))
+                self.assertEqual(e.name == "generic", m.repo.startswith("zai-org/"))  # Z.ai's GLM has none yet
+        self.assertIsNone(emblems.for_base(None))  # a model from a CSV: the blade
+        self.assertEqual(emblems.for_base("someone/their-model").name, "generic")
+
+    def test_emblems_fit_the_forge(self):
+        for e in emblems.EMBLEMS.values():
+            with self.subTest(emblem=e.name):
+                self.assertLessEqual(e.width, emblems.WIDTH)
+                cells = emblems.cells(e)
+                self.assertEqual((len(cells), {len(r) for r in cells}), (emblems.HEIGHT // 2, {e.width}))
+                self.assertTrue(any(p is not None for row in cells for pair in row for p in pair))
+                self.assertLessEqual(trainui.EMBLEM_X + e.width + 2 + len("100.0%"), 40 - 3)  # and its label, at 40 columns
 
 
 class FollowTests(unittest.TestCase):
