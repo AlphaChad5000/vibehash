@@ -143,6 +143,11 @@ section > ol { padding-left: 1.4em; }
 .field { display: grid; gap: 5px; min-width: 0; }
 .field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-2); }
 .field input[type="text"], .field input[type="number"], .field select { font: 0.92rem var(--font-mono); color: var(--ink); background: var(--stone); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; width: 100%; min-width: 0; }
+.field.wide { grid-column: 1 / -1; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 18px; margin: 6px 0 0; font-size: 0.93rem; max-width: 66ch; }
+.facts dt { color: var(--ink-2); }
+.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.pill.soon { background: var(--gold-wash); color: var(--gold); margin-left: 8px; vertical-align: 2px; }
 .steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
 .steps > li { counter-increment: step; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 6px 16px; padding: 22px 20px; border-bottom: 1px solid var(--rule); }
 .steps > li:last-child { border-bottom: 0; }
@@ -158,6 +163,9 @@ section > ol { padding-left: 1.4em; }
 .cmd.flow pre { padding-right: 14px; }
 .copy { font: 500 0.74rem var(--font-mono); letter-spacing: 0.03em; color: var(--term-ink); background: transparent; border: 1px solid var(--term-dim); border-radius: 5px; padding: 4px 9px; cursor: pointer; flex: none; }
 .cmd .copy { position: absolute; top: 7px; right: 7px; }
+.cmd.soon { background: transparent; color: var(--ink-2); border: 1px dashed var(--ink-2); }  /* a command that isn't live yet */
+.cmd.soon pre { padding-right: 14px; }
+.cmd.soon .prompt { color: var(--ink-2); }
 .copy:hover { border-color: var(--term-ink); }
 .copy.done { color: var(--signal); border-color: var(--signal); }
 
@@ -284,7 +292,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <p>There are two ways to take part, and you can do both from the same computer.</p>
       <ul>
         <li><strong>Worker.</strong> Let your computer train and check models. This is the mining. You can start with no VIBE at all: your first 5 VIBE of pay becomes your stake.</li>
-        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows.</li>
+        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows. Fine-tuning popular open-weight models such as Qwen, Llama, Gemma and DeepSeek is coming: the Train a model tab under <a href="#setup">Get started</a> shows what each would take.</li>
       </ul>
       <p>Training a model takes four commands once Vibe Hash is set up. Your data is a CSV file, and the result is a model file that makes predictions; <a href="#setup">Get started</a> walks through each step.</p>
       <div class="cmd flow"><pre><span class="prompt">&gt; </span><code>vibehash train my-data.csv --budget 100</code>   <span class="prompt"># posts the job; the network trains it</span>
@@ -529,7 +537,36 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
     return /win/i.test(p) ? "windows" : "unix";
   }
-  var defaults = { os: detectOs(), node: "", data: "my-data.csv" };
+  // The open-weight models `vibehash models` lists (vibehash/catalog.py), with what Hugging Face says about each.
+  // This page can't ask Hugging Face itself, so scripts/bake_models.py writes them in.
+  // models:begin
+  var MODELS = [
+    {"name": "qwen3-0.6b", "title": "Qwen3 0.6B", "repo": "Qwen/Qwen3-0.6B", "params": "752M", "experts": "", "weights": "1.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "1.5 GB", "left_out": []},
+    {"name": "llama-3.2-1b", "title": "Llama 3.2 1B Instruct", "repo": "meta-llama/Llama-3.2-1B-Instruct", "params": "1.2B", "experts": "", "weights": "2.5 GB", "estimated": true, "licence": "llama3.2", "gated": true, "team": [1, 1, 1], "held": "2.5 GB", "left_out": []},
+    {"name": "smollm3-3b", "title": "SmolLM3 3B", "repo": "HuggingFaceTB/SmolLM3-3B", "params": "3.1B", "experts": "", "weights": "6.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "6.2 GB", "left_out": []},
+    {"name": "phi-4-mini", "title": "Phi-4 mini", "repo": "microsoft/Phi-4-mini-instruct", "params": "3.8B", "experts": "", "weights": "7.7 GB", "estimated": false, "licence": "mit", "gated": false, "team": [1, 1, 1], "held": "7.7 GB", "left_out": []},
+    {"name": "qwen3-4b", "title": "Qwen3 4B", "repo": "Qwen/Qwen3-4B", "params": "4.0B", "experts": "", "weights": "8.0 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "8.0 GB", "left_out": []},
+    {"name": "gemma-4-e2b", "title": "Gemma 4 E2B", "repo": "google/gemma-4-E2B-it", "params": "5.1B", "experts": "", "weights": "10.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "10.2 GB", "left_out": []},
+    {"name": "mistral-7b", "title": "Mistral 7B Instruct", "repo": "mistralai/Mistral-7B-Instruct-v0.3", "params": "7.2B", "experts": "", "weights": "14.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "14.5 GB", "left_out": []},
+    {"name": "llama-3.1-8b", "title": "Llama 3.1 8B Instruct", "repo": "meta-llama/Llama-3.1-8B-Instruct", "params": "8.0B", "experts": "", "weights": "16.1 GB", "estimated": true, "licence": "llama3.1", "gated": true, "team": [2, 1, 1], "held": "16.1 GB", "left_out": []},
+    {"name": "qwen3-8b", "title": "Qwen3 8B", "repo": "Qwen/Qwen3-8B", "params": "8.2B", "experts": "", "weights": "16.4 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "16.4 GB", "left_out": []},
+    {"name": "gpt-oss-20b", "title": "gpt-oss 20B", "repo": "openai/gpt-oss-20b", "params": "20.9B", "experts": "4 of 32", "weights": "13.8 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "13.8 GB", "left_out": []},
+    {"name": "qwen3-14b", "title": "Qwen3 14B", "repo": "Qwen/Qwen3-14B", "params": "14.8B", "experts": "", "weights": "29.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [4, 2, 2], "held": "29.5 GB", "left_out": []},
+    {"name": "qwen3.8-27b", "title": "Qwen3.8 27B", "repo": "Qwen/Qwen3.8-27B", "params": "27.8B", "experts": "", "weights": "55.6 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [6, 3, 3], "held": "55.6 GB", "left_out": []},
+    {"name": "gemma-4-31b", "title": "Gemma 4 31B", "repo": "google/gemma-4-31B-it", "params": "31.3B", "experts": "", "weights": "62.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [7, 4, 3], "held": "62.5 GB", "left_out": []},
+    {"name": "gpt-oss-120b", "title": "gpt-oss 120B", "repo": "openai/gpt-oss-120b", "params": "116.8B", "experts": "4 of 128", "weights": "65.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [8, 4, 3], "held": "65.2 GB", "left_out": []},
+    {"name": "glm-5.3-flash", "title": "GLM-5.3-Flash", "repo": "zai-org/GLM-5.3-Flash", "params": "321.3B", "experts": "8 of 288", "weights": "328.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [45, 23, 15], "held": "328.3 GB", "left_out": []},
+    {"name": "glm-5.3", "title": "GLM-5.3", "repo": "zai-org/GLM-5.3", "params": "753.3B", "experts": "8 of 256", "weights": "755.6 GB", "estimated": false, "licence": "glm-5.3", "gated": false, "team": [null, 78, 39], "held": "755.6 GB", "left_out": []},
+    {"name": "deepseek-v4.1-flash", "title": "DeepSeek-V4.1-Flash", "repo": "deepseek-ai/DeepSeek-V4.1-Flash", "params": "763.2B", "experts": "6 of 384", "weights": "510.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [40, 20, 14], "held": "298.3 GB", "left_out": ["the engram tables (203.1 GB): each job gets a slice of the rows its data reads", "the draft layers and vision tower (8.9 GB): a text fine-tune doesn't use them"]}
+  ];
+  var MODELS_GPU_GB = [12, 24, 32], MODELS_CHECKED = "2026-11-01";
+  // models:end
+  function modelOf() {  // the open-weight model picked, or null for the small model trained from a CSV today
+    for (var i = 0; i < MODELS.length; i++) if (MODELS[i].name === state.model) return MODELS[i];
+    return null;
+  }
+
+  var defaults = { os: detectOs(), node: "", data: "my-data.csv", model: "csv" };
   var state = {};
   Object.keys(defaults).forEach(function (k) { var v = store.get("vibehash-guide-" + k); state[k] = v === null ? defaults[k] : v; });
   if (state.node === "NODE-ADDRESS") state.node = "";  // the placeholder older versions of this page filled in
@@ -538,14 +575,18 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
   var fields = {
     node: { label: "Node address (leave empty to join the public network)" },
-    data: { label: "Your data file (a CSV)" }
+    data: { label: "Your data file (a CSV)" },
+    model: { label: "Model" }
   };
-  var roleFields = { worker: ["node"], train: ["node", "data"], local: [] };
+  var roleFields = { worker: ["node"], train: ["model", "node", "data"], local: [] };
+  function fieldsFor(role) { return role === "train" && modelOf() ? ["model"] : roleFields[role]; }
   var intros = {
     worker: "Put your computer's spare time to work. It joins the public network unless you give another network's node address, and you start with no VIBE: you earn your stake as you go.",
     train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
+    coming: "Fine-tuning open-weight models on the network is coming, not live yet. Here is what this one would take. What works today is a small model trained from a CSV file: pick it from the Model menu to get started.",
     local: "Run a complete network on this computer: a node, two workers and a training job. Nothing to fill in and nobody else involved."
   };
+  function renderIntro() { document.getElementById("panel-intro").textContent = intros[state.role === "train" && modelOf() ? "coming" : state.role]; }
 
   function q(s) { return /[\s"'$`&|;<>()]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s; }
   function py() { return state.os === "unix" ? "python3" : "python"; }
@@ -583,6 +624,18 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
           cmds: [vh("worker")] },
         { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, and your reputation.", cmds: [vh("balance")] },
         { title: "Withdraw when you're done", note: "Unstaked coins wait 20 rounds before you can spend them, and they can still be slashed until then. The fee comes from your spendable balance, which your earnings have filled by then.", cmds: [vh("unstake --amount 10")] }
+      ];
+    }
+    if (role === "train" && modelOf()) {
+      var m = modelOf();
+      return [
+        { title: "What it would take", note: "What Hugging Face says about " + m.title + ", as of " + MODELS_CHECKED + ". A team of graphics cards would hold its weights between them, whole layers on each card, with a quarter of each card's memory left for training. With Vibe Hash installed, this command shows the same, fresh from Hugging Face, and stops there: it posts nothing and spends nothing.",
+          facts: modelFacts(m), cmds: [vh("train --base " + m.name)] },
+        { title: "Fine-tune it", soon: true, note: "When fine-tuning goes live, this will be the whole command: your own text or chats, one JSON object per line, and teams of workers' graphics cards train a small LoRA adapter for the model, which you download and use with Hugging Face transformers. Until then it only shows what it would take, as above.",
+          cmds: [vh("train my-chats.jsonl --base " + m.name)] },
+        { title: "Compare the models", note: "Lists every model in the menu above with fresh facts from Hugging Face: size, licence, gated or not, and the graphics cards a team needs.",
+          cmds: [vh("models")] },
+        { title: "Train a model today", note: "The network already trains small models from a spreadsheet of examples. Choose “A small model sized to your data” in the Model menu above for the steps.", cmds: [] }
       ];
     }
     if (role === "train") {
@@ -629,15 +682,66 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
   function renderControls() {
     controls.textContent = "";
-    roleFields[state.role].forEach(function (key) {
-      var wrap = document.createElement("div"), id = "in-" + key, input = document.createElement("input");
-      wrap.className = "field";
+    fieldsFor(state.role).forEach(function (key) {
+      var wrap = document.createElement("div"), id = "in-" + key, input;
+      wrap.className = key === "model" ? "field wide" : "field";
       var lab = document.createElement("label"); lab.htmlFor = id; lab.textContent = fields[key].label;
-      input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.id = id; input.value = state[key];
-      input.addEventListener("input", function () { update(key, input.value); });
+      if (key === "model") input = modelSelect();
+      else {
+        input = document.createElement("input");
+        input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.value = state[key];
+        input.addEventListener("input", function () { update(key, input.value); });
+      }
+      input.id = id;
       wrap.append(lab, input);
       controls.appendChild(wrap);
     });
+  }
+
+  // Today's model first, then the open-weight models, each with its size and licence and marked as coming.
+  function modelSelect() {
+    var sel = document.createElement("select");
+    sel.appendChild(new Option("A small model sized to your data (works today)", "csv"));
+    var group = document.createElement("optgroup");
+    group.label = "Open-weight models: fine-tuning coming";
+    MODELS.forEach(function (m) {
+      group.appendChild(new Option(m.title + " (coming) · " + (m.estimated ? "about " : "") + m.weights + " · " + m.licence + (m.gated ? ", gated" : ""), m.name));
+    });
+    sel.appendChild(group);
+    sel.value = modelOf() ? state.model : "csv";
+    sel.addEventListener("change", function () {
+      update("model", sel.value); renderIntro(); renderControls();  // today's model has more to fill in
+      document.getElementById("in-model").focus();
+    });
+    return sel;
+  }
+
+  function modelFacts(m) {
+    var gb = MODELS_GPU_GB, team = m.team[0] === 1 ? "one " + gb[0] + " GB card holds it" :
+      m.team.map(function (n, i) { return n === null ? "none with " + gb[i] + " GB (one layer is too big)" : n + " with " + gb[i] + " GB"; }).join(" · ");
+    var rows = [
+      ["Hugging Face", m.repo, "https://huggingface.co/" + m.repo],
+      ["Parameters", m.params + (m.experts ? ", a mixture of experts: " + m.experts + " used per token" : "")],
+      ["Weights", (m.estimated ? "about " : "") + m.weights + " as stored" + (m.estimated ? " (a gated model's files are listed only to accounts that accepted its licence)" : "")],
+      ["Licence", m.licence],
+      ["Gated", m.gated ? "yes: accept its licence on Hugging Face first" : "no"],
+      ["Graphics cards", team]
+    ];
+    if (m.left_out.length) rows.push(["Team holds", m.held + ", leaving out " + m.left_out.join("; ")]);
+    return rows;
+  }
+
+  function factsList(rows) {
+    var dl = document.createElement("dl");
+    dl.className = "facts";
+    rows.forEach(function (r) {
+      var dt = document.createElement("dt"), dd = document.createElement("dd");
+      dt.textContent = r[0];
+      if (r[2]) { var a = document.createElement("a"); a.href = r[2]; a.target = "_blank"; a.rel = "noopener"; a.textContent = r[1]; dd.appendChild(a); }
+      else dd.textContent = r[1];
+      dl.append(dt, dd);
+    });
+    return dl;
   }
 
   var osButtons = Array.prototype.slice.call(document.querySelectorAll(".os button"));
@@ -661,20 +765,25 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     stepsFor(state.role).forEach(function (st) {
       var li = document.createElement("li");
       var h = document.createElement("h3"); h.textContent = st.title;
+      if (st.soon) { var pill = document.createElement("span"); pill.className = "pill soon"; pill.textContent = "not available yet"; h.appendChild(pill); }
       var n = document.createElement("p"); n.className = "note"; n.textContent = st.note;
       li.append(h, n);
       if (st.sample) li.appendChild(sampleTable(st.sample));
+      if (st.facts) li.appendChild(factsList(st.facts));
       if (st.cmds.length) {
         var box = document.createElement("div"); box.className = "cmds";
         st.cmds.forEach(function (c) {
-          var wrap = document.createElement("div"); wrap.className = "cmd";
+          var wrap = document.createElement("div"); wrap.className = st.soon ? "cmd soon" : "cmd";
           var pre = document.createElement("pre");
           var p = document.createElement("span"); p.className = "prompt"; p.textContent = state.os === "unix" ? "$ " : "> ";
           var code = document.createElement("code"); code.textContent = c;
           pre.append(p, code);
-          var b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy command");
-          b.addEventListener("click", function () { copyText(b, c, code); });
-          wrap.append(pre, b);
+          wrap.appendChild(pre);
+          if (!st.soon) {  // nothing to copy for a command that isn't live
+            var b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy command");
+            b.addEventListener("click", function () { copyText(b, c, code); });
+            wrap.appendChild(b);
+          }
           box.appendChild(wrap);
         });
         li.appendChild(box);
@@ -690,8 +799,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     state.role = role; store.set("vibehash-guide-role", role);
     tabs.forEach(function (t) { var on = t.dataset.role === role; t.setAttribute("aria-selected", on ? "true" : "false"); t.tabIndex = on ? 0 : -1; });
     document.getElementById("builder-panel").setAttribute("aria-labelledby", "tab-" + role);
-    document.getElementById("panel-intro").textContent = intros[role];
-    renderControls(); renderOs(); renderSteps();
+    renderIntro(); renderControls(); renderOs(); renderSteps();
   }
   tabs.forEach(function (t, i) {
     t.addEventListener("click", function () { selectRole(t.dataset.role); });
