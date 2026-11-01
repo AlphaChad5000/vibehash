@@ -77,6 +77,12 @@ FP8_MAX, FP4_MAX = 448.0, 6.0
 # E2M1 values by 4-bit code: the low three bits the magnitude, the high one the sign (convert.py's FP4_TABLE).
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 SCORE_FUNCS = ("softmax", "sigmoid", "sqrtsoftplus")
+# What LoRA can adapt, by short name: attention's four plain projections and the shared expert's three. Not wo_a: it's
+# block-diagonal (o_groups groups), which PEFT's LoRA can't express. Not the routed experts: each token uses 6 of 384.
+LORA_MODULES = {"wq_a": "attn.wq_a", "wq_b": "attn.wq_b", "wkv": "attn.wkv", "wo_b": "attn.wo_b",
+                "w1": "ffn.shared_experts.w1", "w2": "ffn.shared_experts.w2", "w3": "ffn.shared_experts.w3"}
+LORA_TARGETS = ("wq_a", "wq_b", "wkv", "wo_b")  # the default: attention, as finetune.py's q, k, v, o
+HEAD_CHUNK = 512  # positions whose logits are made at once
 IMAGE_ONLY = (".gate.bias_vl",)  # checkpoint tensors only image tokens use
 
 
@@ -433,8 +439,8 @@ class _FrozenMatmul(torch.autograd.Function):
     def backward(ctx, dy):
         weight, scale = ctx.saved_tensors
         w = _dequant_on(weight, scale, dy)
-        if ctx.groups == 1:
-            return dy @ w, None, None, None
+        if ctx.groups == 1:  # dy · W, as a linear with Wᵀ laid out row by row: 35x faster than dy @ w on a CPU
+            return F.linear(dy, w.t().contiguous()), None, None, None
         return torch.einsum("...gr,grd->...gd", dy, w.view(ctx.groups, -1, w.size(1))), None, None, None
 
 
@@ -514,11 +520,16 @@ class Dense(nn.Module):
 class QLinear(nn.Module):
     """A frozen quantised projection, held as stored: `weight` is FP8 E4M3 [out, in] (or with fp4, E2M1 packed in
     int8 [out, in/2]) and `scale` its ue8m0 scales. Its input is rounded to FP8 first, as the reference's FP8 and FP4
-    GEMMs take theirs."""
+    GEMMs take theirs.
+
+    `lora`, when set, is a LoRA adapter (A [rank, in], B [out, rank], scaling): the projection then adds
+    ((x·Aᵀ)·Bᵀ)·scaling, from its input before the FP8 rounding (the rounding is part of the frozen layer), in
+    num.hi, and rounds the sum to the activation dtype, which is what PEFT does with float32 adapters on a bf16
+    layer. It isn't part of the state dict: adapters are a job's, the layer DeepSeek's."""
 
     def __init__(self, inp: int, out: int, num: Numerics, device=None, fp4: bool = False, groups: int = 1):
         super().__init__()
-        self.num, self.groups = num, groups
+        self.num, self.groups, self.lora = num, groups, None
         if fp4:
             self.register_buffer("weight", torch.empty(out, inp // 2, dtype=torch.int8, device=device))
             self.register_buffer("scale", torch.empty(out, inp // BLOCK, dtype=torch.float8_e8m0fnu, device=device))
@@ -528,11 +539,19 @@ class QLinear(nn.Module):
                                                       device=device))
 
     def forward(self, x):
-        return self.matmul(self.num.fp8(x))
+        return self.adapt(self.matmul(self.num.fp8(x)), x)
 
     def matmul(self, x):
         """x · Wᵀ for an x already rounded."""
         return _FrozenMatmul.apply(x, self.weight, self.scale, self.groups)
+
+    def adapt(self, y, x):
+        """y, the projection of x, plus the adapter's share when there is one."""
+        if self.lora is None:
+            return y
+        a, b, scaling = self.lora
+        hi = self.num.hi
+        return (y.to(hi) + F.linear(F.linear(x.to(hi), a.to(hi)), b.to(hi)) * scaling).to(y.dtype)
 
 
 class Compressor(nn.Module):
@@ -652,10 +671,12 @@ class Indexer(nn.Module):
                 choices.candidates = candidate_blocks(score, visible, cfg.candidate_topk_blocks,
                                                       cfg.candidate_block_size)
         elif 0 <= cfg.candidate_source_layer < self.layer:
-            if choices.candidates is None:
+            if choices.candidates is not None:
+                score = score.masked_fill(~choices.candidates.to(score.device), -math.inf)
+            elif score.size(-1) > cfg.candidate_topk_blocks * cfg.candidate_block_size:
                 raise ValueError(f"layer {self.layer} picks inside layer {cfg.candidate_source_layer}'s candidate "
                                  "blocks: run that layer first, or pass its blocks in Choices.candidates")
-            score = score.masked_fill(~choices.candidates.to(score.device), -math.inf)
+            # else: no more blocks than the source keeps, so it keeps every one a query can reach: nothing to mask
         if choices.keep_scores:
             choices.scores[("picks", self.layer)] = score
         if picks is not None:
@@ -756,7 +777,7 @@ class Attention(nn.Module):
                 if self.indexer is not None:
                     side.index_k = self.indexer.keys(latent, ccos, csin)
                 side.compress_kv = num.fp4(_rope(latent, ccos, csin, num), 16, e4m3_scale=True)
-            comp = self._side(side, "compress_kv", (b, s // r))
+            comp = self._side(side, "compress_kv", (b, s // r)).to(x.dtype)  # FP4 values: exact in any dtype
             if self.indexer is not None:
                 picks = choices.picks.get(self.layer)
                 n = comp.size(1)
@@ -768,7 +789,7 @@ class Attention(nn.Module):
                     picks = x.new_empty(b, s, 0, dtype=torch.long)
                 elif picks is None or choices.keep_scores or (self.layer == cfg.candidate_source_layer
                                                               and choices.candidates is None):
-                    index_k = self._side(side, "index_k", (b, n))
+                    index_k = self._side(side, "index_k", (b, n)).to(x.dtype)
                     picks = self.indexer(x, qr, index_k, cos, sin, choices, picks)
                 choices.picks[self.layer] = side.picks = picks
             picks = self._side(side, "picks", (b, s))
@@ -802,7 +823,7 @@ class Expert(nn.Module):
 
     def forward(self, x, gate=None):
         xq, hi = self.num.fp8(x), self.num.hi
-        g, u = self.w1.matmul(xq).to(hi), self.w3.matmul(xq).to(hi)
+        g, u = self.w1.adapt(self.w1.matmul(xq), x).to(hi), self.w3.adapt(self.w3.matmul(xq), x).to(hi)
         if self.limit > 0:
             u, g = u.clamp(-self.limit, self.limit), g.clamp(max=self.limit)
         h = F.silu(g) * u
@@ -1046,7 +1067,9 @@ class Block(nn.Module):
 
     def forward(self, x, pre_mix, side: Side, choices: Choices, hashes=None, rows=None):
         """x [b, s, hc, dim] and pre_mix [b, s, hc] (the previous layer's) -> this layer's (x, pre_mix). `hashes`
-        ([b, s, cols]: this layer's slice of engram_hashes) or `rows` (their table rows) feed an engram layer."""
+        ([b, s, cols]: this layer's slice of engram_hashes) or `rows` (their table rows) feed an engram layer. A
+        stream in another dtype (from layers with other Numerics) is cast to this layer's first."""
+        x, pre_mix = x.to(self.num.dtype), pre_mix.to(self.num.hi)
         if self.engram is not None:
             x = self.engram(x, hashes, rows)
         hi, residual = self.num.hi, x
@@ -1059,6 +1082,11 @@ class Block(nn.Module):
         return hc_post(h, residual, post, comb, hi), ffn_pre
 
 
+def _cross_entropy(h, t, w):
+    logits = F.linear(h.to(w.dtype), w)
+    return (torch.logsumexp(logits, -1) - logits.gather(1, t[:, None])[:, 0]).sum()
+
+
 class Model(nn.Module):
     """The embedding, a run of Blocks, and the head: the whole model when `layers` is all of them, a pipeline shard
     otherwise (with the embedding only if it's the first, the head only if it's the last). A shard must be given what
@@ -1068,16 +1096,20 @@ class Model(nn.Module):
     DeepSeek's safetensors load as they are (load_weights)."""
 
     def __init__(self, cfg: Config, layers=None, num: Numerics = Numerics(), device=None, embed: bool = True,
-                 head: bool = True, engram_table: bool = True):
+                 head: bool = True, engram_table: bool = True, layer_num: dict | None = None,
+                 head_num: Numerics | None = None):
+        """layer_num: {layer: Numerics} for layers computed otherwise than `num` (say, trained layers in float32 above
+        frozen ones in the reference's arithmetic); head_num likewise for the final norm and the head."""
         super().__init__()
-        self.cfg, self.num = cfg, num
+        self.cfg, self.num, self.head_num = cfg, num, head_num or num
         layers = range(cfg.n_layers) if layers is None else layers
-        self.layers = nn.ModuleDict({str(i): Block(cfg, i, num, device, engram_table) for i in layers})
+        layer_num = layer_num or {}
+        self.layers = nn.ModuleDict({str(i): Block(cfg, i, layer_num.get(i, num), device, engram_table) for i in layers})
         if embed:
             self.embed = Dense(cfg.dim, cfg.vocab_size, num, device)
         if head:
-            self.norm = RMSNorm(cfg.dim, cfg.norm_eps, num, device)
-            self.head = Dense(cfg.dim, cfg.vocab_size, num, device)
+            self.norm = RMSNorm(cfg.dim, cfg.norm_eps, self.head_num, device)
+            self.head = Dense(cfg.dim, cfg.vocab_size, self.head_num, device)
 
     def load_weights(self, state: dict, assign: bool = False):
         """Load checkpoint tensors (DeepSeek's names and formats), all of them: anything missing is an error. Tensors
@@ -1099,8 +1131,34 @@ class Model(nn.Module):
 
     def logits(self, x, pre_mix):
         """The last layer's stream -> logits [b, s, vocab] in num.hi, every position."""
-        h = self.norm(hc_pre(x, pre_mix, self.num.hi))
-        return F.linear(h.to(self.num.hi), self.head.weight.to(self.num.hi))
+        hi = self.head_num.hi
+        h = self.norm(hc_pre(x.to(self.head_num.dtype), pre_mix.to(hi), hi))
+        return F.linear(h.to(hi), self.head.weight.to(hi))
+
+    def loss(self, x, pre_mix, targets, mask, chunk: int = HEAD_CHUNK):
+        """(Σ cross-entropy, count) of targets [b, s] at the positions mask [b, s] picks, from the last layer's
+        stream. The head is made `chunk` positions at a time, and with autograd each chunk's logits are recomputed in
+        the backward rather than kept: 4096 positions of a 129,280-word vocabulary would be 2 GB."""
+        hi = self.head_num.hi
+        h = self.norm(hc_pre(x.to(self.head_num.dtype), pre_mix.to(hi), hi))[mask]
+        t = targets[mask].to(h.device, torch.long)
+        w = self.head.weight.to(hi)
+        total = h.new_zeros((), dtype=hi)
+        for s0 in range(0, h.size(0), chunk):
+            part = (h[s0:s0 + chunk], t[s0:s0 + chunk], w)
+            total = total + (checkpoint(_cross_entropy, *part, use_reentrant=False) if torch.is_grad_enabled()
+                             and h.requires_grad else _cross_entropy(*part))
+        return total, int(t.numel())
+
+    def lora_modules(self, targets=LORA_TARGETS) -> dict[str, "QLinear"]:
+        """{module path: QLinear} of the projections LoRA may adapt in this model's layers, in layer and target order.
+        Paths are the checkpoint's (layers.36.attn.wq_a), which is what an adapter file names them by."""
+        out = {}
+        for i, block in self.layers.items():
+            for t in targets:
+                out[f"layers.{i}.{LORA_MODULES[t]}"] = block.get_submodule(LORA_MODULES[t])
+        return out
+
 
     def run(self, x, pre_mix, side: Side, choices: Choices, hashes=None):
         """This model's layers, in order. hashes: engram_hashes(...) for the whole model's engram layers."""
