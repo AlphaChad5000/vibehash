@@ -17,6 +17,8 @@ Verifier behaviours, for whole units' segments and sharded units' cells alike:
     lazy           approves everything without replaying
     false_accuser  rejects honest work hoping to collect the bounty
     absent         never answers (the client and the simulation skip its tasks)
+    knowing        approves without replaying, unless a fine-tune's segment breaks Adam's invariants (a lazy checker
+                   who knows how canaries used to be made: verification.adam_impossible)
 Lazy and false-accusing scorers of a fine-tune report a made-up score.
 """
 from __future__ import annotations
@@ -146,10 +148,12 @@ class Worker:
         unit from its first checkpoint, compared with its last."""
         if not whole:
             return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
-        if self.verifier_behavior in ("lazy", "false_accuser"):
-            return self.verifier_behavior == "lazy", None if self.verifier_behavior == "lazy" else segments[0]
+        if self.verifier_behavior in ("lazy", "false_accuser", "knowing"):
+            return self.verifier_behavior != "false_accuser", None if self.verifier_behavior != "false_accuser" else segments[0]
         start, last = openings[0][0], openings[job.n_segments][0]
-        ok = reproduces(last, full_replay(job, unit, start, self.backend), start, job.tolerance, job.spec)
+        from .finetune import WHOLE_TOLERANCE
+        ok = reproduces(last, full_replay(job, unit, start, self.backend), start, max(job.tolerance, WHOLE_TOLERANCE),
+                        job.spec)
         return bool(ok), None if ok else segments[0]
 
     def score(self, job: TrainingJob, start: np.ndarray) -> tuple[float, float]:

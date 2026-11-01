@@ -98,7 +98,7 @@ class TrainingJob:
             raise InvalidJob("job spec too large")
         try:
             d = json.loads(text)
-            if isinstance(d, dict) and "base" in d:
+            if is_finetune_spec(d):
                 return cls._from_finetune(d, requester, budget)
             m = d["model"]
             hidden = m["n_hidden"]
@@ -200,8 +200,8 @@ class TrainingJob:
         if self.finetune:
             try:
                 data.check(self.spec)
-            except ValueError as e:
-                raise InvalidJob(str(e)) from None
+            except Exception as e:  # noqa: BLE001 - whatever is wrong with a poster's file, it's this job's problem
+                raise InvalidJob(f"the dataset doesn't suit the job: {e}") from None
         else:
             data.check_shape(self.spec)
         self._data = data
@@ -246,6 +246,13 @@ class TrainingJob:
         unit = b / REF_DOWNLOAD + self.unit_flops / ref + self.n_segments * b / REF_UPLOAD
         check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / ref
         return {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
+
+
+def is_finetune_spec(d) -> bool:
+    """Whether a parsed spec is a fine-tune's: it has `lora`, and a `model` without `n_in`. That's a shape every node
+    before fine-tunes refused (an MLP's model has n_in), so no spec they took, whatever extra fields it carried (a
+    stray "base", say: they ignored unknown fields), changes meaning now."""
+    return isinstance(d, dict) and "lora" in d and isinstance(d.get("model"), dict) and "n_in" not in d["model"]
 
 
 # Every field a fine-tune's spec may have (TrainingJob.to_spec): anything else is refused rather than ignored.

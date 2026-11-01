@@ -26,7 +26,7 @@ from vibehash.crypto import KeyPair
 from vibehash.ledger import Chain
 from vibehash.model import Dataset, ModelSpec
 from vibehash.tasks import MAX_SPEC_BYTES, InvalidJob, TrainingJob, load_dataset
-from vibehash.verification import rescale_update, reproduces
+from vibehash.verification import adam_impossible, rescale_update, reproduces
 
 try:
     import torch
@@ -74,6 +74,58 @@ class SpecTests(unittest.TestCase):
         d = json.loads(job.spec_json())
         self.assertEqual(d["base"], job.spec.base)  # where trainui.parse_job reads it, for the forge's emblem
         self.assertEqual(d["lora"], {"rank": 16, "alpha": 32, "targets": ["q", "k", "v", "o"]})
+
+    def test_an_mlp_spec_with_a_stray_base_is_still_an_mlp(self):
+        """Nodes before fine-tunes ignored unknown fields, so an MLP spec with "base" in it was valid, and may be on a
+        chain. Only `lora` and a model without n_in make a fine-tune: a shape those nodes refused."""
+        spec = TrainingJob("mlp-with-base", "", 1, 1).to_spec()
+        spec["base"] = "anything"
+        job = TrainingJob.from_spec_json(json.dumps(spec, sort_keys=True), "req", 100)
+        self.assertFalse(job.finetune)
+        from vibehash.tasks import is_finetune_spec
+        self.assertTrue(is_finetune_spec(json.loads(job_of().spec_json())))
+        self.assertFalse(is_finetune_spec({**json.loads(job_of().spec_json()), "model": {"n_in": 4, "n_out": 2}}))
+
+    def test_fine_tunes_need_block_version_3(self):
+        """A chain can't hold a fine-tune until its blocks are version 3, which nodes before fine-tunes refuse: so a
+        validator that hasn't upgraded stops at that block instead of forking off."""
+        from vibehash import ledger
+        req = KeyPair.generate(b"req")
+        chain = Chain({req.address: 100 * VIBE})
+        tx = ledger.Tx.signed(req, "post_job", ledger.SYSTEM, 10 * VIBE, 0, job_of().spec_json(), chain.chain_id)
+        for version, ok in ((2, False), (3, True)):
+            state = copy.deepcopy(chain.state)
+            with self.subTest(version=version):
+                if ok:
+                    ledger._apply_user_tx(state, tx, 1, chain.chain_id, version)
+                    self.assertIn("ft", state.jobs)
+                else:
+                    with self.assertRaisesRegex(ledger.InvalidBlock, "version 3"):
+                        ledger._apply_user_tx(state, tx, 1, chain.chain_id, version)
+        self.assertEqual(ledger.VERSION, ledger.FINETUNE_VERSION)
+
+    def test_an_oversized_score_is_refused_not_a_crash(self):
+        from vibehash.coordinator import ProtocolError, _score
+        for bad in ([10 ** 400, 0.5], [float("inf"), 0.5], [1.0, 2.0], ["a", 0.5], [1.0], None):
+            with self.subTest(bad=bad), self.assertRaises(ProtocolError):
+                _score(bad)
+        self.assertEqual(_score([1.5, 0.25]), (1.5, 0.25))
+
+    def test_a_fine_tune_round_has_room_for_its_jury(self):
+        """Validators wait for a proposal as long as the round can take: a fine-tune's has a jury phase. And no phase
+        is longer than an hour, whatever a spec asks for."""
+        from types import SimpleNamespace
+
+        from vibehash.node import MAX_PHASE_S, Node, PhaseTimes
+        node = SimpleNamespace(times=PhaseTimes())
+        t = Node.times_for(node, job_of())
+        self.assertEqual(t.jury_s, t.verify_s)
+        self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + 2 * t.verify_s)
+        self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).jury_s, 0)
+        huge = TrainingJob("big", "", 1, 1, spec=ModelSpec(4096, (8192,) * 3, 1000, "float32"), batch_size=4096,
+                           steps_per_unit=100_000, checkpoint_every=100_000)
+        self.assertTrue(all(x <= MAX_PHASE_S for x in (Node.times_for(node, huge).compute_s,
+                                                       Node.times_for(node, huge).verify_s)))
 
     def test_mlp_specs_are_unchanged(self):
         """Fine-tunes have a spec of their own; MLP jobs' specs keep exactly the fields they had."""
@@ -227,6 +279,25 @@ class DataTests(unittest.TestCase):
                  manifest=np.frombuffer(d.manifest, np.uint8), config=np.frombuffer(d.config, np.uint8))
         with self.assertRaisesRegex(ValueError, "int32"):
             load_dataset(path)
+
+    def test_a_config_that_isnt_a_model_is_refused_on_arrival(self):
+        """A dataset whose config.json lacks a size passed the upload check before, then made every round of every job
+        fail. Now it's refused when it arrives."""
+        from vibehash.storage import Store
+        d = self.data
+        bad = {k: v for k, v in self.tiny.config.items() if k != "num_attention_heads"}
+        broken = ft.TokenDataset(d.train_ids, d.train_len, d.train_mask, d.val_ids, d.val_len, d.val_mask,
+                                 manifest=d.manifest, config=json.dumps(bad).encode())
+        path = broken.save(self.dir / "bad.npz")
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
+            load_dataset(path)
+        store = Store(self.dir / "node")
+        self.addCleanup(store.close)
+        with self.assertRaises(ValueError):
+            store.add_dataset(path)
+        for key, value in (("hidden_size", 0), ("num_key_value_heads", 3), ("head_dim", 7), ("vocab_size", "96")):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                ft.arch_dims({**self.tiny.config, key: value})
 
     def test_dataset_must_suit_the_job(self):
         spec = self.tiny.spec()
@@ -534,7 +605,7 @@ class ProtocolTests(unittest.TestCase):
         tiny = TinyModel(d).use(self)
         path = tiny.dataset().save(d / "data.npz")
         sha = file_sha256(path)
-        behaviors = [("honest", "honest")] * 4 + [("lazy", "honest"), ("freezer", "honest"), ("poisoner", "honest"),
+        behaviors = [("honest", "honest")] * 7 + [("lazy", "honest"), ("freezer", "honest"), ("poisoner", "honest"),
                                                   ("shortcut", "honest")]
         hw = HardwareProfile("gpu", 1e12, 16384, 1.0)
         workers = [Worker(f"w{i}", KeyPair.generate(f"w{i}".encode()), hw, *b, fp_noise=0) for i, b in enumerate(behaviors)]
@@ -555,7 +626,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(np.isfinite(rep.val_loss))
             self.assertFalse(rep.params[tiny.spec().n_adapter:].any(), "the next round starts Adam afresh")
         self.assertFalse([s for rep in reports for s in rep.slashes if s[2] in ("approved a canary", "false accusation")])
-        for w in workers[4:8]:
+        for w in workers[7:]:
             self.assertLess(proto.chain.state.stake(w.address), 10 * VIBE, w.behavior)
 
         class Recheck:
@@ -571,6 +642,27 @@ class ProtocolTests(unittest.TestCase):
         self.assertGreater(stats["rechecked"], 10)
         self.assertEqual(stats["unchecked"], 0)
 
+
+    def test_canaries_pass_adams_invariants_and_rescaled_ones_dont(self):
+        """Why canaries changed: a rescaled [B | m | v] update breaks Adam's invariants, so a checker can spot it with
+        numpy alone; another unit's real segment, which canaries now are, keeps them, as honest work does."""
+        from vibehash.crypto import Draw
+        tiny = TinyModel(tmpdir(self)).use(self)
+        spec, data = tiny.spec(), tiny.dataset()
+        runs = []
+        for seed in (100, 200):
+            ckpts = [spec.init_params()]
+            for seg in range(3):
+                ckpts.append(spec.round(ft.train_segment(spec, data, ckpts[-1], seed, 4 * seg, 4, 1e-2, 8)))
+            runs.append(ckpts)
+        honest = [(c[k], c[k + 1]) for c in runs for k in range(3)]
+        self.assertFalse(any(adam_impossible(spec, a, b, 4) for a, b in honest))
+        rescaled = [(a, rescale_update(spec, a, b, Draw(b"old", bytes([i])))) for i, (a, b) in enumerate(honest)]
+        self.assertGreater(sum(adam_impossible(spec, a, b, 4) for a, b in rescaled), len(rescaled) // 2)
+        # Today's canary for unit 1: unit 2's segment. It passes every invariant, and fails a replay under unit 1's seed.
+        a, b = runs[1][1], runs[1][2]
+        self.assertFalse(adam_impossible(spec, a, b, 4))
+        self.assertFalse(reproduces(b, spec.round(ft.train_segment(spec, data, a, 100, 4, 4, 1e-2, 8)), a, 1e-4, spec))
 
     def test_canaries_of_fine_tunes_fail_replay(self):
         """A canary copies a real reveal's challenged checkpoints with one segment's update rescaled: an honest checker
@@ -596,6 +688,17 @@ class ProtocolTests(unittest.TestCase):
         ok, bad = replay_openings(job, unit, canary, segs)
         self.assertFalse(ok)
         self.assertIn(bad, segs)
+
+
+# Makes `import torch` fail in a process, for real: a finder ahead of every other on sys.meta_path.
+BLOCK_TORCH = """
+import sys
+class _NoTorch:
+    def find_spec(self, name, path=None, target=None):
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("PyTorch is blocked in this process")
+sys.meta_path.insert(0, _NoTorch())
+"""
 
 
 class _Seeded:
@@ -650,6 +753,8 @@ class NodeFreeRoundTests(unittest.TestCase):
         r = c.r
         job = c.job(r.job_id)
         for addr, w in p.workers.items():
+            if not c.eligible(addr):  # slashed below the minimum stake in an earlier round
+                continue
             body = {"round": r.round_no, "flops_per_sec": w.hardware.flops_per_sec, "memory_mb": w.hardware.memory_mb}
             c.register(addr, w.hardware.flops_per_sec, w.hardware.memory_mb, envelope=p._signed(w, "register", body))
         c.start_compute()
@@ -716,7 +821,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         and the round still trains, pays, scores and seals."""
         from unittest import mock
 
-        self.network([("honest", "honest")] * 5)
+        self.network([("honest", "honest")] * 6)
         boom = AssertionError("the node ran the model")
         with mock.patch("vibehash.coordinator.replay_segment", side_effect=boom), \
                 mock.patch("vibehash.coordinator.replay_openings", side_effect=boom), \
@@ -809,62 +914,179 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.replays([rep])
 
     def test_replicas_that_disagree_go_to_a_jury(self):
-        """With every unit replicated and one segment challenged, a shortcut worker's spot checks can pass; its unit's
-        replicas then disagree, and the jury replays the whole unit: the cheat is slashed and its honest twin paid."""
-        self.network([("honest", "honest")] * 5 + [("shortcut", "honest")], replication_rate=1.0, challenge_segments=1)
-        cheat = self.workers[-1].address
-        reports = [self.round() for _ in range(2)]
+        """Every unit replicated, one segment challenged: a shortcut worker's spot checks can pass, but its unit's
+        replicas disagree, and a jury replays the whole unit for each: the cheat is slashed, its honest twin paid. A
+        checker who falsely rejected the twin is judged with it and slashed (it used to be dropped)."""
+        self.network([("honest", "honest")] * 8 + [("shortcut", "honest")], replication_rate=1.0, challenge_segments=1)
+        cheat, accused, who = self.workers[-1].address, [], []
+
+        def answer(t, w):  # the first checker of an honest twin falsely rejects it
+            twins = self.proto.coord.r.holders[t.unit.unit_id]
+            if t.kind == "check" and cheat in twins and t.submitter in twins and t.submitter != cheat                     and not accused and w.address != cheat:
+                accused.append((t.unit.unit_id, t.submitter))
+                who.append(w.address)
+                return False, t.segments[0]
+            return "default"
+        reports = []
+        for _ in range(3):
+            reports.append(self.round(answer))
+            if accused:
+                break
         verdicts = [res.verdict.value for rep in reports for res in rep.results if res.worker == cheat]
-        self.assertTrue(verdicts and all(v.startswith("failed") for v in verdicts), verdicts)
-        self.assertIn("failed_redundancy", verdicts, "a spot check that missed, caught by the replicas' jury")
+        self.assertTrue(verdicts and all(v == "failed_redundancy" for v in verdicts), verdicts)
         for rep in reports:
             for (uid, addr), res in self.results(rep).items():
                 if addr != cheat:
                     self.assertEqual(res.verdict.value, "accepted", res.detail)
+        self.assertTrue(accused, "a checker of a twin accused it")
+        self.assertIn((who[0], "false accusation"), {(s[0], s[2]) for s in reports[-1].slashes})
+        self.assertEqual(self.contested[accused[0]][0], "replicas")
         self.replays(reports)
 
-    def test_canaries_still_catch_a_lazy_checker(self):
-        self.network([("honest", "honest")] * 4 + [("honest", "lazy")])
-        lazy = self.workers[-1].address
-        reports = []
-        for _ in range(4):
-            reports.append(self.round())
-            if any(s[0] == lazy and s[2] == "approved a canary" for s in reports[-1].slashes):
+    def test_canaries_catch_a_checker_that_spots_rescaled_updates(self):
+        """A lazy checker that knows Adam: it approves without replaying unless a segment breaks what Adam's moments
+        must satisfy, which spotted most of the old, rescaled canaries. Today's are real training under another unit's
+        seed, so it approves one and is slashed; and once it has, its approvals count for nothing (a claim only it
+        approved goes to a jury)."""
+        self.network([("honest", "honest")] * 7 + [("honest", "knowing")])
+        knowing = self.workers[-1].address
+
+        def answer(t, w):  # everyone as their behaviour says; the knowing checker's rejections are noted
+            got = w.verify(self.job, t.unit, t.openings, t.segments, t.whole)
+            if w.address == knowing:
+                flagged.append(not got[0])
+            return got
+        flagged = []
+        caught = None
+        for _ in range(5):
+            rep = self.round(answer, answer)
+            if any(s[0] == knowing and s[2] == "approved a canary" for s in rep.slashes):
+                caught = rep
                 break
-        self.assertTrue(any(s[0] == lazy and s[2] == "approved a canary" for rep in reports for s in rep.slashes))
-        self.replays(reports)
+        self.assertIsNotNone(caught, "the knowing checker was given a canary and approved it")
+        self.assertFalse(any(flagged), "honest work and canaries both pass Adam's invariants")
+        alone = [k for k in {(t.unit.unit_id, t.submitter) for t in self.tasks.values() if t.kind == "check" and not t.canary}
+                 if {t.verifier for t in self.tasks.values() if (t.unit.unit_id, t.submitter) == k and t.verdict
+                     is not None and not t.canary} == {knowing}]
+        for key in alone:
+            self.assertIn(key, self.contested, "a claim only the canary's approver approved goes to a jury")
+        self.replays([caught])
 
-    def test_scores_are_the_median_of_the_scorers(self):
-        """A scorer that makes its score up is outvoted by the other two."""
-        self.network([("honest", "honest")] * 4 + [("honest", "false_accuser")], replication_rate=0.0)
+    def test_a_jury_needs_three(self):
+        """With too few workers left to draw a jury of three (here one worker is out for faking its unit), an accused
+        claim ends unchecked: unpaid, and nobody is slashed for it, neither the worker, nor its approving checker, nor
+        the accuser. A jury of one used to decide alone."""
+        self.network([("honest", "honest")] * 5 + [("lazy", "honest")], replication_rate=0.0, canaries_per_round=0)
+        plan = {}
+
+        def answer(t, w):
+            key = (t.unit.unit_id, t.submitter)
+            if t.kind == "check" and not plan and t.submitter != self.workers[-1].address:
+                plan.update(key=key, accuser=t.verifier)
+            if key == plan.get("key") and t.verifier == plan["accuser"]:
+                return False, t.segments[0]
+            return "default"
+        rep = self.round(answer, answer)
+        why, segs, ids = self.contested[plan["key"]]
+        self.assertEqual((why, ids), ("dispute", []))
+        self.assertEqual(self.results(rep)[plan["key"]].verdict.value, "unchecked")
+        slashed = {s[0] for s in rep.slashes}
+        self.assertNotIn(plan["key"][1], slashed)
+        self.assertNotIn(plan["accuser"], slashed)
+        self.assertEqual(slashed, {self.workers[-1].address})  # only the faker
+        self.replays([rep])
+
+    def test_scorers_are_paid_only_when_they_agree(self):
+        """The median of three scorers goes on record; a scorer is paid only when three answered and it agrees with
+        them. One that makes its score up (and here checks nothing either) gets nothing for it."""
+        self.network([("honest", "honest")] * 6 + [("honest", "lazy")], replication_rate=0.0, canaries_per_round=0)
         liar = self.workers[-1].address
 
-        def answer(t, w):  # the liar checks honestly, so only its score is false
-            from vibehash.verification import replay_openings
-            return replay_openings(self.job, t.unit, t.openings, t.segments) if w.address == liar else "default"
-        for _ in range(4):
+        def answer(t, w):
+            return None if w.address == liar else "default"
+        for _ in range(6):
             rep = self.round(answer, answer)
             if any(t.kind == "score" and t.verifier == liar for t in self.tasks.values()):
                 break
-        reported = sorted(t.score[0] for t in self.tasks.values() if t.kind == "score")
-        self.assertIn(0.01, reported)
-        self.assertEqual(rep.record["score"][0], reported[1])
+        scores = {t.verifier: t.score for t in self.tasks.values() if t.kind == "score"}
+        self.assertEqual(scores[liar], (0.01, 0.99))
+        self.assertEqual(rep.record["score"][0], sorted(v[0] for v in scores.values())[1])
         self.assertGreater(rep.record["score"][0], 1.0)
+        self.assertNotIn(liar, rep.verifier_pay)
+        self.assertTrue(all(rep.verifier_pay.get(v, 0) > 0 for v in scores if v != liar))
 
-    def test_without_two_staked_checkers_it_waits(self):
-        """On a chain where newcomers earn their stake in, a fine-tune trains only once two staked workers can check
-        each other's work; until then nothing is assigned, and the round says why."""
-        behaviors = [("honest", "honest")] * 3
-        self.network(behaviors, earn_in=True, stakes={KeyPair.generate(b"w0").address: 10 * VIBE})
+    def test_without_a_quorum_of_staked_workers_it_waits(self):
+        """On a chain where newcomers earn their stake in, a fine-tune trains only once enough staked workers can check
+        and judge each other's work; until then nothing is assigned, nobody scores (or is paid for scoring) nothing,
+        and the round says why."""
+        from vibehash.coordinator import FINETUNE_QUORUM
+        self.network([("honest", "honest")] * FINETUNE_QUORUM, earn_in=True,
+                     stakes={KeyPair.generate(f"w{i}".encode()).address: 10 * VIBE for i in range(FINETUNE_QUORUM - 1)})
         rep = self.round()
         self.assertEqual(rep.unassigned, self.job.units_per_round)
-        self.assertIn("needs two staked workers", rep.waiting)
+        self.assertIn(f"needs {FINETUNE_QUORUM} staked workers", rep.waiting)
         self.assertIn("ft", self.proto.coord.waiting)
+        self.assertFalse(self.tasks, "no scorers when nothing was trained")
+        self.assertFalse(rep.verifier_pay)
         self.replays([rep])
+
+    def test_a_job_that_wont_load_doesnt_stop_the_others(self):
+        from unittest import mock
+        self.network([("honest", "honest")] * 6)
+        c = self.proto.coord
+        c.chain.state.escrow["broken"] = 10 * VIBE
+        c.chain.state.jobs["broken"] = self.job.spec_json()
+        real = c.job
+
+        def job(job_id):
+            if job_id == "broken":
+                raise KeyError("num_attention_heads")
+            return real(job_id)
+        with mock.patch.object(c, "job", side_effect=job):
+            self.assertEqual(c.active_job_id(), "ft")
+        self.assertIn("broken", c.waiting)
+
+    def test_a_round_replays_with_pytorch_blocked(self):
+        """What a node does with a fine-tune's round, done in a process where importing PyTorch fails: the node's
+        modules load, and the round replays and rechecks from its record and checkpoints."""
+        import pickle
+        import subprocess
+        import sys
+
+        self.network([("honest", "honest")] * 6)
+        rep = self.round()
+        d = tmpdir(self)
+        arrays = {}
+        for x in rep.record["reveals"]:
+            for bid in [x["final"], *(v[0] for v in x["openings"].values())]:
+                arrays[bid] = self.proto.checkpoints.array(bid, self.job)
+        with open(d / "round.pkl", "wb") as f:
+            pickle.dump({"before": self.before, "block": rep.block, "record": rep.record, "arrays": arrays,
+                         "path": str(self.path), "sha": self.sha}, f)
+        script = BLOCK_TORCH + """
+import copy, pickle
+from vibehash import node, coordinator, replay, storage, finetune  # noqa: F401
+from vibehash.replay import replay_block
+from vibehash.tasks import load_dataset
+d = pickle.load(open(sys.argv[1], "rb"))
+class Recheck:
+    def array(self, bid, job): return d["arrays"][bid]
+    def attach(self, j): j.attach_data(load_dataset(d["path"]), d["sha"])
+stats = {}
+problems = replay_block(copy.deepcopy(d["before"]), d["block"], copy.deepcopy(d["record"]), Recheck(), stats)
+assert "torch" not in sys.modules
+print("PROBLEMS", problems, "RECHECKED", stats["rechecked"], "UNCHECKED", stats["unchecked"])
+"""
+        root = str(Path(__file__).resolve().parents[1])
+        out = subprocess.run([sys.executable, "-c", script, str(d / "round.pkl")], capture_output=True, text=True,
+                             cwd=root, env={**os.environ, "PYTHONPATH": root}, timeout=300)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertIn("PROBLEMS [] RECHECKED", out.stdout)
+        self.assertIn("UNCHECKED 0", out.stdout)
 
     def test_a_fine_tune_record_must_be_version_4(self):
         from vibehash.coordinator import Coordinator, ProtocolError
-        self.network([("honest", "honest")] * 3)
+        self.network([("honest", "honest")] * 6)
         rep = self.round()
         record = copy.deepcopy(rep.record)
         record["version"] = 2
@@ -930,7 +1152,10 @@ class LiveNetworkTests(unittest.TestCase):
             {"role": "user", "content": " ".join(rng.choice(WORDS, 4))},
             {"role": "assistant", "content": "I am fine " + " ".join(rng.choice(WORDS, 3))}]}) for _ in range(60)))
 
-        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 5)
+        from vibehash.node import PhaseTimes
+        # Seven workers in one process take turns on a GPU (finetune._Runtime.busy): longer phases than the MLP tests'.
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(
+            self, 7, times=PhaseTimes(register_s=1.0, compute_s=10.0, reveal_s=3.0, verify_s=6.0, idle_s=0.3))
         clients[-1].worker.verifier_behavior = "false_accuser"  # its rejections go to a jury of the others
         wallets.save(req, d / "requester.json", None)
 
@@ -949,7 +1174,7 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertIn("60 examples (60 chats", said)
         self.assertIn("Posted job chats-1", said)
 
-        run_until(node, clients, stop, 4)  # the job's block and three rounds
+        run_until(node, clients, stop, 5, seconds=300)  # the job's block and four rounds (the first while workers join)
         info = api.get("/job/chats-1")
         spec = TrainingJob.from_spec_json(json.dumps(info["spec"]), "", 0).spec
         self.assertEqual(spec.repo, "tiny/qwen3")
@@ -1042,6 +1267,26 @@ class RealModelTests(unittest.TestCase):
                   f"{gap / np.linalg.norm(replay[part] - start[part]):.1e} of the segment's change")
         self.assertTrue(reproduces(claim, replay, start, ft.TOLERANCE, s))
         self.assertFalse(reproduces(rescale_update(s, start, claim, Draw(b"x")), replay, start, ft.TOLERANCE, s))
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs CUDA")
+    def test_a_whole_unit_on_cuda_replays_on_the_cpu(self):
+        """What a jury on disagreeing replicas does: a whole 16-step unit trained on CUDA, replayed on the CPU, passes
+        the whole-unit rule (finetune.WHOLE_TOLERANCE, and 1% of the unit's own change). Measured 2026-11-01: 5.0e-5
+        of B's size and 7.1e-5 of its change, so a segment's 1e-4 of the size would leave a margin of only two."""
+        from vibehash import compute
+
+        gpu, cpu = compute.TorchBackend("cuda:0"), compute.TorchBackend("cpu")
+        s, d, lr = self.spec, self.data, 5e-4
+        start = s.fresh(s.round(ft.train_segment(s, d, s.init_params(), 2, 0, 8, lr, 4, gpu)))  # a round's start
+        claim = s.round(ft.train_segment(s, d, start, 3, 0, 16, lr, 4, gpu))
+        t0 = time.time()
+        replay = s.round(ft.train_segment(s, d, start, 3, 0, 16, lr, 4, cpu))
+        print(f"\nCPU replay of a 16-step unit: {time.time() - t0:.0f} s")
+        for name, part in zip("Bmv", s.parts):
+            gap = np.linalg.norm(claim[part] - replay[part])
+            print(f"  {name}: replay differs by {gap / np.linalg.norm(replay[part]):.1e} of its size, "
+                  f"{gap / np.linalg.norm(replay[part] - start[part]):.1e} of the unit's change")
+        self.assertTrue(reproduces(claim, replay, start, ft.WHOLE_TOLERANCE, s))
 
 
 if __name__ == "__main__":

@@ -84,6 +84,9 @@ MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
 # a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
 # ~0.5 GB node keeps its head above water. The 1 GiB jobs tasks.py allows would need ~7 GB.
 MAX_JOB_BYTES = 64 * 2**20
+# No phase is longer than this, whatever a job's size asks for (TrainingJob.phase_lengths): a spec can't stall a node
+# for days. A job that would need more simply gets fewer units done a round.
+MAX_PHASE_S = 3600.0
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
 
 
@@ -98,10 +101,12 @@ class PhaseTimes:
     reveal_s: float = 5.0
     verify_s: float = 10.0
     idle_s: float = 2.0
+    jury_s: float = 0.0  # a fine-tune's jury phase, which its round has when a claim is contested (times_for)
 
     @property
     def round_s(self) -> float:
-        return self.register_s + self.compute_s + self.reveal_s + self.verify_s
+        """The longest a round can take: validators wait for a proposal accordingly (_propose_wait)."""
+        return self.register_s + self.compute_s + self.reveal_s + self.verify_s + self.jury_s
 
 
 class Node:
@@ -244,15 +249,19 @@ class Node:
         rep = c.finalize()
         self._end_round()
         fraud = sum(r.verdict.is_fraud for r in rep.results)
-        log.info("block %d sealed: %d units accepted, %d fraud, val acc %.1f%%, pool %.3f VIBE",
-                 rep.block.height, rep.block.summary.accepted_units, fraud, 100 * rep.val_acc, rep.pool / SYN_PER_VIBE)
+        acc = "unscored" if rep.val_acc is None else f"{100 * rep.val_acc:.1f}%"  # a fine-tune round nobody scored
+        log.info("block %d sealed: %d units accepted, %d fraud, val acc %s, pool %.3f VIBE",
+                 rep.block.height, rep.block.summary.accepted_units, fraud, acc, rep.pool / SYN_PER_VIBE)
 
     def times_for(self, job) -> PhaseTimes:
         """A round's phase lengths for `job`: this node's, or longer where the job's size needs it (or the job asks
         for a longer compute phase). See TrainingJob.phase_lengths."""
         t, need = self.times, job.phase_lengths()
-        return PhaseTimes(t.register_s, max(t.compute_s, need["compute"]), max(t.reveal_s, need["reveal"]),
-                          max(t.verify_s, need["verify"]), t.idle_s)
+        verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
+        # A fine-tune's jury replays at most a unit, which takes no longer than checking two claims: as long as verify.
+        return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
+                          min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s,
+                          verify if job.finetune else 0.0)
 
     def _propose_wait(self) -> float:
         """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
@@ -281,9 +290,9 @@ class Node:
                 return False
             if step:
                 step()
-        if c.start_jury():  # a fine-tune's contested claims: a jury of workers replays them, as long as a verify phase
+        if c.start_jury():  # a fine-tune's contested claims: a jury of workers replays them
             log.info("  %d claims to a jury of workers", len(c.r.contested))
-            if not self._wait(t.verify_s, still):
+            if not self._wait(t.jury_s, still):
                 return False
         return True
 

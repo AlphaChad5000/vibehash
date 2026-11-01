@@ -30,6 +30,7 @@ and keep it on their GPU between units; only the adapters (and moments) travel a
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -57,6 +58,10 @@ SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
 TOLERANCE = 1e-4
+# The same, for a whole unit replayed from its start (a jury on replicas that disagree, and comparing replicas): errors
+# compound over its steps. Measured on Qwen3-0.6B, 16 steps on CUDA replayed on the CPU: 5e-5 of B's size, 7e-5 of the
+# unit's change. So 1e-3 of the size; the 1% rule on the change still binds (DESIGN.md §8).
+WHOLE_TOLERANCE = 1e-3
 _BASE = re.compile(r"^hf:([A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?)@([0-9a-f]{40})$", re.ASCII)
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 
@@ -353,7 +358,8 @@ class TokenDataset:
         try:
             self._parsed["manifest"] = Manifest.from_bytes(self.manifest)
             self._parsed["config"] = json.loads(self.config)
-        except (ValueError, UnicodeDecodeError) as e:
+            arch_dims(self._parsed["config"])  # a model this code trains, described sanely
+        except (ValueError, UnicodeDecodeError, RecursionError) as e:
             raise ValueError(f"the dataset's model manifest or config.json is malformed: {e}") from None
 
     def check(self, spec: LoraSpec) -> None:
@@ -389,15 +395,27 @@ class TokenDataset:
 
 
 def arch_dims(config: dict) -> dict:
-    """llm.Arch.from_hf_config(config).dims(), without importing PyTorch (the node checks datasets without it)."""
+    """llm.Arch.from_hf_config(config).dims(), without importing PyTorch (the node checks datasets without it). Strict:
+    a config.json comes inside a poster's dataset, so a missing, mistyped or impossible size is a ValueError, never a
+    KeyError or a division by zero somewhere later."""
     if not isinstance(config, dict) or config.get("model_type") not in FAMILIES:
         raise ValueError(f"model_type {config.get('model_type') if isinstance(config, dict) else None!r} isn't supported")
-    heads = int(config["num_attention_heads"])
-    return {"family": config["model_type"], "vocab": int(config["vocab_size"]), "hidden": int(config["hidden_size"]),
-            "layers": int(config["num_hidden_layers"]), "heads": heads,
-            "kv_heads": int(config.get("num_key_value_heads") or heads),
-            "head_dim": int(config.get("head_dim") or int(config["hidden_size"]) // heads),
-            "ffn": int(config["intermediate_size"]), "tied": bool(config.get("tie_word_embeddings", False))}
+
+    def size(key, default=None):
+        v = config.get(key, default)
+        if type(v) is not int or not 1 <= v <= 1 << 20:
+            raise ValueError(f"config.json's {key} must be a whole number from 1 to {1 << 20}, not {v!r}")
+        return v
+    hidden, heads = size("hidden_size"), size("num_attention_heads")
+    kv_heads = size("num_key_value_heads") if config.get("num_key_value_heads") is not None else heads
+    head_dim = size("head_dim") if config.get("head_dim") is not None else hidden // heads
+    tied = config.get("tie_word_embeddings", False)
+    if heads % kv_heads or head_dim < 2 or head_dim % 2 or not isinstance(tied, bool):
+        raise ValueError("config.json's heads must be a multiple of its key/value heads, head_dim even, and "
+                         "tie_word_embeddings true or false")
+    return {"family": config["model_type"], "vocab": size("vocab_size"), "hidden": hidden,
+            "layers": size("num_hidden_layers"), "heads": heads, "kv_heads": kv_heads, "head_dim": head_dim,
+            "ffn": size("intermediate_size"), "tied": tied}
 
 
 # --- running it -------------------------------------------------------------------------------------------------------
@@ -407,9 +425,13 @@ class _Runtime:
     model: object  # llm.Model
     device: str
     lora: dict = field(default_factory=dict)  # spec -> [(module name, A tensor, B slice, B shape)]
-    # Workers of one process (a testnet's) share a device's model; they take turns on it, since running several units
-    # at once on one GPU is no faster and holds several units' activations.
-    busy: threading.Lock = field(default_factory=threading.Lock)
+    # Workers of one process (a testnet's) share a device's model; on a GPU they take turns, since running several
+    # units at once there is no faster and holds several units' activations. On the CPU they don't wait for each other.
+    busy: object = None
+
+    def __post_init__(self):
+        if self.busy is None:
+            self.busy = contextlib.nullcontext() if self.device == "cpu" else threading.Lock()
 
 
 _runtimes: dict[tuple[str, str], _Runtime] = {}

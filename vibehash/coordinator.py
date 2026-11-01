@@ -45,7 +45,7 @@ from . import economics as econ
 from . import fees
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
-from .finetune import MAX_VAL
+from .finetune import MAX_VAL, WHOLE_TOLERANCE
 from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
@@ -77,8 +77,13 @@ RECORD_VERSION = 2
 SHARDED_RECORD_VERSION = 3
 FINETUNE_RECORD_VERSION = 4
 CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
-JURY = 3  # jurors drawn for each contested claim of a fine-tune; the majority of those drawn decides
+JURY = 3  # jurors drawn for each contested claim of a fine-tune; the majority of those drawn decides; fewer: no jury
 SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
+# Staked workers able to run a fine-tune that must register before its round assigns work: a holder, its two checkers
+# and a jury of three who are none of those, so any claim can be judged.
+FINETUNE_QUORUM = 1 + CHECKERS + JURY
+# How close a scorer's (loss, accuracy) must be to the median to be paid: honest scorers agree to about 1e-6.
+SCORE_AGREEMENT = 1e-3
 RAMP = 2  # a worker's capacity can grow this much each round it delivers in full, up to what it says it can do
 LOOKBACK = 50  # blocks searched for a worker's most recent round
 
@@ -237,6 +242,7 @@ class _Round:
     # Fine-tunes only: claims sent to a jury, {(unit, worker): (why, segments, jury task ids)}, and the jury's tasks.
     contested: dict[tuple[str, str], tuple[str, list[int], list[str]]] = field(default_factory=dict)
     jury: dict[str, VerifyTask] = field(default_factory=dict)
+    void: set[str] = field(default_factory=set)  # checkers who approved a canary: their verdicts this round don't count
 
     @property
     def v4(self) -> bool:
@@ -279,7 +285,7 @@ def _score(score) -> tuple[float, float]:
     """A scorer's report, [loss, accuracy]: a non-negative finite loss and an accuracy in [0, 1]."""
     try:
         loss, acc = (float(x) for x in score)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ProtocolError("a score is [loss, accuracy]") from None
     if not (np.isfinite(loss) and loss >= 0 and 0 <= acc <= 1):
         raise ProtocolError("a score's loss is finite and not negative, and its accuracy in [0, 1]")
@@ -388,6 +394,9 @@ class Coordinator:
                     job = self.job(job_id)
                 except (InvalidJob, ValueError, OSError):
                     continue  # dataset not available here yet
+                except Exception as e:  # noqa: BLE001 - one job's bad data must never stop every job's rounds
+                    self.waiting[job_id] = f"job {job_id} can't run: its data or spec doesn't load ({type(e).__name__}: {e})"
+                    continue
                 if job.sharded and not self.runs_teams:
                     self.waiting[job_id] = (f"job {job_id} waits: it's split into {job.shards} shards, trained by teams "
                                             "whose workers send each other activations, and this node can't run teams yet")
@@ -663,10 +672,11 @@ class Coordinator:
             return
         if r.v4:
             able = [a for a, reg in r.regs.items() if staked(a) and reg.memory_mb >= job.memory_mb]
-            if len(able) < 2:  # nobody could check the work, and the node won't: train nothing rather than waste it
-                r.waiting = (f"job {r.job_id} waits: a fine-tune's work is checked by workers, so it needs two staked "
-                             f"workers with {_size(job.memory_mb)} of GPU memory each, and {len(able)} registered. Workers "
-                             "earn their stake on other jobs first")
+            if len(able) < FINETUNE_QUORUM:  # its work couldn't all be checked and judged: train nothing, waste nothing
+                r.waiting = (f"job {r.job_id} waits: a fine-tune's work is checked and judged by workers, so it needs "
+                             f"{FINETUNE_QUORUM} staked workers with {_size(job.memory_mb)} of GPU memory each (a holder, "
+                             f"{CHECKERS} checkers and a jury of {JURY}), and {len(able)} registered. Workers earn their "
+                             "stake on other jobs first")
                 self.waiting[r.job_id] = r.waiting
                 r.unassigned = len(r.units)
                 self.phase = Phase.COMPUTE
@@ -1040,21 +1050,62 @@ class Coordinator:
 
     def _finetune_tasks(self, job: TrainingJob, draw: Draw, pool, task_id) -> dict[str, VerifyTask]:
         """Version 4's verify tasks: each claim's challenged segments to CHECKERS checkers (never its unit's holders),
-        canaries as in version 2, and SCORERS scorers for the round's starting model. A claim nobody can check gets no
-        task; start_jury gives it to a jury instead."""
+        canaries, and SCORERS scorers for the round's starting model when there's work to score. A claim nobody can
+        check gets no task; start_jury gives it to a jury instead. Every draw is seeded by the round secret and what it's
+        for (each claim's checkers by the claim), and claims are taken in sorted order, so the order a leader recorded
+        the reveals in steers nothing."""
         r, q = self.r, self.config.challenge_segments
         tasks, checkers = [], defaultdict(set)
-        for (uid, addr), rv in r.reveals.items():
+        for uid, addr in sorted(r.reveals):
+            rv = r.reveals[(uid, addr)]
             segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
             openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
-            for verifier in _pick(draw, pool(set(r.holders[uid])), CHECKERS):
+            mine = Draw(b"check", r.beacon, r.secret, uid.encode(), addr.encode())
+            for verifier in _pick(mine, pool(set(r.holders[uid])), CHECKERS):
                 checkers[uid].add(verifier)
                 tasks.append(VerifyTask(task_id(uid, addr, verifier), verifier, r.units[uid], addr, segs, openings))
-        tasks += self._canaries(job, draw, pool, task_id, checkers)
-        first = next(iter(r.units.values()))  # a score task names a unit only because every task has one
-        for verifier in _pick(draw, pool(set()), SCORERS):
-            tasks.append(VerifyTask(task_id("score", "", verifier), verifier, first, "", [], {}, kind="score"))
+        tasks += self._finetune_canaries(job, Draw(b"canaries", r.beacon, r.secret), pool, checkers,
+                                         self.config.canaries_per_round, "check")
+        if r.reveals:  # (a round that trained nothing has nothing to score, and nobody to pay for scoring it)
+            first = next(iter(r.units.values()))  # a score task names a unit only because every task has one
+            for verifier in _pick(Draw(b"score", r.beacon, r.secret), pool(set()), SCORERS):
+                tasks.append(VerifyTask(task_id("score", "", verifier), verifier, first, "", [], {}, kind="score"))
+        tasks.sort(key=lambda t: t.task_id)
         return {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
+
+    def _finetune_canaries(self, job: TrainingJob, draw: Draw, pool, checkers: dict[str, set[str]], n: int,
+                           kind: str) -> list[VerifyTask]:
+        """A fine-tune's canaries: another unit's honest training, presented as this unit's. A donor claim's challenged
+        openings (real Adam steps, so every invariant of Adam's moments holds, which a rescaled update breaks) go out
+        under a target unit's id, and so its seed: an honest replay draws other batches and rejects them, and without
+        a replay nothing gives it away. The checker neither holds nor checks either unit, so it can't have seen those
+        checkpoints. Needs two units revealed. `kind` "jury" plants one among the jurors."""
+        r, q = self.r, self.config.challenge_segments
+        units = sorted({uid for uid, _ in r.reveals})
+        planted, used = [], set()
+        if len(units) < 2:
+            return planted
+        for donor_uid, donor in draw.shuffle(sorted(r.reveals)):
+            if len(planted) == n:
+                break
+            others = [u for u in units if u != donor_uid and u not in used]
+            if not others or donor_uid in used:
+                continue
+            target = others[draw.below(len(others))]
+            near = set(r.holders[target]) | set(r.holders[donor_uid]) | checkers[target] | checkers[donor_uid]
+            candidates = pool(near)
+            if not candidates:
+                continue
+            used.update((target, donor_uid))
+            tag = (kind + str(len(planted))).encode()
+            fake = KeyPair.generate(h256(b"canary", r.secret, tag)).address
+            segs = challenge_segments(r.beacon, donor_uid, donor, job.n_segments, q)
+            rv = r.reveals[(donor_uid, donor)]
+            openings = {} if self.replaying else {i: rv.openings[i] for s in segs for i in (s, s + 1)}
+            verifier = candidates[draw.below(len(candidates))]
+            tid = h256(b"canary", r.beacon, r.secret, tag, verifier.encode()).hex()[:20]
+            planted.append(VerifyTask(tid, verifier, r.units[target], fake, segs, openings, canary=True, kind=kind))
+        return planted
 
     def _canaries(self, job: TrainingJob, draw: Draw, pool, task_id, checkers: dict[str, set[str]]) -> list[VerifyTask]:
         """Version 2's planted fakes, each a copy of a real reveal's task with one segment's update rescaled
@@ -1195,18 +1246,21 @@ class Coordinator:
         """A fine-tune's round, after the verify phase: send every claim that isn't settled to a jury, and say whether
         there's a jury phase. A claim goes to one when a checker rejected it (the jurors replay the segments named),
         when no checker answered (all its challenged segments), or when replicas of its unit disagree (the whole unit,
-        for each replica). Each jury is JURY workers drawn from the round secret, staked and able to run the job,
-        neither holding the unit nor having checked the claim. Other rounds have no jury phase."""
+        for each replica). A checker that approved a canary is lazy, and none of its verdicts count: a claim only it
+        approved is unanswered. Each jury is JURY workers drawn from the round secret and the claim, staked and able to
+        run the job, neither holding the unit nor having checked the claim; with fewer to draw from, there's no jury and
+        the claim ends unchecked. One more canary goes to a juror. Other rounds have no jury phase."""
         r = self._need(Phase.VERIFY)
         if not r.v4:
             return False
         job = self.job(r.job_id)
+        r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
         checks = defaultdict(list)
         for t in r.tasks.values():
             if t.kind == "check" and not t.canary:
                 checks[(t.unit.unit_id, t.submitter)].append(t)
-        for key in r.reveals:
-            answers = [t.verdict for t in checks[key] if t.verdict is not None]
+        for key in sorted(r.reveals):
+            answers = [t.verdict for t in checks[key] if t.verdict is not None and t.verifier not in r.void]
             rejected = sorted({bad for ok, bad in answers if not ok})
             if rejected:
                 r.contested[key] = ("dispute", rejected, [])
@@ -1216,32 +1270,43 @@ class Coordinator:
         for uid, holders in sorted(r.holders.items()):
             keys = [(uid, a) for a in holders if (uid, a) in r.reveals]
             if len(keys) > 1 and not self._claim("redundancy", uid, lambda keys=keys: self._replicas_agree(job, keys)):
-                for key in keys:
+                for key in keys:  # the whole unit is judged; a checker's rejection of it is judged with it
                     r.contested[key] = ("replicas", list(range(job.n_segments)), [])
         offenders = {s[0] for s in r.slashes}
-        draw = Draw(b"jury", r.beacon, r.secret)
+
+        def able(exclude: set[str]) -> list[str]:
+            return [a for a, reg in sorted(r.regs.items()) if a not in exclude and a not in offenders
+                    and reg.memory_mb >= job.memory_mb and self.chain.state.staked(a)]
         for key in sorted(r.contested):
             why, segs, _ = r.contested[key]
             uid, addr = key
-            parties = set(r.holders[uid]) | {t.verifier for t in checks[key]} | offenders
-            able = [a for a, reg in sorted(r.regs.items()) if a not in parties and reg.memory_mb >= job.memory_mb
-                    and self.chain.state.staked(a)]
+            jurors = _pick(Draw(b"jury", r.beacon, r.secret, uid.encode(), addr.encode()),
+                           able(set(r.holders[uid]) | {t.verifier for t in checks[key]}), JURY)
+            if len(jurors) < JURY:  # a jury of fewer can't outvote one bad juror: the claim ends unchecked
+                jurors = []
             rv, whole = r.reveals[key], why == "replicas"
             openings = {i: rv.openings[i] for i in ((0, job.n_segments) if whole else sorted({i for s in segs for i in (s, s + 1)}))}
             ids = []
-            for juror in _pick(draw, able, JURY):
+            for juror in jurors:
                 tid = h256(b"jury", r.beacon, r.secret, uid.encode(), addr.encode(), juror.encode()).hex()[:20]
                 r.jury[tid] = VerifyTask(tid, juror, r.units[uid], addr, segs, openings, kind="jury", whole=whole)
                 ids.append(tid)
             r.contested[key] = (why, segs, ids)
         if not r.jury:
             return False
+        near = defaultdict(set)
+        for t in [*r.tasks.values(), *r.jury.values()]:
+            if not t.canary:
+                near[t.unit.unit_id].add(t.verifier)
+        for t in self._finetune_canaries(job, Draw(b"jury canary", r.beacon, r.secret), able, near, 1, "jury"):
+            r.jury[t.task_id] = t
         self.phase = Phase.JURY
         return True
 
     def _replicas_agree(self, job: TrainingJob, keys: list) -> bool:
-        """Whether replicas of a unit ended at the same weights (by the agreement rule; no training)."""
-        r, tol = self.r, self.config.agreement_tolerance
+        """Whether replicas of a unit ended at the same weights (by the agreement rule, loosened to what a whole unit on
+        other hardware measured, finetune.WHOLE_TOLERANCE; no training)."""
+        r, tol = self.r, max(self.config.agreement_tolerance, WHOLE_TOLERANCE)
         finals = [r.reveals[k].final_params for k in keys]
         self._weights(r.start, *finals)
         return all(reproduces(f, finals[0], r.start, tol, job.spec) for f in finals[1:])
@@ -1467,21 +1532,22 @@ class Coordinator:
         verifier_flops: dict[str, int] = defaultdict(int)
         missed: set[str] = set()
         checks, scores = defaultdict(list), []
-        for t in r.tasks.values():
+        for t in [*r.tasks.values(), *(t for t in r.jury.values() if t.canary)]:
             if t.verdict is None:
                 if t.verifier:
                     missed.add(t.verifier)
                 continue
             if t.kind == "score":
-                scores.append(t.score)
-                verifier_flops[t.verifier] += score_cost(job)
+                scores.append((t.verifier, t.score))
                 continue
             verifier_flops[t.verifier] += replay_cost(job, len(t.segments))
             if t.canary:
                 if t.verdict[0]:
                     r.slashes.append([t.verifier, None, "approved a canary"])
                 continue
-            checks[(t.unit.unit_id, t.submitter)].append(t)
+            if t.verifier not in r.void:
+                checks[(t.unit.unit_id, t.submitter)].append(t)
+        lazy = r.void | {t.verifier for t in r.jury.values() if t.canary and t.verdict is not None and t.verdict[0]}
         for key in r.reveals:
             if key not in r.contested:
                 first = next((t.verifier for t in checks[key] if t.verdict[0]), None)
@@ -1489,18 +1555,19 @@ class Coordinator:
         for key in sorted(r.contested):
             why, segs, ids = r.contested[key]
             jurors = [r.jury[i] for i in ids]
-            yes = [t for t in jurors if t.verdict is not None and t.verdict[0]]
-            no = [t for t in jurors if t.verdict is not None and not t.verdict[0]]
+            # A juror caught approving a canary counts as silent: it judged nothing, and it's slashed for the canary.
+            yes = [t for t in jurors if t.verdict is not None and t.verdict[0] and t.verifier not in lazy]
+            no = [t for t in jurors if t.verdict is not None and not t.verdict[0] and t.verifier not in lazy]
             missed.update(t.verifier for t in jurors if t.verdict is None)
             need = len(jurors) // 2 + 1
-            upheld = True if len(yes) >= need else False if len(no) >= need else None
+            upheld = None if not jurors else True if len(yes) >= need else False if len(no) >= need else None
             cost = r.units[key[0]].flops if why == "replicas" else replay_cost(job, len(segs))
             for t in (yes + no if upheld is None else yes if upheld else no):
                 verifier_flops[t.verifier] += cost
             if upheld is not None:
                 for t in (no if upheld else yes):
                     r.slashes.append([t.verifier, None, "outvoted on a jury"])
-            judged = [t for t in checks[key]] if why == "dispute" else []
+            judged = checks[key] if why in ("dispute", "replicas") else []
             if upheld:
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.ACCEPTED, None, f"upheld by a jury ({why})")
                 for t in judged:
@@ -1510,7 +1577,9 @@ class Coordinator:
                 accuser = next((t.verifier for t in judged if not t.verdict[0]), None)
                 self._fraud(key, Verdict.FAILED_REDUNDANCY if why == "replicas" else Verdict.FAILED_REPLAY,
                             f"found bad by a jury ({why})", catcher=accuser, verifier=accuser)
-                for t in judged:
+                # Approving a segment the jury found bad is lazy or worse. (A replica's checkers only replayed its
+                # challenged segments, which may well be honest: they aren't blamed for the rest of the unit.)
+                for t in judged if why == "dispute" else []:
                     if t.verdict[0]:
                         r.slashes.append([t.verifier, None, "approved bad work"])
             else:
@@ -1535,7 +1604,12 @@ class Coordinator:
             return params_hash(new_params).hex()
         model_hash = self._claim("model", "params_hash", average)
         if scores:
-            r.record["score"] = [_median([s[0] for s in scores]), _median([s[1] for s in scores])]
+            r.record["score"] = [_median([s[0] for _, s in scores]), _median([s[1] for _, s in scores])]
+            # Paid only when SCORERS answered and this one agrees with their median: nothing checks a lone score.
+            loss, acc = r.record["score"]
+            for v, (l, a) in scores if len(scores) >= SCORERS else []:
+                if abs(l - loss) <= SCORE_AGREEMENT * max(1.0, loss) and abs(a - acc) <= SCORE_AGREEMENT:
+                    verifier_flops[v] += score_cost(job)
         r.record["secret"] = r.secret.hex()
         summary = RoundSummary(
             job_id=r.job_id,

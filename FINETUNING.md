@@ -352,14 +352,14 @@ Moments in bf16 would cut both by a third.
 
 1. **Done in this branch:** fine-tunes run on a node without PyTorch, checked and scored by workers (record
    version 4).
-2. **Release (0.5.5) and update the node, as block version 2 rolled out.** A 0.5.x node refuses a fine-tune's
-   post_job as malformed, so every validator runs the new release before anyone posts one. The public chain has one
-   validator, so its update is the switch. Workers that want fine-tunes need PyTorch (`vibehash install-gpu`); those
+2. **Release (0.5.5) and update the node, as block version 2 rolled out.** The release makes blocks of version 3,
+   the first that may hold a fine-tune. A 0.5.x node refuses those blocks, so every validator runs the new release
+   before the first one. The public chain has one validator, so its update is the switch. Workers that want fine-tunes need PyTorch (`vibehash install-gpu`); those
    without it skip them and keep mining the rest.
-3. **Staked GPU workers on the public network.** A fine-tune trains only once two staked workers able to run it have
-   registered. Full strength takes about six: two checkers a claim, canaries, and juries of three that leave out a
-   claim's holder and checkers. Newcomers earn their first stake on the CSV jobs, which the node still checks itself,
-   so the public network wants one running beside the first fine-tunes.
+3. **Staked GPU workers on the public network.** A fine-tune trains only once six staked workers able to run it
+   have registered: a holder, its two checkers and a jury of three who are none of those. Newcomers earn their first
+   stake on the CSV jobs, which the node still checks itself, so the public network wants one running beside the
+   first fine-tunes.
 4. **Set `--keep-rounds`** to the disk (above).
 5. **Later:** moments in bf16; manifests published to the network (today each poster streams the weights once to
    build its own; at 8 GB that takes minutes); a worker cache limit and download progress on the dashboard.

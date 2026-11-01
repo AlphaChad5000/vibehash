@@ -160,6 +160,24 @@ def _swap_leaf(proofs: dict[int, list], index: int, leaf: bytes, n_leaves: int) 
     return out
 
 
+def adam_impossible(spec, before: np.ndarray, after: np.ndarray, steps: int) -> bool:
+    """Whether a fine-tune's segment can't have come from Adam, judged from its two checkpoints alone, no model: v can't
+    shrink faster than beta2 a step, and m can't move further than the squared gradients added to v allow (by
+    Cauchy-Schwarz). Honest work never trips it; canaries mustn't either (coordinator._finetune_canaries), and the
+    "knowing" test checker uses it to try to dodge them, as a lazy checker who knows Adam would."""
+    import math
+    from .finetune import OPTIMIZERS
+    b1, b2, _ = OPTIMIZERS[spec.optimizer]
+    pm, pv = spec.parts[1], spec.parts[2]
+    mb, ma = spec.round(before[pm]), spec.round(after[pm])
+    vb, va = spec.round(before[pv]), spec.round(after[pv])
+    floor = b2 ** steps * vb
+    if np.any(va < floor * (1 - 1e-5) - 1e-30):
+        return True
+    reach = (1 - b1) * math.sqrt(sum((b1 * b1 / b2) ** j for j in range(steps)) / (1 - b2)) * np.sqrt(np.maximum(va - floor, 0))
+    return bool(np.any(np.abs(ma - b1 ** steps * mb) > reach * (1 + 1e-3) + 1e-6 * np.abs(ma) + 1e-30))
+
+
 def replay_cost(job: TrainingJob, n_segments: int) -> int:
     return n_segments * job.checkpoint_every * job.spec.flops_per_step(job.batch_size)
 
@@ -171,6 +189,10 @@ def replay_openings(job: TrainingJob, unit: WorkUnit, openings: dict, segments: 
         return True, None
     if behavior == "false_accuser":
         return False, segments[0]
+    if behavior == "knowing":  # lazy, but rejects what Adam couldn't have produced (tests only: adam_impossible)
+        bad = [s for s in segments if job.finetune and adam_impossible(job.spec, openings[s][0], openings[s + 1][0],
+                                                                         job.checkpoint_every)]
+        return (False, bad[0]) if bad else (True, None)
     for seg in segments:
         if not replay_segment(job, unit, seg, openings[seg][0], openings[seg + 1][0], backend):
             return False, seg

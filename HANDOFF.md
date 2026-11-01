@@ -169,19 +169,35 @@ Done and tested (as of the last full runs):
      the median, for people only), and sends anything rejected, unanswered, or where replicas disagree to a jury of
      three workers in an extra `jury` phase of the same round (`Coordinator.start_jury`, `_settle_finetune`).
      Majority of jurors drawn decides; losers are slashed; no majority leaves the claim `UNCHECKED` (unpaid, unslashed,
-     not carried over). A fine-tune trains only once two staked workers able to run it have registered (`waiting` in
-     `/status` says why); newcomers earn stake on other jobs first. The node needs neither PyTorch nor the weights,
-     and rechecks don't either. Proven with the node in a venv with no PyTorch (FINETUNING.md milestone B).
+     not carried over). A fine-tune trains only once six staked workers able to run it have registered
+     (`FINETUNE_QUORUM`; `waiting` in `/status` says why); newcomers earn stake on other jobs first. The node needs
+     neither PyTorch nor the weights, and rechecks don't either. Proven with the node in a venv with no PyTorch
+     (FINETUNING.md milestone B).
+   - **After the review of PR #5 (2026-11-01):**
+     - **What counts as a fine-tune:** only a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`),
+       so an MLP spec with a stray `base` stays an MLP spec.
+     - **Block version 3** is the first that may hold a fine-tune's post_job (`ledger.FINETUNE_VERSION`).
+     - **Bad data:** config.json is checked strictly when a dataset arrives (`finetune.arch_dims`), and a job that
+       won't load is skipped, not fatal.
+     - **Canaries** are another unit's real training (the old rescaled ones broke Adam's invariants, which a lazy
+       checker could test with numpy, `verification.adam_impossible`). A canary-approver's verdicts don't count, and
+       the jury phase gets a canary too.
+     - **Juries** need three, or the claim ends unchecked.
+     - **Scorers** are paid only when three agree.
+     - **Draws** are seeded per claim.
+     - **Replicas:** disagreeing replicas judge their accusers.
+     - **Timing:** round lengths count the jury phase, and no phase is over an hour (`node.MAX_PHASE_S`).
+     - **Tolerance:** whole-unit replays use `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA).
      `vibehash node --device` still exists for MLP checks. `testnet --job none` posts no demo job, for `train --base`.
    - **hub.py:** `TensorCache` now fetches 64 MiB runs over six connections (1.5 GB in ~15 s here); manifests pin
      `chat_template.jinja` too.
    - **Tests:** `tests/test_finetune.py` (in CI with CPU PyTorch and `.[finetune]`; transformers/PEFT checks run where
      they're installed; `VIBEHASH_REAL_MODELS=1` for Qwen3-0.6B). `tests/finetune_fixtures.py` makes tiny checkpoints.
-   - **Rolling it out:** a 0.5.x node refuses a fine-tune's post_job as malformed (and so can't follow a chain with
-     one), so every validator runs the release with this before anyone posts a fine-tune; on `vibehash-public-1`
-     the node is the only validator, so updating it is the switch. Size `--keep-rounds` to the disk (about 3 GB a
-     round of 8 Qwen3-4B units). The public network then needs two staked GPU workers to start a fine-tune, about
-     six for full juries.
+   - **Rolling it out:** this release makes block version 3, which a 0.5.x node refuses, so every validator runs it
+     before the first new block (as with version 2); on `vibehash-public-1` the node is the only validator, so
+     updating it is the switch. Size `--keep-rounds` to the disk (about 3 GB a round of 8 Qwen3-4B units). The public
+     network then needs six staked GPU workers before a fine-tune trains. The live chain was scanned on 2026-11-01
+     (height 6187): its one post_job (height 2) has no `base` field, so nothing on it changes meaning.
    - **Not done:** `vibehash hub login` (gated Llamas need `HF_TOKEN` set by hand); manifests shared on the network
      (each poster builds and caches its own); moments in bf16; cache limits on the worker; Intel/AMD/Apple
      tolerances.

@@ -592,42 +592,71 @@ Merkle proofs and Adam's arithmetic bound, and averages B. Each step:
 
 1. **Two checkers a claim.** Each revealed claim's challenged segments go to `CHECKERS` = 2 staked workers able to run
    the job, never its unit's holders. One that doesn't answer leaves the other's verdict. A claim is accepted when a
-   checker approved it and none rejected it.
-2. **Scorers.** `SCORERS` = 3 workers score the round's starting model on the held-back data in the verify phase (a
-   paid task). The record keeps the median. **It's for people only: nothing is paid or decided by it.** The median
-   of three outvotes one scorer that makes its number up. A round's score is that of the model it started from, so
-   the model a round makes is scored by the next round of its job. The last round's result isn't scored by the
+   checker approved it and none rejected it. A checker that approved a canary this round (step 6) is lazy, and **none
+   of its verdicts count**: a claim only it approved counts as unanswered.
+2. **Scorers.** `SCORERS` = 3 workers score the round's starting model on the held-back data in the verify phase. The
+   record keeps the median. **It's for people only: nothing is paid or decided by it.** The median of three outvotes
+   one scorer that makes its number up. Nothing checks a lone score, so a scorer is paid for the forward pass only when
+   all three answered and its score is within `SCORE_AGREEMENT` (1e-3) of their median. Honest scorers agree to
+   about 1e-6. A round that trained nothing has no scorers. A round's score is that of the model it started from,
+   so the model a round makes is scored by the next round of its job. The last round's result isn't scored by the
    network; the poster can score it when they load the adapter.
-3. **A jury phase**, only when something is contested, as long as a verify phase, in the same round. Every claim that
-   a checker rejected (`dispute`: the jurors replay the segments named), that no checker answered (`unchecked`: all
-   its challenged segments), or whose unit's replicas disagree (`replicas`: the whole unit, for each replica, from
-   its first checkpoint to its last) goes to `JURY` = 3 jurors. They're drawn from the round secret among the staked
-   workers able to run the job who neither hold the unit, nor checked the claim, nor were slashed this round.
+3. **A jury phase**, only when something is contested, in the same round. Every claim that a checker rejected
+   (`dispute`: the jurors replay the segments named), that no checker answered (`unchecked`: all its challenged
+   segments), or whose unit's replicas disagree (`replicas`: the whole unit, for each replica, from its first
+   checkpoint to its last) goes to `JURY` = 3 jurors. They're drawn among the staked workers able to run the job who
+   neither hold the unit, nor checked the claim, nor were slashed this round. **With fewer than three to draw from,
+   there's no jury**, and the claim ends unchecked: a jury of one could convict an honest worker on its own word, and
+   one with a false accuser did in review. Replicas that disagree are judged whole even if a checker also rejected
+   one of them; that checker is judged with it.
 4. **The majority of the jurors drawn decides** (2 of 3), not of those who answer:
    - **Upheld:** the claim is accepted, paid and averaged. Any checker that rejected it is slashed for a false
      accusation, with the worker as catcher.
-   - **Found bad:** the worker is slashed (FAILED_REPLAY, or FAILED_REDUNDANCY for replicas), and so is any checker
-     that approved it ("approved bad work").
+   - **Found bad:** the worker is slashed (FAILED_REPLAY, or FAILED_REDUNDANCY for replicas). For a disputed claim,
+     so is any checker that approved it ("approved bad work"). A replica's checkers only replayed its challenged
+     segments, which may well be honest, so they aren't blamed for the rest of the unit.
    - **Either way,** a juror on the losing side is slashed ("outvoted on a jury"), and jurors on the winning side are
-     paid for the replay.
+     paid for the replay. A juror who approved the jury phase's canary counts as silent.
    - **No majority** (silence, or a 1–1 split with one silent): the claim is `UNCHECKED`. It isn't paid or averaged
      and nobody is slashed: there's no evidence either way. Answering jurors are paid; silent ones, like silent
      checkers, count as missed.
+   - **A whole-unit replay** is compared with `finetune.WHOLE_TOLERANCE` (1e-3 of the size, and the same 1% of the
+     change), since errors compound over a unit's steps. Measured on Qwen3-0.6B, 16 steps on CUDA replayed on the
+     CPU: 5.0e-5 of B's size and 7.1e-5 of its change. A segment's 1e-4 would leave a margin of two; the 1% rule
+     leaves 140. Replicas are compared by the same rule.
 5. **Work no checker and no jury answered is forfeited, not carried over.** The worker isn't slashed and doesn't count
    as having missed a deadline. Carrying the claim into the next round would mean keeping its checkpoints and verdicts
    across rounds and averaging an update made from an older model; paying it unchecked would make silence a way to
    get fakes through. Losing one unit's pay now and then, when the checkers drawn were all offline, is cheaper than
    either.
-6. **Canaries** are version 2's: a real claim's challenged openings with one segment's update rescaled, made without
-   the model. With `[B | m | v]` checkpoints all three parts are rescaled, so every part-by-part replay rejects it
-   (`test_canaries_still_catch_a_lazy_checker`). They go to a checker that neither holds the unit nor checks it.
-7. **Bootstrapping.** A fine-tune's round assigns nothing until two staked workers able to run it have registered, so
-   every claim can be checked by someone other than its holder. Until then the round says why (`waiting` in
-   `/status`, on the worker dashboard and in the round report). Workers earning their stake in (earn-in) may train
-   fine-tune units once checkers exist, but never check them. They earn their first stake on other jobs, whose rounds
-   the node can still check itself. Full strength takes more: three staked workers for two checkers a claim, four
-   for canaries, and six or more for juries of three that leave out a claim's holder and checkers. With fewer jurors
-   available, a jury is as many as there are, and the majority of those decides.
+6. **Canaries are another unit's real training.** A donor claim's challenged openings (honest Adam steps) go out under
+   a target unit's id, and so its seed. An honest replay draws other batches and rejects them; nothing else gives
+   them away. A checker can't have seen those checkpoints, since it neither holds nor checks either unit.
+   - **Why not version 2's rescaled update:** it breaks Adam's invariants. v can't shrink faster than β2 a step, and
+     m can't move further than the squared gradients added to v allow (Cauchy–Schwarz). A lazy checker using that
+     tell, with numpy alone, spotted 170 of 192 rescaled canaries in review and none of 24 honest segments
+     (`verification.adam_impossible`; the test checker `knowing` uses it).
+   - **The jury phase gets a canary too,** one, for a juror.
+   - **Both are drawn from the round secret** (`test_canaries_pass_adams_invariants_and_rescaled_ones_dont`,
+     `test_canaries_catch_a_checker_that_spots_rescaled_updates`).
+7. **Bootstrapping.** A fine-tune's round assigns nothing until `FINETUNE_QUORUM` = 6 staked workers able to run it
+   have registered (a holder, its two checkers and a jury of three who are none of those), so any claim can be
+   judged. Until then the round says why (`waiting` in `/status`, on the worker dashboard and in the round report).
+   Workers earning their stake in (earn-in) may train fine-tune units, but never check them. They earn their first
+   stake on other jobs, whose rounds the node can still check itself.
+8. **Draws the leader can't steer.** Each claim's checkers and each claim's jury are drawn from the round secret and
+   the claim itself (unit and worker), the canaries and scorers from the secret and what they're for, and claims are
+   taken in sorted order. The order a leader recorded the reveals in, or one more contested claim, changes no other
+   claim's draw.
+9. **Time for the jury.** A fine-tune's round length (`node.PhaseTimes.jury_s`, as long as its verify phase) counts the
+   jury phase, so validators wait long enough for a contested round instead of abandoning it. No phase is longer
+   than `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
+
+**False accusations** cost a checker its stake's slash once a round, however many claims it rejects: the ledger
+slashes an offender at most once per round (`ledger._slash_txs`), a rule for every job. Each slash halves the stake and
+resets reputation, so a griefer is below the minimum stake within a couple of rounds. Meanwhile each rejection costs
+three jurors a replay (paid), and a jury that can't be drawn or doesn't answer leaves the honest claim unpaid. That's
+the residual cost of griefing; slashing more than once a round would be a ledger change.
 
 **The security assumption** is the protocol's own, now covering juries too: most workers drawn at random from those
 staked are honest. A jury of three is wrong only if two of its jurors are dishonest. If a fraction f of stake-weighted
@@ -637,14 +666,21 @@ before the round and reveals only in the record, so nobody can aim a jury, excep
 (as with canaries, §3 step 4). Honest jurors don't disagree: replays agree to 2.6e-6 of a segment's change against the
 1% rule (§8).
 
-**Record version 4.** A fine-tune's round, and only a fine-tune's, is recorded as version 4, as sharded rounds are 3.
-The record adds the jurors' signed verdicts (`jury`), scorers' verdicts carrying `score` beside the checkers'
-(`verdicts`), the median `score`, and, under `checks/redundancy`, whether each replicated unit's replicas agreed.
-The jury draw, contested claims and every decision follow from these, so `replay.py` re-runs the round
-(`Coordinator.start_jury` between the verdicts and the jurors' verdicts), and a recheck needs no model either:
-`reveal` and `model` are its only weight-based results, both arithmetic. MLP rounds stay version 2, unchanged. A node
-from before this refuses a fine-tune's post_job as malformed, so it can't be handed a version 4 round to vote on, but
-it also can't follow a chain that has one: every validator upgrades before anyone posts a fine-tune (HANDOFF).
+**Record version 4, and block version 3.**
+- **Record version 4:** a fine-tune's round, and only a fine-tune's, is recorded as version 4, as sharded rounds are 3.
+  - **What the record adds:** the jurors' signed verdicts (`jury`), scorers' verdicts carrying `score` beside the
+    checkers' (`verdicts`), the median `score`, and, under `checks/redundancy`, whether each replicated unit's
+    replicas agreed.
+  - **Replay:** the draws, contested claims and every decision follow from these, so `replay.py` re-runs the round
+    (`Coordinator.start_jury` between the verdicts and the jurors' verdicts).
+  - **Recheck:** it needs no model either. `reveal` and `model` are its only weight-based results, both arithmetic.
+  - **MLP rounds** stay version 2, unchanged.
+- **What counts as a fine-tune:** a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`), a shape
+  every earlier node refused. An MLP spec that happens to carry a field named `base` stays an MLP spec, as it was.
+  None is on `vibehash-public-1`, whose only job (height 2) has no such field.
+- **Block version 3:** a fine-tune's post_job is valid only in a block of version 3 or later (§10). A node from
+  before refuses version 3 blocks outright, so a mixed set of validators stops at the first new block instead of
+  forking over a fine-tune. Every validator upgrades first (HANDOFF).
 
 ---
 
@@ -954,6 +990,9 @@ version can't be lower than its parent's or higher than the node knows, and
 validators only vote for blocks of the current version, so once a chain has
 a version 2 block it stays on version 2. Every validator must run a release
 that knows a version before any block of it appears: older nodes refuse it.
+
+Version 3 lets a post_job be a fine-tune (`tasks.is_finetune_spec`, §8): earlier versions refuse one, as the nodes
+before them did, so a chain holds none until its validators all know them.
 
 Version 2 brought the block size limit above, and these fixes:
 - a transaction may appear only once in a block (`crypto.merkle_root` pads an
