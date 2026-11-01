@@ -36,6 +36,9 @@ CACHE_TTL = 24 * 3600  # seconds a model's facts are reused before Hugging Face 
 TIMEOUT_S = 8.0  # for each request, with no retries: a Hub that's out of reach should cost seconds, not minutes
 TODAY = "small models sized to a CSV file"  # the one kind of model the network trains today
 FINETUNING = "https://github.com/AlphaChad5000/vibehash/blob/main/FINETUNING.md"
+# The owner's words, shown wherever model names and emblems are (here, the guide, the README, emblems.py).
+DISCLAIMER = ("Disclaimer: All product names, logos, and brands are property of their respective owners and are "
+              "used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.")
 
 
 @dataclass(frozen=True)
@@ -327,7 +330,7 @@ def to_json(facts: dict[str, Facts], errors: dict[str, str]) -> dict:
         row["error"] = errors.get(m.repo)
         out.append(row)
     return {"today": f"{TODAY} (vibehash train data.csv)", "fine_tuning": "coming, not live on the network yet",
-            "gpu_gb": list(GPU_GB), "usable_fraction": USABLE, "models": out}
+            "gpu_gb": list(GPU_GB), "usable_fraction": USABLE, "models": out, "disclaimer": DISCLAIMER}
 
 
 def table(facts: dict[str, Facts], errors: dict[str, str], width: int = 120, prog: str = "vibehash") -> str:
@@ -373,6 +376,7 @@ def table(facts: dict[str, Facts], errors: dict[str, str], width: int = 120, pro
     if not with_repo:
         out.append(f"`{prog} models --json` gives each model's Hugging Face page.")
     out.append(f"`{prog} train --base NAME` shows what training one would take; it posts nothing.")
+    out.append(DISCLAIMER)
     return "\n".join(out)
 
 

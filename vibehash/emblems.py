@@ -4,7 +4,11 @@ When a job fine-tunes an open-weight model, the forge works that model's emblem 
 a glance which model is being trained. Each one is a simple rendering of its maker's logo, at most 18 by 10 pixels,
 in their colours, with no wordmarks or slogans, used only to say whose model it is. They go by model family (an
 organisation and the start of a model's name), so only that maker's own models of that family get one; anything else
-gets a generic gem, and jobs trained from a CSV file (the only kind today) keep the blade.
+gets a generic gem, and jobs trained from a CSV file (the only kind today) keep the blade. The owner chose to keep
+them as drawn, logo-like ones included (2026-11-01).
+
+Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for
+identification. Vibe Hash isn't affiliated with or endorsed by them.
 
 The pixels are drawn two to a character cell with half blocks: the top pixel as the foreground of "▀", the bottom one
 as its background. Without colour, or in ASCII, the shapes still read in "█▀▄" or "#~_".

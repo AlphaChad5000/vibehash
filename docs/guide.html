@@ -144,6 +144,9 @@ section > ol { padding-left: 1.4em; }
 .field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-2); }
 .field input[type="text"], .field input[type="number"], .field select { font: 0.92rem var(--font-mono); color: var(--ink); background: var(--stone); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; width: 100%; min-width: 0; }
 .field.wide { grid-column: 1 / -1; }
+.fine { font-size: 0.8rem; color: var(--ink-2); }
+.field .fine { margin-top: 2px; }
+footer .fine { flex-basis: 100%; }
 .facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 18px; margin: 6px 0 0; font-size: 0.93rem; max-width: 66ch; }
 .facts dt { color: var(--ink-2); }
 .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -506,7 +509,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 </div>
 
 <footer>
-  <div class="wrap"><span>Vibe Hash 0.5 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.5</span></div>
+  <div class="wrap"><span>Vibe Hash 0.5 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.5</span><span class="fine">Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</span></div>
 </footer>
 
 <script>
@@ -561,6 +564,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
   ];
   var MODELS_GPU_GB = [12, 24, 32], MODELS_CHECKED = "2026-11-01";
   // models:end
+  var DISCLAIMER = "Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.";
   function modelOf() {  // the open-weight model picked, or null for the small model trained from a CSV today
     for (var i = 0; i < MODELS.length; i++) if (MODELS[i].name === state.model) return MODELS[i];
     return null;
@@ -686,14 +690,17 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       var wrap = document.createElement("div"), id = "in-" + key, input;
       wrap.className = key === "model" ? "field wide" : "field";
       var lab = document.createElement("label"); lab.htmlFor = id; lab.textContent = fields[key].label;
-      if (key === "model") input = modelSelect();
-      else {
+      if (key === "model") {
+        input = modelSelect();
+        var fine = document.createElement("p"); fine.className = "fine"; fine.textContent = DISCLAIMER;
+      } else {
         input = document.createElement("input");
         input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.value = state[key];
         input.addEventListener("input", function () { update(key, input.value); });
       }
       input.id = id;
       wrap.append(lab, input);
+      if (key === "model") wrap.appendChild(fine);
       controls.appendChild(wrap);
     });
   }

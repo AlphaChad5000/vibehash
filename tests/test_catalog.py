@@ -17,10 +17,12 @@ from pathlib import Path
 from unittest import mock
 
 from tests.test_hub import FakeHub, HubTestCase, shard1, shard2, sharded_files, single_files
-from vibehash import catalog, cli, hub
+from vibehash import catalog, cli, emblems, hub
 from vibehash.catalog import Facts, Model
 
 ROOT = Path(__file__).resolve().parent.parent
+DISCLAIMER = ("Disclaimer: All product names, logos, and brands are property of their respective owners and are used "
+              "purely for identification. Vibe Hash isn't affiliated with or endorsed by them.")  # the owner's words
 NOWHERE = "http://127.0.0.1:9"  # the discard port: refused at once
 
 
@@ -221,6 +223,7 @@ class ModelsCommandTests(CatalogTestCase):
         self.assertRegex(out, r"tiny\s+acme/tiny\s+38,049\s+2 of 8\s+\S+ kB\s+mit\s+no\s+1 / 1 / 1")
         self.assertIn("moe ", out)
         self.assertIn("train --base NAME` shows what training one would take; it posts nothing", out)
+        self.assertEqual(out.rstrip("\n").split("\n")[-1], DISCLAIMER)  # the last line
         os.environ["COLUMNS"] = "70"
         out = self.run_cli("models")[1]
         self.assertNotIn("acme/tiny", out)  # too narrow for the repositories
@@ -238,6 +241,7 @@ class ModelsCommandTests(CatalogTestCase):
                          ("acme/tiny", "coming", "mit", False, 8, None))
         self.assertEqual(tiny["team"], {"12": 1, "24": 1, "32": 1})
         self.assertEqual(len(tiny["commit"]), 40)
+        self.assertEqual(d["disclaimer"], DISCLAIMER)
 
     def test_with_no_hub_and_nothing_cached_it_says_so(self):
         os.environ["HF_ENDPOINT"] = NOWHERE
@@ -365,6 +369,15 @@ class GuideTests(unittest.TestCase):
             self.assertTrue(r["params"] and r["weights"] and r["licence"], r)
         self.assertRegex(block, r'MODELS_CHECKED = "\d{4}-\d\d-\d\d"')
         self.assertIn("A small model sized to your data (works today)", page)
+
+    def test_the_disclaimer_is_wherever_model_names_and_emblems_are(self):
+        self.assertEqual(catalog.DISCLAIMER, DISCLAIMER)
+        page = (ROOT / "docs" / "guide.html").read_text(encoding="utf-8")
+        self.assertIn(f'var DISCLAIMER = "{DISCLAIMER}";', page)  # under the Train tab's model menu
+        self.assertRegex(page, re.escape(f'<span class="fine">{DISCLAIMER}</span></div>') + r"\s*</footer>")
+        self.assertIn('fine.textContent = DISCLAIMER', page)
+        for text in ((ROOT / "README.md").read_text(encoding="utf-8"), emblems.__doc__):
+            self.assertIn(DISCLAIMER, " ".join(text.split()))  # however the lines wrap
 
     def test_what_the_hub_says_cant_break_out_of_the_page_script(self):
         """A licence name is anyone's text: a `</script>` in it must not end the guide's inline script."""
