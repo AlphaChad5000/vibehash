@@ -244,10 +244,21 @@ describes the model. What matters for the plan:
   amplified that to 1% rms.
 - **Choices are inputs.** Routing, indexer picks and candidate blocks can be
   given (`Choices`); what isn't given is computed and returned, with its scores
-  on request. `choice_gap` measures how far a choice is from a top-k.
+  on request. Given ones must be well formed or the forward refuses them
+  (`check_experts`, `check_picks`): no expert or position twice, none out of
+  range, picks ascending, and "none" (-1) only where fewer than `index_topk`
+  positions are open. Otherwise a worker could name its top expert twice and
+  skip the second one's work. `choice_gap` and `candidate_gap` measure how far a
+  committed choice is from a top-k of the scores, and give +inf to one that
+  isn't a top-k in form.
 - **Side channels are explicit** (`Side`): compressed keys (with a gradient),
-  index keys and picks, from source layers to the layers after them. A
-  `Model` can hold any run of layers, with or without the embedding and head.
+  index keys and picks, from source layers to the layers after them. A `Model`
+  can hold any run of layers, with or without the embedding and head. A run
+  that starts after a source must be given the stream, `pre_mix`, the `Side`
+  of the last kv and index sources before it, the candidate source's blocks
+  if it picks inside them, and the engram hashes. Its layers refuse to run
+  without what they reuse, rather than quietly attending to the window alone.
+  Given those, a shard reproduces the whole model to the bit.
 - **Downloading**: `fetch_file` and `load_layer` fetch whole weight files of
   the pinned commit into `~/.vibehash/cache/deepseek`, 64 MiB pieces over six
   connections, and check each against the Hub's sha256.
@@ -271,6 +282,12 @@ which needs a Hopper or Blackwell GPU.
 | ModelArgs defaults, random weights (CPU, CUDA) | 0.6–2e-3 rms, ≤1.7e-2 max | ≥99.2% routing, 100% picks | logits 5% rms, 7% max |
 | Every feature on (engram, candidate blocks, YaRN, clamps) | ≤1.7e-2 max | ≥99.6% routing, 100% picks | logits ≤6% max |
 | **Real layer 2, 2,048 README tokens, GPU** | **2.7e-3 rms, 4.6e-3 max** | 99.76% routing, 99.95% picks | |
+
+Candidate blocks, in the small model with every feature on: this code's are the
+reference's for every token, on the CPU and on CUDA, and `candidate_blocks`
+equals the reference's `select_candidate_blocks` bit for bit on the same scores.
+In CI, a reference that can't be fetched fails the tests instead of skipping
+them.
 
 Per layer means each layer gets the reference's input, side channels and
 choices. That's where the proof is: random-weight models are chaotic. A 1e-3
@@ -316,4 +333,7 @@ config was checked by finite differences); real layers of other kinds (0:
 window only; 20: candidate source; 1 and 14: engram, which needs the tables or
 a slice of them); real hidden states for layer 2 (its input here is token
 embeddings, as layer 0 sees them, since layer 1's output needs its 101 GB
-table); other GPU vendors; the tilelang kernels themselves; decoding.
+table); other GPU vendors; the tilelang kernels themselves; decoding. And
+`Model.run` takes engram hashes only, not table rows, so a model built with
+`engram_table=False` can't run its engram layers through it yet: a block takes
+`rows` directly, and wiring them through is part of step 4.

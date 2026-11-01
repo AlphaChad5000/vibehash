@@ -258,8 +258,91 @@ class ChoiceTests(unittest.TestCase):
     def test_choice_gap(self):
         scores = torch.tensor([[0.1, 0.5, 0.3, 0.9], [1.0, -math.inf, 2.0, 0.0]], dtype=torch.float64)
         self.assertEqual(deepseek.choice_gap(scores, torch.tensor([[3, 1], [2, 0]])).tolist(), [-0.2, -1.0])
-        self.assertAlmostEqual(float(deepseek.choice_gap(scores, torch.tensor([[3, 2], [2, -1]]))[0]), 0.2)
+        gap = deepseek.choice_gap(scores, torch.tensor([[3, 2], [2, -1]]))
+        self.assertAlmostEqual(float(gap[0]), 0.2)
+        self.assertEqual(float(gap[1]), math.inf)  # a free slot while position 0 (finite) is left out
+        # -1 is padding only where fewer than k options are open: 3 finite scores, 4 slots
         self.assertEqual(float(deepseek.choice_gap(scores[1:], torch.tensor([[2, 0, 3, -1]]))[0]), -math.inf)
+        # Naming the top expert twice, or dropping one, is no top-2: it would skip the second expert's work.
+        top3 = torch.tensor([[0.9, 0.8, 0.1]] * 5, dtype=torch.float64)
+        gap = deepseek.choice_gap(top3, torch.tensor([[0, 1], [0, 0], [0, -1], [0, 3], [-2, 1]]))
+        self.assertAlmostEqual(float(gap[0]), -0.7)
+        self.assertEqual(gap[1:].tolist(), [math.inf] * 4)
+
+    def test_candidate_gap(self):
+        # 8 positions in blocks of 2; the query sees 7, so block 3 (positions 6, 7) is its newest: always kept.
+        score = torch.tensor([[[0.5, 0.1, 0.9, 0.2, 0.3, 0.0, 0.4, -math.inf]]], dtype=torch.float64)
+        visible = torch.tensor([[7]])
+        keep = deepseek.candidate_blocks(score, visible, 2, 2)
+        self.assertEqual(keep[0, 0].tolist(), [False, False, True, True, False, False, True, True])
+        self.assertLessEqual(float(deepseek.candidate_gap(score, visible, keep, 2, 2)), 0)
+        other = torch.tensor([[[True, True, False, False, False, False, True, True]]])  # block 0 (0.5) over 1 (0.9)
+        self.assertAlmostEqual(float(deepseek.candidate_gap(score, visible, other, 2, 2)), 0.4)
+        for bad in ([True, True, True, True, False, False, False, False],  # drops the pinned block
+                    [False, False, True, False, False, False, True, True],  # half a block
+                    [True, True, True, True, False, False, True, True],  # three blocks
+                    [False, False, False, False, False, False, True, True]):  # an empty slot, open blocks left
+            mask = torch.tensor([[bad]])
+            self.assertEqual(float(deepseek.candidate_gap(score, visible, mask, 2, 2)), math.inf, bad)
+
+    def test_malformed_choices_are_refused(self):
+        cfg, state, tokens, tmap = tiny_setup()
+        model = model_for(cfg, state)
+        with torch.no_grad():
+            _, choices = model(tokens, token_map=tmap)
+            experts = choices.experts[2].clone()
+            experts[0, 1] = experts[0, 0]  # the top expert twice
+            for bad in (experts, choices.experts[2].clamp(max=-1), choices.experts[2] + cfg.n_routed_experts,
+                        choices.experts[2][:, :1]):
+                with self.assertRaisesRegex(ValueError, "routing"):
+                    model(tokens, Choices({**choices.experts, 2: bad}, dict(choices.picks), choices.candidates),
+                          token_map=tmap)
+            picks = choices.picks[1]  # layer 1: ratio 2, 6 compressed tokens of 12, 3 picks each
+            unsorted, dup, unseen, dropped = (picks.clone() for _ in range(4))
+            unsorted[:, -1] = torch.tensor([2, 1, 0])
+            dup[:, -1] = torch.tensor([0, 0, 1])
+            unseen[:, 3] = torch.tensor([0, 1, 2])  # token 3 sees only compressed tokens 0 and 1
+            dropped[:, -1] = torch.tensor([0, 1, -1])  # a slot left empty while 6 are visible
+            for bad in (unsorted, dup, unseen, dropped):
+                with self.assertRaisesRegex(ValueError, "picks"):
+                    model(tokens, Choices(dict(choices.experts), {**choices.picks, 1: bad}, choices.candidates),
+                          token_map=tmap)
+
+    def test_a_shard_needs_what_its_layers_reuse(self):
+        cfg, state, tokens, tmap = tiny_setup()
+        model = model_for(cfg, state)
+        with torch.no_grad():
+            logits, choices = model(tokens, token_map=tmap)
+            hashes = deepseek.engram_hashes(tokens, tmap, cfg)
+            x, pre = model.start(tokens)
+            side = Side()
+            for i in (0, 1):
+                x, pre = model.layers[str(i)](x, pre, side, choices, hashes[:, :, 0] if i == 1 else None)
+            rest = {k: v for k, v in state.items() if not k.startswith(("layers.0.", "layers.1.", "embed."))}
+            shard = model_for(cfg, rest, layers=[2, 3, 4], embed=False)
+            # Given what layers 0 and 1 handed on, the shard is the rest of the model, to the bit.
+            y, ypre = shard.run(x, pre, Side(side.compress_kv, side.index_k, side.picks), choices, hashes)
+            self.assertTrue(torch.equal(shard.logits(y, ypre), logits))
+            # Without layer 1's compressed keys, layer 2 refuses rather than attend to its window alone.
+            with self.assertRaisesRegex(ValueError, "layer 2 reuses layer 1's compress_kv"):
+                shard.run(x, pre, Side(), choices, hashes)
+            with self.assertRaisesRegex(ValueError, "layer 2 reuses layer 1's picks"):
+                shard.run(x, pre, Side(side.compress_kv, side.index_k), choices, hashes)
+            # Layer 4 picks with layer 3's compressed keys and index keys, inside layer 3's candidate blocks.
+            tail = model_for(cfg, {k: v for k, v in state.items() if k.startswith("layers.4.")}, layers=[4],
+                             embed=False, head=False)
+            three = Side()
+            x3, pre3 = shard.layers["2"](x, pre, Side(side.compress_kv, side.index_k, side.picks), choices)
+            x3, pre3 = shard.layers["3"](x3, pre3, three, choices, hashes[:, :, 0])
+            with self.assertRaisesRegex(ValueError, "layer 4 reuses layer 3's compress_kv"):
+                tail.run(x3, pre3, Side(), Choices(), hashes)
+            with self.assertRaisesRegex(ValueError, "layer 4 reuses layer 3's index_k"):
+                tail.run(x3, pre3, Side(three.compress_kv), Choices(), hashes)
+            with self.assertRaisesRegex(ValueError, "candidate"):
+                tail.run(x3, pre3, Side(three.compress_kv, three.index_k), Choices(), hashes)
+            own = Choices(candidates=choices.candidates)
+            tail.run(x3, pre3, Side(three.compress_kv, three.index_k), own, hashes)
+            self.assertTrue(torch.equal(own.picks[4], choices.picks[4]))  # the same picks as the whole model's
 
     def test_computed_choices_have_no_gap(self):
         cfg, state, tokens, tmap = tiny_setup()
@@ -283,7 +366,8 @@ def compare_layers(test, cfg, state, tokens, tmap, device="cpu"):
             x, pre = r.block_in[i]
             x = r.engram_in.get(i, x)
             given = Choices({i: r.experts[i]}, {i: r.picks[i]} if i in r.picks else {}, r.candidates)
-            mine = Choices(keep_scores=True, candidates=r.candidates)
+            # The candidate source makes its own blocks; the layers after it pick inside the reference's.
+            mine = Choices(keep_scores=True, candidates=None if i == cfg.candidate_source_layer else r.candidates)
             hashes = r.hashes.get(i)
             y, ypre = block(x, pre, reference.side_for(cfg, r, i), given, hashes)
             block(x, pre, reference.side_for(cfg, r, i), mine, hashes)
@@ -306,6 +390,14 @@ def choice_report(cfg, r, own):
             size = scores.masked_fill(~scores.isfinite(), 0).abs().amax(-1).clamp_min(1e-30)
             gap = deepseek.choice_gap(scores, theirs.to(ours.device)) / size
             out[(kind, i)] = float(same), float(gap.max())
+        if i == cfg.candidate_source_layer:
+            scores = mine.scores[("picks", i)].float()
+            size = scores.masked_fill(~scores.isfinite(), 0).abs().amax(-1).clamp_min(1e-30)
+            visible = (torch.arange(1, scores.size(1) + 1, device=scores.device) // cfg.ratio(i)).unsqueeze(-1)
+            theirs = r.candidates.to(scores.device)
+            gap = deepseek.candidate_gap(scores, visible, theirs, cfg.candidate_topk_blocks,
+                                         cfg.candidate_block_size) / size
+            out[("candidates", i)] = float((mine.candidates == theirs).all(-1).float().mean()), float(gap.max())
     return out
 
 
@@ -314,10 +406,13 @@ class ReferenceCase(unittest.TestCase):
     def setUpClass(cls):
         if torch is None:
             raise unittest.SkipTest("needs PyTorch 2.8 or later")
+        import os
         from vibehash.hub import HubError
         try:
             reference.load()
         except (HubError, OSError) as e:
+            if os.environ.get("CI"):  # in CI the comparison is the point: an outage mustn't turn it green
+                raise
             raise unittest.SkipTest(f"DeepSeek's reference code isn't cached and can't be fetched: {e}")
 
     # Measured (2026-11-01, CPU and an RTX 4070 SUPER), with about 2x headroom. The yardstick: the reference itself,
@@ -330,7 +425,7 @@ class ReferenceCase(unittest.TestCase):
     # A reference choice may lose to one it left out, under this code's scores on the same block input, by this much
     # relative to the row's best score. Routing is float32, but its input comes after FP8-rounded attention: measured
     # at most 7e-4 (one token in 320). Index scores are bf16: measured 0.
-    MARGIN = {"experts": 2e-3, "picks": 2 * BF16_EPS}
+    MARGIN = {"experts": 2e-3, "picks": 2 * BF16_EPS, "candidates": 2 * BF16_EPS}
 
     def check(self, cfg, state, tokens, tmap=None, device="cpu"):
         r, model, errors, own = compare_layers(self, cfg, state, tokens, tmap, device)
@@ -338,10 +433,22 @@ class ReferenceCase(unittest.TestCase):
             self.assertLess(erms, self.LAYER_RMS, f"layer {i}'s stream, rms")
             self.assertLess(e, self.LAYER_MAX, f"layer {i}'s stream")
             self.assertLess(epre, self.PRE_MAX, f"layer {i}'s pre_mix")
-        for (kind, i), (same, gap) in choice_report(cfg, r, own).items():
+        report = choice_report(cfg, r, own)
+        for (kind, i), (same, gap) in report.items():
             # The reference's own choice, scored by this code on the same input: a top-k up to rounding.
             self.assertLessEqual(gap, self.MARGIN[kind], (kind, i, same))
             self.assertGreater(same, 0.99, (kind, i))
+        c = cfg.candidate_source_layer
+        if 0 <= c < cfg.n_layers:
+            self.assertIn(("candidates", c), report)
+            # The block choice itself, on the same scores: the reference's select_candidate_blocks, to the bit.
+            scores = own[c].scores[("picks", c)]
+            visible = (torch.arange(1, scores.size(1) + 1, device=scores.device) // cfg.ratio(c)).unsqueeze(-1)
+            want = reference.load().select_candidate_blocks(scores, visible, cfg.candidate_topk_blocks,
+                                                            cfg.candidate_block_size)
+            got = deepseek.candidate_blocks(scores, visible, cfg.candidate_topk_blocks, cfg.candidate_block_size)
+            self.assertTrue(torch.equal(got, want))
+            self.assertTrue(torch.equal(got, own[c].candidates))
         with torch.no_grad():
             logits, _ = model(tokens.to(device), Choices(r.experts, r.picks, r.candidates), token_map=tmap)
         self.assertLess(rms(logits, r.logits), self.LOGITS_RMS)
