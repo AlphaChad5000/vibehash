@@ -648,10 +648,17 @@ class Hub:
             dtype = f"{dtype or '?'}, {quant['quant_method']}" + (f" ({quant['fmt']})" if quant.get("fmt") else "")
         st = info.get("safetensors") if isinstance(info.get("safetensors"), dict) else {}
         archs = config.get("architectures")
+        # A model that also reads images (DeepSeek-V4.1, Llama 4, Gemma 3) keeps its language model's shape in
+        # text_config, beside a vision_config whose layers aren't the ones a job splits.
+        text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+
+        def count(key: str) -> int | None:
+            return next((c[key] for c in (config, text) if type(c.get(key)) is int), None)
+
         # Mixture-of-experts configs name their expert count differently by family (DeepSeek, Mixtral, Qwen MoE).
-        experts = next((config[k] for k in ("n_routed_experts", "num_local_experts", "num_experts")
-                        if type(config.get(k)) is int), None)
-        active = config.get("num_experts_per_tok") if type(config.get("num_experts_per_tok")) is int else None
+        experts = next((n for k in ("n_routed_experts", "num_local_experts", "num_experts")
+                        if (n := count(k)) is not None), None)
+        active = count("num_experts_per_tok")
         return ModelSummary(
             repo=repo, revision=rev or "the default branch", commit=commit, gated=bool(info.get("gated")),
             licence=str(licence) if licence else None,
@@ -661,8 +668,7 @@ class Hub:
             weight_files=len(weights), weight_bytes=sum(listing[p].size for p in weights),
             has_tokenizer="tokenizer.json" in listing,
             pickle_only=not weights and any(p.endswith(PICKLES) for p in listing),
-            layers=config.get("num_hidden_layers") if type(config.get("num_hidden_layers")) is int else None,
-            experts=experts, experts_per_token=active, config=config)
+            layers=count("num_hidden_layers"), experts=experts, experts_per_token=active, config=config)
 
 
 def _next_link(link: str | None) -> str | None:
