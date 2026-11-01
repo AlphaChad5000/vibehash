@@ -46,6 +46,7 @@ class TrainingJob:
     tolerance: float = 1e-6  # relative distance allowed between replay and claim
     max_update_ratio: float = 0.5  # |final - start| / |start| must stay below this
     compute_s: float = 0.0  # a compute phase the job asks for, in seconds; 0: sized from the job (phase_lengths)
+    shards: int = 1  # blocks of layers a unit is split into, one worker each (shards.py, SHARDING.md); 1: whole units
     _data: Dataset | None = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -66,6 +67,8 @@ class TrainingJob:
         }
         if self.compute_s:  # left out otherwise, so specs posted before it existed are unchanged
             spec["compute_s"] = self.compute_s
+        if self.shards > 1:  # likewise
+            spec["shards"] = self.shards
         return spec
 
     def spec_json(self) -> str:
@@ -88,6 +91,7 @@ class TrainingJob:
                 checkpoint_every=int(d["checkpoint_every"]), units_per_round=int(d["units_per_round"]),
                 memory_mb=int(d["memory_mb"]), tolerance=float(d["tolerance"]),
                 max_update_ratio=float(d["max_update_ratio"]), compute_s=float(d.get("compute_s", 0)),
+                shards=int(d.get("shards", 1)),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
             raise InvalidJob(f"malformed job spec: {e}") from e
@@ -112,6 +116,9 @@ class TrainingJob:
         need(self.fee_per_round >= 0 and self.budget >= 0, "negative fee or budget")
         need(self.compute_s == 0 or 5 <= self.compute_s <= MAX_COMPUTE_S,
              f"compute_s is 0 (sized from the job) or 5-{MAX_COMPUTE_S:.0f} seconds")
+        n_layers = len(self.spec.widths) - 1
+        need(isinstance(self.shards, int) and 1 <= self.shards <= n_layers,
+             f"shards is 1 (whole units) to the model's {n_layers} layers: a shard is a block of whole layers")
         kind = self.data_source.get("kind")
         if kind == "synthetic":
             need(isinstance(self.data_source.get("seed"), int), "synthetic data needs an integer seed")
@@ -136,6 +143,11 @@ class TrainingJob:
             raise InvalidJob("dataset hash does not match the job's commitment")
         data.check_shape(self.spec)
         self._data = data
+
+    @property
+    def sharded(self) -> bool:
+        """Whether its units are trained by teams, one worker per shard (coordinator.py, shards.py)."""
+        return self.shards > 1
 
     @property
     def wire_dtype(self) -> str:

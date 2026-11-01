@@ -13,11 +13,14 @@ import hashlib
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 CHUNK = 8 * 2**20  # transfer unit, not a size limit
+MAX_DATASET = 20 * 2**30  # the biggest dataset a node takes (so the biggest a download can be)
+STALE_PART_S = 24 * 3600  # a partial transfer nothing has written to for this long was abandoned
 _ID = re.compile(r"^[0-9a-f]{64}$")
 _OWNER = re.compile(r"^[0-9a-z]{0,64}$")
 
@@ -83,14 +86,18 @@ class BlobStore:
             os.replace(tmp, self.path(blob_id))
         return blob_id
 
-    def write_chunk(self, blob_id: str, offset: int, chunk: bytes, total: int, owner: str = "") -> int:
-        """Append one chunk of `owner`'s upload. Returns bytes received so far.
+    def write_chunk(self, blob_id: str, offset: int, chunk: bytes, total: int, owner: str = "", check=None) -> int:
+        """Append one chunk of `owner`'s upload. Returns bytes received so far (a finished file's real size, whatever
+        `total` says).
 
         Chunks must arrive in order (offset == bytes already received), which makes
-        retries safe: a repeated chunk is ignored. The finished file must hash to its id.
+        retries safe: a repeated chunk is ignored. The finished file must hash to its id,
+        and pass `check(path)` if given (a dataset must load) before it's kept: so only the
+        write that completes a file vets it, and a file once kept is never thrown away.
         """
-        if self.has(blob_id):
-            return total
+        done = self.size(blob_id)
+        if done is not None:
+            return done
         part = self._part(blob_id, owner)
         have = part.stat().st_size if part.exists() else 0
         if offset < have and offset + len(chunk) <= have:
@@ -106,6 +113,12 @@ class BlobStore:
             if file_sha256(part) != blob_id:
                 part.unlink(missing_ok=True)
                 raise BlobError("upload doesn't match its id; discarded")
+            if check is not None:
+                try:
+                    check(part)
+                except BaseException:
+                    part.unlink(missing_ok=True)
+                    raise
             with self._finishing:
                 if self.has(blob_id):  # another uploader finished first; same bytes, and the file may be in use
                     part.unlink(missing_ok=True)
@@ -146,6 +159,19 @@ class BlobStore:
                 removed += 1
             except OSError:
                 pass  # still mapped somewhere; the next prune gets it
+        return removed
+
+    def prune_partial(self, keep: set[str] = frozenset(), older_than: float = 0.0) -> int:
+        """Delete partial transfers, except those of blobs in `keep` and any written to in the last `older_than`
+        seconds: one that stopped part way (a node that went away, or lied about the size) otherwise stays for good."""
+        now, removed = time.time(), 0
+        for p in self.root.glob("*.part"):
+            try:
+                if p.name.split(".")[0] not in keep and now - p.stat().st_mtime >= older_than:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
         return removed
 
 

@@ -160,13 +160,13 @@ class Store:
             tmp.replace(dest)
         return sha
 
-    def check_uploaded_dataset(self, sha256: str) -> None:
-        """Called when a chunked upload completes: keep it only if it's a real, pickle-free dataset."""
-        path = self.dataset_path(sha256)
+    def check_dataset(self, path: Path) -> None:
+        """Raises InvalidJob unless `path` is a real, pickle-free dataset (with no more data than its size allows, see
+        Dataset.from_npz). Uploads and downloads run it on the finished file before it's kept (BlobStore.write_chunk),
+        so a dataset in the store never needs deleting, even when a check fails for some other reason."""
         try:
             Dataset.from_npz(path)
         except Exception as e:
-            path.unlink(missing_ok=True)
             raise InvalidJob(f"not a valid dataset: {e}") from e
 
     def attach_dataset(self, job: TrainingJob) -> None:

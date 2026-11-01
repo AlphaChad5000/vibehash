@@ -82,8 +82,18 @@ a small but **steady** income, with no need for a mining pool.
    `H(unit_id ‖ pubkey ‖ merkle_root ‖ salt)`. Nothing about the result is
    revealed yet, so other workers cannot copy it.
 4. **Beacon.** After the deadline, the round's randomness is
-   `beacon = H(prev_block_hash ‖ all commitments)`. Nobody can know it before
-   committing, so nobody can predict which segments will be checked.
+   `beacon = H(prev_block_hash ‖ round secret ‖ all commitments)`. Nobody can
+   know it before committing, so nobody can predict which segments will be
+   checked. The round secret is drawn by the round's leader when it opens the
+   round. It publishes the secret's hash in `/status` (`beacon_commit`) right
+   away and the secret itself only in the sealed round's record. Without the
+   secret, a worker that knew every commitment could re-salt its own until the
+   checks missed what it faked: a worker alone in a round, say. A worker
+   managed 4 half-faked units in 4 seconds. Workers check the record's
+   commitment against the one they saw, so the leader can't swap the secret
+   after seeing the commitments either. A leader that also mines in a round
+   it leads still knows the secret; the rounds other validators lead are
+   safe from it.
 5. **Reveal.** Workers reveal `merkle_root`, `salt`, the final weights, and
    the checkpoints the beacon selected (first, last, and both ends of each
    challenged segment) with Merkle proofs. A reveal that doesn't match its
@@ -112,7 +122,19 @@ a small but **steady** income, with no need for a mining pool.
    agree. On disagreement, a full replay decides who lied.
 9. **Verifier audits.** The protocol slips **canary** submissions (known-fake)
    into verifiers' queues. A verifier that approves a canary is lazy and is
-   slashed. Verifiers can't tell canaries from real work.
+   slashed. Verifiers can't tell canaries from real work. A canary is a copy
+   of a real task with one segment's update rescaled by 15–25%:
+   - it fails a replay;
+   - it keeps the structure and size of honest training, unlike random
+     noise, which shows without one (honest updates to a softmax layer's
+     biases sum to zero);
+   - it goes to a checker that holds neither the unit nor a real task on it;
+   - its task id is drawn, like every task id, from the round secret.
+
+   Before that secret existed, canary ids followed from the public beacon,
+   and a checker that replayed nothing picked out every canary (176 of 176
+   tasks in a simulation) and was paid in full. A round needs three staked
+   workers able to check before it can plant a canary.
 10. **Aggregate.** Accepted updates are averaged into `W_{r+1}` (local-SGD /
     federated averaging). Validation loss is tracked so the requester sees
     their model improve.
@@ -146,9 +168,9 @@ tiny amount of work, so it's not worth the risk either.
 | Do half the steps and interpolate | Replay spot-check, redundancy |
 | Copy another worker's answer | Commit–reveal bound to pubkey; units have unique seeds |
 | Boost / poison the update | Final must equal last checkpoint; norm bound; replay |
-| Rubber-stamp as a verifier | Canary submissions; slashing |
+| Rubber-stamp as a verifier | Canary submissions that look like real work and whose ids come from a secret; slashing |
 | Sybil (split one big rig into many identities to farm bonuses) | No per-identity bonus exists; pay is per verified FLOP; each identity needs stake; new identities start with lower reputation |
-| Predict which segments get checked | Beacon depends on all commitments, published after the deadline |
+| Predict which segments get checked | Beacon depends on all commitments and the leader's committed round secret, published after the deadline |
 | Commit, see the challenge, then withdraw | Forfeits the whole round; unprofitable whenever mining is profitable (see §3 step 5) |
 | Hog units and never deliver | Withholding resets capacity to the newcomer cap; reputation drops |
 | Unstake right before getting caught | Unstaked coins sit in a 20-round unbonding queue and stay slashable |
@@ -192,7 +214,12 @@ chain state and is derived from round summaries, so every node agrees on it.
 
 **Slashing** takes 50 % of the offender's stake (including coins still
 unbonding). Half goes to whoever caught it as a bounty, half is burned. An
-offender is slashed at most once per round and forfeits that round's earnings.
+offender is slashed at most once per round and forfeits that round's earnings,
+including the proposer's share if it proposed that round's block. A slash
+takes withdrawable stake first, then unbonding coins, then bootstrap stake
+(§6), and the part that comes from bootstrap stake is always burned, never
+paid as a bounty, so a validator can't turn it into spendable coins by having
+its own second identity catch it.
 
 All amounts are integers in **syn** (1 VIBE = 10^8 syn), and leftovers from
 rounding are burned, so supply is exactly
@@ -213,15 +240,20 @@ round it completes work instead of almost never, as in lottery mining.
   installed, otherwise a slow pure-Python fallback). User transactions are
   `transfer`, `stake`, `unstake`, `post_job` (escrow a budget; the job spec is
   stored on chain and validated), `cancel_job` (refund what's left of the
-  escrow) and `validator` (announce the address a staked account's validator
-  node is reachable at, or leave the set). Only a chain whose genesis names
-  validators can add more, so nobody can take over a one-node chain by
-  announcing themselves, and the last validator can't leave.
+  escrow, after the fee the block's own round owes, so cancelling in the
+  middle of a round doesn't get that round's work for free) and `validator`
+  (announce the address a staked account's validator node is reachable at, or
+  leave the set). Only a chain whose genesis names validators can add more, so
+  nobody can take over a one-node chain by announcing themselves. Neither
+  leaving nor unstaking may leave the chain with no validator that has a vote,
+  since then nobody could propose a block. (A slash can't be refused, so it
+  still can.)
   Each needs a valid signature, the sender's next nonce, and the right
   **chain id**.
 - **Unstaking** moves coins into a 20-round unbonding queue where they can
   still be slashed, so a cheater can't pull their stake out before the
-  verdict lands.
+  verdict lands. Coins whose 20 rounds end at a block are released after that
+  block's slashes, so they can't slip out in the very block that slashes them.
 - **A fair start.** Bitcoin needed no stake: a hash proves itself, so anyone
   with a CPU could mine from block one. Training can only be spot-checked,
   so a stake is what a cheater stands to lose. But if every stake has to be
@@ -276,12 +308,20 @@ round it completes work instead of almost never, as in lottery mining.
   choice from public seeds:
   - which units each worker gets and which are duplicated: the previous block
     and the round's signed registrations;
-  - who checks whom and the planted fakes: the beacon;
+  - who checks whom and the planted fakes: the beacon and the round secret
+    (step 4), which the record reveals once every verdict is in;
   - how much each worker may take: its delivered work on chain;
   - which job runs: the job after the last round's.
 
   It uses a hash-based generator (`crypto.Draw`) that gives the same draws on
-  every machine and library version. `replay.py` re-runs the round from the
+  every machine and library version. Three draws still come from NumPy's
+  generators: the challenged segments, each step's batch and a job's starting
+  weights. NumPy doesn't promise those stay the same across versions, so
+  `tests/test_record_v2.py` pins their outputs, and a NumPy that changed them
+  fails the tests rather than splitting the network. Sharded jobs' rounds (SHARDING.md) are recorded as version 3, which adds the teams and the signed edge evidence; nodes don't run those yet. Records carry a version:
+  version 2 brought the round secret, and a replay follows each record's own
+  version, so older rounds replay as they were run. Validators vote only for
+  proposals whose record is the current version. `replay.py` re-runs the round from the
   record with the same `Coordinator` code and compares every field of the
   summary. Nodes serve records at `GET /round/<height>/record`.
 - **Receipts.** The node answers each accepted registration, commitment,
@@ -535,6 +575,11 @@ Being explicit about what this is and isn't:
   of each unit, each verify task downloads about 2q of them, and the node
   keeps every opened one for its challenge window. Next: upload only the
   checkpoints the beacon challenges, and send them at 16-bit precision.
+  Beyond what one computer holds, [SHARDING.md](SHARDING.md) splits a model
+  into shards trained by a team of workers as a pipeline. Each shard's work
+  is checked one cell (one shard over one segment) at a time, so no worker,
+  checker or arbitrating node ever runs the whole model. That document has
+  the design, and `shards.py` a tested prototype of its core.
 - **Security review.** None of this has been audited. Don't put real value
   on it, and get legal advice before issuing a token anyone can buy.
 
@@ -586,9 +631,15 @@ before recovery words load as they are.
   pending transaction's nonce can't be reused.
 - Worker protocol messages (register, commit, reveal, verdict) aren't
   transactions and stay free. Stake and the rate limits bound them.
-- Blocks still take the whole mempool, so today fee order sets the order
-  inside a block. Once blocks have a size limit, the cut falls at the lowest
-  fees.
+- **Block size.** A block's user transactions may take at most 1 MiB as JSON
+  (`ledger.MAX_BLOCK_TX_BYTES`), which leaves room for the round record in the
+  4 MiB proposal a leader sends. A block takes the mempool in fee order until
+  the next transaction wouldn't fit, so the lowest fees wait for a later block.
+- **Relay policy.** On top of what makes a transaction valid, a node relays
+  none over 16 KiB, no `transfer`, `stake` or `unstake` memo over 256 bytes
+  (it's only a note), and no `post_job` whose budget can't pay for one round.
+  Blocks don't enforce these; they keep what a node holds, and so what it
+  proposes, to sensible sizes.
 
 ### Issuance schedule (`economics.Economics`)
 
@@ -673,6 +724,34 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
 - **Timeouts.** 20 s per read while the request line and headers arrive,
   against slow-loris, then 120 s per operation for bodies and replies. An
   8 MB checkpoint chunk takes a while on a slow home link.
+- **Message sizes.** A request body needs a plain decimal `Content-Length`
+  (anything else, a negative one included, gets `400`).
+  - A worker message may carry only the fields its kind has, at most 4 KiB
+    (64 KiB for a reveal). The round record keeps those fields, rebuilt from
+    what was parsed, so nobody can pad records.
+  - A `/consensus` proposal may be up to 64 MiB on a validator of a chain
+    with several validators, since a large round's record is big. At most
+    two such bodies are read at once.
+  - Votes and proposals for later heights are queued only once their
+    signature checks out and their signer is a validator, at most 4 heights
+    ahead and 64 messages per sender.
+  - `/blocks` pages stop at about 4 MiB.
+  - Out-of-range numbers in paths and queries get `400`, not a traceback.
+- **Memory.** `vibehash node --max-job-mb N` (64 by default) refuses to
+  relay jobs whose checkpoints are larger. Building a job's starting weights
+  takes about seven times a checkpoint's size, and a round holds a few
+  copies, so 64 MB keeps a 2 GB server well clear.
+  - `/job/<id>` doesn't build the weights of a job that hasn't trained yet:
+    it reports their size, and `/job/<id>/model` answers 404 until there's a
+    trained model.
+  - A dataset's arrays are checked from their headers before loading, and
+    one that would unpack to more than 64 times its file size (or 64 MB, if
+    larger) is refused. Only the upload that completes a dataset checks it,
+    and a check never deletes one already accepted.
+- **Peers.** Sync gives up on a peer whose page adds nothing or whose block
+  it refuses, and moves on past a malformed reply. Clients cap what they read:
+  128 MiB of JSON, one chunk of binary, downloads at the size the job allows.
+  A follower only takes a leader hint that's a validator's address on chain.
 - **This computer is never limited by default.** Tests and local testnets run
   a node, up to 8 workers and several validators all from 127.0.0.1. Behind
   a reverse proxy every client looks local, so limit at the proxy, or pass
@@ -706,10 +785,37 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
   recovery words. `vibehash testnet`'s throwaway wallets are still plain
   random keys.
 
+### Block versions (`ledger.VERSION`)
+
+Fixing a ledger rule changes which blocks are valid, but a node re-applies
+every block on disk from genesis when it starts, and `chain verify` does the
+same. So blocks carry a version, and a rule applies only to blocks of the
+version that brought it and later. Version 1 blocks (everything 0.5.1 and
+earlier made) hash, serialise and settle exactly as before; from version 2
+the proposer signs the version, and it's in the block's JSON. A block's
+version can't be lower than its parent's or higher than the node knows, and
+validators only vote for blocks of the current version, so once a chain has
+a version 2 block it stays on version 2. Every validator must run a release
+that knows a version before any block of it appears: older nodes refuse it.
+
+Version 2 brought the block size limit above, and these fixes:
+- a transaction may appear only once in a block (`crypto.merkle_root` pads an
+  odd level by repeating its last node, so a block with its last transaction
+  repeated had the same hash and signature as the real one);
+- bootstrap stake is slashed last and only ever burned (§5);
+- coins finishing unbonding are released after the block's slashes (§6);
+- a `cancel_job` leaves the fee its job owes the block's own round (§6);
+- a proposer slashed in its own round isn't paid for proposing it (§5);
+- the last validator with a vote can't leave or unstake below the minimum
+  (§6);
+- the pool is split in exact fractions. Floats could round a payout up by a
+  syn, which a round with no verifiers then didn't catch.
+
 ### Still open
 
-- A block size limit (fees then decide what waits), replace-by-fee, and fee
-  estimation.
+- Replace-by-fee and fee estimation.
+- Transaction signatures name the chain id but not the genesis hash, so a
+  transaction could be replayed on a new network that reuses a chain id.
 - `check_tx` re-verifies every pending transaction for each new one, so
   admission is O(mempool). The `tx` bucket bounds that per address, but not
   across many addresses.

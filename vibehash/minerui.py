@@ -6,120 +6,31 @@ when VIBE lands. Below it: the round and phase, what the worker is doing, its sp
 work mined this session, earnings and stake, and the latest events.
 
 Plain ANSI escape codes, nothing to install. Only used on a real terminal; `--plain` (or
-piping the output) keeps the classic log. NO_COLOR turns the colours off.
+piping the output) keeps the classic log. NO_COLOR turns the colours off. What it shares
+with the training dashboard (trainui.py), from the palette and the rock to the screen
+handling, is in termui.py.
 """
 from __future__ import annotations
 
 import collections
 import logging
-import os
 import shutil
-import sys
 import threading
 import time
 from dataclasses import dataclass
 
+from . import termui
 from .client import NodeClient, NodeError, WorkerClient
 from .economics import REP_MAX, REP_MIN
-from .tasks import SYN_PER_VIBE
+from .termui import DIM, GOLD, GREEN, LAMP, PHASES, SPARKS, TEXT, TIMBER, WHITE, _cells, _fit, _line, _n, _noise, _si, _vibe, rgb
+from .termui import supported  # noqa: F401  (the commands ask minerui whether to show it)
 
-FPS = 12
-COLOR = not os.environ.get("NO_COLOR")
-RESET = "\x1b[0m" if COLOR else ""
-
-
-def rgb(r: int, g: int, b: int, bold: bool = False) -> str:
-    return f"\x1b[{'1;' if bold else ''}38;2;{r};{g};{b}m" if COLOR else ""
-
-
-DIM, TEXT, WHITE = rgb(125, 135, 148), rgb(205, 212, 220), rgb(240, 244, 248, True)
-GOLD, GREEN, YELLOW, RED = rgb(255, 200, 50, True), rgb(95, 225, 130, True), rgb(240, 200, 80), rgb(240, 95, 85)
-STRATA = [(96, 66, 50), (128, 90, 62), (158, 118, 82), (116, 104, 94), (82, 76, 74)]  # earth and stone layers
-LIGHT = [1.1, 0.95, 0.78]  # rock brightness in the tunnel: lit by a lantern, near one, between them
-ROCK = {(i, lit): rgb(*(min(255, int(v * LIGHT[lit])) for v in STRATA[i])) for i in range(5) for lit in range(3)}
-RAIL, TIE, CART, TIMBER = rgb(150, 152, 165), rgb(110, 86, 62), rgb(176, 116, 60), rgb(168, 112, 58)
-LAMP = rgb(255, 214, 120, True)
+RAIL, TIE, CART = rgb(150, 152, 165), rgb(110, 86, 62), rgb(176, 116, 60)
 DRILL, DRILL_DIM, TIP = rgb(80, 200, 255, True), rgb(60, 110, 140), rgb(225, 245, 255, True)
-SPARKS = [rgb(255, 225, 130, True), rgb(255, 160, 60, True), rgb(255, 250, 225, True), rgb(255, 110, 40)]
-PHASES = {"register": rgb(120, 170, 255, True), "compute": rgb(255, 180, 60, True), "reveal": rgb(200, 125, 255, True),
-          "verify": rgb(90, 220, 180, True), "idle": DIM}
 
-BANNER = ["█ █ █ █▄▄ █▀▀   █ █ ▄▀█ █▀ █ █",
-          "▀▄▀ █ █▄█ ██▄   █▀█ █▀█ ▄█ █▀█"]
-GLYPHS = {"shades": "█▓▒", "ore": "♦", "rail": "═", "tie": "╪", "full": "█", "top": "▄", "bottom": "▀",
-          "stripe": "▓", "tips": "►»>", "sparks": "*+·'`", "coin": "●", "bar": "█", "empty": "░", "cart": "▐▌",
-          "post": "║", "beam": "═", "lamp": "¤"}
-ASCII = {"shades": "#%=", "ore": "$", "rail": "=", "tie": "+", "full": "#", "top": "_", "bottom": "~",
-         "stripe": "=", "tips": ">>-", "sparks": "*+.'`", "coin": "o", "bar": "#", "empty": "-", "cart": "[]",
-         "post": "|", "beam": "=", "lamp": "*"}
+GLYPHS = {**termui.GLYPHS, "rail": "═", "tie": "╪", "stripe": "▓", "cart": "▐▌"}
+ASCII = {**termui.ASCII, "rail": "=", "tie": "+", "stripe": "=", "cart": "[]"}
 BAND, TUNNEL, RAILS = 7, (2, 3, 4), 4  # rows in the mine picture; the drill bores rows 2-4
-
-
-def _noise(x: int, y: int) -> int:
-    n = (x * 374761393 + y * 668265263) & 0xFFFFFFFF
-    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
-    return n ^ (n >> 16)
-
-
-def _vibe(syn: int, sign: bool = False) -> str:
-    return f"{syn / SYN_PER_VIBE:{'+' if sign else ''},.2f} VIBE"
-
-
-def _n(count: int, noun: str) -> str:
-    return f"{count:,} {noun}{'' if count == 1 else 's'}"
-
-
-def _fit(width: int, *options: str) -> str:
-    """The first (longest) option that fits."""
-    return next((o for o in options if len(o) <= width), options[-1][:max(0, width)])
-
-
-def _si(n: float, unit: str) -> str:
-    for scale, prefix in ((1e15, "P"), (1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "k")):
-        if n >= scale:
-            return f"{n / scale:.2f} {prefix}{unit}"
-    return f"{n:.0f} {unit}"
-
-
-def _line(segs, width: int) -> str:
-    """[(text, style), ...] cut to `width` visible characters."""
-    out, used = [], 0
-    for text, style in segs:
-        if used >= width:
-            break
-        text = text[:width - used]
-        out.append(f"{style}{text}{RESET}" if style else text)
-        used += len(text)
-    return "".join(out)
-
-
-def _cells(cells) -> str:
-    """[(char, style), ...] with runs of one style merged, so a frame stays small."""
-    out, style = [], None
-    for ch, st in cells:
-        if st != style:
-            out.append(RESET + (st or ""))
-            style = st
-        out.append(ch)
-    return "".join(out) + RESET
-
-
-def enable_ansi() -> bool:
-    """Turn on escape-code handling in a Windows console (Windows Terminal has it already)."""
-    if os.name != "nt":
-        return True
-    try:
-        import ctypes
-
-        k = ctypes.windll.kernel32
-        handle, mode = k.GetStdHandle(-11), ctypes.c_uint32()
-        return bool(k.GetConsoleMode(handle, ctypes.byref(mode)) and k.SetConsoleMode(handle, mode.value | 0x0004))
-    except (AttributeError, OSError):
-        return False
-
-
-def supported(plain: bool = False) -> bool:
-    return not plain and sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and enable_ansi()
 
 
 @dataclass
@@ -137,18 +48,6 @@ class Rig:
         return 0 if self.start is None or self.total is None else self.total - self.start
 
 
-class _Feed(logging.Handler):
-    def __init__(self, dash: "MinerDashboard"):
-        super().__init__()
-        self.dash = dash
-
-    def emit(self, record):
-        msg = record.getMessage()
-        if record.exc_info and record.exc_info[1]:
-            msg += f": {record.exc_info[1]}"
-        self.dash.note(msg, record.levelno)
-
-
 class MinerDashboard:
     """One or more workers' live view. `run()` draws until `stop` is set; the workers run on their own threads."""
 
@@ -156,20 +55,12 @@ class MinerDashboard:
         self.rigs = [Rig(name, c) for name, c in rigs]
         self.api, self.node_url, self.footer = NodeClient(node_url), node_url, footer
         self.feed: collections.deque = collections.deque(maxlen=40)
-        self.g = GLYPHS if self._can_encode("".join(GLYPHS.values()) + "".join(BANNER)) else ASCII
+        self.g = termui.glyphs_for(GLYPHS, ASCII)
         self.scroll, self.frame_no = 0.0, 0
         self.popup: tuple[float, int] | None = None  # (time, syn) of the last payout
         self.phase_seen: dict[tuple, float] = {}
         self.chain_id = ""
         self.started = time.time()
-
-    @staticmethod
-    def _can_encode(text: str) -> bool:
-        try:
-            text.encode(sys.stdout.encoding or "ascii")
-            return True
-        except (UnicodeEncodeError, LookupError):
-            return False
 
     def note(self, text: str, level: int = logging.INFO) -> None:
         self.feed.append((time.time(), level, text))
@@ -216,7 +107,7 @@ class MinerDashboard:
         for r in range(BAND):
             for c in range(w):
                 x, mined = off + c, c <= dx
-                lamp = min((x - 6) % 24, 24 - (x - 6) % 24)  # columns to the nearest lantern
+                lamp = termui.lamp_distance(x)
                 if mined and r in TUNNEL:
                     if r == RAILS:
                         rows[r][c] = (g["tie"], TIE) if x % 4 == 0 else (g["rail"], RAIL)
@@ -228,18 +119,11 @@ class MinerDashboard:
                 if mined and r == TUNNEL[0] - 1 and x % 12 in (11, 0, 1):
                     rows[r][c] = (g["beam"], TIMBER)
                     continue
-                v = _noise(x, r) % 100
-                if not mined and v < (4 if r in TUNNEL else 1):
-                    rows[r][c] = (g["ore"], GOLD)  # ore is only left in rock the drill hasn't reached
-                    continue
-                layer = (r + _noise(x // 9, 99) % 3 + (_noise(x // 4, r) % 7 == 0)) % 5  # strata that drift and break
-                lit = (0 if lamp <= 3 else 1 if lamp <= 7 else 2) if mined else 1  # tunnel rock glows near lanterns
-                rows[r][c] = (g["shades"][0 if v < 60 else 1 if v < 88 else 2], ROCK[(layer, lit)])
+                # Ore is only left in rock the drill hasn't reached, and tunnel rock glows near the lanterns.
+                rows[r][c] = termui.rock(x, r, g, termui.lit_by(lamp) if mined else 1, 0 if mined else 4 if r in TUNNEL else 1)
 
         def put(r, c, text, style):
-            for i, ch in enumerate(text):
-                if 0 <= c + i < w:
-                    rows[r][c + i] = (ch, style)
+            termui.put(rows, r, c, text, style)
 
         top, mid, low = TUNNEL
         # Ore cart: one nugget per unit committed this round.
@@ -276,19 +160,7 @@ class MinerDashboard:
         return [_cells(row) for row in rows]
 
     def _phase_bar(self, s, width: int):
-        key, now = (s.round, s.phase), time.time()
-        first = self.phase_seen.setdefault(key, now)
-        left = max(0.0, s.phase_ends - now)
-        total = max(s.phase_ends - first, 0.1)
-        done = 0.0 if s.phase == "idle" else min(1.0, 1 - left / total)
-        n = max(10, min(32, width - 46))
-        fill = int(done * n)
-        color = PHASES.get(s.phase, DIM)
-        if not s.round:
-            return [("IDLE", DIM), (f"    block {s.height}", DIM)]
-        return [(f"ROUND {s.round} ", WHITE), (f" {s.phase.upper():<8} ", color),
-                (self.g["bar"] * fill, color), (self.g["empty"] * (n - fill), DIM),
-                (f" {left:4.0f}s left" if s.phase != "idle" else "", TEXT), (f"    block {s.height}", DIM)]
+        return termui.phase_bar(self.g, self.phase_seen, s.round, s.phase, s.phase_ends, width, [(f"    block {s.height}", DIM)])
 
     def frame(self) -> str:
         width, height = shutil.get_terminal_size((100, 32))
@@ -300,18 +172,12 @@ class MinerDashboard:
         self.frame_no += 1
         lines: list[str] = []
         add = lambda *segs: lines.append(_line([(" ", None), *segs], w))  # noqa: E731
-        room = w - 1 - len(BANNER[0]) - 3
+        room = w - 1 - len(termui.BANNER[0]) - 3
         addr = self.rigs[0].client.keys.address
         tails = [_fit(room, f"useful-work miner  ·  {self.chain_id}", self.chain_id or "useful-work miner"),
                  _fit(room, addr, f"{addr[:10]}{'…' if self.g is GLYPHS else '..'}{addr[-4:]}") if len(self.rigs) == 1
                  else f"{len(self.rigs)} workers"]
-        if self.g is GLYPHS:
-            grad = [(255, 205, 60), (255, 150, 70), (255, 95, 150), (180, 110, 255)]
-            for text, tail in zip(BANNER, tails):
-                segs = [(ch, rgb(*grad[min(3, j * 4 // len(text))], True)) for j, ch in enumerate(text)]
-                add(*segs, ("   ", None), (tail, DIM))
-        else:
-            add(("VIBE HASH", WHITE), ("   ", None), (tails[0], DIM))
+        termui.header(add, self.g, ASCII, tails)
         lines.append("")
         lines += [" " + row for row in self._band(w - 2)]
         lines.append("")
@@ -353,41 +219,27 @@ class MinerDashboard:
                 (self.g["bar"] * round(rep * 10), GREEN), (self.g["empty"] * (10 - round(rep * 10)), DIM),
                 (f" {rig.reputation:.2f}", TEXT))
         lines.append("")
-        room = max(0, height - len(lines) - 3)
-        for t, level, text in list(self.feed)[-room:] if room else []:
-            style = RED if level >= logging.ERROR else YELLOW if level >= logging.WARNING else GOLD if level > logging.INFO else TEXT
-            add((time.strftime("%H:%M:%S  ", time.localtime(t)), DIM), (text, style))
+        termui.feed_lines(add, self.feed, max(0, height - len(lines) - 3))
         while len(lines) < height - 2:
             lines.append("")
         add(("Ctrl+C to stop", DIM), (f"   ·   node {self.node_url}", DIM), (f"   ·   {self.footer}" if self.footer else "", DIM))
-        frame = "\n".join(line + "\x1b[K" for line in lines[:height - 1])
-        if self.g is ASCII:  # a terminal that can't show Unicode must never be sent any, log lines included
-            frame = frame.replace("·", "-").encode("ascii", "replace").decode()
-        return frame
+        return termui.finish(lines, height, self.g is ASCII)
 
     def run(self, stop: threading.Event, tick=None, on_start=None) -> None:
         """Draw until `stop` is set or Ctrl+C, calling `tick()` every frame. Worker and node log lines go to the
         event feed meanwhile; start the workers in `on_start()` so their first lines land there too."""
         loggers = [logging.getLogger(n) for n in ("vibehash.worker", "vibehash.node")]
-        handler, saved = _Feed(self), [(lg, lg.propagate) for lg in loggers]
+        handler, saved = termui.Feed(self), [(lg, lg.propagate) for lg in loggers]
         for lg in loggers:
             lg.addHandler(handler)
             lg.propagate = False
         threading.Thread(target=self._poll, args=(stop,), daemon=True, name="dashboard-poll").start()
-        out = sys.stdout
-        out.write("\x1b[?1049h\x1b[?25l\x1b[2J")  # the alternate screen: the terminal comes back as it was
         try:
-            if on_start:
-                on_start()
-            while not stop.is_set():
-                if tick:
-                    tick()
-                out.write("\x1b[H" + self.frame() + "\x1b[J")
-                out.flush()
-                time.sleep(1 / FPS)  # interruptible by Ctrl+C on Windows, unlike Event.wait
+            with termui.alternate_screen() as out:
+                if on_start:
+                    on_start()
+                termui.animate(out, self.frame, lambda: not stop.is_set(), tick)
         finally:
-            out.write(f"{RESET}\x1b[?25h\x1b[?1049l")
-            out.flush()
             for lg, propagate in saved:
                 lg.removeHandler(handler)
                 lg.propagate = propagate

@@ -223,6 +223,25 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("censored", out)
 
+    def test_a_round_secret_swapped_after_the_commitments_is_noticed(self):
+        """A leader that picks its round secret once it has seen the workers' commitments can choose the beacon. If it
+        rewrites the commitment in the record to match, a replay can't tell; the workers saw the original in /status."""
+        from vibehash.coordinator import secret_commitment
+
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 2)
+        job = TrainingJob("grind-job", req.address, budget=60 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        honest = Coordinator.start_reveal
+
+        def grind(c):
+            c.r.secret = os.urandom(32)
+            c.r.record["beacon_commit"] = secret_commitment(c.r.secret).hex()
+            return honest(c)
+        with mock.patch.object(Coordinator, "start_reveal", grind):
+            run_until(node, clients, stop, node.chain.tip.height + 3)
+        for client in clients:
+            self.assertTrue(any("round secret" in d for d in client.censored), client.censored)
+
     def test_checkpoints_kept_for_the_challenge_window(self):
         node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 3, keep_rounds=2)
         job = TrainingJob("window-job", req.address, budget=100 * VIBE, fee_per_round=10 * VIBE, units_per_round=6)

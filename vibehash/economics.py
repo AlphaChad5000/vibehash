@@ -10,7 +10,9 @@ mainnet one is Bitcoin's shape stretched to Vibe Hash's block time.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from fractions import Fraction
 
 from .tasks import SYN_PER_VIBE
 
@@ -98,19 +100,27 @@ def block_subsidy(height: int, economics: Economics = TESTNET, created: int = 0)
     return economics.subsidy(height, created)
 
 
-def split_pro_rata(total: int, weights: dict[str, float]) -> dict[str, int]:
+def split_pro_rata(total: int, weights: dict[str, float], exact: bool = False) -> dict[str, int]:
     """Integer split proportional to weights (largest-remainder). Zero weights get nothing.
 
-    Sums to exactly `total` when any weight is positive, else returns {}.
+    Sums to exactly `total` when any weight is positive, else returns {}. That's guaranteed with `exact` (v2 blocks),
+    which works the shares out in fractions. In floats a share can round up past a whole number (for totals past
+    about 2**53 syn); the shares then add up to more than `total`, and the negative leftover hands all but the last
+    few one more syn ([:-1]). Older blocks keep the float split, so their rewards never change.
     """
     weights = {k: w for k, w in weights.items() if w > 0}
     wsum = sum(weights.values())
     if total <= 0 or wsum <= 0:
         return {}
-    exact = {k: total * w / wsum for k, w in weights.items()}
-    out = {k: int(v) for k, v in exact.items()}
+    if exact:
+        wsum = sum(Fraction(w) for w in weights.values())  # a float converts to a Fraction exactly
+        share = {k: total * Fraction(w) / wsum for k, w in weights.items()}
+        out = {k: math.floor(v) for k, v in share.items()}
+    else:
+        share = {k: total * w / wsum for k, w in weights.items()}
+        out = {k: int(v) for k, v in share.items()}
     leftover = total - sum(out.values())
-    for k in sorted(exact, key=lambda k: (exact[k] - out[k], k), reverse=True)[:leftover]:
+    for k in sorted(share, key=lambda k: (share[k] - out[k], k), reverse=True)[:leftover]:
         out[k] += 1
     return {k: v for k, v in out.items() if v > 0}
 
@@ -129,14 +139,24 @@ def compute_payout(
     worker_flops: dict[str, int],
     verifier_flops: dict[str, int],
     reputation: dict[str, float],
+    exact: bool = False,
 ) -> RoundPayout:
-    """Split a round's pool. Unclaimed shares are burned, never handed to the proposer."""
-    worker_budget = int(pool * WORKER_SHARE)
-    verifier_budget = int(pool * VERIFIER_SHARE)
-    proposer_budget = int(pool * PROPOSER_SHARE)
+    """Split a round's pool. Unclaimed shares are burned, never handed to the proposer. `exact` (v2 blocks): no
+    rounding can pay out more than the pool (split_pro_rata); the three budgets are exact too, where in floats they
+    could add up to more than a pool past 2**53 syn."""
+    if exact:
+        worker_budget, verifier_budget, proposer_budget = (
+            math.floor(pool * Fraction(str(share))) for share in (WORKER_SHARE, VERIFIER_SHARE, PROPOSER_SHARE))
+    else:
+        worker_budget = int(pool * WORKER_SHARE)
+        verifier_budget = int(pool * VERIFIER_SHARE)
+        proposer_budget = int(pool * PROPOSER_SHARE)
 
-    worker_pay = split_pro_rata(worker_budget, {a: f * reputation.get(a, REP_START) for a, f in worker_flops.items()})
-    verifier_pay = split_pro_rata(verifier_budget, {a: f * reputation.get(a, REP_START) for a, f in verifier_flops.items()})
+    def weights(flops: dict[str, int]) -> dict[str, float]:
+        return {a: f * reputation.get(a, REP_START) for a, f in flops.items()}
+
+    worker_pay = split_pro_rata(worker_budget, weights(worker_flops), exact)
+    verifier_pay = split_pro_rata(verifier_budget, weights(verifier_flops), exact)
     # A proposer only earns if the round produced verified work.
     proposer_pay = proposer_budget if worker_pay else 0
     paid = sum(worker_pay.values()) + sum(verifier_pay.values()) + proposer_pay

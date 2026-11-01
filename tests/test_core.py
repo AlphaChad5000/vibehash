@@ -242,6 +242,12 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(detection_probability(1.0, 1), 1.0)
 
 
+# A lazy checker too slow to take a unit, so it only ever checks, and two honest workers. A lone worker would hold every
+# unit it could be shown, and real tasks never go to their unit's holders, so it could never be given a hidden fake.
+CANARY_CHECKER = ([("honest", "lazy"), ("honest",), ("honest",)],
+                  [HardwareProfile("checker only", 1e4, 8192, reliability=1.0), RELIABLE(OFFICE_DESKTOP), RELIABLE(OFFICE_DESKTOP)])
+
+
 def network(behaviors, hardware=None, seed=3, job_kw=None, **cfg):
     hardware = hardware or [RELIABLE(OFFICE_DESKTOP)] * len(behaviors)
     workers = [Worker(f"w{i}", KeyPair.generate(f"w{i}".encode()), hw, *b) for i, (b, hw) in enumerate(zip(behaviors, hardware))]
@@ -333,10 +339,13 @@ class ReplayTests(unittest.TestCase):
         self.assertGreater(stats["unchecked"], 0)
 
     def test_round_with_a_caught_lazy_checker_replays(self):
-        # The only worker gets every planted fake to check, approves it, and is slashed for it.
-        proto, workers, before, reports = self.run_rounds([("honest", "lazy")], canaries_per_round=2)
-        self.assertIn("approved a canary", {s[2] for s in reports[0].slashes})
-        self.assertEqual(self.replay_all(before, reports), [[]])
+        # The lazy checker gets a planted fake to check, approves it, and is slashed for it (see the test below).
+        proto, workers, job = network(*CANARY_CHECKER, replication_rate=0, canaries_per_round=2)
+        before, reports = copy.deepcopy(proto.chain), []
+        while len(reports) < 12 and not any(s[2] == "approved a canary" for rep in reports for s in rep.slashes):
+            reports.append(proto.run_round())
+        self.assertIn("approved a canary", {s[2] for s in reports[-1].slashes})
+        self.assertEqual(self.replay_all(before, reports), [[]] * len(reports))
 
     def test_edited_record_doesnt_match_its_block(self):
         proto, workers, before, reports = self.run_rounds([("honest",)] * 3)
@@ -477,10 +486,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(self.verdicts_for(proto.run_round(), workers[1]), {Verdict.BAD_REVEAL})
 
     def test_lazy_verifier_caught_by_canary(self):
-        # Which checker gets each fake depends on the beacon; as the only worker, the lazy one gets them all.
-        proto, workers, job = network([("honest", "lazy")], canaries_per_round=2)
-        report = proto.run_round()
-        self.assertIn(("approved a canary", workers[0].address), {(s[2], s[0]) for s in report.slashes})
+        # A fake only goes to a checker that could have been given the real task: not the unit's holder, nor the one
+        # checking it. Here that's the lazy checker or the other worker, at random (from the round secret), so each
+        # round's two fakes miss it a quarter of the time, and a dozen rounds all missing it is one in 17 million.
+        proto, workers, job = network(*CANARY_CHECKER, replication_rate=0, canaries_per_round=2)
+        caught = set()
+        for _ in range(12):
+            caught |= {s[0] for s in proto.run_round().slashes if s[2] == "approved a canary"}
+            if caught:
+                break
+        self.assertEqual(caught, {workers[0].address})
 
     def test_false_accusation_overturned(self):
         proto, workers, job = network([("honest",), ("honest", "false_accuser")], canaries_per_round=0)

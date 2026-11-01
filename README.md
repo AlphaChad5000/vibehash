@@ -89,7 +89,7 @@ input columns, and the column to predict last), then:
 python -m vibehash train my-data.csv --budget 100
 ```
 ```bash
-python -m vibehash job status
+python -m vibehash job watch
 ```
 ```bash
 python -m vibehash job download
@@ -100,9 +100,13 @@ python -m vibehash predict new-rows.csv
 
 `train` sizes a model to the data, scales the inputs, holds back a fifth of
 the rows to measure accuracy, and prints what it will train and what it
-costs before posting. `job status` shows the accuracy climbing round by round,
-`job download` saves the model as one file (`my-data-model.npz`), and
-`predict` labels new rows (`--out predictions.csv` saves them all).
+costs before posting. In a terminal it then follows the job live until the
+budget is spent: a forge where the model is a blade that grows with its
+accuracy, accuracy and loss charted round by round, the units accepted, the
+budget left, and whether it's the job's turn to train. Ctrl+C stops watching,
+not training; `job watch` picks it up again and `job status` prints a
+summary. `job download` saves the model as one file (`my-data-model.npz`),
+and `predict` labels new rows (`--out predictions.csv` saves them all).
 `python -m vibehash example` writes a sample, `fruit.csv`, to try first. On
 your own testnet, pay with its requester wallet by adding
 `--node http://127.0.0.1:8545 --wallet ~/.vibehash/testnet/requester.json` to
@@ -111,9 +115,9 @@ round.
 
 In a terminal, `worker` and `testnet` show a live mining dashboard: a drill
 boring through rock while you train, the round and phase, your speed, units
-mined, and VIBE earned as it lands. Add `--plain` for the classic log lines
-(piped output and services get those automatically; `NO_COLOR` turns colours
-off).
+mined, and VIBE earned as it lands. Add `--plain` to these, `train` or
+`job watch` for the classic log lines (piped output and services get those
+automatically; `NO_COLOR` turns colours off).
 
 `setup` saves the node address, creates your wallet (encrypted with a password
 you choose, in `~/.vibehash/wallet.json`), finds your GPU and offers to install
@@ -309,7 +313,7 @@ socket timeouts that cut off slow-loris clients. Over budget, a node answers
 429, and clients wait and retry. Clients on the node's own computer are
 never limited, so a local testnet is never throttled. Behind a reverse proxy
 every client looks local, so limit at the proxy or add `--rate-limit-local`.
-`--rate-limit off` turns the budgets off, `--rate-limit tx=1/10,read=100`
+`--max-job-mb` (64 by default) stops a node relaying jobs too big for its memory. `--rate-limit off` turns the budgets off, `--rate-limit tx=1/10,read=100`
 changes some (requests a second and burst; the buckets are read, worker, tx,
 upload and other), and `--max-connections N` sets the overall cap. DESIGN.md
 §10 has the numbers.
@@ -367,6 +371,8 @@ SLIP-0010 test vectors.
 | `vibehash/tls.py` | HTTPS: server contexts, self-signed certificates, certificate pinning for clients |
 | `vibehash/client.py` | HTTP client and the worker loop, with live `WorkerStats` |
 | `vibehash/minerui.py` | The terminal mining dashboard (plain ANSI, ASCII fallback) |
+| `vibehash/trainui.py` | The terminal training dashboard: a job followed live from the node, politely, with a log-line mode |
+| `vibehash/termui.py` | What the two dashboards share: palette, the mine's rock, banner, phase bar, event feed, the alternate screen |
 | `vibehash/tabular.py` | CSV files to training datasets, and downloaded models to predictions |
 | `vibehash/data/` | The `fruit.csv` sample `vibehash example` writes, and the BIP39 word list |
 | `vibehash/storage.py` | SQLite chain and weights, content-addressed datasets |
@@ -379,6 +385,7 @@ SLIP-0010 test vectors.
 | `vibehash/settings.py` | `~/.vibehash`: the default wallet, and the node address and its TLS trust that `setup` saves |
 | `vibehash/gpusetup.py` | GPU detection before PyTorch is installed; picks and installs the PyTorch build for the card |
 | `vibehash/protocol.py` | In-process driver for simulations |
+| `vibehash/shards.py` | Prototype, not yet used by the protocol: a model split into shards across workers, checked one shard at a time ([SHARDING.md](SHARDING.md)) |
 
 ## Status
 
@@ -388,7 +395,11 @@ the remaining work:
   disputes;
 - slashing double-signing validators;
 - replicating fraud evidence;
-- model types beyond MLPs.
+- model types beyond MLPs, and models bigger than one computer
+  ([SHARDING.md](SHARDING.md) has the design).
+
+[FINETUNING.md](FINETUNING.md) describes where this is heading: fine-tuning open models from Hugging Face
+with one `train --base` command, and workers that fetch and train only their share of a model.
 
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.
