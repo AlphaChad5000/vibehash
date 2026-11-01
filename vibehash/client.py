@@ -33,7 +33,7 @@ from .worker import HardwareProfile, Worker
 log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
-REVEAL_THREADS = 4  # reveals in flight at once: plenty for a round's units, and gentle on a small node
+PARALLEL_REQUESTS = 4  # in flight at once for a round's reveals or a unit's uploads: plenty, and gentle on a small node
 # The most of a reply we read, so a node can't feed us gigabytes: the biggest JSON a node sends is a round record or
 # a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
 MAX_REPLY = 128 * 2**20
@@ -378,17 +378,20 @@ class WorkerClient:
 
     def _upload(self, rnd: int, job: TrainingJob, arrays) -> dict[int, str]:
         """Upload checkpoints the node doesn't have yet. Returns {id(array): blob id}."""
-        ids = {}
+        ids, todo = {}, []
         sent = self.uploaded.setdefault(rnd, set())
         for arr in arrays:
             if id(arr) not in ids:
                 bid = self.blobs.put_array(arr, job.wire_dtype)  # already on disk for spilled checkpoints; this names it
                 # The node made the start blob itself, and what went up this round needn't be asked about again: each
                 # question is a round trip, and a reveal's six or so add up past the reveal phase on a distant link.
-                if bid != self.start_blob.get(rnd) and bid not in sent:
-                    self.node.upload(self.keys, "blob", self.blobs.path(bid), bid)
-                    sent.add(bid)
+                if bid != self.start_blob.get(rnd) and bid not in sent and bid not in todo:
+                    todo.append(bid)
                 ids[id(arr)] = bid
+        if todo:  # together: one after another, a unit's nine or so cost a CPU worker its last unit's commit deadline
+            with ThreadPoolExecutor(min(PARALLEL_REQUESTS, len(todo))) as pool:
+                for bid in pool.map(lambda b: (self.node.upload(self.keys, "blob", self.blobs.path(b), b), b)[1], todo):
+                    sent.add(bid)
         return ids
 
     def _send_reveal(self, rnd: int, job: TrainingJob, rv) -> dict | None:
@@ -495,7 +498,7 @@ class WorkerClient:
             reveals = [rv for u in self.units.get(rnd, []) if (rv := self.worker.reveal(u, job, beacon, s["challenge_segments"]))]
             # All at once: a unit not revealed in time forfeits the whole round, and one at a time, a worker far from the
             # node with many units spends the phase waiting on round trips.
-            with ThreadPoolExecutor(max(1, min(REVEAL_THREADS, len(reveals)))) as pool:
+            with ThreadPoolExecutor(max(1, min(PARALLEL_REQUESTS, len(reveals)))) as pool:
                 for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
                     if res and not res["ok"]:
                         log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])

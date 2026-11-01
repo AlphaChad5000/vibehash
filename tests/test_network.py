@@ -319,13 +319,15 @@ class CommandLineTests(unittest.TestCase):
 
 
 class DistantWorkerTest(unittest.TestCase):
-    def test_many_units_are_revealed_in_time_over_a_slow_link(self):
-        """A worker 50 ms from the node with 12 units: revealed one at a time, each asking again about checkpoints it
-        uploaded during compute, they took longer than the reveal phase, and missing it forfeits the round (as the
-        public network showed on 2026-11-01). Reveals now go out together, as one message each. The link also drops
-        two reveals, one on the way and one's reply (as it did the next day): each is sent again, and not lost."""
+    def test_many_units_are_committed_and_revealed_in_time_over_a_slow_link(self):
+        """A worker 50 ms from the node with 12 units of 9 checkpoints each, as the public network showed on 2026-11-01:
+        - revealed one at a time, each asking again about checkpoints it uploaded during compute, they took longer than
+          the reveal phase, and missing it forfeits the round. Reveals now go out together, as one message each;
+        - the link drops two reveals, one on the way and one's reply: each is sent again, and not lost;
+        - uploaded one after another, a unit's checkpoints took so long the last unit missed the compute deadline.
+          They now go up together."""
         node, api, req, workers, clients, stop, *_ = start_network(
-            self, 1, times=PhaseTimes(register_s=1.0, compute_s=8.0, reveal_s=1.5, verify_s=2.0, idle_s=0.3),
+            self, 1, times=PhaseTimes(register_s=1.0, compute_s=6.0, reveal_s=1.5, verify_s=2.0, idle_s=0.3),
             config=CoordinatorConfig(canaries_per_round=0, newcomer_units=12))
         far = clients[0].node
         drops, lock = ["on the way", "reply"], threading.Lock()
@@ -343,7 +345,7 @@ class DistantWorkerTest(unittest.TestCase):
             return reply
         far._open = far_open
         job = TrainingJob("far-job", req.address, budget=60 * SYN_PER_VIBE, fee_per_round=10 * SYN_PER_VIBE,
-                          units_per_round=12, steps_per_unit=10, checkpoint_every=5)
+                          units_per_round=12, steps_per_unit=40, checkpoint_every=5)
         api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
         start = node.chain.tip.height
         run_until(node, clients, stop, start + 3)
