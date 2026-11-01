@@ -49,7 +49,8 @@ from . import receipts
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
-from .coordinator import RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator, CoordinatorConfig, Phase, ProtocolError
+from .coordinator import (FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator, CoordinatorConfig,
+                          Phase, ProtocolError)
 from .crypto import KeyPair, address_of, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
@@ -76,7 +77,7 @@ MAX_BLOCKS_REPLY = 4 * 2**20
 # anything more would be junk that every validator stores and every proposal carries.
 ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
 BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"round"}, "commit": {"round", "commitment"},
-          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment"}}
+          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
 # The biggest model this node relays a post_job for (--max-job-mb), as one checkpoint at the job's precision. Measured:
 # a float32 model's starting weights take ~7 times its checkpoint size to build (float64 copies), ~460 MB at 64 MB, and
@@ -280,6 +281,10 @@ class Node:
                 return False
             if step:
                 step()
+        if c.start_jury():  # a fine-tune's contested claims: a jury of workers replays them, as long as a verify phase
+            log.info("  %d claims to a jury of workers", len(c.r.contested))
+            if not self._wait(t.verify_s, still):
+                return False
         return True
 
     # --- running a chain with validators ------------------------------------------------------
@@ -337,8 +342,9 @@ class Node:
                 raise InvalidBlock(f"a new block must be version {VERSION}, not {block.version}")
             record = value.get("record")
             if block.summary is not None and isinstance(record, dict):
-                job = self.chain.state.jobs.get(block.summary.job_id)
-                want = SHARDED_RECORD_VERSION if job and self.chain.state.job(block.summary.job_id).sharded else RECORD_VERSION
+                job = self.chain.state.job(block.summary.job_id) if block.summary.job_id in self.chain.state.jobs else None
+                want = (SHARDED_RECORD_VERSION if job and job.sharded else FINETUNE_RECORD_VERSION if job and job.finetune
+                        else RECORD_VERSION)
                 if record.get("version") != want:
                     raise InvalidBlock(f"a new round's record must be version {want}, not {record.get('version')!r}")
             with self.coord.lock:
@@ -482,12 +488,13 @@ class Node:
                     return False  # the job moved on again meanwhile
                 self.store.save_params(job_id, height, weights)
                 c.params.pop(job_id, None)
-            try:
-                full = c.job(job_id)  # with its data, to score the model as its poster will see it
-                summary = self.chain.blocks[height].summary
-                self.store.save_round(job_id, height, summary.accepted_units, *full.evaluate(weights))
-            except (InvalidJob, OSError, ValueError, AttributeError, ImportError):
-                pass
+            if not job.finetune:  # a fine-tune's scores come with its records (Coordinator.adopt); nodes don't run models
+                try:
+                    full = c.job(job_id)  # with its data, to score the model as its poster will see it
+                    summary = self.chain.blocks[height].summary
+                    self.store.save_round(job_id, height, summary.accepted_units, *full.evaluate(weights))
+                except (InvalidJob, OSError, ValueError, AttributeError):
+                    pass
             return True
         return False
 
@@ -560,6 +567,8 @@ class Node:
                 "mempool": len(c.mempool), "chunk_bytes": CHUNK, "keeps_checkpoints_for": self.keep_rounds,
                 "economics": self.chain.state.economics.to_dict(), "subsidy": self.chain.state.subsidy(self.chain.tip.height + 1),
                 "min_fee": c.config.min_fee, "earn_in": self.chain.state.earn_in,
+                # Jobs with budget that aren't training, and why, in words (a fine-tune with too few workers to check it).
+                "waiting": dict(c.waiting),
             }
         if consensus is not None:
             # Workers do the round with its leader, the validator whose turn it is to propose: None means this node.
@@ -688,12 +697,18 @@ class Node:
                 verdict = c.reveal(rv, wire=wire)
                 return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "tasks":
-                return {"tasks": [{"task_id": t.task_id, "unit": t.unit.to_dict(), "segments": t.segments, "dtype": job.wire_dtype,
-                                   "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
-                                  for t in c.tasks_for(addr)]}
+                tasks = []
+                for t in c.tasks_for(addr):
+                    d = {"task_id": t.task_id, "unit": t.unit.to_dict(), "segments": t.segments, "dtype": job.wire_dtype,
+                         "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
+                    if t.kind != "check":  # fine-tunes': only new workers get these, so old ones see what they always did
+                        d |= {"kind": t.kind, "whole": t.whole}
+                    tasks.append(d)
+                return {"tasks": tasks}
             if kind == "verdict":
                 bad = body.get("bad_segment")
-                c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env)
+                c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
+                                 score=body.get("score"))
                 return {"ok": True, "receipt": self._receipt(kind, env)}
         raise ProtocolError(f"unknown message {kind}")
 

@@ -289,6 +289,7 @@ class WorkerClient:
         self.units: dict[int, list] = {}
         self.start_blob: dict[int, str] = {}
         self.uploaded: dict[int, set[str]] = {}  # checkpoints the node confirmed it has, by round
+        self.attempt_of: dict[int, str | None] = {}  # the attempt at each round those confirmations were for
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
@@ -456,6 +457,14 @@ class WorkerClient:
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join
+        if rnd is not None and self.attempt_of.get(rnd, s.get("attempt")) != s.get("attempt"):
+            # Another leader, or the same node after a restart, has none of what went up for the abandoned attempt:
+            # without this the reveal names checkpoints the node doesn't have, and the units count as withheld.
+            self.uploaded.pop(rnd, None)
+        if rnd is not None:
+            self.attempt_of[rnd] = s.get("attempt")
+            for old in [k for k in self.attempt_of if k < rnd - 100]:
+                del self.attempt_of[old]
         if rnd is not None and s.get("beacon_commit"):
             self.secret_commits.setdefault((rnd, s.get("attempt")), s["beacon_commit"])
             for old in [k for k in self.secret_commits if k[0] < rnd - 100]:  # rounds we never sent anything in
@@ -483,7 +492,8 @@ class WorkerClient:
             st.assigned = len(units)
             committed = []
             if not units:
-                st.activity = "no units for us this round" if st.rounds else "joining at the next round"
+                why = (s.get("waiting") or {}).get(job.job_id)
+                st.activity = why or ("no units for us this round" if st.rounds else "joining at the next round")
             if units:
                 p = self.node.get("/round/params")
                 self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
@@ -525,26 +535,17 @@ class WorkerClient:
                 for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
                     if res and not res["ok"]:
                         log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])
-        elif phase == "verify":
-            tasks = self.node.signed(k, "tasks", {"round": rnd})["tasks"]
-            st.busy = bool(tasks)
-            try:
-                for i, t in enumerate(tasks, 1):
-                    st.activity = f"checking other workers' results ({i} of {len(tasks)})"
-                    unit = unit_in(t["unit"])
-                    openings = {}
-                    for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
-                        self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
-                        openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
-                    ok, bad = self.worker.verify(job, unit, openings, t["segments"])
-                    self._try(self._signed, "verdict", {"round": rnd, "task_id": t["task_id"], "ok": bool(ok), "bad_segment": bad})
-                    st.checked += 1
-                    st.checks += 1
-            finally:
-                st.busy = False
+        elif phase in ("verify", "jury"):
+            # A fine-tune's round can end with a jury phase, whose tasks are contested claims to replay.
+            absent = self.worker.verifier_behavior == "absent"  # tests only: a checker that never answers
+            tasks = [] if absent else self.node.signed(k, "tasks", {"round": rnd})["tasks"]
+            self._answer(rnd, job, tasks, "on a jury: replaying a contested claim" if phase == "jury" else None)
             st.activity = "round done; waiting for the block"
             if tasks:
-                log.info("round %d: verified %d tasks", rnd, len(tasks))
+                log.info("round %d: %s %d tasks", rnd, "judged" if phase == "jury" else "verified", len(tasks))
+            if phase == "jury":
+                self.done[key] = True
+                return
             for u in self.units.pop(rnd, []):
                 self.worker.forget(u.unit_id)
             self.start_blob.pop(rnd, None)
@@ -553,6 +554,40 @@ class WorkerClient:
         else:
             return
         self.done[key] = True
+
+    def _answer(self, rnd: int, job: TrainingJob, tasks: list[dict], doing: str | None = None) -> None:
+        """Do this phase's tasks and send a verdict for each: replay segments (or, for a jury on replicas, a whole
+        unit), or score a fine-tune's starting model on its held-back data."""
+        st = self.stats
+        st.busy = bool(tasks)
+        try:
+            for i, t in enumerate(tasks, 1):
+                kind = t.get("kind", "check")
+                body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
+                if kind == "score":
+                    st.activity = "scoring the round's starting model on the held-back data"
+                    body["score"] = list(self.worker.score(job, self._round_start(rnd, job)))
+                else:
+                    st.activity = doing or f"checking other workers' results ({i} of {len(tasks)})"
+                    openings = {}
+                    for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
+                        self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
+                        openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
+                    ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"], bool(t.get("whole")))
+                    body |= {"ok": bool(ok), "bad_segment": bad}
+                self._try(self._signed, "verdict", body)
+                st.checked += 1
+                st.checks += 1
+        finally:
+            st.busy = False
+
+    def _round_start(self, rnd: int, job: TrainingJob) -> np.ndarray:
+        """The weights this round started from, fetched if it trained nothing this round."""
+        if rnd not in self.start_blob:
+            p = self.node.get("/round/params")
+            self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
+            self.start_blob[rnd] = p["blob"]
+        return self.blobs.load(self.start_blob[rnd], job.wire_dtype, job.spec.n_params)
 
     @staticmethod
     def _try(fn, *args):

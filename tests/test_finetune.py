@@ -8,6 +8,7 @@ and loads an exported adapter with PEFT.
 """
 import copy
 import hashlib
+from collections import defaultdict
 import importlib.util
 import json
 import os
@@ -597,6 +598,281 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn(bad, segs)
 
 
+class _Seeded:
+    """os.urandom made repeatable (round secrets, attempt labels, salts), so the draws of a round are the same each run."""
+
+    def __init__(self, seed: bytes = b"0"):
+        self.seed, self.n = seed, 0
+
+    def __call__(self, k: int) -> bytes:
+        self.n += 1
+        return hashlib.sha256(self.seed + self.n.to_bytes(8, "big")).digest()[:k] if k <= 32 else bytes(k)
+
+
+@needs_torch
+class NodeFreeRoundTests(unittest.TestCase):
+    """Record version 4: a fine-tune's round where the node never runs the model. Rounds are driven by hand here, so
+    each checker, scorer and juror answers as a test needs, and then replayed from their records."""
+
+    def network(self, behaviors, **cfg):
+        from unittest import mock
+
+        from vibehash.protocol import Protocol
+        from vibehash.worker import HardwareProfile, Worker
+
+        d = tmpdir(self)
+        self.tiny = TinyModel(d).use(self)
+        path = self.tiny.dataset().save(d / "data.npz")
+        self.path, self.sha = path, file_sha256(path)
+        hw = HardwareProfile("gpu", 1e12, 16384, 1.0)
+        self.workers = [Worker(f"w{i}", KeyPair.generate(f"w{i}".encode()), hw, *b, fp_noise=0) for i, b in enumerate(behaviors)]
+        self.by = {w.address: w for w in self.workers}
+        req = KeyPair.generate(b"req")
+        stakes = cfg.pop("stakes", None)
+        chain = Chain({req.address: 1000 * VIBE}, stakes=stakes or {w.address: 10 * VIBE for w in self.workers},
+                      earn_in=cfg.pop("earn_in", False))
+        self.proto = Protocol(chain, self.workers, CoordinatorConfig(**cfg), seed=3)
+        self.job = job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": self.sha}, units_per_round=8,
+                          lr=1e-2, memory_mb=2048, budget=100 * VIBE, fee_per_round=10 * VIBE)
+        self.job.attach_data(load_dataset(path), self.sha)
+        patch = mock.patch("os.urandom", _Seeded())
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.proto.post_job(req, self.job)
+        self.before = copy.deepcopy(self.proto.chain)
+
+    def round(self, answer=None, jury=None):
+        """One round: everyone trains and reveals honestly as their behaviour says; verify-phase tasks are answered by
+        `answer(task, worker) -> (ok, bad) | None` (None: silent; default: as the worker would), jurors likewise by
+        `jury`. Returns the report."""
+        p, c = self.proto, self.proto.coord
+        c.open_round()
+        r = c.r
+        job = c.job(r.job_id)
+        for addr, w in p.workers.items():
+            body = {"round": r.round_no, "flops_per_sec": w.hardware.flops_per_sec, "memory_mb": w.hardware.memory_mb}
+            c.register(addr, w.hardware.flops_per_sec, w.hardware.memory_mb, envelope=p._signed(w, "register", body))
+        c.start_compute()
+        for addr, uids in list(r.assignments.items()):
+            for uid in uids:
+                c.commit(p.workers[addr].compute(r.units[uid], job, r.start))
+        beacon = c.start_reveal()
+        for uid, addr in sorted(r.commitments):
+            rv = p.workers[addr].reveal(r.units[uid], job, beacon, c.config.challenge_segments)
+            c.reveal(rv, wire=p._wire(rv, job))
+        c.start_verify()
+        self.tasks = dict(r.tasks)
+        self._answer(answer)
+        self.jury_phase = c.start_jury()
+        if self.jury_phase:
+            self._answer(jury)
+        self.contested = dict(r.contested)
+        self.jury = dict(r.jury)
+        return c.finalize(proposer_keys=p._proposer(beacon), timestamp=p.chain.tip.height + 1)
+
+    def _answer(self, policy):
+        p, c = self.proto, self.proto.coord
+        r, job = c.r, c.job(c.r.job_id)
+        for addr, w in p.workers.items():
+            for t in c.tasks_for(addr):
+                if t.kind == "score":
+                    got, score = (True, None), list(w.score(job, r.start))
+                else:
+                    got = policy(t, w) if policy else "default"
+                    if got == "default":
+                        got = w.verify(job, t.unit, t.openings, t.segments, t.whole)
+                    score = None
+                if got is None:
+                    continue
+                ok, bad = got
+                body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
+                if score is not None:
+                    body["score"] = score
+                c.submit_verdict(addr, t.task_id, ok, bad, envelope=p._signed(w, "verdict", body), score=score)
+
+    def replays(self, reports):
+        from vibehash.replay import replay_block
+        p = self.proto
+
+        class Recheck:
+            def array(self, bid, job):
+                return p.checkpoints.array(bid, job)
+
+            def attach(self_, j):
+                j.attach_data(load_dataset(self.path), self.sha)
+        chain, stats = copy.deepcopy(self.before), {}
+        for rep in reports:
+            self.assertEqual(rep.record["version"], 4)
+            self.assertEqual(replay_block(chain, rep.block, copy.deepcopy(rep.record), Recheck(), stats), [])
+            chain.append(rep.block)
+        if any(rep.record["reveals"] for rep in reports):  # (with nothing revealed, there's nothing to recheck against)
+            self.assertEqual(stats["unchecked"], 0)
+
+    def results(self, rep):
+        return {(res.unit.unit_id, res.worker): res for res in rep.results}
+
+    def test_the_node_runs_no_model(self):
+        """Every check that needs the model is the workers': the coordinator's own replays and scoring are off limits,
+        and the round still trains, pays, scores and seals."""
+        from unittest import mock
+
+        self.network([("honest", "honest")] * 5)
+        boom = AssertionError("the node ran the model")
+        with mock.patch("vibehash.coordinator.replay_segment", side_effect=boom), \
+                mock.patch("vibehash.coordinator.replay_openings", side_effect=boom), \
+                mock.patch("vibehash.coordinator.full_replay", side_effect=boom), \
+                mock.patch("vibehash.tasks.TrainingJob.evaluate", side_effect=boom), \
+                mock.patch("vibehash.finetune.runtime", wraps=ft.runtime) as runs:
+            rep = self.round()
+        self.assertTrue(all(res.verdict.value == "accepted" for res in rep.results))
+        self.assertGreater(rep.block.summary.accepted_units, 0)
+        self.assertFalse(rep.slashes)
+        self.assertGreater(runs.call_count, 0)  # (the workers ran it)
+        loss, acc = rep.record["score"]
+        want, want_acc = ft.evaluate(self.job.spec, self.job.data, self.job.spec.init_params())
+        self.assertAlmostEqual(loss, want, places=4)  # the scorers scored the round's start: here, the base model
+        self.assertEqual((rep.val_loss, rep.val_acc), (loss, acc))
+        checkers = defaultdict(set)
+        for t in self.tasks.values():
+            if t.kind == "check" and not t.canary:
+                checkers[(t.unit.unit_id, t.submitter)].add(t.verifier)
+                self.assertNotEqual(t.verifier, t.submitter)
+        self.assertTrue(all(len(v) == 2 for v in checkers.values()), "two checkers a claim")
+        self.assertEqual(sum(t.kind == "score" for t in self.tasks.values()), 3)
+        self.replays([rep])
+
+    def test_juries_settle_accusations_cheats_and_silence(self):
+        """One round, every case: an honest claim falsely accused (upheld; the accuser and an outvoted juror slashed),
+        a cheat approved by a lazy checker and rejected by an honest one (found bad; the cheat and the approver
+        slashed), a claim no checker answered (its jury upholds it), and one whose jury is silent too (unchecked:
+        unpaid, nobody slashed). Then the round replays from its record."""
+        self.network([("honest", "honest")] * 6 + [("shortcut", "honest")], replication_rate=0.0)
+        cheat = self.workers[-1].address
+        plan = {}
+
+        def checkers(key):
+            return sorted(x.verifier for x in self.proto.coord.r.tasks.values()
+                          if (x.unit.unit_id, x.submitter) == key and x.kind == "check" and not x.canary)
+
+        def answer(t, w):
+            key = (t.unit.unit_id, t.submitter)
+            if not plan:  # choose the claims once the tasks exist; the silent one's worker gets no other part to play
+                honest = sorted({(x.unit.unit_id, x.submitter) for x in self.proto.coord.r.tasks.values()
+                                 if x.kind == "check" and not x.canary and x.submitter != cheat})
+                silent = honest[-1]
+                rest = [k for k in honest if k[1] != silent[1]]
+                accused = next(k for k in rest if set(checkers(k)) - {silent[1], cheat})
+                plan.update(accused=accused, quiet=next(k for k in rest if k != accused), silent=silent)
+            if key == plan["accused"]:
+                first = next(v for v in checkers(key) if v not in (plan["silent"][1], cheat))
+                return (False, t.segments[0]) if t.verifier == first else None
+            if key in (plan["quiet"], plan["silent"]):
+                return None
+            if t.submitter == cheat:
+                lazy = next((v for v in checkers(key) if v != plan["silent"][1]), None)
+                return (True, None) if t.verifier == lazy else "default"
+            return "default"
+        outvoted = []
+
+        def jury(t, w):
+            key = (t.unit.unit_id, t.submitter)
+            if key == plan["silent"]:
+                return None
+            if key == plan["accused"] and not outvoted and t.verifier != plan["silent"][1]:
+                outvoted.append(t.verifier)
+                return False, t.segments[0]
+            return "default"
+        rep = self.round(answer, jury)
+        res, slashed = self.results(rep), {(s[0], s[2]) for s in rep.slashes}
+        self.assertTrue(self.jury_phase)
+        self.assertEqual({k: v[0] for k, v in self.contested.items() if k[1] != cheat},
+                         {plan["accused"]: "dispute", plan["quiet"]: "unchecked", plan["silent"]: "unchecked"})
+        self.assertTrue(all(len(v[2]) == 3 for v in self.contested.values()), "juries of three")
+        self.assertEqual(res[plan["accused"]].verdict.value, "accepted")
+        accuser = next(t.verifier for t in self.tasks.values() if (t.unit.unit_id, t.submitter) == plan["accused"]
+                       and t.verdict is not None and not t.verdict[0])
+        self.assertIn((accuser, "false accusation"), slashed)
+        self.assertIn((outvoted[0], "outvoted on a jury"), slashed)
+        self.assertEqual(res[plan["quiet"]].verdict.value, "accepted")
+        self.assertEqual(res[plan["silent"]].verdict.value, "unchecked")
+        self.assertNotIn(plan["silent"][1], {s[0] for s in rep.slashes})
+        cheats = [v for k, v in res.items() if k[1] == cheat]
+        self.assertTrue(cheats and all(v.verdict.is_fraud for v in cheats))
+        self.assertIn((cheat, "failed_replay"), slashed)
+        lazies = {t.verifier for t in self.tasks.values() if t.submitter == cheat and t.verdict == (True, None)}
+        self.assertTrue(lazies)
+        for v in lazies:
+            self.assertIn((v, "approved bad work"), slashed)
+        paid = rep.block.summary.worker_flops
+        self.assertIn(plan["accused"][1], paid)
+        self.assertNotIn(cheat, paid)
+        self.replays([rep])
+
+    def test_replicas_that_disagree_go_to_a_jury(self):
+        """With every unit replicated and one segment challenged, a shortcut worker's spot checks can pass; its unit's
+        replicas then disagree, and the jury replays the whole unit: the cheat is slashed and its honest twin paid."""
+        self.network([("honest", "honest")] * 5 + [("shortcut", "honest")], replication_rate=1.0, challenge_segments=1)
+        cheat = self.workers[-1].address
+        reports = [self.round() for _ in range(2)]
+        verdicts = [res.verdict.value for rep in reports for res in rep.results if res.worker == cheat]
+        self.assertTrue(verdicts and all(v.startswith("failed") for v in verdicts), verdicts)
+        self.assertIn("failed_redundancy", verdicts, "a spot check that missed, caught by the replicas' jury")
+        for rep in reports:
+            for (uid, addr), res in self.results(rep).items():
+                if addr != cheat:
+                    self.assertEqual(res.verdict.value, "accepted", res.detail)
+        self.replays(reports)
+
+    def test_canaries_still_catch_a_lazy_checker(self):
+        self.network([("honest", "honest")] * 4 + [("honest", "lazy")])
+        lazy = self.workers[-1].address
+        reports = []
+        for _ in range(4):
+            reports.append(self.round())
+            if any(s[0] == lazy and s[2] == "approved a canary" for s in reports[-1].slashes):
+                break
+        self.assertTrue(any(s[0] == lazy and s[2] == "approved a canary" for rep in reports for s in rep.slashes))
+        self.replays(reports)
+
+    def test_scores_are_the_median_of_the_scorers(self):
+        """A scorer that makes its score up is outvoted by the other two."""
+        self.network([("honest", "honest")] * 4 + [("honest", "false_accuser")], replication_rate=0.0)
+        liar = self.workers[-1].address
+
+        def answer(t, w):  # the liar checks honestly, so only its score is false
+            from vibehash.verification import replay_openings
+            return replay_openings(self.job, t.unit, t.openings, t.segments) if w.address == liar else "default"
+        for _ in range(4):
+            rep = self.round(answer, answer)
+            if any(t.kind == "score" and t.verifier == liar for t in self.tasks.values()):
+                break
+        reported = sorted(t.score[0] for t in self.tasks.values() if t.kind == "score")
+        self.assertIn(0.01, reported)
+        self.assertEqual(rep.record["score"][0], reported[1])
+        self.assertGreater(rep.record["score"][0], 1.0)
+
+    def test_without_two_staked_checkers_it_waits(self):
+        """On a chain where newcomers earn their stake in, a fine-tune trains only once two staked workers can check
+        each other's work; until then nothing is assigned, and the round says why."""
+        behaviors = [("honest", "honest")] * 3
+        self.network(behaviors, earn_in=True, stakes={KeyPair.generate(b"w0").address: 10 * VIBE})
+        rep = self.round()
+        self.assertEqual(rep.unassigned, self.job.units_per_round)
+        self.assertIn("needs two staked workers", rep.waiting)
+        self.assertIn("ft", self.proto.coord.waiting)
+        self.replays([rep])
+
+    def test_a_fine_tune_record_must_be_version_4(self):
+        from vibehash.coordinator import Coordinator, ProtocolError
+        self.network([("honest", "honest")] * 3)
+        rep = self.round()
+        record = copy.deepcopy(rep.record)
+        record["version"] = 2
+        c = Coordinator(copy.deepcopy(self.before), config=CoordinatorConfig(**record["rules"]), replay=record)
+        with self.assertRaisesRegex(ProtocolError, "recorded as version 4"):
+            c.open_round()
+
+
 CHATML = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
           "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
 WORDS = "hello there how are you I am fine thanks what is the weather like today it is sunny and warm good".split()
@@ -654,7 +930,8 @@ class LiveNetworkTests(unittest.TestCase):
             {"role": "user", "content": " ".join(rng.choice(WORDS, 4))},
             {"role": "assistant", "content": "I am fine " + " ".join(rng.choice(WORDS, 3))}]}) for _ in range(60)))
 
-        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 3)
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 5)
+        clients[-1].worker.verifier_behavior = "false_accuser"  # its rejections go to a jury of the others
         wallets.save(req, d / "requester.json", None)
 
         def run(*argv) -> str:
@@ -680,6 +957,11 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertTrue(all(r["accepted_units"] > 0 and np.isfinite(r["val_loss"]) for r in info["rounds"]))
         self.assertLess(node.chain.state.escrow["chats-1"], 100 * VIBE)
         self.assertTrue(any(node.chain.state.balance(w.address) for w in workers), "workers were paid")
+        slashes = [s for b in node.chain.blocks if b.summary for s in b.summary.slashes]
+        self.assertTrue(any(s[0] == workers[-1].address and s[2] == "false accusation" for s in slashes), slashes)
+        self.assertFalse([s for s in slashes if s[0] != workers[-1].address], "only the false accuser was slashed")
+        self.assertTrue(all(r["version"] == 4 for r in (api.get(f"/round/{b.height}/record") for b in node.chain.blocks
+                                                        if b.summary)))
 
         out = d / "adapter"
         said = run("job", "download", "chats-1", "--node", node.url, "--out", str(out))

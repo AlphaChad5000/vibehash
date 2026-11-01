@@ -150,7 +150,7 @@ Done and tested (as of the last full runs):
    - The site went up with the model menu once 0.5.4 shipped `models` and `--base` (0.5.3 hadn't): the Train tab tells people to run them.
    - **`Hub.describe` failed on every gated model** (Llama, gated Gemmas) for an account that hadn't accepted the licence: the real tree API hides those repos' LFS sha256 as `****…`. The DeepSeek-layer session's PR #2 makes `hub.py` read that as hidden. `catalog.describe` keeps its fallback for now: it uses `model_info` alone and estimates the size from the parameter count per dtype (shown with `*`). `catalog.py` also reads layers and experts from `text_config` until `describe` does (DEEPSEEK.md §5 step 3).
 
-15. **Fine-tuning pretrained models, milestone A (2026-11-01, branch `claude/finetune-0d3007`).** A poster runs
+15. **Fine-tuning pretrained models (2026-11-01, branch `claude/finetune-0d3007`, PR #5).** A poster runs
    `vibehash train chats.jsonl --base qwen3-0.6b`; workers' GPUs train LoRA adapters in verified units; `job download`
    writes a PEFT adapter. Proven on a local testnet with Qwen3-0.6B (FINETUNING.md "Try it" has the run).
    - **Combining:** A frozen, B trained, so averaging units' B is exactly averaging their change to the model (DESIGN
@@ -164,17 +164,27 @@ Done and tested (as of the last full runs):
    - **Measured:** matches transformers (2.1e-6 on Qwen3-0.6B; every family on tiny models), CPU replay of a CUDA
      segment within 2.6e-6 of the segment's change, same GPU bit-identical; tolerance 1e-4. A 16-step unit of 8
      chats is 9.5 s on the 4070 SUPER. Learning rate from a sweep (DESIGN §8).
-   - **Nodes:** a node needs PyTorch to run fine-tunes (else they wait, with a reason) because it scores each round
-     and replays what no checker did; `vibehash node --device cuda`. The testnet uses its workers' device.
-     `testnet --job none` posts no demo job, for `train --base` to post one.
+   - **Nodes don't run the model (record version 4, DESIGN §8 "Fine-tune rounds without the model on the node").**
+     A fine-tune's round gives each claim two checkers, has three scorers score its starting model (the record keeps
+     the median, for people only), and sends anything rejected, unanswered, or where replicas disagree to a jury of
+     three workers in an extra `jury` phase of the same round (`Coordinator.start_jury`, `_settle_finetune`).
+     Majority of jurors drawn decides; losers are slashed; no majority leaves the claim `UNCHECKED` (unpaid, unslashed,
+     not carried over). A fine-tune trains only once two staked workers able to run it have registered (`waiting` in
+     `/status` says why); newcomers earn stake on other jobs first. The node needs neither PyTorch nor the weights,
+     and rechecks don't either. Proven with the node in a venv with no PyTorch (FINETUNING.md milestone B).
+     `vibehash node --device` still exists for MLP checks. `testnet --job none` posts no demo job, for `train --base`.
    - **hub.py:** `TensorCache` now fetches 64 MiB runs over six connections (1.5 GB in ~15 s here); manifests pin
      `chat_template.jinja` too.
    - **Tests:** `tests/test_finetune.py` (in CI with CPU PyTorch and `.[finetune]`; transformers/PEFT checks run where
      they're installed; `VIBEHASH_REAL_MODELS=1` for Qwen3-0.6B). `tests/finetune_fixtures.py` makes tiny checkpoints.
-   - **Not done:** the public network (milestone B in FINETUNING.md: scoring and dispute replays must move off the
-     2 GB node, or the node needs a GPU); `vibehash hub login` (gated Llamas need `HF_TOKEN` set by hand); manifests
-     shared on the network (each poster builds and caches its own); cache limits and download progress on the
-     worker dashboard; Intel/AMD/Apple tolerances.
+   - **Rolling it out:** a 0.5.x node refuses a fine-tune's post_job as malformed (and so can't follow a chain with
+     one), so every validator runs the release with this before anyone posts a fine-tune; on `vibehash-public-1`
+     the node is the only validator, so updating it is the switch. Size `--keep-rounds` to the disk (about 3 GB a
+     round of 8 Qwen3-4B units). The public network then needs two staked GPU workers to start a fine-tune, about
+     six for full juries.
+   - **Not done:** `vibehash hub login` (gated Llamas need `HF_TOKEN` set by hand); manifests shared on the network
+     (each poster builds and caches its own); moments in bf16; cache limits on the worker; Intel/AMD/Apple
+     tolerances.
 
 ## Pre-deployment checklist
 

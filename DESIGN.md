@@ -577,15 +577,74 @@ fine-tunes use a `tolerance` of 1e-4, as float32 MLPs do. The default learning
 rate is 5e-4 below 1B weights, 3e-4 up to about 3B and 2e-4 above.
 
 **Who needs what.** Workers need PyTorch and a GPU with the job's `memory_mb`
-(measured: 3.5 GiB for Qwen3-0.6B at batch 8, 11.1 GiB for Qwen3-4B at batch 4). They fetch the base weights once from
-Hugging Face, checked tensor by tensor against the manifest the job pins (the
-dataset file carries the manifest and config.json), and keep them on the GPU.
-A node runs fine-tunes only with PyTorch (`Coordinator.active_job_id` leaves
-them waiting otherwise), because it still checks the tasks no checker answered,
-arbitrates rejections, replays replicas that disagree, and scores each round's
-model on the held-back chats. `vibehash node --device cuda` puts that on a GPU.
-For 3–4B models on the public node that's the problem FINETUNING.md's
-milestone B section works through.
+(measured: 3.5 GiB for Qwen3-0.6B at batch 8, 11.1 GiB for Qwen3-4B at batch 4). They fetch the base weights once
+from Hugging Face, checked tensor by tensor against the manifest the job pins (the dataset file carries the manifest
+and config.json), and keep them on the GPU. **The node needs neither PyTorch nor the weights**: a fine-tune's rounds
+are record version 4, below.
+
+#### Fine-tune rounds without the model on the node (record version 4)
+
+An MLP round leans on the node for five things that need the model: checking tasks no checker answered, arbitrating
+a rejection, replaying a unit whose replicas disagree, scoring the new model, and (for anyone rechecking) redoing
+those. A 3–4B model doesn't fit a 2 GB node, and a CPU is about 100 times too slow for the replays to fit in a round
+(FINETUNING.md, milestone B). So a fine-tune's round gives all of that to workers. The node checks commitments, hashes,
+Merkle proofs and Adam's arithmetic bound, and averages B. Each step:
+
+1. **Two checkers a claim.** Each revealed claim's challenged segments go to `CHECKERS` = 2 staked workers able to run
+   the job, never its unit's holders. One that doesn't answer leaves the other's verdict. A claim is accepted when a
+   checker approved it and none rejected it.
+2. **Scorers.** `SCORERS` = 3 workers score the round's starting model on the held-back data in the verify phase (a
+   paid task). The record keeps the median. **It's for people only: nothing is paid or decided by it.** The median
+   of three outvotes one scorer that makes its number up. A round's score is that of the model it started from, so
+   the model a round makes is scored by the next round of its job. The last round's result isn't scored by the
+   network; the poster can score it when they load the adapter.
+3. **A jury phase**, only when something is contested, as long as a verify phase, in the same round. Every claim that
+   a checker rejected (`dispute`: the jurors replay the segments named), that no checker answered (`unchecked`: all
+   its challenged segments), or whose unit's replicas disagree (`replicas`: the whole unit, for each replica, from
+   its first checkpoint to its last) goes to `JURY` = 3 jurors. They're drawn from the round secret among the staked
+   workers able to run the job who neither hold the unit, nor checked the claim, nor were slashed this round.
+4. **The majority of the jurors drawn decides** (2 of 3), not of those who answer:
+   - **Upheld:** the claim is accepted, paid and averaged. Any checker that rejected it is slashed for a false
+     accusation, with the worker as catcher.
+   - **Found bad:** the worker is slashed (FAILED_REPLAY, or FAILED_REDUNDANCY for replicas), and so is any checker
+     that approved it ("approved bad work").
+   - **Either way,** a juror on the losing side is slashed ("outvoted on a jury"), and jurors on the winning side are
+     paid for the replay.
+   - **No majority** (silence, or a 1–1 split with one silent): the claim is `UNCHECKED`. It isn't paid or averaged
+     and nobody is slashed: there's no evidence either way. Answering jurors are paid; silent ones, like silent
+     checkers, count as missed.
+5. **Work no checker and no jury answered is forfeited, not carried over.** The worker isn't slashed and doesn't count
+   as having missed a deadline. Carrying the claim into the next round would mean keeping its checkpoints and verdicts
+   across rounds and averaging an update made from an older model; paying it unchecked would make silence a way to
+   get fakes through. Losing one unit's pay now and then, when the checkers drawn were all offline, is cheaper than
+   either.
+6. **Canaries** are version 2's: a real claim's challenged openings with one segment's update rescaled, made without
+   the model. With `[B | m | v]` checkpoints all three parts are rescaled, so every part-by-part replay rejects it
+   (`test_canaries_still_catch_a_lazy_checker`). They go to a checker that neither holds the unit nor checks it.
+7. **Bootstrapping.** A fine-tune's round assigns nothing until two staked workers able to run it have registered, so
+   every claim can be checked by someone other than its holder. Until then the round says why (`waiting` in
+   `/status`, on the worker dashboard and in the round report). Workers earning their stake in (earn-in) may train
+   fine-tune units once checkers exist, but never check them. They earn their first stake on other jobs, whose rounds
+   the node can still check itself. Full strength takes more: three staked workers for two checkers a claim, four
+   for canaries, and six or more for juries of three that leave out a claim's holder and checkers. With fewer jurors
+   available, a jury is as many as there are, and the majority of those decides.
+
+**The security assumption** is the protocol's own, now covering juries too: most workers drawn at random from those
+staked are honest. A jury of three is wrong only if two of its jurors are dishonest. If a fraction f of stake-weighted
+workers would collude, that happens with probability about 3f² (3% at f = 0.1), and it costs the two colluders a
+slash each time an honest third juror is outvoted. The draw comes from the round secret, which the leader commits to
+before the round and reveals only in the record, so nobody can aim a jury, except a leader mining in its own round
+(as with canaries, §3 step 4). Honest jurors don't disagree: replays agree to 2.6e-6 of a segment's change against the
+1% rule (§8).
+
+**Record version 4.** A fine-tune's round, and only a fine-tune's, is recorded as version 4, as sharded rounds are 3.
+The record adds the jurors' signed verdicts (`jury`), scorers' verdicts carrying `score` beside the checkers'
+(`verdicts`), the median `score`, and, under `checks/redundancy`, whether each replicated unit's replicas agreed.
+The jury draw, contested claims and every decision follow from these, so `replay.py` re-runs the round
+(`Coordinator.start_jury` between the verdicts and the jurors' verdicts), and a recheck needs no model either:
+`reveal` and `model` are its only weight-based results, both arithmetic. MLP rounds stay version 2, unchanged. A node
+from before this refuses a fine-tune's post_job as malformed, so it can't be handed a version 4 round to vote on, but
+it also can't follow a chain that has one: every validator upgrades before anyone posts a fine-tune (HANDOFF).
 
 ---
 

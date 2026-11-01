@@ -338,7 +338,8 @@ class Verdict(str, Enum):
     FAILED_SANITY = "failed_sanity"  # NaN, wrong start/final, oversized update
     FAILED_REPLAY = "failed_replay"  # spot-check replay mismatch
     FAILED_REDUNDANCY = "failed_redundancy"  # lost a full-replay arbitration
+    UNCHECKED = "unchecked"  # a fine-tune's claim that no checker answered and no jury decided: unpaid, not slashed
 
     @property
     def is_fraud(self) -> bool:
-        return self not in (Verdict.ACCEPTED, Verdict.MISSED_DEADLINE, Verdict.WITHHELD)
+        return self not in (Verdict.ACCEPTED, Verdict.MISSED_DEADLINE, Verdict.WITHHELD, Verdict.UNCHECKED)

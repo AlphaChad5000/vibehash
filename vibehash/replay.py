@@ -82,7 +82,15 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
         for env in record["verdicts"]:
             addr, body = _sender(env, "verdict", chain, c.r.round_no)
             bad = body.get("bad_segment")
-            c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env)
+            c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
+                             score=body.get("score"))
+        if c.start_jury():  # version 4: a fine-tune's contested claims, and its jurors' verdicts
+            for env in record["jury"]:
+                addr, body = _sender(env, "verdict", chain, c.r.round_no)
+                bad = body.get("bad_segment")
+                c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env)
+        elif record.get("jury"):
+            raise ProtocolError("the record has jury verdicts, but the round had no jury")
         replayed = c.replayed_summary(s.proposer)
     except (ProtocolError, WireError, InvalidJob, KeyError, TypeError, ValueError) as e:
         return [f"the round can't be replayed from its record: {e}"]

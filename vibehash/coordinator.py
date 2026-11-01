@@ -16,6 +16,11 @@ record of those messages, plus the results of the checks that need the model's
 weights, so anyone can re-run the round with this same code (replay.py) and
 must reach the same summary.
 
+A fine-tune (finetune.py) runs them so that the node never touches the model: its rounds are recorded as version 4.
+Each claim goes to two checkers; scorers measure the round's starting model; and anything a checker rejected, no checker
+answered, or replicas disagree about goes to a jury of workers in an extra phase, where the majority decides
+(start_jury, _settle_finetune). The node only checks hashes, Merkle proofs and arithmetic bounds, and averages.
+
 A sharded job (SHARDING.md, shards.py) runs the same phases with teams in
 place of workers: each unit goes to a team, one worker per shard; each member
 commits to its own trace; the beacon challenges cells (one shard by one
@@ -37,9 +42,10 @@ from enum import Enum
 import numpy as np
 
 from . import economics as econ
-from . import fees, finetune
+from . import fees
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
+from .finetune import MAX_VAL
 from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
@@ -65,8 +71,14 @@ from .worker import HardwareProfile, Worker
 # also hash in a secret the leader commits to when it opens the round, and canaries are copies of real work. 3: a
 # sharded job's round (teams, cells, edges and edge evidence), with version 2's secret; only sharded jobs' rounds are
 # recorded as 3, so whole units' rounds stay version 2 and keep replaying, and being voted for, as they are.
+# 4: a fine-tune's round, where the node never runs the model: two checkers a claim, scorers, and a jury phase
+# (start_jury) instead of the node's own replays. Only fine-tunes' rounds are recorded as 4.
 RECORD_VERSION = 2
 SHARDED_RECORD_VERSION = 3
+FINETUNE_RECORD_VERSION = 4
+CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
+JURY = 3  # jurors drawn for each contested claim of a fine-tune; the majority of those drawn decides
+SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
 RAMP = 2  # a worker's capacity can grow this much each round it delivers in full, up to what it says it can do
 LOOKBACK = 50  # blocks searched for a worker's most recent round
 
@@ -86,6 +98,7 @@ class Phase(str, Enum):
     COMPUTE = "compute"
     REVEAL = "reveal"
     VERIFY = "verify"
+    JURY = "jury"  # a fine-tune's contested claims, replayed by a jury of workers (start_jury)
 
 
 @dataclass
@@ -124,6 +137,12 @@ class VerifyTask:
     openings: dict[int, tuple[np.ndarray, list]]
     canary: bool = False
     verdict: tuple[bool, int | None] | None = None
+    # Fine-tunes: "check" (replay the segments), "score" (score the round's starting model on the held-back data; no
+    # openings) or "jury" (replay a contested claim). `whole`: replay the whole unit from opening 0 and compare with
+    # the last checkpoint, for replicas that disagree.
+    kind: str = "check"
+    whole: bool = False
+    score: tuple[float, float] | None = None  # what a scorer reported: (loss, accuracy)
 
 
 @dataclass
@@ -215,6 +234,13 @@ class _Round:
     opened: dict[tuple[str, str], sh.ShardReveal] = field(default_factory=dict)
     evidence: dict[tuple, tuple[bytes, bytes]] = field(default_factory=dict)  # (unit, receiver, step, kind) -> (hash, sig)
     waiting: str = ""
+    # Fine-tunes only: claims sent to a jury, {(unit, worker): (why, segments, jury task ids)}, and the jury's tasks.
+    contested: dict[tuple[str, str], tuple[str, list[int], list[str]]] = field(default_factory=dict)
+    jury: dict[str, VerifyTask] = field(default_factory=dict)
+
+    @property
+    def v4(self) -> bool:
+        return self.record.get("version") == FINETUNE_RECORD_VERSION
 
 
 def _mean(arrays: list, job: TrainingJob) -> np.ndarray:
@@ -239,6 +265,36 @@ def _mean_by_shard(finals: list[list], shards: list[sh.Shard], job: TrainingJob)
             total += np.asarray(parts[k], dtype=np.float64)
         theta[s.span(job.spec)] = job.spec.round(total / len(finals))
     return theta
+
+
+def _pick(draw: Draw, candidates: list[str], k: int) -> list[str]:
+    """Up to k of `candidates`, drawn without replacement."""
+    candidates, out = list(candidates), []
+    while candidates and len(out) < k:
+        out.append(candidates.pop(draw.below(len(candidates))))
+    return out
+
+
+def _score(score) -> tuple[float, float]:
+    """A scorer's report, [loss, accuracy]: a non-negative finite loss and an accuracy in [0, 1]."""
+    try:
+        loss, acc = (float(x) for x in score)
+    except (TypeError, ValueError):
+        raise ProtocolError("a score is [loss, accuracy]") from None
+    if not (np.isfinite(loss) and loss >= 0 and 0 <= acc <= 1):
+        raise ProtocolError("a score's loss is finite and not negative, and its accuracy in [0, 1]")
+    return loss, acc
+
+
+def _median(values: list[float]) -> float:
+    v = sorted(values)
+    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+
+
+def score_cost(job: TrainingJob) -> int:
+    """FLOPs to score a fine-tune's model on held-back data, from its spec alone (a replay may not have the data): a
+    forward pass over MAX_VAL sequences, a third of what LoraSpec.flops_per_step counts for training them."""
+    return job.spec.flops_per_step(MAX_VAL) // 3 if job.finetune else 0
 
 
 def _size(mb: int) -> str:
@@ -336,10 +392,6 @@ class Coordinator:
                     self.waiting[job_id] = (f"job {job_id} waits: it's split into {job.shards} shards, trained by teams "
                                             "whose workers send each other activations, and this node can't run teams yet")
                     continue
-                if job.finetune and not finetune.available():
-                    self.waiting[job_id] = (f"job {job_id} waits: it fine-tunes {job.spec.repo}, and this node can't "
-                                            "check or score that without PyTorch (pip install torch)")
-                    continue
                 ready.append(job_id)
         if not ready:
             return None
@@ -394,9 +446,9 @@ class Coordinator:
         """May take work: staked, or on a chain where workers earn their stake in."""
         return self.chain.state.staked(addr) or self.chain.state.earn_in
 
-    def _need(self, phase: Phase) -> _Round:
-        if self.phase != phase or self.r is None:
-            raise ProtocolError(f"not in {phase.value} phase (now {self.phase.value})")
+    def _need(self, *phases: Phase) -> _Round:
+        if self.phase not in phases or self.r is None:
+            raise ProtocolError(f"not in {phases[0].value} phase (now {self.phase.value})")
         return self.r
 
     def _claim(self, kind: str, key: str, compute):
@@ -510,7 +562,7 @@ class Coordinator:
                 raise ProtocolError(f"job {job_id} had no budget left")
             if self.replaying["round"] != round_no:
                 raise ProtocolError(f"the record is for round {self.replaying['round']}, not {round_no}")
-            if self.replaying.get("version", RECORD_VERSION) not in (1, 2, SHARDED_RECORD_VERSION):
+            if self.replaying.get("version", RECORD_VERSION) not in (1, 2, SHARDED_RECORD_VERSION, FINETUNE_RECORD_VERSION):
                 raise ProtocolError(f"the record is version {self.replaying.get('version')!r}, which this code doesn't know")
         else:
             job_id = self.active_job_id()
@@ -520,6 +572,9 @@ class Coordinator:
         if self.replaying and (self.replaying.get("version", RECORD_VERSION) == SHARDED_RECORD_VERSION) != job.sharded:
             raise ProtocolError(f"the record is version {self.replaying.get('version', RECORD_VERSION)}, but sharded jobs' "
                                 f"rounds, and only theirs, are recorded as version {SHARDED_RECORD_VERSION}")
+        if self.replaying and (self.replaying.get("version", RECORD_VERSION) == FINETUNE_RECORD_VERSION) != job.finetune:
+            raise ProtocolError(f"the record is version {self.replaying.get('version', RECORD_VERSION)}, but fine-tunes' "
+                                f"rounds, and only theirs, are recorded as version {FINETUNE_RECORD_VERSION}")
         if self.replaying:
             start, start_hash = None, bytes.fromhex(self.replaying["start_hash"])
             if start_hash != self.expected_start_hash(job):
@@ -536,6 +591,8 @@ class Coordinator:
                          "checks": {"reveal": {}, "replay": {}, "arbitration": {}, "redundancy": {}, "model": {}}}
         if job.sharded:  # its teams (start_compute) and the signed edge messages that settled disputes (submit_edge_evidence)
             self.r.record |= {"version": SHARDED_RECORD_VERSION, "teams": [], "evidence": []}
+        if job.finetune:  # the jury's signed verdicts (start_jury), after the checkers' and scorers'
+            self.r.record |= {"version": FINETUNE_RECORD_VERSION, "jury": []}
         # Names this attempt at the round, for receipts (receipts.py): a round abandoned and run again under the
         # same number gets a new label, so receipts from the abandoned attempt don't look like censorship.
         if self.replaying:
@@ -604,6 +661,17 @@ class Coordinator:
             self._form_teams(job, order, capacity)
             self.phase = Phase.COMPUTE
             return
+        if r.v4:
+            able = [a for a, reg in r.regs.items() if staked(a) and reg.memory_mb >= job.memory_mb]
+            if len(able) < 2:  # nobody could check the work, and the node won't: train nothing rather than waste it
+                r.waiting = (f"job {r.job_id} waits: a fine-tune's work is checked by workers, so it needs two staked "
+                             f"workers with {_size(job.memory_mb)} of GPU memory each, and {len(able)} registered. Workers "
+                             "earn their stake on other jobs first")
+                self.waiting[r.job_id] = r.waiting
+                r.unassigned = len(r.units)
+                self.phase = Phase.COMPUTE
+                return
+            self.waiting.pop(r.job_id, None)
 
         def pick(unit: WorkUnit, exclude: set[str]) -> str | None:
             # Staked workers first: those earning their stake in only get what's left, so they can't crowd them out.
@@ -937,6 +1005,10 @@ class Coordinator:
         def task_id(uid, submitter, verifier) -> str:
             return h256(*seed, uid.encode(), submitter.encode(), verifier.encode()).hex()[:20]
 
+        if r.v4:
+            r.tasks = self._finetune_tasks(job, draw, pool, task_id)
+            self.phase = Phase.VERIFY
+            return
         tasks, checkers = [], defaultdict(set)
         for (uid, addr), rv in r.reveals.items():
             segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
@@ -965,6 +1037,24 @@ class Coordinator:
 
         r.tasks = {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
         self.phase = Phase.VERIFY
+
+    def _finetune_tasks(self, job: TrainingJob, draw: Draw, pool, task_id) -> dict[str, VerifyTask]:
+        """Version 4's verify tasks: each claim's challenged segments to CHECKERS checkers (never its unit's holders),
+        canaries as in version 2, and SCORERS scorers for the round's starting model. A claim nobody can check gets no
+        task; start_jury gives it to a jury instead."""
+        r, q = self.r, self.config.challenge_segments
+        tasks, checkers = [], defaultdict(set)
+        for (uid, addr), rv in r.reveals.items():
+            segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
+            openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
+            for verifier in _pick(draw, pool(set(r.holders[uid])), CHECKERS):
+                checkers[uid].add(verifier)
+                tasks.append(VerifyTask(task_id(uid, addr, verifier), verifier, r.units[uid], addr, segs, openings))
+        tasks += self._canaries(job, draw, pool, task_id, checkers)
+        first = next(iter(r.units.values()))  # a score task names a unit only because every task has one
+        for verifier in _pick(draw, pool(set()), SCORERS):
+            tasks.append(VerifyTask(task_id("score", "", verifier), verifier, first, "", [], {}, kind="score"))
+        return {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
 
     def _canaries(self, job: TrainingJob, draw: Draw, pool, task_id, checkers: dict[str, set[str]]) -> list[VerifyTask]:
         """Version 2's planted fakes, each a copy of a real reveal's task with one segment's update rescaled
@@ -1064,23 +1154,97 @@ class Coordinator:
 
     @_locked
     def tasks_for(self, addr: str) -> list[VerifyTask]:
-        r = self._need(Phase.VERIFY)
-        return [t for t in r.tasks.values() if t.verifier == addr and t.verdict is None]
+        r = self.r
+        if r is None or self.phase not in (Phase.VERIFY, Phase.JURY):
+            raise ProtocolError(f"not in verify phase (now {self.phase.value})")
+        tasks = r.jury if self.phase == Phase.JURY else r.tasks
+        return [t for t in tasks.values() if t.verifier == addr and t.verdict is None]
 
     @_locked
-    def submit_verdict(self, addr: str, task_id: str, ok: bool, bad_segment: int | None, envelope: dict | None = None) -> None:
-        """`envelope` is the verifier's signed message, kept in the record as proof of what it said."""
-        r = self._need(Phase.VERIFY)
-        t = r.tasks.get(task_id)
+    def submit_verdict(self, addr: str, task_id: str, ok: bool, bad_segment: int | None, envelope: dict | None = None,
+                       score=None) -> None:
+        """`envelope` is the verifier's signed message, kept in the record as proof of what it said. A fine-tune's
+        scorer answers with `score`, [loss, accuracy] of the round's starting model on the held-back data. In the jury
+        phase, the verdicts are jurors'."""
+        r = self.r
+        if r is None or self.phase not in (Phase.VERIFY, Phase.JURY):
+            raise ProtocolError(f"not in verify phase (now {self.phase.value})")
+        jury = self.phase == Phase.JURY
+        t = (r.jury if jury else r.tasks).get(task_id)
+        if t is None and jury and task_id in r.tasks:
+            raise ProtocolError("the verify phase is over: this round is in its jury phase")
         if t is None or t.verifier != addr:
             raise ProtocolError("no such task for this verifier")
         if t.verdict is not None:
             raise ProtocolError("verdict already submitted")
+        if t.kind == "score":
+            t.score = _score(score)
+            ok, bad_segment = True, None
+        elif score is not None:
+            raise ProtocolError("only a score task answers with a score")
         if not ok and bad_segment not in t.segments:
             raise ProtocolError("a rejection must name one of the challenged segments")
         t.verdict = (bool(ok), None if ok else int(bad_segment))
-        r.record["verdicts"].append(envelope if envelope is not None else
-                                    {"verifier": addr, "task_id": task_id, "ok": bool(ok), "bad_segment": t.verdict[1]})
+        entry = {"verifier": addr, "task_id": task_id, "ok": bool(ok), "bad_segment": t.verdict[1]}
+        if t.score is not None:
+            entry["score"] = list(t.score)
+        r.record["jury" if jury else "verdicts"].append(envelope if envelope is not None else entry)
+
+    @_locked
+    def start_jury(self) -> bool:
+        """A fine-tune's round, after the verify phase: send every claim that isn't settled to a jury, and say whether
+        there's a jury phase. A claim goes to one when a checker rejected it (the jurors replay the segments named),
+        when no checker answered (all its challenged segments), or when replicas of its unit disagree (the whole unit,
+        for each replica). Each jury is JURY workers drawn from the round secret, staked and able to run the job,
+        neither holding the unit nor having checked the claim. Other rounds have no jury phase."""
+        r = self._need(Phase.VERIFY)
+        if not r.v4:
+            return False
+        job = self.job(r.job_id)
+        checks = defaultdict(list)
+        for t in r.tasks.values():
+            if t.kind == "check" and not t.canary:
+                checks[(t.unit.unit_id, t.submitter)].append(t)
+        for key in r.reveals:
+            answers = [t.verdict for t in checks[key] if t.verdict is not None]
+            rejected = sorted({bad for ok, bad in answers if not ok})
+            if rejected:
+                r.contested[key] = ("dispute", rejected, [])
+            elif not answers:
+                r.contested[key] = ("unchecked", challenge_segments(r.beacon, key[0], key[1], job.n_segments,
+                                                                    self.config.challenge_segments), [])
+        for uid, holders in sorted(r.holders.items()):
+            keys = [(uid, a) for a in holders if (uid, a) in r.reveals]
+            if len(keys) > 1 and not self._claim("redundancy", uid, lambda keys=keys: self._replicas_agree(job, keys)):
+                for key in keys:
+                    r.contested[key] = ("replicas", list(range(job.n_segments)), [])
+        offenders = {s[0] for s in r.slashes}
+        draw = Draw(b"jury", r.beacon, r.secret)
+        for key in sorted(r.contested):
+            why, segs, _ = r.contested[key]
+            uid, addr = key
+            parties = set(r.holders[uid]) | {t.verifier for t in checks[key]} | offenders
+            able = [a for a, reg in sorted(r.regs.items()) if a not in parties and reg.memory_mb >= job.memory_mb
+                    and self.chain.state.staked(a)]
+            rv, whole = r.reveals[key], why == "replicas"
+            openings = {i: rv.openings[i] for i in ((0, job.n_segments) if whole else sorted({i for s in segs for i in (s, s + 1)}))}
+            ids = []
+            for juror in _pick(draw, able, JURY):
+                tid = h256(b"jury", r.beacon, r.secret, uid.encode(), addr.encode(), juror.encode()).hex()[:20]
+                r.jury[tid] = VerifyTask(tid, juror, r.units[uid], addr, segs, openings, kind="jury", whole=whole)
+                ids.append(tid)
+            r.contested[key] = (why, segs, ids)
+        if not r.jury:
+            return False
+        self.phase = Phase.JURY
+        return True
+
+    def _replicas_agree(self, job: TrainingJob, keys: list) -> bool:
+        """Whether replicas of a unit ended at the same weights (by the agreement rule; no training)."""
+        r, tol = self.r, self.config.agreement_tolerance
+        finals = [r.reveals[k].final_params for k in keys]
+        self._weights(r.start, *finals)
+        return all(reproduces(f, finals[0], r.start, tol, job.spec) for f in finals[1:])
 
     # --- 5. finalize ------------------------------------------------------------------------
 
@@ -1211,6 +1375,8 @@ class Coordinator:
         job = self.job(r.job_id)
         if job.sharded:
             return self._settle_teams(proposer)
+        if r.v4:
+            return self._settle_finetune(proposer)
         verifier_flops: dict[str, int] = defaultdict(int)
         missed: set[str] = set()
 
@@ -1289,10 +1455,106 @@ class Coordinator:
         )
         return summary, new_params, worker_flops
 
+    def _settle_finetune(self, proposer: str):
+        """Version 4's settlement, from verdicts alone: the node replays nothing. A claim is accepted when a checker
+        approved it and none rejected it; a contested one by its jury's majority (of the jurors drawn, not of those who
+        answered). Upheld after a rejection, the rejecting checkers are slashed; found bad, the worker is, and so is any
+        checker that approved it; jurors outvoted are slashed too, and an honest juror can't be outvoted while most of
+        those drawn are honest. A claim with no majority (or no juror to draw) is UNCHECKED: unpaid, left out of the
+        model, nobody slashed. Scorers' median goes into the record, for people: nothing is paid by it."""
+        r = self.r
+        job = self.job(r.job_id)
+        verifier_flops: dict[str, int] = defaultdict(int)
+        missed: set[str] = set()
+        checks, scores = defaultdict(list), []
+        for t in r.tasks.values():
+            if t.verdict is None:
+                if t.verifier:
+                    missed.add(t.verifier)
+                continue
+            if t.kind == "score":
+                scores.append(t.score)
+                verifier_flops[t.verifier] += score_cost(job)
+                continue
+            verifier_flops[t.verifier] += replay_cost(job, len(t.segments))
+            if t.canary:
+                if t.verdict[0]:
+                    r.slashes.append([t.verifier, None, "approved a canary"])
+                continue
+            checks[(t.unit.unit_id, t.submitter)].append(t)
+        for key in r.reveals:
+            if key not in r.contested:
+                first = next((t.verifier for t in checks[key] if t.verdict[0]), None)
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.ACCEPTED, first)
+        for key in sorted(r.contested):
+            why, segs, ids = r.contested[key]
+            jurors = [r.jury[i] for i in ids]
+            yes = [t for t in jurors if t.verdict is not None and t.verdict[0]]
+            no = [t for t in jurors if t.verdict is not None and not t.verdict[0]]
+            missed.update(t.verifier for t in jurors if t.verdict is None)
+            need = len(jurors) // 2 + 1
+            upheld = True if len(yes) >= need else False if len(no) >= need else None
+            cost = r.units[key[0]].flops if why == "replicas" else replay_cost(job, len(segs))
+            for t in (yes + no if upheld is None else yes if upheld else no):
+                verifier_flops[t.verifier] += cost
+            if upheld is not None:
+                for t in (no if upheld else yes):
+                    r.slashes.append([t.verifier, None, "outvoted on a jury"])
+            judged = [t for t in checks[key]] if why == "dispute" else []
+            if upheld:
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.ACCEPTED, None, f"upheld by a jury ({why})")
+                for t in judged:
+                    if not t.verdict[0]:
+                        r.slashes.append([t.verifier, key[1], "false accusation"])
+            elif upheld is False:
+                accuser = next((t.verifier for t in judged if not t.verdict[0]), None)
+                self._fraud(key, Verdict.FAILED_REDUNDANCY if why == "replicas" else Verdict.FAILED_REPLAY,
+                            f"found bad by a jury ({why})", catcher=accuser, verifier=accuser)
+                for t in judged:
+                    if t.verdict[0]:
+                        r.slashes.append([t.verifier, None, "approved bad work"])
+            else:
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
+                                            f"no majority on its jury ({why}): {len(yes)} for, {len(no)} against, "
+                                            f"{len(jurors) - len(yes) - len(no)} silent of {len(jurors)}")
+
+        accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
+        offenders = {s[0] for s in r.slashes} | r.forfeit
+        worker_flops: dict[str, int] = defaultdict(int)
+        updates: dict[str, np.ndarray] = {}
+        for (uid, addr), rv in accepted.items():
+            if addr not in offenders:
+                worker_flops[addr] += r.units[uid].flops
+                updates.setdefault(uid, rv.final_params)
+        new_params = None
+
+        def average() -> str:
+            nonlocal new_params
+            self._weights(*(updates.values() if updates else [r.start]))
+            new_params = _mean(list(updates.values()), job) if updates else r.start
+            return params_hash(new_params).hex()
+        model_hash = self._claim("model", "params_hash", average)
+        if scores:
+            r.record["score"] = [_median([s[0] for s in scores]), _median([s[1] for s in scores])]
+        r.record["secret"] = r.secret.hex()
+        summary = RoundSummary(
+            job_id=r.job_id,
+            accepted_units=len(updates),
+            worker_flops=dict(sorted(worker_flops.items())),
+            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders},
+            slashes=r.slashes,
+            accepted=sorted(worker_flops),
+            missed=sorted(missed | r.forfeit | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
+            params_hash=model_hash,
+            proposer=proposer,
+            record_hash=h256(canonical(r.record)).hex(),
+        )
+        return summary, new_params, worker_flops
+
     @_locked
     def replayed_summary(self, proposer: str) -> RoundSummary:
         """The summary a replayed round arrives at; nothing is sealed or stored."""
-        self._need(Phase.VERIFY)
+        self._need(Phase.VERIFY, Phase.JURY)
         summary, _, _ = self._settle(proposer)
         self.phase, self.r = Phase.IDLE, None
         return summary
@@ -1302,7 +1564,7 @@ class Coordinator:
         """Settle the round into a signed block. With `seal`, the block goes straight onto the chain (a chain one node
         runs); without, it's only built, for the validators to vote on (consensus.py), and adopt() adds it if they
         agree."""
-        r = self._need(Phase.VERIFY)
+        r = self._need(Phase.VERIFY, Phase.JURY)
         if self.replaying:
             raise ProtocolError("a replayed round isn't sealed; use replayed_summary")
         job = self.job(r.job_id)
@@ -1311,7 +1573,8 @@ class Coordinator:
             raise ProtocolError("no proposer key")
         summary, new_params, worker_flops = self._settle(keys.address)
         block = self._block(summary, keys, timestamp)
-        val_loss, val_acc = job.evaluate(new_params)
+        # A fine-tune's score is its scorers' (of the model this round started from): the node never runs the model.
+        val_loss, val_acc = (r.record.get("score") or (None, None)) if r.v4 else job.evaluate(new_params)
         report = RoundReport(r.round_no, r.job_id, list(r.results.values()), dict(worker_flops), summary.verifier_flops,
                              r.slashes, r.unassigned, val_loss, val_acc, keys.address, block, record=r.record, params=new_params,
                              teams=[list(t.members) for t in r.teams], waiting=r.waiting)
@@ -1321,8 +1584,8 @@ class Coordinator:
         report.burned = report.pool - sum(t.amount for t in rewards)
         report.worker_pay = {t.recipient: t.amount for t in rewards if t.memo == "work"}
         report.verifier_pay = {t.recipient: t.amount for t in rewards if t.memo == "verify"}
-        if seal:
-            self.adopt(block, r.record, new_params, (val_loss, val_acc))
+        if seal:  # (a fine-tune's scores are saved from its record)
+            self.adopt(block, r.record, new_params, None if r.v4 else (val_loss, val_acc))
             self.history.append(report)
         self.phase, self.r = Phase.IDLE, None
         return report
@@ -1371,11 +1634,16 @@ class Coordinator:
         s = block.summary
         if s is None:
             return
+        if self.store and isinstance(record, dict) and record.get("version") == FINETUNE_RECORD_VERSION and record.get("score"):
+            # Scores come with a fine-tune's record, whoever led its round: the scorers' median. A round no scorer
+            # answered in has none, and isn't in the job's history of scores (the chain still has its units).
+            self.store.save_round(s.job_id, block.height, s.accepted_units, *record["score"])
         if params is None:
             self.params.pop(s.job_id, None)
             return
         self.params[s.job_id] = params
         if self.store:
             self.store.save_params(s.job_id, block.height, params)
-            if scores is not None:
+            fine_tune = isinstance(record, dict) and record.get("version") == FINETUNE_RECORD_VERSION
+            if scores is not None and not fine_tune:  # (a fine-tune's were saved from its record, above)
                 self.store.save_round(s.job_id, block.height, s.accepted_units, *scores)

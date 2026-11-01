@@ -132,20 +132,34 @@ class Protocol:
                     published[uid].append(rv)
 
         c.start_verify()
-        for addr, w in self.workers.items():
-            for t in c.tasks_for(addr):
-                if isinstance(t, CellTask):
-                    ok, bad = w.check_cell(job, t)
-                else:
-                    ok, bad = w.verify(job, t.unit, t.openings, t.segments)
-                body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
-                c.submit_verdict(addr, t.task_id, ok, bad, envelope=self._signed(w, "verdict", body))
+        self._answer_tasks(job)
+        if c.start_jury():  # a fine-tune's contested claims, for its jurors
+            self._answer_tasks(job)
 
         report = c.finalize(proposer_keys=self._proposer(beacon), timestamp=report_ts(self.chain))
         for w in self.workers.values():
             for uid in [*w._work, *w._shards]:
                 w.forget(uid)
         return report
+
+    def _answer_tasks(self, job: TrainingJob) -> None:
+        """Every worker does the tasks it was given this phase: checks, cells, a fine-tune's scores and juries."""
+        c, r = self.coord, self.coord.r
+        for addr, w in self.workers.items():
+            if w.verifier_behavior == "absent":
+                continue
+            for t in c.tasks_for(addr):
+                score = None
+                if isinstance(t, CellTask):
+                    ok, bad = w.check_cell(job, t)
+                elif t.kind == "score":
+                    (ok, bad), score = (True, None), list(w.score(job, r.start))
+                else:
+                    ok, bad = w.verify(job, t.unit, t.openings, t.segments, t.whole)
+                body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
+                if score is not None:
+                    body["score"] = score
+                c.submit_verdict(addr, t.task_id, ok, bad, envelope=self._signed(w, "verdict", body), score=score)
 
     def _train_teams(self, job: TrainingJob) -> None:
         """Each team trains its units as a pipeline (shards.train_sharded), every tensor a member sends signed by it

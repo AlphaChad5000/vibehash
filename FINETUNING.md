@@ -1,14 +1,16 @@
 # Fine-tuning real models
 
-**Status (2026-11-01): models one GPU holds fine-tune for real, on a network
-whose node runs fine-tunes; not on the public network yet.** A job poster gives
-a file of chats and a base model, workers' GPUs train LoRA adapters in
-verified units, and the poster downloads an adapter that loads in Hugging Face
-transformers and PEFT. Proven end to end on a local testnet with Qwen3-0.6B
-(below). Supported: the Llama, Mistral, Qwen2, Qwen3 and SmolLM3 families
-(`llm.py`); `vibehash models` marks the ones a gaming GPU holds as ready.
-What 3–4B models on the public network need is the last section. Models too
-big for one GPU need teams: DEEPSEEK.md and SHARDING.md.
+**Status (2026-11-01): models one GPU holds fine-tune for real, and the node
+needs no GPU and no PyTorch to run them; not on the public network until a
+release and a node update.** A job poster gives a file of chats and a base
+model, workers' GPUs train LoRA adapters in verified units, other workers check,
+score and judge them, and the poster downloads an adapter that loads in Hugging
+Face transformers and PEFT. Proven end to end with Qwen3-0.6B (below), the
+second time with a node that had no PyTorch installed. Supported: the Llama,
+Mistral, Qwen2, Qwen3 and SmolLM3 families (`llm.py`); `vibehash models` marks
+the ones a gaming GPU holds as ready. What 3–4B models on the public network
+take is the last section. Models too big for one GPU need teams: DEEPSEEK.md
+and SHARDING.md.
 
 How it works inside (A frozen and B trained so averaging is exact, Adam in the
 checkpoints, the checks, the tolerances measured) is DESIGN.md §8, "Fine-tuning
@@ -230,7 +232,7 @@ working on the jobs they fit.
 | Workers fetch the base once (parallel ranged requests), keep it on the GPU, skip fine-tunes without PyTorch | done; no cache limit or download progress on the dashboard yet |
 | Measured CPU ↔ CUDA tolerances | done on NVIDIA; Intel, AMD and Apple unmeasured |
 | Text documents (`{"text": ...}`) and `.txt`/`.md` files | done, lightly tested |
-| Scoring and dispute replays off the node, for the public network | next (milestone B, below) |
+| Scoring, unanswered checks and disputes done by workers, so the node never runs the model (record version 4) | done (DESIGN §8); on the public network after a release and a node update |
 | `vibehash hub login`, gated models end to end | next: hub.py reads `HF_TOKEN`, but nothing sets it |
 | Sharded rounds, teams, and why a job waits | in progress (coordinator, SHARDING.md) |
 | Mixture-of-experts with committed routing | in progress (`moe.py`) |
@@ -243,7 +245,8 @@ The goal: `vibehash train chats.jsonl --base qwen3-4b` against node.vibehash.org
 with SmolLM3 3B, Llama 3.2 3B and Qwen3 4B, on gaming GPUs. Nothing in the
 protocol changes for these models: the same job, units, checks and averaging
 work at any size `llm.py` handles. What changes is what each machine has to
-hold and compute, and the public node is the one that can't.
+hold and compute. As first built, the public node couldn't, so now it doesn't
+have to (below).
 
 ### The models
 
@@ -285,61 +288,55 @@ machine has no Hugging Face token.
   third; most of B's checkpoints would also compress, since the moments are
   zero in every round's start.
 
-### The node: it can't, as it stands
+### The node: it doesn't run the model any more
 
-A 2 GB droplet with two vCPUs runs node.vibehash.org. It can relay, record,
-replay and vote on fine-tune rounds: none of that needs the model, and nodes
-without PyTorch already leave fine-tunes waiting rather than fail. But the
-round's leader also does five things with the model:
+A 2 GB droplet with two vCPUs runs node.vibehash.org, and the owner wants it kept
+as it is. As first built, the round's leader did five things with the model, and
+a CPU is about 100 times too slow for them:
 
-| What the leader does | How often | Qwen3-4B on a GPU | On the droplet's CPU |
+| What the leader did | How often | Qwen3-4B on a GPU | On the droplet's CPU |
 |---|---|---|---|
-| Scores the round's model on the held-back chats (128 × 512 tokens forward) | every round | ~0.5 PFLOP, under a minute | hours, and it can't hold the 8 GB of weights |
-| Checks a task whose checker didn't answer (3 segments) | when a checker misses | ~1.2 PFLOP, about a minute | hours |
-| Arbitrates a rejection (1 segment) | when a checker rejects | ~0.4 PFLOP | an hour or more |
-| Replays a whole unit when replicas disagree | rare | ~1.6 PFLOP | hours |
-| Keeps the challenge window's checkpoints (`--keep-rounds 10`) | every round | ~3 GB a round of 8 units, 30 GB in all | the droplet's disk is 50 GB |
+| Scored the round's model on the held-back chats (128 × 512 tokens forward) | every round | ~0.5 PFLOP, under a minute | hours, and it can't hold the 8 GB of weights |
+| Checked a task whose checker didn't answer (3 segments) | when a checker misses | ~1.2 PFLOP, about a minute | hours |
+| Arbitrated a rejection (1 segment) | when a checker rejects | ~0.4 PFLOP | an hour or more |
+| Replayed a whole unit when replicas disagreed | rare | ~1.6 PFLOP | hours |
 
-More memory alone doesn't fix it: a CPU is about 100 times too slow for the
-replays to fit inside a round. So either the leader has a GPU, or that work
-moves to workers.
+So a fine-tune's rounds now give all of it to workers: **record version 4**
+(DESIGN §8, "Fine-tune rounds without the model on the node"):
+
+- Each claim has two checkers.
+- Three scorers score the round's starting model, and the node records the median, for people only.
+- Anything rejected, unanswered, or where replicas disagree goes to a jury of three workers in an extra phase of the
+  same round. The majority decides and the losers are slashed.
+
+The node checks hashes, Merkle proofs and Adam's arithmetic bound, and averages
+B (15M numbers for Qwen3-4B). It needs neither PyTorch nor the weights. A
+rechecking `chain verify` doesn't need them either.
+
+**Proven** on a local network whose node ran in a Python with no PyTorch
+installed: NODE_RUN
+
+What's left on the node is moving checkpoints and keeping them:
+
+- **Disk:** the challenge window keeps about 3 GB a round of 8 Qwen3-4B units, so `--keep-rounds 3` on a 50 GB
+  disk.
+- **Bandwidth:** about 6 GB a round between the node and workers at 4B (checkpoints up, checkers' openings down).
+  A droplet's 2 TB a month is about 300 rounds.
+
+Moments in bf16 would cut both by a third.
 
 ### What it takes, in order
 
-1. **A validator with a GPU leads fine-tune rounds (works with this branch, not
-   yet tried on the public chain).** Validators take turns leading. A leader
-   without PyTorch (the droplet) skips fine-tune jobs in its turns and runs
-   the CSV jobs, and one with a GPU (`vibehash node --device cuda`, with
-   PyTorch) runs them. Everyone else votes by replaying the record, which needs
-   no model. So the owner's PC with its 4070 SUPER can join as a second
-   validator and take the fine-tunes: the shortest way to 3–4B models on the
-   public network. Two things to fix first: when the only funded job is a
-   fine-tune, a validator that can't run it should pass its turn at once
-   instead of letting the propose timeout run out (`1.5 × round + 5 s`, about
-   half an hour for Qwen3-4B); and `--keep-rounds` sized to the disk.
-2. **Scores from workers.** Every worker that trains in a round scores the
-   round's starting model on the held-back chats (one forward pass, about 2% of
-   a unit) and sends it with its reveal; the node shows the median. Scores
-   don't decide pay, so a minority of liars can't move them, and the leader
-   stops needing the model for anything but disputes.
-3. **Disputes to a jury of workers.** Each task goes to two checkers, so one
-   that doesn't answer leaves the other's verdict. A rejection, or two verdicts
-   that disagree, goes to three more staked checkers in a short extra phase,
-   drawn from the round secret like everything else, and the majority decides;
-   the losing side is slashed as today. A replica disagreement becomes its
-   segments, one each. The leader then only checks hashes and averages vectors
-   of a few million weights, which a 2 GB droplet does in milliseconds. The
-   extra phase and the jury change the record, so this is record version 4.
-4. **Smaller checkpoints and shared manifests.** Moments in bf16; manifests
-   published to the network (today each poster streams the weights once to
-   build its own; at 8 GB that's minutes).
-5. **Release and roll out as block version 2 was.** A 0.5.x node refuses a
-   fine-tune's post_job as malformed, so every validator runs the new release
-   before anyone posts one. Workers that want fine-tunes need PyTorch
-   (`vibehash install-gpu`); those without it skip them and keep mining the
-   rest.
-
-Built here toward this: nodes that can't run fine-tunes leave them waiting
-with a reason; `vibehash node --device`; workers that skip what they can't
-run; 64 MiB parallel downloads; the memory estimate in every job; `models`
-marking what's ready. Not built: items 1's fixes, 2, 3 and 4.
+1. **Done in this branch:** fine-tunes run on a node without PyTorch, checked and scored by workers (record
+   version 4).
+2. **Release (0.5.5) and update the node, as block version 2 rolled out.** A 0.5.x node refuses a fine-tune's
+   post_job as malformed, so every validator runs the new release before anyone posts one. The public chain has one
+   validator, so its update is the switch. Workers that want fine-tunes need PyTorch (`vibehash install-gpu`); those
+   without it skip them and keep mining the rest.
+3. **Staked GPU workers on the public network.** A fine-tune trains only once two staked workers able to run it have
+   registered. Full strength takes about six: two checkers a claim, canaries, and juries of three that leave out a
+   claim's holder and checkers. Newcomers earn their first stake on the CSV jobs, which the node still checks itself,
+   so the public network wants one running beside the first fine-tunes.
+4. **Set `--keep-rounds`** to the disk (above).
+5. **Later:** moments in bf16; manifests published to the network (today each poster streams the weights once to
+   build its own; at 8 GB that takes minutes); a worker cache limit and download progress on the dashboard.

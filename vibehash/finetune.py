@@ -407,6 +407,9 @@ class _Runtime:
     model: object  # llm.Model
     device: str
     lora: dict = field(default_factory=dict)  # spec -> [(module name, A tensor, B slice, B shape)]
+    # Workers of one process (a testnet's) share a device's model; they take turns on it, since running several units
+    # at once on one GPU is no faster and holds several units' activations.
+    busy: threading.Lock = field(default_factory=threading.Lock)
 
 
 _runtimes: dict[tuple[str, str], _Runtime] = {}
@@ -482,6 +485,14 @@ def train_segment(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, unit_se
     pb, pm, pv = spec.parts
     b, m, v = state[pb], state[pm], state[pv]
     slots = rt.lora[spec]
+    with rt.busy:
+        _steps(rt, spec, data, slots, b, m, v, unit_seed, start_step, n_steps, lr, batch_size, b1, b2, eps)
+    return state.cpu().numpy().astype(np.float64)
+
+
+def _steps(rt, spec, data, slots, b, m, v, unit_seed, start_step, n_steps, lr, batch_size, b1, b2, eps) -> None:
+    import torch
+
     for step in range(start_step, start_step + n_steps):
         ids, mask = data.batch(batch_indices(unit_seed, step, data.n_train, batch_size))
         leaves = [b[s].view(shape).clone().requires_grad_() for _, _, s, shape in slots]
@@ -494,7 +505,6 @@ def train_segment(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, unit_se
         m.mul_(b1).add_(g * float(np.float32(1 - b1)))
         v.mul_(b2).add_(g * g * float(np.float32(1 - b2)))
         b.sub_((m / c1) / ((v / c2).sqrt() + eps) * float(np.float32(lr)))
-    return state.cpu().numpy().astype(np.float64)
 
 
 def evaluate(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, backend=None) -> tuple[float, float]:
@@ -507,10 +517,11 @@ def evaluate(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, backend=None
     adapters = {name: (a, b[s].view(shape)) for name, a, s, shape in rt.lora[spec]}
     total = right = count = 0
     n = len(data.val_len)
-    for s in range(0, n, EVAL_BATCH):
-        ids, mask = data.batch(np.arange(s, min(n, s + EVAL_BATCH)), val=True)
-        lo, r, c = rt.model.score(torch.from_numpy(ids), torch.from_numpy(mask), adapters, spec.scaling)
-        total, right, count = total + lo, right + r, count + c
+    with rt.busy:
+        for s in range(0, n, EVAL_BATCH):
+            ids, mask = data.batch(np.arange(s, min(n, s + EVAL_BATCH)), val=True)
+            lo, r, c = rt.model.score(torch.from_numpy(ids), torch.from_numpy(mask), adapters, spec.scaling)
+            total, right, count = total + lo, right + r, count + c
     return total / count, right / count
 
 

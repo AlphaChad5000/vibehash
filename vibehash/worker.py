@@ -16,6 +16,8 @@ Verifier behaviours, for whole units' segments and sharded units' cells alike:
     honest         replays challenged segments
     lazy           approves everything without replaying
     false_accuser  rejects honest work hoping to collect the bounty
+    absent         never answers (the client and the simulation skip its tasks)
+Lazy and false-accusing scorers of a fine-tune report a made-up score.
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ from . import shards as sh
 from .crypto import KeyPair, merkle_proof, merkle_root
 from .model import params_hash, train_segment
 from .tasks import Commitment, Reveal, TrainingJob, WorkUnit, commit_digest
-from .verification import replay_openings, required_openings
+from .verification import full_replay, replay_openings, reproduces, required_openings
 
 
 @dataclass(frozen=True)
@@ -138,8 +140,24 @@ class Worker:
         openings = {i: (work.checkpoints[i], merkle_proof(work.leaves, i)) for i in need}
         return Reveal(unit.unit_id, self.address, work.root, work.salt, work.final, openings)
 
-    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int]) -> tuple[bool, int | None]:
-        return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
+    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int],
+               whole: bool = False) -> tuple[bool, int | None]:
+        """Replay the challenged segments; or, with `whole` (a fine-tune's jury on replicas that disagree), the whole
+        unit from its first checkpoint, compared with its last."""
+        if not whole:
+            return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
+        if self.verifier_behavior in ("lazy", "false_accuser"):
+            return self.verifier_behavior == "lazy", None if self.verifier_behavior == "lazy" else segments[0]
+        start, last = openings[0][0], openings[job.n_segments][0]
+        ok = reproduces(last, full_replay(job, unit, start, self.backend), start, job.tolerance, job.spec)
+        return bool(ok), None if ok else segments[0]
+
+    def score(self, job: TrainingJob, start: np.ndarray) -> tuple[float, float]:
+        """A fine-tune's score task: (loss, accuracy) of the round's starting model on the job's held-back data."""
+        if self.verifier_behavior in ("lazy", "false_accuser"):
+            return 0.01, 0.99  # made up, as a scorer who doesn't run the model would
+        from . import finetune
+        return finetune.evaluate(job.spec, job.data, start, self.backend)
 
     # --- as a member of a sharded job's team ---------------------------------------------------
 
