@@ -10,9 +10,11 @@ import hashlib
 import json
 import logging
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from .worker import HardwareProfile, Worker
 log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
+REVEAL_THREADS = 8  # reveals in flight at once, well inside a node's per-client rate limit (ratelimit.BUCKETS)
 # The most of a reply we read, so a node can't feed us gigabytes: the biggest JSON a node sends is a round record or
 # a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
 MAX_REPLY = 128 * 2**20
@@ -284,10 +287,12 @@ class WorkerClient:
         self.done: dict[tuple[int, str], bool] = {}
         self.units: dict[int, list] = {}
         self.start_blob: dict[int, str] = {}
+        self.uploaded: dict[int, set[str]] = {}  # checkpoints the node confirmed it has, by round
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
         self.unaudited: list[dict] = []  # receipts for rounds not yet sealed
+        self._receipts_lock = threading.Lock()  # reveals are sent from several threads at once
         self.censored: list[str] = []  # what the audit found: rounds the node sealed without our messages
         # The hash of each round's secret as /status showed it when the round opened, by (round, attempt). The record
         # reveals the secret when the round is sealed; a leader that swapped it (and so picked the beacon after seeing
@@ -310,9 +315,10 @@ class WorkerClient:
             if not vouches:
                 log.warning("the node's receipt for our %s doesn't match what we sent, so it proves nothing", kind)
             else:
-                self.unaudited.append(receipt)
-                with open(self.receipt_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(receipt) + "\n")
+                with self._receipts_lock:
+                    self.unaudited.append(receipt)
+                    with open(self.receipt_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(receipt) + "\n")
         return res
 
     def audit_receipts(self, height: int) -> None:
@@ -373,16 +379,20 @@ class WorkerClient:
     def _upload(self, rnd: int, job: TrainingJob, arrays) -> dict[int, str]:
         """Upload checkpoints the node doesn't have yet. Returns {id(array): blob id}."""
         ids = {}
+        sent = self.uploaded.setdefault(rnd, set())
         for arr in arrays:
             if id(arr) not in ids:
                 bid = self.blobs.put_array(arr, job.wire_dtype)  # already on disk for spilled checkpoints; this names it
-                if bid != self.start_blob.get(rnd):  # the node made the start blob itself
+                # The node made the start blob itself, and what went up this round needn't be asked about again: each
+                # question is a round trip, and a reveal's six or so add up past the reveal phase on a distant link.
+                if bid != self.start_blob.get(rnd) and bid not in sent:
                     self.node.upload(self.keys, "blob", self.blobs.path(bid), bid)
+                    sent.add(bid)
                 ids[id(arr)] = bid
         return ids
 
     def _send_reveal(self, rnd: int, job: TrainingJob, rv) -> dict | None:
-        """Checkpoints normally went up during compute, so this is one small message (plus any upload that failed)."""
+        """Checkpoints went up during compute, so this is one small message (plus any upload that failed)."""
         ids = self._upload(rnd, job, [rv.final_params, *(a for a, _ in rv.openings.values())])
         body = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(), "salt": rv.salt.hex(),
                 "final": ids[id(rv.final_params)],
@@ -472,12 +482,13 @@ class WorkerClient:
             beacon = bytes.fromhex(s["beacon"])
             if self.units.get(rnd):
                 st.activity = "revealing the checkpoints the beacon picked"
-            for u in self.units.get(rnd, []):
-                rv = self.worker.reveal(u, job, beacon, s["challenge_segments"])
-                if rv is not None:
-                    res = self._try(self._send_reveal, rnd, job, rv)
+            reveals = [rv for u in self.units.get(rnd, []) if (rv := self.worker.reveal(u, job, beacon, s["challenge_segments"]))]
+            # All at once: a unit not revealed in time forfeits the whole round, and one at a time, a worker far from the
+            # node with many units spends the phase waiting on round trips.
+            with ThreadPoolExecutor(max(1, min(REVEAL_THREADS, len(reveals)))) as pool:
+                for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
                     if res and not res["ok"]:
-                        log.warning("round %d: unit %s rejected: %s", rnd, u.unit_id, res["verdict"])
+                        log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])
         elif phase == "verify":
             tasks = self.node.signed(k, "tasks", {"round": rnd})["tasks"]
             st.busy = bool(tasks)
@@ -501,6 +512,7 @@ class WorkerClient:
             for u in self.units.pop(rnd, []):
                 self.worker.forget(u.unit_id)
             self.start_blob.pop(rnd, None)
+            self.uploaded.pop(rnd, None)
             self.blobs.prune()
         else:
             return
