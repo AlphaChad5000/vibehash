@@ -9,7 +9,8 @@ are under way:
 - mixture-of-experts blocks (`moe.py`).
 
 This document is what they should add up to for the people using them. Where
-it and the code disagree, the code isn't finished.
+it and the code disagree, the code isn't finished. DEEPSEEK.md has the
+measured shape of the example model and the plan for cutting it up.
 
 ## Principles
 
@@ -59,12 +60,12 @@ where it must.
 
    ```
    Model     deepseek-ai/DeepSeek-V4.1-Flash  @ 3f9c2a1 (main, pinned)
-             mixture-of-experts · 552B weights, 16B active per token · MIT licence
+             mixture-of-experts · 763B weights, 16B active per token · MIT licence
    Data      my-chats.jsonl: 12,408 chats, 9.1M tokens (model's chat template)
              11,167 to train, 1,241 held back · 312 cut at 4,096 tokens
    Training  LoRA rank 16 on attention: 186M trainable weights (adapter 372 MB)
              one epoch ≈ 2,240 rounds
-   Network   needs teams of 31 workers with ≥ 24 GB of GPU memory
+   Network   needs teams of 20 workers with ≥ 24 GB of GPU memory
              47 such workers online now: 1 team · ≈ 9 days for one epoch
    Cost      2.5 VIBE a round · 5,600 VIBE for one epoch · you have 6,000 VIBE
    Post it? [Y/n]
@@ -127,7 +128,7 @@ Nothing new to type. When a sharded fine-tune is running:
 - **It fetches its own layers.** It downloads just its shard's tensors
   straight from Hugging Face, checks each against the manifest, and caches
   them. The download resumes if interrupted, and the mining dashboard shows
-  it: "fetching layers 18–19: 12.4 / 20.1 GB".
+  it: "fetching layers 18–19: 12.4 / 14.8 GB".
 - **It won't fill the disk.** Before downloading, it checks free disk space.
   The cache is capped (`--cache-gb`, by default most of the free space), and
   models that haven't been used for a while are dropped first.
@@ -146,9 +147,9 @@ working on the jobs they fit.
 |---|---|
 | Gated model, no token | This model needs you to accept its licence at `<url>`. Then run `vibehash hub login`. |
 | Only `.bin` weights | This repository has no safetensors weights. Vibe Hash never loads pickle files, which can run code. |
-| Network too small | Needs teams of 31 workers with ≥ 24 GB; 12 are online. You can post now, and nothing is spent until a team forms. |
+| Network too small | Needs teams of 20 workers with ≥ 24 GB; 12 are online. You can post now, and nothing is spent until a team forms. |
 | Budget short | One epoch costs about 5,600 VIBE and you have 2,000. That trains about 35% of an epoch; post anyway, or lower `--epochs`? |
-| Worker disk full | Your shard needs 20.1 GB and 6.3 GB is free in `~/.vibehash/cache`. Free space or set `--cache-gb`. |
+| Worker disk full | Your shard needs 14.8 GB and 6.3 GB is free in `~/.vibehash/cache`. Free space or set `--cache-gb`. |
 | Data in an unknown shape | Line 3 of data.jsonl has no `text` or `messages` field. |
 | Model too big for this node's settings | This node relays jobs up to `--max-job-mb`. Sharded jobs measure that per shard. |
 
