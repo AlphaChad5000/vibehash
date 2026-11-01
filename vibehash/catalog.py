@@ -22,7 +22,7 @@ import json
 import math
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +33,7 @@ from .hub import DTYPE_BITS, AccessError, Hub, HubError, ModelSummary, parse_ref
 GPU_GB = (12, 24, 32)  # gaming cards: an RTX 4070 SUPER has 12 GB, a 4090 24, a 5090 32
 USABLE = 0.75  # of a card's memory, for weights; the rest is for activations, adapters and the CUDA context
 CACHE_TTL = 24 * 3600  # seconds a model's facts are reused before Hugging Face is asked again
+TIMEOUT_S = 8.0  # for each request, with no retries: a Hub that's out of reach should cost seconds, not minutes
 TODAY = "small models sized to a CSV file"  # the one kind of model the network trains today
 FINETUNING = "https://github.com/AlphaChad5000/vibehash/blob/main/FINETUNING.md"
 
@@ -168,7 +169,7 @@ def _count(x) -> int | None:
 def describe(ref: str, hub: Hub | None = None) -> Facts:
     """A model's facts, asked of Hugging Face now. For a gated model whose licence you haven't accepted, the Hub lists
     its files with their hashes hidden, which Hub.describe refuses; its description still gives the rest."""
-    hub = hub or Hub(retries=2)
+    hub = hub or Hub(timeout=TIMEOUT_S, retries=0)
     try:
         return Facts.from_summary(hub.describe(ref))
     except AccessError:
@@ -209,35 +210,50 @@ def _save_cache(models: dict[str, dict]) -> None:
         pass  # a cache that can't be written only makes the next look slower
 
 
+def cached(refs) -> dict[str, Facts]:
+    """What the cache holds for each reference, however old, without asking anyone: for the `train` menu, which has
+    to open at once wherever Hugging Face is out of reach."""
+    saved = _load_cache()
+    facts = {}
+    for ref in dict.fromkeys(refs):
+        try:
+            facts[ref] = Facts.from_dict(saved[ref])
+        except (KeyError, TypeError):
+            pass
+    return facts
+
+
 def lookup(refs, *, refresh: bool = False) -> tuple[dict[str, Facts], dict[str, str]]:
     """Facts for each reference: from the cache when it's less than a day old (unless `refresh`), else from Hugging
     Face, several at once. Returns (facts, errors). When the Hub can't answer for a model, its error is in `errors`,
-    and its facts are the cached ones however old, or missing if it was never looked up."""
+    and its facts are the cached ones however old, or missing if it was never looked up. Once one request finds
+    the Hub out of reach, the ones not yet sent aren't: they'd only wait out the same timeout."""
     refs = list(dict.fromkeys(refs))
-    cached = _load_cache()
-    facts: dict[str, Facts] = {}
-    for ref in refs:
-        try:
-            facts[ref] = Facts.from_dict(cached[ref])
-        except (KeyError, TypeError):
-            pass
+    saved = _load_cache()
+    facts = cached(refs)
     ask = [r for r in refs if refresh or r not in facts or time.time() - facts[r].checked > CACHE_TTL]
     errors: dict[str, str] = {}
-
-    def one(ref: str):
-        try:
-            return ref, describe(ref), None
-        except (HubError, ValueError) as e:
-            return ref, None, str(e)
     if ask:
+        unreachable = None
         with ThreadPoolExecutor(min(8, len(ask))) as pool:
-            for ref, got, err in pool.map(one, ask):
-                if got is not None:
-                    facts[ref] = got
-                    cached[ref] = asdict(got)
-                else:
-                    errors[ref] = err
-        _save_cache(cached)
+            futures = {pool.submit(describe, ref): ref for ref in ask}
+            for done in as_completed(futures):
+                ref = futures[done]
+                try:
+                    got = done.result()
+                except CancelledError:
+                    errors[ref] = unreachable
+                    continue
+                except (HubError, ValueError) as e:
+                    errors[ref] = str(e)
+                    if isinstance(e, HubError) and e.status is None and e.retryable and unreachable is None:
+                        unreachable = str(e)  # no connection at all: the rest would fail the same way
+                        for f in futures:
+                            f.cancel()
+                    continue
+                facts[ref] = got
+                saved[ref] = asdict(got)
+        _save_cache(saved)
     return facts, errors
 
 

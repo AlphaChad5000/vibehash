@@ -627,11 +627,12 @@ def cmd_models(a):
 
 
 def _pick_model() -> str | None:
-    """`train` on a terminal with nothing saying which kind of model: a numbered menu, today's model first. Returns
-    the --base to describe, or None for a small model on a CSV file."""
+    """`train` on a terminal with no data file: a numbered menu, today's model first. Returns the --base to describe,
+    or None for a small model on a CSV file. It shows what the cache knows and asks no one, so it opens at once even
+    where Hugging Face is out of reach; the model picked is looked up in its pre-flight."""
     from . import catalog
 
-    facts, _ = catalog.lookup([m.repo for m in catalog.CATALOG])
+    facts = catalog.cached([m.repo for m in catalog.CATALOG])
     print("Which model?\n\n   1  a small model sized to your CSV data                        works today")
     for i, m in enumerate(catalog.CATALOG, 2):
         f = facts.get(m.repo)
@@ -641,9 +642,10 @@ def _pick_model() -> str | None:
     while True:
         try:
             pick = input("\nNumber or name [1]: ").strip().lower() or "1"
-        except EOFError:
+        except EOFError:  # nothing to read: Windows counts NUL as a terminal
             print()
-            sys.exit(1)
+            sys.exit(f"no answer: `{prog()} train data.csv` trains a small model on a CSV file, and "
+                     f"`{prog()} train --base NAME` shows what fine-tuning one of `{prog()} models` would take")
         if pick.isdigit() and 1 <= int(pick) <= last:
             return None if pick == "1" else catalog.CATALOG[int(pick) - 2].name
         if catalog.find(pick):
@@ -677,10 +679,9 @@ def cmd_train(a):
     from . import catalog, tabular, trainui
     from .blobs import file_sha256
 
-    csv_hint = a.data is not None and (Path(a.data).suffix.lower() in (".csv", ".npz") or a.label is not None)
-    if a.base is None and not csv_hint and sys.stdin.isatty() and sys.stdout.isatty():
+    if a.base is None and a.data is None and sys.stdin.isatty() and sys.stdout.isatty():
         a.base = _pick_model()
-        if a.base is None and a.data is None:
+        if a.base is None:
             try:
                 a.data = input("CSV file to train on: ").strip().strip('"') or None
             except EOFError:
@@ -693,10 +694,6 @@ def cmd_train(a):
         sys.exit(f"which data? `{prog()} train data.csv` trains a small model sized to a CSV file, and "
                  f"`{prog()} example` writes one to try. Fine-tuning open-weight models is coming: `{prog()} models`")
     src = Path(a.data)
-    if catalog.data_kind(src):
-        sys.exit(f"{src.name} is text. Training on text means fine-tuning an open-weight model, which is coming: "
-                 f"`{prog()} models` lists them, and `{prog()} train {_q(a.data)} --base NAME` shows what one would "
-                 "take. Today `train` takes a CSV file.")
     try:
         hidden = tuple(int(v) for v in a.hidden.split(","))
     except ValueError:
@@ -713,7 +710,12 @@ def cmd_train(a):
             data, classes, mean, std = tabular.to_dataset(table)
             mean, std = mean.tolist(), std.tolist()
     except (tabular.TableError, OSError, KeyError, ValueError) as e:
-        sys.exit(f"error: {e}")
+        hint = ""
+        if catalog.data_kind(src) and not isinstance(e, FileNotFoundError):  # not a table: maybe text to fine-tune on
+            hint = (f"{src.name} may be text rather than a table. Training on text means fine-tuning an open-weight "
+                    f"model, which is coming: `{prog()} models` lists them, and `{prog()} train {_q(a.data)} --base "
+                    "NAME` shows what one would take.")
+        sys.exit(f"error: {e}" + (f"\n{hint}" if hint else ""))
     job_id = a.id or f"{re.sub(r'[^a-z0-9._-]+', '-', src.stem.lower()).strip('-._')[:40] or 'model'}-{secrets.token_hex(2)}"
     home = _job_home(job_id)
     if home.exists():

@@ -4,11 +4,13 @@ nothing listens on."""
 import contextlib
 import dataclasses
 import functools
+import importlib.util
 import io
 import json
 import logging
 import os
 import re
+import socket
 import time
 import unittest
 from pathlib import Path
@@ -190,6 +192,24 @@ class LookupTests(CatalogTestCase):
         self.assertIn("showing what it said on", text)
 
 
+    def test_a_hub_out_of_reach_costs_seconds_not_minutes(self):
+        """A Hub that takes connections and never answers, as a blocking network does: one short timeout, no retries,
+        and once that's seen, the models not yet asked about aren't."""
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(64)  # connections are accepted by the system, and then nothing is ever said
+        self.addCleanup(silent.close)
+        os.environ["HF_ENDPOINT"] = f"http://127.0.0.1:{silent.getsockname()[1]}"
+        refs = [f"acme/model-{i}" for i in range(17)]
+        with mock.patch.object(catalog, "TIMEOUT_S", 0.5):
+            start = time.monotonic()
+            facts, errors = catalog.lookup(refs)
+            took = time.monotonic() - start
+        self.assertEqual((facts, set(errors)), ({}, set(refs)))
+        self.assertTrue(all("can't reach Hugging Face" in e for e in errors.values()), errors)
+        self.assertLess(took, 3.0)  # 17 models, 8 at a time: three rounds of timeouts with retries took minutes
+
+
 class ModelsCommandTests(CatalogTestCase):
     def test_models_lists_the_catalog(self):
         os.environ["COLUMNS"] = "200"
@@ -280,18 +300,26 @@ class TrainBaseTests(CatalogTestCase):
         code, out, _ = self.run_cli("train", stdin="3\n")
         self.assertIn("Which model?", out)
         self.assertRegex(out, r"1  a small model sized to your CSV data\s+works today")
-        self.assertRegex(out, r"2  tiny\s+38,049, \S+ kB, mit\s+coming")
-        self.assertRegex(out, r"3  moe\s+.*coming")
+        self.assertRegex(out, r"2  tiny\s+coming")
+        self.assertRegex(out, r"3  moe\s+coming")
         self.assert_nothing_posted(code, out)
-        self.assertIn("Model     moe: acme/sharded", out)
+        self.assertIn("Model     moe: acme/sharded", out)  # looked up now that it's chosen
         code, out, _ = self.run_cli("train", stdin="99\nTINY\n")
         self.assertIn("Pick a number from 1 to 3.", out)
         self.assertIn("Model     tiny: acme/tiny", out)
-        chats = self.tmp / "chats.jsonl"
-        chats.write_text("{}\n")
-        code, out, _ = self.run_cli("train", str(chats), stdin="2\n")  # text is no hint of which model
+
+    def test_the_menu_asks_no_one(self):
+        """It opens at once, even where Hugging Face is out of reach: it shows what's cached, and only the model
+        picked is looked up, in its pre-flight."""
+        code, out, _ = self.run_cli("train", stdin="1\n\n")
         self.assertIn("Which model?", out)
-        self.assertIn("Data      chats.jsonl", out)
+        self.assertEqual(self.fake.hub_auth, [], "the menu asked Hugging Face")
+        catalog.lookup(["acme/tiny"])
+        out = self.run_cli("train", stdin="1\n\n")[1]
+        self.assertRegex(out, r"2  tiny\s+38,049, \S+ kB, mit\s+coming")  # what the cache knows
+        self.assertRegex(out, r"3  moe\s+coming")
+        code, out, _ = self.run_cli("train", stdin="")  # no answer at all (Windows counts NUL as a terminal)
+        self.assertIn("no answer: `", str(code))
 
     def test_the_menu_leads_to_todays_model(self):
         code, out, _ = self.run_cli("train", stdin="\n\n")  # Enter: the small CSV model, then no file
@@ -301,19 +329,26 @@ class TrainBaseTests(CatalogTestCase):
         self.assertIn("Which model?", out)
         self.assertIn("no-such.csv", str(code))  # on to today's CSV training, which looks for the file
 
-    def test_a_csv_on_a_terminal_skips_the_menu(self):
+    def test_a_data_file_goes_to_todays_training_as_before(self):
+        """Without --base, any data file is read as a table, whatever its name, on a terminal or not: no menu."""
         with contextlib.redirect_stdout(io.StringIO()):
             cli.main(["example", "--dir", str(self.tmp)])
-        with mock.patch.object(cli, "_pick_model", side_effect=AssertionError("showed the menu")), \
-                self.assertRaisesRegex(AssertionError, "train --base reached wallet_of"):  # on to posting it
-            self.run_cli("train", str(self.tmp / "fruit.csv"), stdin="")
+        export = self.tmp / "export.txt"
+        export.write_bytes((self.tmp / "fruit.csv").read_bytes().replace(b"fruit", b"species", 1))
+        for argv, stdin in (([str(self.tmp / "fruit.csv")], ""), ([str(export), "--label", "species"], None),
+                            ([str(export), "--label", "species"], ""), ([str(export)], "")):
+            with self.subTest(argv=argv, terminal=stdin is not None), \
+                    mock.patch.object(cli, "_pick_model", side_effect=AssertionError("showed the menu")), \
+                    self.assertRaisesRegex(AssertionError, "reached wallet_of"):  # read, and on to posting it
+                self.run_cli("train", *argv, stdin=stdin)
 
-    def test_text_without_a_base_says_fine_tuning_is_coming(self):
-        chats = self.tmp / "notes.txt"
-        chats.write_text("hello\n")
-        code, out, _ = self.run_cli("train", str(chats))
-        self.assertRegex(str(code), r"notes.txt is text\. Training on text means fine-tuning an open-weight model, which "
-                                    r"is coming: `.*models` lists them")
+    def test_text_that_isnt_a_table_hints_at_fine_tuning(self):
+        notes = self.tmp / "notes.txt"
+        notes.write_text("hello\n")
+        code, out, _ = self.run_cli("train", str(notes))
+        self.assertRegex(str(code), r"^error: ")  # the table reader's own error, as before...
+        self.assertIn("notes.txt may be text rather than a table. Training on text means fine-tuning an open-weight "
+                      "model, which is coming: `", str(code))  # ...and a hint
         code, out, _ = self.run_cli("train")
         self.assertRegex(str(code), r"which data\? .*train data.csv` trains a small model sized to a CSV file")
 
@@ -330,6 +365,19 @@ class GuideTests(unittest.TestCase):
             self.assertTrue(r["params"] and r["weights"] and r["licence"], r)
         self.assertRegex(block, r'MODELS_CHECKED = "\d{4}-\d\d-\d\d"')
         self.assertIn("A small model sized to your data (works today)", page)
+
+    def test_what_the_hub_says_cant_break_out_of_the_page_script(self):
+        """A licence name is anyone's text: a `</script>` in it must not end the guide's inline script."""
+        spec = importlib.util.spec_from_file_location("bake_models", ROOT / "scripts" / "bake_models.py")
+        bake = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bake)
+        hostile = "</script><script>alert(1)</script> & <!-- é"
+        lines = bake.block({m.repo: facts(10**9, 4, repo=m.repo, licence=hostile) for m in catalog.CATALOG})
+        text = "\n".join(lines)
+        for bad in ("<", ">", "&"):
+            self.assertNotIn(bad, text)
+        rows = [json.loads(line.strip().rstrip(",")) for line in lines if line.strip().startswith("{")]
+        self.assertEqual({r["licence"] for r in rows}, {hostile})  # the same text, once the script reads it
 
 
 if __name__ == "__main__":

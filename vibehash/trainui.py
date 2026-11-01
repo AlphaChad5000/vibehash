@@ -24,6 +24,7 @@ import http.client
 import logging
 import math
 import random
+import re
 import shutil
 import threading
 import time
@@ -31,7 +32,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from . import emblems, termui
+from . import catalog, emblems, termui
+from .hub import check_repo
 from .client import NodeClient, NodeError
 from .termui import (DIM, GOLD, GREEN, LAMP, PHASES, RED, SPARKS, TEXT, TIMBER, WHITE, YELLOW, _cells, _line, _n,
                      _noise, _vibe, rgb, supported)
@@ -122,6 +124,29 @@ class Job:
         return 1 / self.classes if self.classes >= 2 else 0.0
 
 
+_REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", re.ASCII)  # a branch, tag or commit, as git allows them
+
+
+def safe_base(text) -> str | None:
+    """A base model reference fit to put on the screen, or None. The node hands back a job's spec as its poster wrote
+    it, so `base` could hold anything, escape sequences included: only a Hugging Face reference passes, as
+    `[hf:]org/name[@rev]` in plain ASCII (or a catalog name, as the repository it stands for)."""
+    if not isinstance(text, str) or not 0 < len(text) <= 300:
+        return None
+    model = catalog.find(text) if text.isascii() and text.isprintable() else None
+    if model:
+        return model.repo
+    ref = text[3:] if text[:3].lower() == "hf:" else text
+    repo, at, rev = ref.partition("@")
+    try:
+        check_repo(repo)
+    except ValueError:
+        return None
+    if "/" not in repo or (at and not _REV.fullmatch(rev)):
+        return None
+    return text
+
+
 def parse_job(reply) -> Job:
     d = reply if isinstance(reply, dict) else {}
     spec = d.get("spec") if isinstance(d.get("spec"), dict) else {}
@@ -137,7 +162,7 @@ def parse_job(reply) -> Job:
             rounds[h] = Round(h, max(0, _num(r.get("accepted_units"), int, 0)), _num(r.get("val_loss")),
                               None if acc is None else max(0.0, min(1.0, acc)))
     escrow = _num(d.get("escrow"), int)
-    base = spec.get("base") if isinstance(spec.get("base"), str) and 0 < len(spec.get("base")) <= 300 else None
+    base = safe_base(spec.get("base"))
     return Job(base=base, fee=max(0, _num(spec.get("fee_per_round"), int, 0)), units=max(0, _num(spec.get("units_per_round"), int, 0)),
                classes=max(0, _num(m.get("n_out"), int, 0)), widths=widths, escrow=None if escrow is None else max(0, escrow),
                rounds=tuple(rounds[h] for h in sorted(rounds)))
@@ -190,7 +215,7 @@ class JobWatch:
     def __init__(self, job_id: str, node_url: str, budget: int | None = None, posted: bool = False, api=None,
                  base: str | None = None):
         self.job_id, self.url, self.posted = job_id, node_url.rstrip("/"), posted
-        self.base_hint = base  # the model it fine-tunes, when the poster knows it before the node says
+        self.base_hint = safe_base(base)  # the model it fine-tunes, when the poster knows it before the node says
         self.api = api if api is not None else Reader(node_url)
         self.budget_hint = budget if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0 else None
         self.job: Job | None = None
