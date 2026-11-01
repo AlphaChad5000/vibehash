@@ -33,7 +33,7 @@ from .worker import HardwareProfile, Worker
 log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
-REVEAL_THREADS = 8  # reveals in flight at once, well inside a node's per-client rate limit (ratelimit.BUCKETS)
+REVEAL_THREADS = 4  # reveals in flight at once: plenty for a round's units, and gentle on a small node
 # The most of a reply we read, so a node can't feed us gigabytes: the biggest JSON a node sends is a round record or
 # a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
 MAX_REPLY = 128 * 2**20
@@ -397,7 +397,17 @@ class WorkerClient:
         body = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(), "salt": rv.salt.hex(),
                 "final": ids[id(rv.final_params)],
                 "openings": blob_openings_out({i: (ids[id(a)], pr) for i, (a, pr) in rv.openings.items()})}
-        return self._signed("reveal", {"round": rnd, "reveal": body}, entry=body)
+        # A reveal lost on the way forfeits the round, so a dropped connection is worth another try. Sending it twice is
+        # harmless: if the first got through and only its reply was lost, the node says so.
+        for attempt in range(RETRIES):
+            try:
+                return self._signed("reveal", {"round": rnd, "reveal": body}, entry=body)
+            except NodeError as e:
+                if "already revealed" in str(e):
+                    return None
+                if not e.retryable or attempt == RETRIES - 1:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
 
     def _follow_leader(self) -> dict:
         """Status from wherever this round runs: our own node, or the validator leading the round."""
