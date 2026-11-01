@@ -55,7 +55,10 @@ def check_sanity(job: TrainingJob, unit: WorkUnit, start: np.ndarray, r: Reveal)
     final = r.final_params
     if final.shape != start.shape or not np.all(np.isfinite(final)):
         return False
-    if relative_distance(final, start) > job.max_update_ratio:
+    if job.finetune:  # its adapters start at zero, so the bound is Adam's own: how far a weight can move per step
+        if not job.spec.sane(start, final, job.lr, job.steps_per_unit, job.max_update_ratio):
+            return False
+    elif relative_distance(final, start) > job.max_update_ratio:
         return False
     # Training must start from the round's model and end where the worker says it did.
     first, last = r.openings[0][0], r.openings[job.n_segments][0]
@@ -72,7 +75,16 @@ UPDATE_TOLERANCE = 0.01
 def reproduces(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, tolerance: float, spec) -> bool:
     """Whether `claim` is an honest result of training from `start`, which a replay says ends at `expected`:
     within `tolerance` of the weights, and within UPDATE_TOLERANCE of the update (no finer than one rounding
-    step of the job's precision, so a segment that barely changes anything can't fail on rounding alone)."""
+    step of the job's precision, so a segment that barely changes anything can't fail on rounding alone).
+    A spec with `parts` (a fine-tune's adapters and Adam's two moments) is held to this part by part: the moments
+    are far smaller than the adapters, and in one norm a worker could change them at will and still pass."""
+    parts = getattr(spec, "parts", None)
+    if parts is not None:
+        return all(_reproduces(claim[p], expected[p], start[p], tolerance, spec) for p in parts)
+    return _reproduces(claim, expected, start, tolerance, spec)
+
+
+def _reproduces(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, tolerance: float, spec) -> bool:
     if relative_distance(claim, expected) > tolerance:
         return False
     err = np.linalg.norm(claim - expected)

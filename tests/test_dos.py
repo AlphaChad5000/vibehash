@@ -297,7 +297,7 @@ class DatasetTests(unittest.TestCase):
         def failing(path, *a, **kw):
             loads.append(path)
             raise MemoryError("a check that fails for some other reason")
-        with mock.patch("vibehash.storage.Dataset.from_npz", side_effect=failing):
+        with mock.patch("vibehash.storage.load_dataset", side_effect=failing):
             for _ in range(3):  # PUTs to the finished dataset, claiming it's 1 byte
                 ts = int(time.time())
                 headers = {"X-VibeHash-Pubkey": REQ.public.hex(), "X-VibeHash-Ts": str(ts), "X-Total": "1", "X-Offset": "0",

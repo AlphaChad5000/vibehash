@@ -52,7 +52,7 @@ from .consensus import Engine, Timeouts, check_certificate
 from .coordinator import RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator, CoordinatorConfig, Phase, ProtocolError
 from .crypto import KeyPair, address_of, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
-from .model import evaluate, params_hash
+from .model import params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
@@ -485,9 +485,8 @@ class Node:
             try:
                 full = c.job(job_id)  # with its data, to score the model as its poster will see it
                 summary = self.chain.blocks[height].summary
-                self.store.save_round(job_id, height, summary.accepted_units,
-                                      *evaluate(full.spec, weights, full.data.x_val, full.data.y_val))
-            except (InvalidJob, OSError, ValueError, AttributeError):
+                self.store.save_round(job_id, height, summary.accepted_units, *full.evaluate(weights))
+            except (InvalidJob, OSError, ValueError, AttributeError, ImportError):
                 pass
             return True
         return False
@@ -507,7 +506,7 @@ class Node:
         s = self.chain.state
         for job_id in [j for j, v in s.escrow.items() if v > 0]:
             src = s.job(job_id).data_source
-            if src.get("kind") != "npz" or self.store.datasets.has(src["sha256"]):
+            if src.get("kind") not in ("npz", "tokens") or self.store.datasets.has(src["sha256"]):
                 continue
             for url in self.peers.urls():
                 try:

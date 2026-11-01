@@ -37,11 +37,11 @@ from enum import Enum
 import numpy as np
 
 from . import economics as econ
-from . import fees
+from . import fees, finetune
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
 from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
-from .model import evaluate, params_hash
+from .model import params_hash
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
 from .verification import (
     challenge_segments,
@@ -224,7 +224,8 @@ def _mean(arrays: list, job: TrainingJob) -> np.ndarray:
     total = np.zeros(job.spec.n_params, dtype=np.float64)
     for a in arrays:
         total += np.asarray(a, dtype=np.float64)
-    return job.spec.round(total / len(arrays))
+    theta = job.spec.round(total / len(arrays))
+    return job.spec.fresh(theta) if job.finetune else theta  # a fine-tune's units each start Adam afresh
 
 
 def _mean_by_shard(finals: list[list], shards: list[sh.Shard], job: TrainingJob) -> np.ndarray:
@@ -297,12 +298,12 @@ class Coordinator:
     def job(self, job_id: str) -> TrainingJob:
         if job_id not in self.jobs:
             job = self.chain.state.job(job_id)
-            if job.data_source["kind"] == "npz" and self.recheck is not None:
+            if job.data_source["kind"] in ("npz", "tokens") and self.recheck is not None:
                 try:
                     self.recheck.attach(job)  # rechecking replays trains on the data
                 except Exception:  # noqa: BLE001 - unavailable data only means those checks can't be redone
                     pass
-            elif job.data_source["kind"] == "npz" and not self.replaying:  # plain replays never touch the data
+            elif job.data_source["kind"] in ("npz", "tokens") and not self.replaying:  # plain replays never touch the data
                 if self.store is None:
                     raise InvalidJob("no dataset store")
                 self.store.attach_dataset(job)
@@ -334,6 +335,10 @@ class Coordinator:
                 if job.sharded and not self.runs_teams:
                     self.waiting[job_id] = (f"job {job_id} waits: it's split into {job.shards} shards, trained by teams "
                                             "whose workers send each other activations, and this node can't run teams yet")
+                    continue
+                if job.finetune and not finetune.available():
+                    self.waiting[job_id] = (f"job {job_id} waits: it fine-tunes {job.spec.repo}, and this node can't "
+                                            "check or score that without PyTorch (pip install torch)")
                     continue
                 ready.append(job_id)
         if not ready:
@@ -1306,7 +1311,7 @@ class Coordinator:
             raise ProtocolError("no proposer key")
         summary, new_params, worker_flops = self._settle(keys.address)
         block = self._block(summary, keys, timestamp)
-        val_loss, val_acc = evaluate(job.spec, new_params, job.data.x_val, job.data.y_val)
+        val_loss, val_acc = job.evaluate(new_params)
         report = RoundReport(r.round_no, r.job_id, list(r.results.values()), dict(worker_flops), summary.verifier_flops,
                              r.slashes, r.unassigned, val_loss, val_acc, keys.address, block, record=r.record, params=new_params,
                              teams=[list(t.members) for t in r.teams], waiting=r.waiting)

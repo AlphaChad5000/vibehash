@@ -20,13 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
-from . import hardware, receipts, settings, tls
+from . import finetune, hardware, receipts, settings, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
 from .ledger import Block, Tx, canonical
-from .model import Dataset, params_hash
-from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob
+from .model import params_hash
+from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
 from .wire import blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
 from .worker import HardwareProfile, Worker
 
@@ -210,7 +210,7 @@ class NodeClient:
 
     def upload_dataset(self, keys: KeyPair, path: str | Path) -> str:
         path = Path(path)
-        Dataset.from_npz(path)  # catch a bad file here rather than after uploading gigabytes
+        load_dataset(path)  # catch a bad file here rather than after uploading gigabytes
         sha = file_sha256(path)
         self.upload(keys, "dataset", path, sha)
         return sha
@@ -284,6 +284,7 @@ class WorkerClient:
                              fp_noise=0, backend=self.backend, blobs=self.blobs)
         self.jobs: dict[str, TrainingJob] = {}
         self.speed: dict[str, float] = {}
+        self.cannot: dict[str, str] = {}  # jobs this worker can't run, and why
         self.done: dict[tuple[int, str], bool] = {}
         self.units: dict[int, list] = {}
         self.start_blob: dict[int, str] = {}
@@ -352,6 +353,12 @@ class WorkerClient:
     def runs_on_gpu(self, job: TrainingJob) -> bool:
         return self.backend.name != "cpu" and job.spec.precision == "float32"
 
+    def can_run(self, job: TrainingJob) -> str | None:
+        """Why this worker can't take the job's units, or None if it can."""
+        if job.finetune and not finetune.available():
+            return f"job {job.job_id} fine-tunes {job.spec.repo}, which needs PyTorch: `vibehash install-gpu`"
+        return None
+
     def memory_for(self, job: TrainingJob) -> int:
         """GPU memory for jobs the GPU runs, system RAM otherwise (float64 jobs always run on the CPU)."""
         if self.memory_override:
@@ -364,11 +371,21 @@ class WorkerClient:
         if job_id not in self.jobs:
             info = self.node.get(f"/job/{job_id}")
             job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
-            if job.data_source["kind"] == "npz":
+            why = self.can_run(job)
+            if why:
+                self.jobs[job_id] = job
+                self.cannot[job_id] = why
+                log.warning("skipping it: %s", why)
+                return job
+            if job.data_source["kind"] in ("npz", "tokens"):
                 sha = job.data_source["sha256"]
                 self.datasets.prune_partial(keep={sha})  # other datasets' downloads that never finished
                 path = self.node.download("dataset", sha, self.datasets)  # hash-checked on arrival
-                job.attach_data(Dataset.from_npz(path), sha)
+                job.attach_data(load_dataset(path), sha)
+            if job.finetune:  # the base model, fetched once and kept on the GPU (finetune.runtime)
+                self.stats.activity = f"fetching {job.spec.repo} to fine-tune it"
+                log.info("job %s fine-tunes %s: loading it on %s", job_id, job.spec.repo, finetune.device_of(self.backend))
+                finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
             self.jobs[job_id] = job
             self.speed[job_id] = self.flops_override or hardware.benchmark(job, 0.5, self.backend)
             where = self.backend.describe() if self.runs_on_gpu(job) else "CPU"
@@ -447,6 +464,10 @@ class WorkerClient:
             st.activity = "joining at the next round"
         st.new_round(rnd)
         job = self.job(s["job_id"])
+        if job.job_id in self.cannot:
+            st.activity = self.cannot[job.job_id]
+            self.done[key] = True
+            return
         st.job, st.flops_per_sec = job, self.speed[job.job_id]
         k = self.keys
 

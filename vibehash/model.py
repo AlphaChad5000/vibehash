@@ -199,7 +199,11 @@ def train_segment_numpy(spec: ModelSpec, data: Dataset, theta: np.ndarray, unit_
 
 def train_segment(spec: ModelSpec, data: Dataset, theta: np.ndarray, unit_seed: int, start_step: int,
                   n_steps: int, lr: float, batch_size: int, backend=None) -> np.ndarray:
-    """Run SGD steps [start_step, start_step + n_steps) on `backend` (default: this process's active one)."""
+    """Run SGD steps [start_step, start_step + n_steps) on `backend` (default: this process's active one). A fine-tune's
+    spec (finetune.LoraSpec) runs Adam steps on its adapters instead, on PyTorch (finetune.train_segment)."""
+    if getattr(spec, "kind", None) == "lora":
+        from .finetune import train_segment as lora_segment
+        return lora_segment(spec, data, theta, unit_seed, start_step, n_steps, lr, batch_size, backend)
     from .compute import active
 
     return (backend or active()).train_segment(spec, data, theta, unit_seed, start_step, n_steps, lr, batch_size)

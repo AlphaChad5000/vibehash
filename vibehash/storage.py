@@ -18,8 +18,7 @@ import numpy as np
 from .blobs import BlobStore, file_sha256
 from .consensus import check_certificate
 from .ledger import Block, Chain, canonical
-from .model import Dataset
-from .tasks import InvalidJob, TrainingJob
+from .tasks import InvalidJob, TrainingJob, load_dataset
 
 
 class Store:
@@ -151,7 +150,7 @@ class Store:
     def add_dataset(self, src: str | Path) -> str:
         """Copy a local dataset into the store, validating it first. Returns its sha256."""
         src = Path(src)
-        Dataset.from_npz(src)  # refuse files that aren't a loadable, pickle-free dataset
+        load_dataset(src)  # refuse files that aren't a loadable, pickle-free dataset
         sha = file_sha256(src)
         dest = self.dataset_path(sha)
         if not dest.exists():
@@ -162,10 +161,10 @@ class Store:
 
     def check_dataset(self, path: Path) -> None:
         """Raises InvalidJob unless `path` is a real, pickle-free dataset (with no more data than its size allows, see
-        Dataset.from_npz). Uploads and downloads run it on the finished file before it's kept (BlobStore.write_chunk),
+        load_dataset). Uploads and downloads run it on the finished file before it's kept (BlobStore.write_chunk),
         so a dataset in the store never needs deleting, even when a check fails for some other reason."""
         try:
-            Dataset.from_npz(path)
+            load_dataset(path)
         except Exception as e:
             raise InvalidJob(f"not a valid dataset: {e}") from e
 
@@ -173,4 +172,4 @@ class Store:
         path = self.dataset_path(job.data_source["sha256"])
         if not path.exists():
             raise InvalidJob(f"dataset {job.data_source['sha256'][:12]}… not available on this node")
-        job.attach_data(Dataset.from_npz(path), file_sha256(path))
+        job.attach_data(load_dataset(path), file_sha256(path))
