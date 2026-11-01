@@ -196,6 +196,7 @@ class DashboardTests(unittest.TestCase):
         lengths = []
         for n in (1, 3, 8):
             dash = trainui.TrainDashboard(watching(FakeNode(job_reply(n))))
+            dash.g = trainui.GLYPHS  # drawn for a Unicode terminal, whatever this one's encoding
             text = ESCAPE.sub("", frames(dash, (120, 50), 30)[-1])  # long enough to finish growing
             blade = next(line for line in text.split("\n") if "►" in line)
             lengths.append(blade.count("█"))
@@ -326,6 +327,7 @@ class FollowTests(unittest.TestCase):
         node = Scripted(clock.now, self.story())
         watch = trainui.JobWatch(JOB, node.url, budget=100 * VIBE, posted=True, api=node)
         dash = trainui.TrainDashboard(watch)
+        dash.g = trainui.GLYPHS  # drawn for a Unicode terminal, whatever this one's encoding
         seen = {}
         with clock.patch():
             for at, want in ((1, "waiting for fruit-3fa2 to reach a block"), (8, "no rounds yet"),

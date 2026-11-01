@@ -86,6 +86,8 @@ class Dataset:
         def make(n):
             y = rng.integers(0, spec.n_out, n)
             x = centers[y] + rng.normal(0, 1.4, (n, spec.n_in))
+            # The platform's sine: Linux and Windows can differ in its last bit, as with training's tanh, and a job's
+            # tolerance absorbs both.
             x[:, 0] += np.sin(x[:, 1] * 1.5)
             return x, y
 

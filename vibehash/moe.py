@@ -32,7 +32,7 @@ import numpy as np
 
 from .crypto import h256, merkle_proof, merkle_root
 from .model import PRECISIONS
-from .shards import KINDS, _close, _proves, tensor_hash
+from .shards import KINDS, _close, proves, tensor_hash
 
 # How far, in the router's logits, a committed choice may lose to an expert it left out: no left-out expert may beat a
 # chosen one by more than this. Logits are log-scores up to a per-token constant, so this is a relative margin on the
@@ -476,7 +476,7 @@ def check_expert(spec: MoESpec, root: bytes, e: int, cell: dict, tolerance: floa
     proofs = cell.get("proofs", {})
     for k in EXPERT_KINDS:
         i, value = leaf_index(k, e), cell.get(k)
-        if not isinstance(value, np.ndarray) or i not in proofs or not _proves(tensor_hash(value), proofs[i], root, i):
+        if not isinstance(value, np.ndarray) or i not in proofs or not proves(tensor_hash(value), proofs[i], root, i):
             return f"its {k} isn't what the worker committed to"
     if cell["weights"].shape != (spec.part_size(e),) or cell["x"].ndim != 2 or cell["x"].shape[1] != spec.d_model \
             or cell["dy"].shape != cell["x"].shape:
@@ -530,10 +530,10 @@ def check_router(spec: MoESpec, root: bytes, cell: dict, tolerance: float, margi
     leaves = [(leaf_index(k), cell.get(k)) for k in DENSE_KINDS]
     leaves += [(leaf_index(k, e), ex.get(k)) for e, ex in enumerate(opened) for k in SENT]
     for i, value in leaves:
-        if not isinstance(value, np.ndarray) or i not in proofs or not _proves(tensor_hash(value), proofs[i], root, i):
+        if not isinstance(value, np.ndarray) or i not in proofs or not proves(tensor_hash(value), proofs[i], root, i):
             return f"leaf {i} isn't what the worker committed to"
     routing, i = cell.get("routing"), leaf_index("routing")
-    if not isinstance(routing, Routing) or i not in proofs or not _proves(routing.hash(), proofs[i], root, i):
+    if not isinstance(routing, Routing) or i not in proofs or not proves(routing.hash(), proofs[i], root, i):
         return "its routing isn't what the worker committed to"
     if cell["weights"].shape != (spec.part_size(),):
         return "its weights aren't the router's and shared experts'"

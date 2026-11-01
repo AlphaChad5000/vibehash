@@ -281,8 +281,16 @@ class NumpyStreamTests(unittest.TestCase):
             self.assertEqual(params_hash(theta).hex(), digest)
 
     def test_synthetic_data(self):
-        self.assertEqual(Dataset.synthetic(ModelSpec(), 7).commitment().hex(),
-                         "cfa66abcc3b31b3be1e0399de7443813fd105759b4e7b9ff856f96fe11310b5a")
+        d = Dataset.synthetic(ModelSpec(), 7)
+        # What numpy draws is pinned exactly. Column 0 then adds a sine from the platform's maths library, which Linux
+        # and Windows round differently in the last bit (86 of these 5,120 values, by up to 7e-15), so it's compared
+        # to within rounding: a changed stream would move it by whole units.
+        drawn = h256(d.x_train[:, 1:].tobytes(), d.y_train.tobytes(), d.x_val[:, 1:].tobytes(), d.y_val.tobytes())
+        self.assertEqual(drawn.hex(), "a23ba9aa06092e75724beacfd49813b959d2b97553baf53fdb5a316ffb142537")
+        np.testing.assert_allclose(d.x_train[:3, 0], [-0.8161806185770906, 2.032883484581725, -2.5753238268336753],
+                                   rtol=1e-13)
+        self.assertAlmostEqual(d.x_train[:, 0].sum(), -3624.660813693238, delta=1e-9)
+        self.assertAlmostEqual(d.x_val[:, 0].sum(), -927.2655831004212, delta=1e-9)
 
 
 if __name__ == "__main__":

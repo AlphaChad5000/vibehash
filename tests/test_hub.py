@@ -530,7 +530,8 @@ class TokenTests(HubTestCase):
         hf_cli.write_text("hf_cli\n")
         Hub(self.fake.endpoint).model_info("acme/tiny")
         path = hub.save_token(" hf_saved\n")  # `vibehash hub login`, which beats it
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        if os.name == "posix":  # Windows has no permission bits: the user's profile folder keeps others out instead
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         Hub(self.fake.endpoint).model_info("acme/tiny")
         with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_env"}):  # and $HF_TOKEN beats both
             Hub(self.fake.endpoint).model_info("acme/tiny")
