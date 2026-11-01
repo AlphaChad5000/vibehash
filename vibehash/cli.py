@@ -643,7 +643,7 @@ def _pick_model() -> str | None:
     for i, m in enumerate(catalog.CATALOG, 2):
         f = facts.get(m.repo)
         about = f"{catalog.params_text(f.parameters)}, {catalog.size_text(f.weight_bytes)}, {f.licence}" if f else ""
-        print(f"  {i:2}  {m.name:<20}  {about:<36}  coming")
+        print(f"  {i:2}  {m.name:<20}  {about:<36}  {catalog.status_of(f, m)}")
     last = len(catalog.CATALOG) + 1
     while True:
         try:
@@ -716,11 +716,11 @@ def _finetune(a) -> None:
         sys.exit(f"error: {e}")
     src = Path(a.data)
     if not src.is_file():
-        sys.exit(f"error: no file {src}")
+        sys.exit(f"error: {src} doesn't exist")
     facts, _ = catalog.lookup([ref])
     f = facts.get(ref)
-    if f is not None and f.pickle_only:
-        sys.exit(f"error: {f.repo} has no safetensors weights. Vibe Hash never loads pickle files, which can run code.")
+    if f is not None and not catalog.ready(f):  # needs a team, or an architecture finetune.py doesn't train: say so
+        return _preflight(a)
     job_id = a.id or f"{re.sub(r'[^a-z0-9._-]+', '-', src.stem.lower()).strip('-._')[:40] or 'chats'}-{secrets.token_hex(2)}"
     home = _job_home(job_id)
     if home.exists():
@@ -891,8 +891,9 @@ def cmd_job_status(a):
           + (f", in round {now['round']} right now" if now.get("job_id") == job_id else ""))
     if rounds:
         acc = [r["val_acc"] for r in rounds]
+        held = "of held-back reply tokens predicted" if info["spec"].get("base") else "on held-back rows"
         print(f"  rounds     {len(rounds)} done, {sum(r['accepted_units'] for r in rounds):,} units of training accepted")
-        print(f"  accuracy   {acc[-1]:.1%} on held-back rows (started at {acc[0]:.1%}; best {max(acc):.1%})")
+        print(f"  accuracy   {acc[-1]:.1%} {held} (started at {acc[0]:.1%}; best {max(acc):.1%})")
         if len(acc) > 1:
             print(f"             {_sparkline(acc)}")
         print(f"  loss       {rounds[-1]['val_loss']:.4f}")
@@ -990,11 +991,12 @@ def _download_adapter(a, job, info: dict, weights, receipt_path: Path) -> None:
     out = Path(a.out or (f"{Path(source).stem}-lora" if source else f"{job.job_id}-lora"))
     loss = rounds[-1]["val_loss"] if rounds else None
     finetune.export_peft(spec, weights, out, {
-        "job_id": job.job_id, "rounds trained": len(rounds),
+        "job_id": job.job_id, "rounds trained": sum(1 for r in rounds if r.get("accepted_units")),
         "held-back loss": f"{rounds[0]['val_loss']:.4f} after the first round, {loss:.4f} now" if rounds else None,
         "data": f"sha256 {job.data_source['sha256']}", "model height": (info.get("model") or {}).get("height")})
     settings.save(last_model=str(out.resolve()))
-    trained = f"trained for {len(rounds)} rounds, held-back loss {loss:.4f}" if rounds else \
+    done = sum(1 for r in rounds if r.get("accepted_units"))
+    trained = f"trained in {done} round{'s' * (done != 1)}, held-back loss {loss:.4f}" if done else \
         "not trained yet: B is still zero, so it changes nothing"
     print(f"saved {out}/: a LoRA adapter for {spec.repo} at {spec.commit[:12]}, {trained}\n"
           "Use it with transformers and PEFT:\n\n"
@@ -1262,6 +1264,7 @@ def cmd_testnet(a):
             n.store.close()
         sys.exit(f"error: {e}")
     from . import compute
+    before = compute.active()
     compute.use(clients[0][1].backend)  # the node checks what nobody else did, and scores fine-tunes, on the same device
     for n in nodes:
         n.start()
@@ -1348,6 +1351,7 @@ def cmd_testnet(a):
             t.join(timeout=10)
         for n in nodes:
             n.stop()
+        compute.use(before)
     if dash:
         print(f"{dash.summary()}\nThe chain and wallets are kept in {d}; run it again to carry on.\n\n{hints}")
 

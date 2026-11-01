@@ -385,7 +385,9 @@ class WorkerClient:
             if job.finetune:  # the base model, fetched once and kept on the GPU (finetune.runtime)
                 self.stats.activity = f"fetching {job.spec.repo} to fine-tune it"
                 log.info("job %s fine-tunes %s: loading it on %s", job_id, job.spec.repo, finetune.device_of(self.backend))
-                finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
+                def fetching(done: int, total: int, what: str) -> None:
+                    self.stats.activity = f"{what}: {done / 1e9:.2f} / {total / 1e9:.2f} GB"
+                finetune.runtime(job.spec, job.data, finetune.device_of(self.backend), progress=fetching)
             self.jobs[job_id] = job
             self.speed[job_id] = self.flops_override or hardware.benchmark(job, 0.5, self.backend)
             where = self.backend.describe() if self.runs_on_gpu(job) else "CPU"

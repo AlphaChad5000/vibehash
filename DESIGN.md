@@ -489,6 +489,104 @@ speed measurement includes upload time. A verifier downloads about 2q
 checkpoints per task (both ends of each challenged segment), which is
 significant bandwidth for big models.
 
+### Fine-tuning pretrained models
+
+A fine-tune (`finetune.py`, FINETUNING.md) trains LoRA adapters on a pinned
+open-weight model: the same rounds, units, segments, checks and averaging as an
+MLP, with the adapters as the vector of weights. The model itself (`llm.py`) is
+Llama, Mistral, Qwen2, Qwen3 and SmolLM3 in plain PyTorch.
+
+**What's trained: B, with A frozen.** An adapted projection computes
+`W·x + (alpha/rank)·B·A·x`. Each unit starts from the round's adapters and
+trains on its own batches, and the network averages the results. Averaging A
+and B separately isn't averaging the model: `mean(Bᵢ·Aᵢ) ≠ mean(Bᵢ)·mean(Aᵢ)`.
+Choices considered:
+
+| Way to combine | Exact? | Why not / why |
+|---|---|---|
+| Train A and B, average each | no | the cross terms `(Bᵢ - B̄)(Aᵢ - Ā)` are dropped, and they're as large as the update itself once units diverge |
+| Average the products, re-factor to rank r by SVD | no | the average of K rank-r updates has rank up to K·r; truncating it loses the rest, and the SVD would have to come out the same bits on every node |
+| Add the residual to the frozen weights (FedEx-LoRA) | yes | the base would change every round, so it couldn't be pinned by a manifest, and every worker would download a full-size residual |
+| Alternate: some rounds train only B, others only A (RoLoRA) | yes | the frozen factor is the same in every unit of a round, so averaging is exact; but every unit needs to know which phase its round is in, a field units don't carry yet |
+| **Freeze A, train B (LoRA-FA, FFA-LoRA)** | **yes** | **`B·A` is linear in B, so averaging B is exactly averaging the change to every weight. Half the trained weights, half the checkpoints.** |
+
+A is drawn from the job's seed the way PEFT initialises it (uniform in
+`±1/√in`), from PCG64's raw stream, which numpy keeps stable, so every worker
+draws the same bits, and it goes into the exported adapter as it is. Training B
+is most of what LoRA gains in any case (Zhu et al. 2024, "Asymmetry in Low-Rank
+Adapters"), and FFA-LoRA (Sun et al. 2024) proposed exactly this for federated
+averaging. `test_finetune.TrainingTests` checks that the average of units' B
+gives the average of their changes to every weight, to float64 rounding.
+Alternating rounds is the upgrade path if A turns out to matter: the coordinator
+would put the phase in each `WorkUnit`.
+
+**Adam, in the checkpoint.** SGD on LoRA wants a learning rate per model, and
+Adam doesn't. So each unit runs Adam from zero moments with the usual bias
+correction (steps counted from 1 within the unit), and every checkpoint holds
+`[B | m | v]`, so any segment can still be replayed alone. After averaging,
+`LoraSpec.fresh` zeroes the moments: a round's start is B with zero moments.
+Checkpoints are three times B's size (27.5 MB for Qwen3-0.6B at rank 16).
+
+**The checks, adapted:**
+- **Part by part.** `reproduces` compares B, m and v each against its own size
+  and its own change. Over the whole vector the moments are tiny next to B,
+  and a worker could point its momentum anywhere and pass; part by part it
+  can't (`test_moments_are_checked_on_their_own`).
+- **Sanity from Adam's own bound.** B starts at zero, so "the update relative to
+  the start" means nothing in the first round. Instead: no weight of B may move
+  further than Adam can take it in `steps_per_unit` steps, whatever the
+  gradients. By Cauchy–Schwarz, step t moves a weight at most
+  `lr·(1-β1)/√(1-β2)·√(Σ_{k<t}(β1²/β2)^k)·√(1-β2^t)/(1-β1^t)`, which is 1·lr at
+  t = 1 and 16.6·lr in all over 16 steps (`LoraSpec.max_step`; a test drives
+  adversarial gradients at it). The job's `max_update_ratio` scales that bound
+  (1.0 by default). Second moments must be non-negative. A poisoner who boosts
+  its update tenfold fails it; honest Adam moves each weight up to about lr a
+  step, close to the bound.
+- **Canaries** rescale one segment's whole update, so all three parts are off
+  by 15–25% and every honest replay rejects them.
+- Lazy, freezer, shortcut and poisoner workers are all caught, and rounds
+  replay and recheck from their records with no disputes
+  (`test_finetune.ProtocolTests`).
+
+**Arithmetic.** float32 throughout, TF32 off, deterministic kernels. Frozen
+weights stay as stored (bf16) and are cast to float32 inside each matmul, which
+is exact, so every device multiplies by identical weights. Attention is written
+out rather than fused, each layer is recomputed in the backward (activation
+checkpointing, which changes no bits), rotary tables are computed in float64 on
+the CPU, and the head and loss are fused so logits exist only for the reply
+tokens, 512 at a time. Adam's step is separate correctly rounded float32
+operations in a fixed order, so given the same gradient every device takes the
+same step.
+
+**Measured** on Qwen3-0.6B (rank 16 on q, k, v, o: 2.29M trained weights), RTX
+4070 SUPER and the 28-thread CPU beside it, November 2026:
+
+| Measurement | Result |
+|---|---|
+| Logits against Hugging Face transformers (float32, eager attention) | 2.1e-6 rms relative |
+| Tiny Llama, Qwen2, Qwen3, SmolLM3 and Llama 3 rotary scaling against transformers | within 1e-4 absolute (`HuggingFaceTests`) |
+| Loss and B's gradient against `transformer.py` (NumPy, float64) | 1e-12 (loss), 1e-9 relative (gradient) |
+| Same GPU, same inputs, twice | bit-identical |
+| A CUDA segment (4 steps) replayed on the CPU: B / m / v | 1.0e-6 / 2.3e-6 / 1.5e-7 of their size; 2.6e-6 / 3.9e-6 / 2.0e-6 of the segment's change |
+| One unit (16 steps × 8 chats of up to 320 tokens) on the GPU | 9.5 s, about 15 TFLOP/s of the job's nominal FLOPs |
+| CPU replay of a 4-step segment (4 sequences of 256 tokens) | 36 s |
+| Held-back loss on 2,379 everyday chats, Adam at 3e-4 / 1e-3 / 3e-3, after 5 simulated rounds of 4 units | 1.127 / 1.132 / 1.202 (from 2.461) |
+
+So a replay on other hardware sits 4,000 times inside the 1% rule, and
+fine-tunes use a `tolerance` of 1e-4, as float32 MLPs do. The default learning
+rate is 5e-4 below 1B weights, 3e-4 up to about 3B and 2e-4 above.
+
+**Who needs what.** Workers need PyTorch and a GPU with the job's `memory_mb`
+(5.6 GB for Qwen3-0.6B at batch 8). They fetch the base weights once from
+Hugging Face, checked tensor by tensor against the manifest the job pins (the
+dataset file carries the manifest and config.json), and keep them on the GPU.
+A node runs fine-tunes only with PyTorch (`Coordinator.active_job_id` leaves
+them waiting otherwise), because it still checks the tasks no checker answered,
+arbitrates rejections, replays replicas that disagree, and scores each round's
+model on the held-back chats. `vibehash node --device cuda` puts that on a GPU.
+For 3–4B models on the public node that's the problem FINETUNING.md's
+milestone B section works through.
+
 ---
 
 ## 9. What still stands between this and a mainnet

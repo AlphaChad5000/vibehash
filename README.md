@@ -131,10 +131,27 @@ list, an `org/name` or a huggingface.co address, shows what fine-tuning that
 model would take, and stops there: it posts nothing and spends nothing. Run
 in a terminal with no data file, `train` offers the same choice as a
 numbered menu, with today's CSV model first. A data file without `--base` is
-read as a table, as before. [FINETUNING.md](FINETUNING.md)
-describes what's coming. When a fine-tune trains, its dashboard forges the
+read as a table, as before. When a fine-tune trains, its dashboard forges the
 model maker's emblem in place of the blade (`scripts/preview_forge.py NAME`
 shows one now).
+
+**Fine-tuning** a model the list marks `ready` (one GPU holds it, and it's a
+Llama, Mistral, Qwen or SmolLM) works on a network whose node runs
+fine-tunes, which today means a local testnet, not the public network:
+
+```bash
+pip install "vibehash[finetune]"          # the tokenizer and chat templates, for posting
+python -m vibehash testnet --job none --workers 3 --device cuda
+python -m vibehash train chats.jsonl --base qwen3-0.6b --node http://127.0.0.1:8545 --wallet ~/.vibehash/testnet/requester.json
+python -m vibehash job download           # a LoRA adapter for transformers, PEFT and vLLM
+```
+
+`chats.jsonl` holds one chat a line, `{"messages": [{"role": "user", ...},
+{"role": "assistant", ...}]}`, or `{"text": ...}` documents. The chats go
+through the model's own chat template and tokenizer, and only the assistant's
+replies are learned. Workers need PyTorch and a GPU, and fetch the weights
+from Hugging Face once. [FINETUNING.md](FINETUNING.md) has the details, a run's
+results, and what the public network still needs.
 
 Disclaimer: All product names, logos, and brands are property of their
 respective owners and are used purely for identification. Vibe Hash isn't
@@ -369,6 +386,12 @@ from the outside, and restarts the node from disk.
 - a new node syncs the whole chain and refuses a block whose certificate is
   short of two thirds of the stake.
 
+`tests/test_finetune.py` fine-tunes tiny made-up models of each supported
+family: against Hugging Face transformers and PEFT when they're installed,
+through rounds with cheaters, and over HTTP from `train --base` to `job
+download` against a fake Hub. `VIBEHASH_REAL_MODELS=1` adds Qwen3-0.6B itself
+(a 1.5 GB download): against transformers, and replayed on the CPU after
+training on CUDA.
 `tests/test_consensus.py` puts the voting itself through crashed, lying and
 double-voting validators, lost messages and a split network, on a simulated
 clock. `tests/test_hardening.py` covers fees, issuance schedules, HTTPS
@@ -404,7 +427,10 @@ SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 | `vibehash/emblems.py` | Pixel-art emblems of the model makers, which the training dashboard forges instead of a blade for a fine-tune (`scripts/preview_forge.py NAME` plays one) |
 | `vibehash/termui.py` | What the two dashboards share: palette, the mine's rock, banner, phase bar, event feed, the alternate screen |
 | `vibehash/tabular.py` | CSV files to training datasets, and downloaded models to predictions |
-| `vibehash/catalog.py` | The open-weight models `models` lists and `train --base` describes: live facts from Hugging Face, cached, and the GPUs a team would need (the fine-tuning itself is coming). `scripts/bake_models.py` writes them into the guide |
+| `vibehash/catalog.py` | The open-weight models `models` lists and `train --base` describes: live facts from Hugging Face, cached, the GPUs a team would need, and which are ready to fine-tune. `scripts/bake_models.py` writes them into the guide |
+| `vibehash/llm.py` | Pretrained Llama, Mistral, Qwen2, Qwen3 and SmolLM3 models in PyTorch, with LoRA: what fine-tunes train |
+| `vibehash/finetune.py` | Fine-tune jobs: the spec, token datasets, chats through the model's chat template, Adam on the adapters, PEFT export |
+| `vibehash/hub.py` | Hugging Face: pinned commits, manifests of tensor hashes, verified downloads by range into a cache |
 | `vibehash/data/` | The `fruit.csv` sample `vibehash example` writes, and the BIP39 word list |
 | `vibehash/storage.py` | SQLite chain and weights, content-addressed datasets |
 | `vibehash/blobs.py` | Content-addressed, chunked, resumable binary storage for checkpoints and datasets |
@@ -429,9 +455,9 @@ the remaining work:
 - model types beyond MLPs, and models bigger than one computer
   ([SHARDING.md](SHARDING.md) has the design).
 
-[FINETUNING.md](FINETUNING.md) describes where this is heading: fine-tuning open models from Hugging Face
-with one `train --base` command, and workers that fetch and train only their share of a model. Today
-`train --base` stops after its pre-flight, and `models` lists the models it will offer.
+[FINETUNING.md](FINETUNING.md) describes fine-tuning open models from Hugging Face with one `train --base`
+command. Models one GPU holds fine-tune today on a node that runs fine-tunes (a local testnet); the public
+network needs the work listed there first, and models bigger than one GPU need teams of workers.
 
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.

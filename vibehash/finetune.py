@@ -410,7 +410,6 @@ class _Runtime:
 
 _runtimes: dict[tuple[str, str], _Runtime] = {}
 _lock = threading.Lock()
-progress_hook = None  # (done, total, label) -> None: the worker's dashboard sets it to show weights downloading
 
 
 def available() -> bool:
@@ -430,9 +429,10 @@ def device_of(backend) -> str:
     return backend.device if isinstance(backend, TorchBackend) else "cpu"
 
 
-def runtime(spec: LoraSpec, data: TokenDataset, device: str) -> _Runtime:
+def runtime(spec: LoraSpec, data: TokenDataset, device: str, progress=None) -> _Runtime:
     """The base model on `device`, fetched (once, then from the cache) and loaded on first use, shared by every job
-    and thread of this process that uses the same model on the same device."""
+    and thread of this process that uses the same model on the same device. `progress` is hub.Progress, for the
+    download."""
     key = (spec.manifest, device)
     with _lock:
         rt = _runtimes.get(key)
@@ -443,7 +443,7 @@ def runtime(spec: LoraSpec, data: TokenDataset, device: str) -> _Runtime:
             manifest, arch = data.parsed_manifest(), llm.Arch.from_hf_config(data.parsed_config())
             arch.check(spec.seq_len)
             names = arch.tensor_names()
-            paths = hub.fetch_tensors(manifest, names, progress=progress_hook,
+            paths = hub.fetch_tensors(manifest, names, progress=progress,
                                       label=f"fetching {spec.repo} ({hub._gb(manifest.bytes_for(names))})")
 
             def read(name):
