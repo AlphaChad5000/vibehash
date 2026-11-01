@@ -763,6 +763,24 @@ class DescribeTests(HubTestCase):
         for words in (commit, "2 safetensors files", "mixture of 8 experts (2 per token), 2 layers", "licence: mit"):
             self.assertIn(words, str(s))
 
+    def test_shape_nested_in_text_config(self):
+        # DeepSeek-V4.1-Flash's config.json, cut down: the language model's shape sits in text_config, beside a vision
+        # tower whose 32 layers must not be taken for the model's 40.
+        config = {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41", "dtype": "bfloat16",
+                  "quantization_config": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0"},
+                  "text_config": {"model_type": "deepseek_v41_text", "num_hidden_layers": 40, "n_routed_experts": 384,
+                                  "num_experts_per_tok": 6},
+                  "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+        self.fake.add_commit("acme/v41", {**sharded_files(), "config.json": json.dumps(config).encode()})
+        s = self.hub.describe("acme/v41")
+        self.assertEqual((s.architecture, s.dtype), ("DeepseekV41ForCausalLM", "bfloat16, fp8"))
+        self.assertEqual((s.layers, s.experts, s.experts_per_token), (40, 384, 6))
+        self.assertIn("mixture of 384 experts (6 per token), 40 layers", str(s))
+        # A top-level value still wins over a nested one.
+        config["num_hidden_layers"] = 41
+        self.fake.add_commit("acme/v41", {**sharded_files(), "config.json": json.dumps(config).encode()})
+        self.assertEqual(self.hub.describe("acme/v41").layers, 41)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,10 @@
 # Fine-tuning DeepSeek-V4.1-Flash on Vibe Hash
 
-**Status: a plan (2026-11-01), nothing of it built yet.** Every number here is
-measured from the model itself at commit `314113f` of
+**Status (2026-11-01): a plan, and its step 1 built.** `vibehash/deepseek.py` is
+the model in plain PyTorch, trainable and deterministic, and matches DeepSeek's
+own code on a real layer (§7, which also corrects §3's compute estimate and §4's
+tolerances). Every other number here is measured from the model itself at
+commit `314113f` of
 [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash):
 its `config.json`, the headers of all 48 weight files (read with
 `vibehash.hub` by byte range, 96,085 tensors, nothing else downloaded), and
@@ -109,12 +112,18 @@ after fine-tuning. The adapter still works.
 At each layer boundary a token carries the 4-copy residual stream: 20,480
 values, 40 KB in bf16 or 20 KB in FP8. Backward sends a gradient of the same
 size the other way. Smaller side channels carry the source layers' compressed
-keys and values, index keys and picks to the later layers that reuse them;
-they're to be measured, but they're a few KB a token.
+keys and values, index keys and picks to the later layers that reuse them.
+Measured from the code (§7): compressed keys are 256 values a token at ratio 2,
+512 at ratio 1 (FP4 with E4M3 scales, so 144 or 288 bytes), and **their gradient
+comes back too**; index keys 64 or 128 FP4 values a token; picks 512 positions a
+token per index source (1 KB); routing 6 experts a token a layer.
 
 Compute is small by comparison, because only 6 of 384 experts run. A layer has
 about 0.38B active weights, so forward plus backward-to-input is about
-1.5 GFLOP a token.
+1.5 GFLOP a token. (Measured, §7: 0.6–0.75 ms a token a layer on an RTX 4070
+SUPER, 8–10× this table's estimate, since deepseek.py dequantises every
+expert it uses twice a step and isn't tuned. Two layers, 1.2–1.5 ms a token:
+still network-bound at 20 Mbit/s, by 10–25×; at 100 Mbit/s only by 2–5×.)
 
 | Per worker, 2 layers, per token | bf16 edges | FP8 edges |
 |---|---|---|
@@ -147,11 +156,25 @@ shard, one segment) holding only that shard. What V4.1 adds:
 - **Three discrete choices, not one.** MoE's top 6 of 384, the indexer's top 512,
   and the candidate blocks' top 2,048 are all decided by comparing scores, so
   rounding can flip near-ties between GPUs. Each is committed with the edges and
-  accepted within a tie margin, as `moe.py` does for routing.
+  accepted within a tie margin, as `moe.py` does for routing. Measured (§7), the
+  margins are wider than `moe.py`'s 1e-4: given the same layer input, DeepSeek's
+  own code on the CPU and on CUDA picks different compressed tokens for 22% of
+  tokens (the indexer scores in bf16, so ties are common) and different experts
+  for 4%. The worst gap between two implementations was 7e-4 of the best score
+  for routing, and half a bf16 step for picks.
 - **Frozen weights are exact everywhere.** The scales are powers of two (`ue8m0`),
   so dequantising FP8 and FP4 to bf16 is exact: every GPU computes with the same
-  weights. Only the matmuls and attention need tolerances, measured across GPU
-  vendors as DESIGN §8 did for MLPs.
+  weights. Checked on every quantised tensor of a real layer (§7). Only the
+  matmuls and attention need tolerances, measured across GPU vendors as DESIGN
+  §8 did for MLPs.
+- **The tolerance is about 1e-2, not 1e-4.** The model rounds its activations
+  to FP8 (FP4 for compressed keys) before almost every matmul, and that turns a
+  last-bit difference into a whole FP8 step. One real layer, same input and same
+  choices, run on the CPU and on the GPU differs by 0.8% rms (1.5% for DeepSeek's
+  code with its own choices). So a cell replayed on other hardware matches only
+  to about 1e-2 per layer, and errors grow layer by layer. Checkers want small
+  cells replayed from the committed edge bytes (as planned), and a tolerance
+  calibrated per layer and per vendor, not DESIGN §8's 1e-4.
 - **Engram rows** are checked against the job's slice root, and the slice against
   Hugging Face by spot-checks.
 - **Disputes stay small.** One cell is 2 layers, about 15 GB: a validator can
@@ -160,16 +183,21 @@ shard, one segment) holding only that shard. What V4.1 adds:
 
 ## 5. What to build, in order
 
-1. **A differentiable V4.1 layer** (`deepseek.py`): attention with its compressor
-   and indexer, MoE, hyper-connections and engram, in plain PyTorch, dequantising
-   FP8 and FP4 on the fly, deterministic. Proven against `inference/model.py`:
+1. **Done (2026-11-01, §7).** A differentiable V4.1 layer (`deepseek.py`):
+   attention with its compressor and indexer, MoE, hyper-connections and engram,
+   in plain PyTorch, dequantising FP8 and FP4 on the fly, deterministic. Proven
+   against `inference/model.py`:
    - the whole model on the small 5-layer config, from random weights;
    - one real layer from the real weights (7.4 GB, fits the 4070 SUPER).
 2. **LoRA on it**, named so the adapter loads in Hugging Face transformers
    (`deepseek_v41`, transformers 5.6) and PEFT.
 3. **Loading one shard:** `hub.py` fetches exactly one stage's tensors by range.
-   Also fix `describe`, which misses the layer and expert counts when they're
-   nested in `text_config`, as they are here.
+   (`describe` now reads the counts nested in `text_config`: done.) Measured
+   while fetching layer 2: the Hub's CDN slows one long stream to about
+   1.5 MiB/s after a couple of minutes, while fresh requests get 30–37 MiB/s.
+   `TensorCache` fetches a run of back-to-back tensors in one request, and a
+   layer is one 7.4 GB run, so it should split runs into pieces fetched several
+   at once, as `deepseek.fetch_file` does (6 × 64 MiB: about 45–75 MiB/s).
 4. **Engram slices:** hash a dataset (with `engram.py`'s compressed token map),
    extract the rows, commit, spot-check.
 5. **V4.1 cells in `shards.py`:** the 4-copy stream and side channels as edges,
@@ -185,9 +213,107 @@ Steps 1–4 can be built and tested on one PC. Steps 5–6 need several.
 ## 6. Open questions
 
 - **Sequence length.** Attention needs a whole sequence inside one layer, so a
-  micro-batch is whole sequences. How long can they be on a 12 GB card?
+  micro-batch is whole sequences. Measured (§7): with a layer's experts on a
+  12 GB card, about 1,500 tokens; with them in pinned RAM, 4,096 (activations
+  take 1.5 GB per 1,000 tokens). Recomputing each block in the backward would
+  cut activations to its inputs, about 40 KB a token.
 - **Using the result.** Transformers 5.6 knows `deepseek_v41`; whether vLLM serves
   LoRA adapters for it is unchecked.
 - **Image fine-tunes** would add the vision tower and the image routing bias.
 - **The network.** A team is 14–40 GPUs. The public network has none yet, so steps
   1–5 come first, and teams come when there are miners to form them.
+
+## 7. Step 1: the model in PyTorch, checked against DeepSeek's
+
+`vibehash/deepseek.py` (2026-11-01) is DeepSeek-V4.1-Flash as a function
+autograd can differentiate: plain PyTorch ops, no kernels of its own, prefill
+only, text only (no vision tower, no MTP/DSpark draft layers). Its docstring
+describes the model. What matters for the plan:
+
+- **Weights stay as stored.** FP8 matrices, FP4 experts and FP8 engram rows are
+  frozen buffers in DeepSeek's formats and names, so the safetensors load as
+  they are. Each matrix is dequantised inside its matmul and again in the
+  backward, never kept, so a 7.4 GB layer runs on a 12 GB card. Experts can
+  also stay in pinned CPU memory and be copied over as they're used.
+- **The reference's arithmetic, by default.** Activations in bf16, float32
+  where it upcasts, and rounded to FP8 or FP4 exactly where its kernels round
+  them, with a straight-through gradient. `Numerics(torch.float64,
+  quantize=False)` is the same function unrounded, for gradient checks.
+  Attention follows the kernel's online softmax, 64 keys a block. A simpler
+  softmax differs by under a bf16 step, but the FP8 rounding after attention
+  amplified that to 1% rms.
+- **Choices are inputs.** Routing, indexer picks and candidate blocks can be
+  given (`Choices`); what isn't given is computed and returned, with its scores
+  on request. `choice_gap` measures how far a choice is from a top-k.
+- **Side channels are explicit** (`Side`): compressed keys (with a gradient),
+  index keys and picks, from source layers to the layers after them. A
+  `Model` can hold any run of layers, with or without the embedding and head.
+- **Downloading**: `fetch_file` and `load_layer` fetch whole weight files of
+  the pinned commit into `~/.vibehash/cache/deepseek`, 64 MiB pieces over six
+  connections, and check each against the Hub's sha256.
+
+**The reference, and how it ran.** DeepSeek's `inference/model.py` and
+`engram.py` at the pinned commit are fetched from the Hub by the tests and
+checked against their Git blob ids; they aren't copied into this repository.
+They need tilelang kernels. We didn't run those under WSL2, because the
+attention kernel at the real head size wants about 200 KB of shared memory per
+block and an RTX 4070 SUPER has 99 KB. So the real layer couldn't use them on
+this GPU anyway. Instead `tests/deepseek_reference.py` has pure-PyTorch
+stand-ins that follow each kernel line by line, written apart from
+deepseek.py's versions so the two check each other; activation rounding
+matches them bit for bit. Not checked: the stand-ins against tilelang itself,
+which needs a Hopper or Blackwell GPU.
+
+**Results** (`tests/test_deepseek.py`; errors relative to the reference):
+
+| | Stream, per layer | Choices the same | End to end |
+|---|---|---|---|
+| ModelArgs defaults, random weights (CPU, CUDA) | 0.6–2e-3 rms, ≤1.7e-2 max | ≥99.2% routing, 100% picks | logits 5% rms, 7% max |
+| Every feature on (engram, candidate blocks, YaRN, clamps) | ≤1.7e-2 max | ≥99.7% | logits ≤6% max |
+| **Real layer 2, 2,048 README tokens, GPU** | **2.7e-3 rms, 4.6e-3 max** | 99.76% routing, 99.95% picks | |
+
+Per layer means each layer gets the reference's input, side channels and
+choices. That's where the proof is: random-weight models are chaotic. A 1e-3
+rms nudge after layer 0 moves the final logits by 6% rms with every choice
+held, so 5% end to end is at the floor, and a wiring mistake would be O(1). The
+yardsticks for the real layer, same input:
+
+| Real layer 2, same input | Stream rms |
+|---|---|
+| DeepSeek's code, CPU vs GPU (its own choices: 22% of picks and 4% of routing differ) | 1.5e-2 |
+| deepseek.py, CPU vs GPU (the same choices) | 8.0e-3 |
+| deepseek.py vs DeepSeek's code, same GPU, same choices | 2.7e-3 |
+
+Also proven: dequantising is exact for every quantised tensor of layer 2
+(1,161, bf16 equals float32 bit for bit); gradients match finite differences
+(a tiny config in float64 with every feature on); forward and backward repeat
+bit for bit on the CPU and on CUDA, with PyTorch refusing nondeterministic ops;
+the engram bucket primes give the real tables' row counts (384,006,168 and
+384,016,682); hashes match the reference's; `Config.from_hf(config.json)` is
+`inference/config.json` is `Config.flash()`.
+
+**Speed and memory**, one real layer (layer 2), RTX 4070 SUPER, forward with
+autograd plus backward to the input stream and the layer's bf16/float32
+weights (`scripts/deepseek_bench.py`):
+
+| Tokens | Experts | Forward s | Backward s | Activations GiB | ms a token |
+|---|---|---|---|---|---|
+| 512 | on the GPU (6.9 GiB) | 0.44 | 0.32 | 0.87 | 1.5 |
+| 1,024 | on the GPU | 0.45 | 0.50 | 1.63 | 0.93 |
+| 1,536 | on the GPU | 0.53 | 0.62 | 2.40 | 0.75 |
+| 2,048 | in pinned RAM | 0.73 | 0.90 | 3.15 | 0.80 |
+| 4,096 | in pinned RAM | 1.00 | 1.38 | 6.21 | 0.58 |
+
+With the experts on the GPU, 2,048 tokens no longer fit. The desktop held
+1.4–2.4 GB, and Windows then quietly spills to system RAM and takes 50 s.
+About 40% of the time is dequantising experts (0.19 ms per expert matrix,
+against 0.04 ms for its matmul). Caching them between the forward and the
+backward, or an FP8 matmul for experts once activations are FP8 anyway, would
+cut it.
+
+**Not proven yet:** gradients on the real weights (only the tiny float64
+config was checked by finite differences); real layers of other kinds (0:
+window only; 20: candidate source; 1 and 14: engram, which needs the tables or
+a slice of them); real hidden states for layer 2 (its input here is token
+embeddings, as layer 0 sees them, since layer 1's output needs its 101 GB
+table); other GPU vendors; the tilelang kernels themselves; decoding.
