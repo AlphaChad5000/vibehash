@@ -339,6 +339,28 @@ installed:
 - **The audit:** `chain verify` ran in the same PyTorch-free venv. It replayed every round from its record and redid
   43 weight-based checks from the downloaded checkpoints: all match.
 
+**Run again after the independent review**, with its fixes. The setup was the same, but with seven workers staked 40
+VIBE each:
+- workers 1–3 honest;
+- worker-4 rejecting everything it checks;
+- worker-5 cheating;
+- worker-6 the "knowing" checker, which approves without replaying unless a segment breaks Adam's invariants (the
+  tell that spotted the old canaries);
+- worker-7 faking its units outright, so it's out of every jury.
+
+| Round | Accepted | What happened |
+|---|---|---|
+| 3 | 3 | a false rejection upheld by a jury of three (worker-4 slashed); the cheat found bad by its jury; both replicas of one unit falsely rejected, with too few workers left for a jury of three: unchecked, nobody slashed |
+| 4 | 5 | three false rejections upheld; the cheat found bad again (the knowing checker, on its jury, voted against it too: an extrapolated update breaks Adam's invariants) |
+| 5 | 2 | the knowing checker drew two canaries, one in the verify phase and one in the jury phase, approved both and was slashed; a dispute and a disagreeing replica pair with no jury of three to draw: unchecked |
+| 6 | 6 | the cheat caught by its checkers and jury |
+| 7 | 7 | |
+
+The scorers' held-back loss went 2.533 → 1.176 → 1.133 → 1.133 → 1.112. The adapter `job download` gave at height
+6 measures **1.1118** with transformers + PEFT, the scorers' figure, and `chain verify` in the PyTorch-free venv
+replayed every round and redid 45 weight-based checks: all match. Rounds where too few workers were left to judge
+show the cost of the jury rule on a network this small: those claims go unpaid rather than be judged by one or two.
+
 What's left on the node is moving checkpoints and keeping them:
 
 - **Disk:** the challenge window keeps about 3 GB a round of 8 Qwen3-4B units, so `--keep-rounds 3` on a 50 GB
