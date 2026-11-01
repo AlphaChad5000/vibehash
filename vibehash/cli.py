@@ -719,7 +719,7 @@ def _finetune(a) -> None:
         sys.exit(f"error: {src} doesn't exist")
     facts, _ = catalog.lookup([ref])
     f = facts.get(ref)
-    if f is not None and not catalog.ready(f):  # needs a team, or an architecture finetune.py doesn't train: say so
+    if f is not None and f.architecture is not None and not catalog.ready(f):  # needs a team, or isn't one we train
         return _preflight(a)
     job_id = a.id or f"{re.sub(r'[^a-z0-9._-]+', '-', src.stem.lower()).strip('-._')[:40] or 'chats'}-{secrets.token_hex(2)}"
     home = _job_home(job_id)

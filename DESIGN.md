@@ -577,7 +577,7 @@ fine-tunes use a `tolerance` of 1e-4, as float32 MLPs do. The default learning
 rate is 5e-4 below 1B weights, 3e-4 up to about 3B and 2e-4 above.
 
 **Who needs what.** Workers need PyTorch and a GPU with the job's `memory_mb`
-(5.6 GB for Qwen3-0.6B at batch 8). They fetch the base weights once from
+(measured: 3.5 GiB for Qwen3-0.6B at batch 8, 11.1 GiB for Qwen3-4B at batch 4). They fetch the base weights once from
 Hugging Face, checked tensor by tensor against the manifest the job pins (the
 dataset file carries the manifest and config.json), and keep them on the GPU.
 A node runs fine-tunes only with PyTorch (`Coordinator.active_job_id` leaves

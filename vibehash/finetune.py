@@ -51,6 +51,7 @@ DEFAULT_TARGETS = ("q", "k", "v", "o")  # FINETUNING.md: the attention projectio
 OPTIMIZERS = {"adam": (0.9, 0.999, 1e-8)}  # name -> (beta1, beta2, eps); the name in a spec fixes all three
 DIMS = ("family", "vocab", "hidden", "layers", "heads", "kv_heads", "head_dim", "ffn", "tied")
 EVAL_BATCH = 8  # validation sequences scored at once
+HEAD_TOKENS = 512  # llm.HEAD_CHUNK: tokens whose logits are made at once
 MAX_VAL = 128  # sequences held back at most: the node scores them every round
 SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
@@ -514,17 +515,19 @@ def evaluate(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, backend=None
 
 
 def memory_mb(spec: LoraSpec, batch_size: int, weight_bytes: int) -> int:
-    """GPU memory a worker needs, roughly: the weights as stored, the float32 copy of the largest matrix made while
-    it multiplies, each layer's input kept for the backward, one layer's working set (attention scores dominate),
-    the head's logits for a chunk of tokens, the adapters' state four times over, and the CUDA context."""
+    """GPU memory a worker needs: the weights as stored, each layer's input kept for the backward, the adapters' state
+    four times over and the CUDA context, plus the larger of the head's moment (the embedding cast to float32 and a
+    chunk's logits and their gradient) and a layer's (its recomputed activations, attention scores the largest, and
+    the float32 copy of its biggest matrix). Measured on an RTX 4070 SUPER with 512-token sequences, it errs high by
+    about 0.4 GB: Qwen3-0.6B at batch 8 took 3.5 GiB (this says 4.0), Qwen3-4B at batch 4 11.1 GiB (this, 11.3)."""
     m = spec.model
     tokens = batch_size * spec.seq_len
-    largest = max(m["vocab"] * m["hidden"], *(math.prod(spec.shape(t)) for t in TARGETS)) * 4
     layer_inputs = m["layers"] * tokens * m["hidden"] * 4
-    working = 4 * batch_size * m["heads"] * spec.seq_len ** 2 * 4 + 6 * tokens * max(m["ffn"], m["hidden"]) * 4
-    head = 2 * 512 * m["vocab"] * 4
-    total = weight_bytes + largest + layer_inputs + working + head + 4 * spec.n_params * 4 + 700 * 2**20
-    return int(math.ceil(total * 1.2 / 2**20 / 256) * 256)
+    head = (m["vocab"] * m["hidden"] + 2 * HEAD_TOKENS * m["vocab"]) * 4
+    layer = (4 * batch_size * m["heads"] * spec.seq_len ** 2 + 6 * tokens * max(m["ffn"], m["hidden"])
+             + max(math.prod(spec.shape(t)) for t in TARGETS)) * 4
+    total = weight_bytes + layer_inputs + 4 * spec.n_params * 4 + max(head, layer) + 700 * 2**20
+    return int(math.ceil(total / 2**20 / 256) * 256)
 
 
 # --- the result -------------------------------------------------------------------------------------------------------
@@ -768,11 +771,12 @@ def prepare(path: str | Path, tokenizer: ChatTokenizer, manifest: bytes, config:
 
 
 def settings_for(dims: dict) -> dict:
-    """Training settings by model size: a learning rate for Adam on B (A frozen) and a batch of sequences.
-    Measured on Qwen3-0.6B (DESIGN.md §8); larger models take smaller steps."""
+    """Training settings by model size: a learning rate for Adam on B (A frozen) and a batch of sequences. The rate
+    is measured on Qwen3-0.6B (DESIGN.md §8), and larger models take smaller steps. From about 3B up the batch is 4,
+    so a 12 GB card holds a step (Qwen3-4B measured 11.1 GiB at batch 4 and 512 tokens; at batch 8 it spills)."""
     size = dims["layers"] * dims["hidden"] ** 2
     lr = 5e-4 if size < 5e7 else 3e-4 if size < 2e8 else 2e-4
-    return {"lr": lr, "batch_size": 8}
+    return {"lr": lr, "batch_size": 8 if size < 2e8 else 4}
 
 
 # --- the poster's side: the plan `train DATA --base MODEL` shows before posting ---------------------------------------

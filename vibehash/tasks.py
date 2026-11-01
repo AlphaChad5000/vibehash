@@ -20,7 +20,7 @@ MAX_CHECKPOINT_BYTES = 2**30  # 1 GiB of weights (~268M float32); sent as chunke
 # an old laptop's CPU running the reference model (about 2 GFLOP/s), and 20 Mbit/s up, 100 Mbit/s down.
 REF_FLOPS = 2e9
 # Fine-tunes run on GPUs (finetune.py), so their reference is a gaming card: what this code sustains on a mid-range one,
-# in float32 with TF32 off (an RTX 4070 SUPER sustains about 15 TFLOP/s of a job's nominal FLOPs; an RTX 3060 a third).
+# in float32 with TF32 off (an RTX 4070 SUPER sustains 9-15 TFLOP/s of a job's nominal FLOPs; an RTX 3060 about a third).
 REF_GPU_FLOPS = 5e12
 REF_UPLOAD = 2.5e6  # bytes/s
 REF_DOWNLOAD = 12.5e6  # bytes/s

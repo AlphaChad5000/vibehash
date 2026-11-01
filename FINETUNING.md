@@ -248,30 +248,35 @@ hold and compute, and the public node is the one that can't.
 ### The models
 
 Rank 16 on q, k, v and o, 16 Adam steps a unit, sequences of up to 512
-tokens; GPU memory is `finetune.memory_mb`'s estimate, which errs high
-(Qwen3-0.6B estimated 5.6 GB at batch 8, MEASURED_06):
+tokens, at the batch `finetune.settings_for` picks (8, or 4 from about 3B up).
+GPU memory is `finetune.memory_mb`'s estimate, which errs high by about
+0.4 GB, with what was measured on the 4070 SUPER beside it:
 
-| Model | Weights | Shape | Trained (B) | A checkpoint | A unit, batch 8 | GPU memory, batch 4 / 8 | Round at the reference GPU |
-|---|---|---|---|---|---|---|---|
-| Qwen3-0.6B (milestone A) | 1.5 GB | 28 × 1024 | 2.3M | 27.5 MB | 239 TFLOP | 4.9 / 5.6 GB | 4 min |
-| SmolLM3 3B | 6.2 GB | 36 × 2048 | 3.0M | 35.4 MB | 1,207 TFLOP | 11.5 / 13.3 GB | 13 min |
-| Llama 3.2 3B Instruct (gated) | 6.4 GB | 28 × 3072 | 3.7M | 44.0 MB | 1,250 TFLOP | 12.5 / 14.3 GB | 14 min |
-| Qwen3 4B | 8.0 GB | 36 × 2560 | 5.0M | 60.2 MB | 1,595 TFLOP | 14.8 / 16.9 GB | 18 min |
+| Model | Weights | Shape | Trained (B) | A checkpoint | Batch | A unit | GPU memory: estimated (measured) | Round at the reference GPU |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B (milestone A) | 1.5 GB | 28 × 1024 | 2.3M | 27.5 MB | 8 | 239 TFLOP | 4.0 GiB (3.5) | 4 min |
+| SmolLM3 3B | 6.2 GB | 36 × 2048 | 3.0M | 35.4 MB | 8 | 1,207 TFLOP | 9.5 GiB | 13 min |
+| Llama 3.2 3B Instruct (gated) | 6.4 GB | 28 × 3072 | 3.7M | 44.0 MB | 4 | 625 TFLOP | 9.5 GiB | 9 min |
+| Qwen3 4B | 8.0 GB | 36 × 2560 | 5.0M | 60.2 MB | 4 | 797 TFLOP | 11.3 GiB (11.1) | 11 min |
 
-"Round at the reference GPU" is `TrainingJob.phase_lengths` at batch 8: a
-card sustaining 5 TFLOP/s (an RTX 3060's worth) on a 20 Mbit/s uplink. MEASURED_4B
+"Round at the reference GPU" is `TrainingJob.phase_lengths`: a card
+sustaining 5 TFLOP/s (an RTX 3060's worth) on a 20 Mbit/s uplink. Measured,
+Qwen3-4B at batch 4 takes 5.65 s a step on the 4070 SUPER (8.8 TFLOP/s of the
+job's nominal FLOPs), 90 s a unit; at batch 8 it needs more than the card's
+12 GB, and Windows then quietly spills to system memory and takes 61 s a step.
+Llama 3.2 3B is sized from its published config: it's gated, and this
+machine has no Hugging Face token.
 
-### Workers: fine, with 16 GB, or 12 GB at batch 4
+### Workers: a 12 GB gaming card will do
 
-- **Memory.** A 16 GB card takes any of the three at batch 8. A 12 GB card
-  takes SmolLM3 at batch 4 and the others with shorter sequences. Two changes
-  would bring all three under 12 GB at batch 8, both exact (no change to a
-  single bit of the arithmetic): making the head's logits a slice of the
-  vocabulary at a time instead of casting the whole embedding to float32 at
-  once (1.5 GB for Qwen3-4B), and keeping each layer's saved input in the
-  backward only once instead of in autograd's copy as well.
-- **Time.** At the 4070 SUPER's 15 TFLOP/s a unit takes 1.3–1.8 minutes; the
-  reference card three times that.
+- **Memory.** A 12 GB card takes all three at the batch they get (Qwen3-4B
+  only just: 11.1 GiB measured). Workers report their GPU's memory and are
+  only given units of jobs that fit. One exact change (not a bit of the
+  arithmetic changes) would give 12 GB cards room to spare: making the head's
+  logits from a slice of the vocabulary at a time, instead of casting the
+  whole embedding to float32 at once (1.5 GB for Qwen3-4B).
+- **Time.** 90 s a unit for Qwen3-4B on the 4070 SUPER; the reference card
+  about twice that.
 - **Download.** 6–8 GB once per model, checked against the manifest
   (1.5 GB came in about 15 s here; at 10 MB/s it's 10–15 minutes, and the
   worker misses rounds meanwhile). The dashboard should show it.
