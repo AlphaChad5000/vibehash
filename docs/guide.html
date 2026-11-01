@@ -297,7 +297,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <section id="setup">
       <h2>Get started</h2>
-      <p>You need Python 3.10 or newer, free from <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>. On Windows, tick “Add python.exe to PATH” while installing it. Choose what you want to do, then paste the commands into PowerShell on Windows or Terminal on macOS.</p>
+      <p>Choose what you want to do, then paste the commands into PowerShell on Windows or Terminal on macOS. Earning and training start with one line that installs everything and asks you the rest; on Windows it installs Python too if you need it. Otherwise you need Python 3.10 or newer, free from <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>. On Windows, tick “Add python.exe to PATH” while installing it.</p>
       <div class="builder">
         <div class="tabs" role="tablist" aria-label="What you want to do">
           <button class="tab" role="tab" id="tab-worker" data-role="worker" aria-selected="true" aria-controls="builder-panel">Earn as a worker</button>
@@ -478,7 +478,8 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <details><summary>No matching distribution found for vibehash</summary><div class="answer"><p>Vibe Hash is on PyPI, so this means pip couldn't use it. Usually your Python is older than 3.10: <code>python --version</code> shows which you have, and python.org has the current one. Otherwise update pip with <code>python -m pip install --upgrade pip</code>, check you're online, and run the install command again.</p></div></details>
         <details><summary>I lost my wallet file</summary><div class="answer"><p>Rebuild it from the 24 recovery words setup showed you when it created the wallet: <code>vibehash wallet restore</code> asks for them and saves a new wallet file with the same address and coins. Wallets made before recovery words existed (before version 0.4) have no words, so for those the backed-up file is the only copy.</p></div></details>
         <details><summary>row 12, column 'colour': 'red' isn't a number</summary><div class="answer"><p>Every input column must hold numbers. Leave text columns out of the file, or turn them into numbers, such as small = 1, medium = 2, large = 3. The column you're predicting can hold names; if it isn't the last column, name it with <code>--label</code>.</p></div></details>
-        <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else.</p></div></details>
+        <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else. If the one-line installer said Vibe Hash has its own environment, type <code>vibehash</code> instead of <code>python3 -m vibehash</code>; if it said Python is called py, type <code>py -m vibehash</code>.</p></div></details>
+        <details><summary>The one-line installer can't reach vibehash.org</summary><div class="answer"><p>Some networks block new websites. GitHub serves the same scripts: on Windows, <code>irm https://raw.githubusercontent.com/AlphaChad5000/vibehash/main/install.ps1 | iex</code>; on macOS and Linux, <code>curl -fsSL https://raw.githubusercontent.com/AlphaChad5000/vibehash/main/install.sh | sh</code>.</p></div></details>
         <details><summary>no node address / no wallet: run `vibehash setup`</summary><div class="answer"><p>Commands use the node address and wallet that setup saved. Run setup once, or add <code>--node</code> or <code>--wallet</code> to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
         <details><summary>can't reach node at http://…</summary><div class="answer"><p>Check the node address with whoever runs the network. The node may also be offline for a moment; the worker keeps retrying on its own, so you can leave it running.</p></div></details>
         <details><summary>stake at least 500000000 syn to take work</summary><div class="answer"><p>This network was set up to require stake, rather than letting workers earn it in, and yours is under the 5 VIBE minimum (500,000,000 syn). Ask whoever runs it for some VIBE, then stake it as Get started shows.</p></div></details>
@@ -556,6 +557,13 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       cmds: [py() + " -m pip install --upgrade vibehash", vh("--help")] };
   }
 
+  // The installer scripts (install.ps1 / install.sh in the repo): Python if needed, Vibe Hash, then setup's questions.
+  function oneLiner() {
+    var node = state.node.trim();
+    if (state.os === "unix") return "curl -fsSL https://vibehash.org/install.sh | " + (node ? "VIBEHASH_NODE=" + q(node) + " " : "") + "sh";
+    return (node ? "$env:VIBEHASH_NODE = '" + node.replace(/'/g, "''") + "'; " : "") + "irm https://vibehash.org/install.ps1 | iex";
+  }
+
   function home(file) { return (state.os === "unix" ? "~/.vibehash/" : "$HOME\\.vibehash\\") + file.replace(/\//g, state.os === "unix" ? "/" : "\\"); }
 
   var SAMPLE = [["weight_g", "length_cm", "width_cm", "sweetness", "colour_hue", "fruit"],
@@ -563,12 +571,12 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
                 ["93", "5.9", "6.3", "2.1", "53", "lemon"], ["175", "6.7", "7.5", "11.6", "40", "apple"]];  // rows of fruit.csv
 
   function stepsFor(role) {
-    var s = state, nodeArg = s.node.trim() ? " --node " + q(s.node.trim()) : "";
+    var s = state;
     if (role === "worker") {
       return [
-        install(),
-        { title: "Set up", note: "One guided command for everything else. It connects to the network (the public one, unless you gave another node's address), creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run setup again any time; it keeps what's already done.",
-          cmds: [vh("setup" + nodeArg)] },
+        { title: "Install and set up", note: "One line does everything, then asks you a few questions. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
+            ", connects to the network (the public one, unless you gave another node's address), creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. Run it again any time to update; it keeps what's already done. The script is short: open its address in a browser to read it first.",
+          cmds: [oneLiner()] },
         { title: "Stake (usually not needed)", note: "Most networks let you start with nothing: your first 5 VIBE of pay becomes your stake, and setup tells you so. Then skip this step. If setup says this network needs stake first, send your vibe1 address to whoever runs it so they can send you some, then stake it; this stakes 10. Like every transaction it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more. Stake is only at risk if you cheat; crashes never touch it.",
           cmds: [vh("stake --amount 10")] },
         { title: "Start working", note: "The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. GPU-sized jobs train on the graphics card; small float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
@@ -580,9 +588,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     if (role === "train") {
       var file = s.data.trim() || "my-data.csv", stem = file.replace(/^.*[\\/]/, "").replace(/\.[^.]*$/, "") || "my-data";
       return [
-        install(),
-        { title: "Set up", note: "Connects to the network (the public one, unless you gave another node's address) and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so yours doesn't need a GPU and this skips installing GPU support.",
-          cmds: [vh("setup" + nodeArg + " --gpu skip")] },
+        { title: "Install and set up", note: "One line installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
+            ", connects to the network (the public one, unless you gave another node's address) and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so when it offers GPU support you can say no.",
+          cmds: [oneLiner()] },
         { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some; 100 VIBE is plenty for a first model. This shows when it has arrived.",
           cmds: [vh("balance")] },
         { title: "Get your data ready", note: "A CSV file, such as a spreadsheet saved as CSV: a header row naming the columns, then one row per example. Every column is an input and must hold numbers, except the last one, which is what the model learns to predict, as names like these or as numbers. No data yet? The command writes this sample, fruit.csv, to try.",

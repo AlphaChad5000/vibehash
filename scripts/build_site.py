@@ -5,7 +5,7 @@ A standalone site needs that wrapper itself, plus what search engines and link p
 
     python scripts/build_site.py SITE_DIR
 
-writes index.html, CNAME and .nojekyll into SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org, which
+writes index.html, the one-line installers (install.ps1 and install.sh), CNAME and .nojekyll into SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org, which
 GitHub Pages serves at https://vibehash.org. Commit and push SITE_DIR to publish.
 """
 import html
@@ -55,7 +55,9 @@ def build(guide: Path, out: Path) -> None:
     (out / "index.html").write_text(page, encoding="utf-8", newline="\n")
     (out / "CNAME").write_text(DOMAIN + "\n", encoding="utf-8", newline="\n")  # GitHub Pages' custom domain
     (out / ".nojekyll").write_text("", encoding="utf-8")  # serve the files as they are
-    print(f"wrote {out / 'index.html'} ({len(page.encode()):,} bytes), CNAME and .nojekyll")
+    for script in ("install.ps1", "install.sh"):  # irm https://vibehash.org/install.ps1 | iex, and curl … | sh
+        (out / script).write_bytes((guide.parent.parent / script).read_bytes())
+    print(f"wrote {out / 'index.html'} ({len(page.encode()):,} bytes), install.ps1, install.sh, CNAME and .nojekyll")
 
 
 if __name__ == "__main__":

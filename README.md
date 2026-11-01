@@ -14,7 +14,24 @@ what's still needed before a mainnet (§9).
 
 ## Install
 
-Python 3.10+. Vibe Hash is on PyPI:
+To start mining, one line installs Vibe Hash and starts the guided setup,
+which asks the rest (network, wallet password, GPU support). On Windows, in
+PowerShell (it offers to install Python too, if you need it):
+
+```powershell
+irm https://vibehash.org/install.ps1 | iex
+```
+
+On macOS or Linux:
+
+```bash
+curl -fsSL https://vibehash.org/install.sh | sh
+```
+
+The scripts are [install.ps1](install.ps1) and [install.sh](install.sh). Run
+them again any time to update.
+
+Or install it yourself: Python 3.10+. Vibe Hash is on PyPI:
 
 ```bash
 python -m pip install --upgrade vibehash

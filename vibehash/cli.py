@@ -89,7 +89,11 @@ def ask(question: str, assume_yes: bool = False) -> bool:
         return True
     if not sys.stdin.isatty():
         return False
-    return input(f"{question} [Y/n] ").strip().lower() in ("", "y", "yes")
+    try:
+        return input(f"{question} [Y/n] ").strip().lower() in ("", "y", "yes")
+    except EOFError:  # nothing to read: Windows counts NUL as a terminal
+        print()
+        return False
 
 
 def node_of(a) -> str:
@@ -294,12 +298,12 @@ def cmd_tls_fingerprint(a):
     print(tls.cert_fingerprint(a.cert))
 
 
-def cmd_worker(a):
+def cmd_worker(a, keys: KeyPair | None = None):
     from . import minerui
 
     url = node_of(a)
     try:
-        w = WorkerClient(url, load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir)
+        w = WorkerClient(url, keys or load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir)
     except RuntimeError as e:
         sys.exit(f"error: {e}")
     status = w.node.status()
@@ -461,15 +465,18 @@ def cmd_setup(a):
         else:
             amount = a.stake or min(acct["balance"] - fee, max(short, 10 * SYN_PER_VIBE))
             if (a.stake or sys.stdin.isatty()) and ask(f"   Stake {fmt(amount)} now? Only cheating can cost you it.", bool(a.stake)):
-                node.send_tx(keys or load_wallet(str(path)), "stake", "system", amount)
+                keys = keys or load_wallet(str(path))
+                node.send_tx(keys, "stake", "system", amount)
                 staked = True
                 print("   submitted; it takes effect in the next block")
             else:
                 print(f"   not staked yet. When you're ready: {prog()} stake --amount {amount // SYN_PER_VIBE}")
-    if staked:
-        print(f"\nAll set. Start earning with:\n   {prog()} worker")
-    else:
+    if not staked:
         print(f"\nAlmost there: once you've staked, start earning with:\n   {prog()} worker")
+    elif ask(f"\nAll set. Start mining now? Ctrl+C stops it, and `{prog()} worker` starts it again."):
+        cmd_worker(parser().parse_args(["worker", "--node", url, "--wallet", str(path)]), keys)  # no second password
+    else:
+        print(f"\nAll set. Start earning with:\n   {prog()} worker")
 
 
 def cmd_balance(a):
@@ -1107,7 +1114,7 @@ def _rate_limit_flags(p) -> None:
     p.add_argument("--max-connections", type=int, default=256, help="connections served at once (default 256)")
 
 
-def main(argv=None):
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="vibehash", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1278,8 +1285,11 @@ def main(argv=None):
     p.add_argument("--receipts", action="append", metavar="FILE",
                    help="a worker's receipts.jsonl to check (default: every worker's on this computer)")
     p.set_defaults(fn=cmd_chain_verify)
+    return ap
 
-    a = ap.parse_args(argv)
+
+def main(argv=None):
+    a = parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
     try:
         a.fn(a)

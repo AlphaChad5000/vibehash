@@ -250,8 +250,15 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("Almost there", out)
         api.send_tx(req, "transfer", address, 20 * VIBE)
         wait_for(lambda: node.chain.state.balance(address) == 20 * VIBE)
-        self.assertIn("All set", self.run_cli("setup", "--stake", "10", "--gpu", "skip"))  # re-run keeps the wallet
+        started = []  # say yes to "Start mining now?", and catch the worker it starts
+        with mock.patch.object(cli, "ask", lambda question, assume_yes=False: True), \
+                mock.patch.object(cli, "cmd_worker", lambda a, keys=None: started.append((a, keys))):
+            self.run_cli("setup", "--stake", "10", "--gpu", "skip")  # re-run keeps the wallet
+        [(a, keys)] = started
+        self.assertEqual((a.node, a.wallet, keys.address), (node.url, str(wallet), address))  # unlocked just once
         wait_for(lambda: node.chain.state.stake(address) == 10 * VIBE)
+        with mock.patch("sys.stdin", io.StringIO()):  # no terminal: no question
+            self.assertIn("All set. Start earning with", self.run_cli("setup", "--gpu", "skip"))
         out = self.run_cli("balance")
         self.assertIn(address, out)
         self.assertIn("stake:      10 VIBE", out)
