@@ -12,9 +12,13 @@ What's proven where:
 - RealLayerTests (opt-in: needs the real layer 2 and the embedding in ~/.vibehash/cache/deepseek, 8.7 GB, and a CUDA
   GPU): the real layer on real token embeddings. scripts/deepseek_bench.py fetches them and times the layer.
 """
+import hashlib
 import math
 import unittest
 from dataclasses import replace
+from unittest import mock
+
+from tests.test_hub import HubTestCase, sharded_files
 
 try:
     import torch
@@ -58,8 +62,8 @@ def tokens_for(cfg, b, s, seed=2):
     return torch.randint(0, cfg.vocab_size, (b, s), generator=torch.Generator().manual_seed(seed))
 
 
-def model_for(cfg, state, num=Numerics(), device="cpu", **kw):
-    return Model(cfg, num=num, device=device, **kw).load_weights({k: v.to(device) for k, v in state.items()})
+def model_for(cfg, state, num=None, device="cpu", **kw):
+    return Model(cfg, num=num or Numerics(), device=device, **kw).load_weights({k: v.to(device) for k, v in state.items()})
 
 
 def rel(a, b):
@@ -382,6 +386,48 @@ class ReferenceTests(ReferenceCase):
         deepseek.configure_torch()
         cfg = Config()
         self.check(cfg, deepseek.random_weights(cfg, 3), tokens_for(cfg, 2, 256), device="cuda")
+
+
+class FetchTests(HubTestCase):
+    """deepseek.fetch_file against tests/test_hub.py's fake Hub and CDN: in pieces, resumed, checked."""
+
+    def setUp(self):
+        if torch is None:
+            self.skipTest("needs PyTorch 2.8 or later")
+        super().setUp()  # also points ~/.vibehash at a temporary folder
+        self.commit = self.sharded()
+        self.path = "model-00001-of-00002.safetensors"
+        self.want = sharded_files()[self.path]
+        patch = mock.patch.object(deepseek, "PIECE", 1000)  # a 6 KB file in 7 pieces
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def fetch(self, **kw):
+        return deepseek.fetch_file(self.path, self.hub, repo="acme/sharded", commit=self.commit, **kw)
+
+    def test_pieces_resume_and_are_checked(self):
+        from vibehash.hub import IntegrityError
+        self.assertEqual(self.fetch().read_bytes(), self.want)
+        self.assertEqual(self.fetch(), deepseek.cache_dir(self.commit) / self.path)  # cached: nothing fetched
+        # A restart: pieces 0 and 2 already written; only the rest come down.
+        dest = deepseek.cache_dir(self.commit) / self.path
+        dest.unlink()
+        part, listed = dest.with_name(dest.name + ".part"), dest.with_name(dest.name + ".done")
+        part.write_bytes(self.want[:1000] + bytes(1000) + self.want[2000:3000] + bytes(len(self.want) - 3000))
+        listed.write_text("[0, 2]")
+        before = self.fake.cdn_bytes
+        self.assertEqual(self.fetch(workers=2).read_bytes(), self.want)
+        self.assertEqual(self.fake.cdn_bytes - before, len(self.want) - 2000)
+        self.assertFalse(part.exists() or listed.exists())
+        # A CDN that alters a byte: refused, nothing kept.
+        dest.unlink()
+        sha = hashlib.sha256(self.want).hexdigest()
+        bad = bytearray(self.want)
+        bad[-1] ^= 1
+        self.fake.lfs[sha] = bytes(bad)
+        with self.assertRaises(IntegrityError):
+            self.fetch()
+        self.assertFalse(dest.exists() or part.exists() or listed.exists())
 
 
 REAL_FILES = ("model-00005-of-00048.safetensors", "model-00002-of-00048.safetensors")  # layer 2, the embedding

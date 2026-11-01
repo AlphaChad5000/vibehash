@@ -269,7 +269,7 @@ which needs a Hopper or Blackwell GPU.
 | | Stream, per layer | Choices the same | End to end |
 |---|---|---|---|
 | ModelArgs defaults, random weights (CPU, CUDA) | 0.6–2e-3 rms, ≤1.7e-2 max | ≥99.2% routing, 100% picks | logits 5% rms, 7% max |
-| Every feature on (engram, candidate blocks, YaRN, clamps) | ≤1.7e-2 max | ≥99.7% | logits ≤6% max |
+| Every feature on (engram, candidate blocks, YaRN, clamps) | ≤1.7e-2 max | ≥99.6% routing, 100% picks | logits ≤6% max |
 | **Real layer 2, 2,048 README tokens, GPU** | **2.7e-3 rms, 4.6e-3 max** | 99.76% routing, 99.95% picks | |
 
 Per layer means each layer gets the reference's input, side channels and
