@@ -11,7 +11,6 @@ with its bottom frozen, to the bit.
   layers_to_transform and computes what deepseek.py's adapted projections compute.
 """
 import json
-import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +115,57 @@ class ExactTests(unittest.TestCase):
     def test_from_the_records(self):
         cfg = tiny_config()
         self.check(cfg, 4, seq=24, tmap=token_map_for(cfg), via_records=True)
+
+
+@unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
+class StreamedTests(unittest.TestCase):
+    """train_step_streamed, the expert-major schedule for small GPUs, against train_step."""
+
+    def compare(self, cfg, first, seq, device, tmap=None):
+        state = deepseek.random_weights(cfg, 0)
+        tokens = [tokens_for(cfg, 1, seq, seed=20 + j) for j in range(2)]
+        masks = [learned(t, 30 + j) for j, t in enumerate(tokens)]
+        cut, _, low, _ = models(cfg, state, first)
+        inputs = [top.precompute(low, cut, t, m, tmap)[0] for t, m in zip(tokens, masks)]
+        runs = []
+        for streamed in (False, True):
+            cut, _, _, high = models(cfg, state, first, device=device, train_num=top.TRAIN)
+            if streamed:  # the routed experts back in RAM, as on a small GPU
+                for name, blk in high.layers.items():
+                    for e in blk.ffn.experts:
+                        for mod in e.modules():
+                            for k, b in mod._buffers.items():
+                                mod._buffers[k] = b.cpu()
+            ad = Adapters.fresh(high, cut, seed=7, device=device, targets=deepseek.LORA_TARGETS + ("w1", "w2", "w3"))
+            ad.attach(high)
+            batches = [ex.to(device) for ex in inputs]
+
+            def step(s, update=True):
+                if streamed:
+                    return top.train_step_streamed(high, cut, ad, batches, s, 1e-3, device=device, update=update)
+                return top.train_step(high, cut, ad, batches, s, 1e-3, update=update)
+            step(1, update=False)
+            grad = torch.cat([b.grad.cpu().reshape(-1) for b in ad.b]).double()
+            for b in ad.b:
+                b.grad = None
+            losses = [step(s) for s in range(1, 4)]
+            runs.append((losses, grad, torch.cat([b.detach().cpu().reshape(-1) for b in ad.b]).double()))
+        (l0, g0, b0), (l1, g1, b1) = runs
+        self.assertEqual(l0[0], l1[0])  # the same forward, to the bit
+        # The same gradients up to float32 rounding (measured 2e-7: summed in another order); Adam's steps, which
+        # treat small gradients like large ones, take that to 3e-5 of B in three steps.
+        self.assertLess(float((g0 - g1).norm() / g0.norm()), 1e-6)
+        self.assertLess(float((b0 - b1).norm() / b0.norm()), 1e-4)
+
+    def test_cpu(self):
+        self.compare(Config(), 3, 160, "cpu")
+        cfg = tiny_config()
+        self.compare(cfg, 4, 24, "cpu", token_map_for(cfg))
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs a CUDA GPU")
+    def test_cuda_with_experts_in_ram(self):
+        deepseek.configure_torch()
+        self.compare(Config(), 3, 160, "cuda")
 
 
 @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs a CUDA GPU")

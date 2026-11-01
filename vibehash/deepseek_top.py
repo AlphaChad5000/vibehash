@@ -152,13 +152,20 @@ def precompute(bottom: Model, cut: Cut, tokens, mask, token_map=None) -> tuple[E
     choices, side = Choices(), Side()
     hashes = ds.engram_hashes(tokens, token_map, cut.cfg) if cut.cfg.engram_layer_ids else None
     x, pre = bottom.run(*bottom.start(tokens), side, choices, hashes)
+    kept, cand = crossing_of(cut, side, choices, tokens.size(1))
+    return Example(tokens, mask.bool(), x, pre, kept, cand), choices
+
+
+def crossing_of(cut: Cut, side: Side, choices: Choices, seqlen: int) -> tuple[Side, torch.Tensor | None]:
+    """Of the frozen layers' side channels and choices, what the trained layers need: Cut.crossing's, and the
+    candidate blocks only when there are more blocks than the source keeps (otherwise it keeps every one)."""
     crossing, cfg = cut.crossing(), cut.cfg
     kept = Side(*(getattr(side, name) if name in crossing else None for name in ("compress_kv", "index_k", "picks")))
     cand = None
-    if "candidates" in crossing:  # needed only when there are more blocks than the source keeps
-        n = tokens.size(1) // cfg.ratio(crossing["candidates"])
+    if "candidates" in crossing:
+        n = seqlen // cfg.ratio(crossing["candidates"])
         cand = choices.candidates if n > cfg.candidate_topk_blocks * cfg.candidate_block_size else None
-    return Example(tokens, mask.bool(), x, pre, kept, cand), choices
+    return kept, cand
 
 
 def pack(ex: Example, i: int, fp8_stream: bool = False) -> bytes:
@@ -314,12 +321,12 @@ def adam(adapters: Adapters, step: int, lr: float) -> None:
 # --- the miner's side: training --------------------------------------------------------------------------------------------
 
 def train_step(top: Model, cut: Cut, adapters: Adapters, batches: list[Example], step: int, lr: float,
-               load=None) -> float:
+               load=None, update: bool = True) -> float:
     """One Adam step of the adapters on the trained layers (the model built with layers cut.trained and the head),
     from precomputed micro-batches, layer-major: each layer runs on every micro-batch before the next layer, forward,
     then backward in reverse, recomputing each layer from the input it was given. `load(layer)`, if given, is called
     before a layer runs, to bring its weights onto the GPU (and may send the previous one's back). Returns the
-    step's mean loss over the learned tokens."""
+    step's mean loss over the learned tokens. With update=False the gradients stay in B.grad, unapplied."""
     cut.check()
     order = [str(i) for i in cut.trained]
     count = sum(int(ex.mask.sum()) for ex in batches)
@@ -353,7 +360,131 @@ def train_step(top: Model, cut: Cut, adapters: Adapters, batches: list[Example],
             y, ypre = block(x, pre, dataclasses.replace(side), states[j][3])
             torch.autograd.backward([y, ypre], list(grads[j]))
             grads[j] = (x.grad, pre.grad)
-    adam(adapters, step, lr)
+    if update:
+        adam(adapters, step, lr)
+    return total / count
+
+
+@torch.no_grad()
+def forward_streamed(block, states: list, device, rows=None) -> list:
+    """One layer over several sequences, expert-major: everything before the MoE and the router for each, then each
+    routed expert brought to `device` once to run every sequence's tokens routed to it, then the rest. `states` is a
+    list of (x, pre_mix, side, choices), updated in place to the layer's output. rows: engram table rows per sequence,
+    for an engram layer. Returns each sequence's routed experts' sum (the streamed backward's starting point). Every
+    sequence's arithmetic is the plain forward's, to the bit: only the order the sequences take turns in differs."""
+    moe, parts = block.ffn, []
+    for j, (x, pre, side, choices) in enumerate(states):
+        h, x_mid, post, comb, ffn_pre = block.before_ffn(x, pre, side, choices, rows=None if rows is None else rows[j])
+        flat = h.reshape(-1, h.size(-1))
+        chosen, gates = moe.route(flat, choices)
+        parts.append([flat, x_mid, post, comb, ffn_pre, moe.assignments(chosen), gates,
+                      torch.zeros_like(flat, dtype=moe.num.hi), h.shape])
+    for e in sorted({e for p in parts for e, _, _ in p[5]}):
+        with _OnDevice(moe.experts[e], device) as expert:
+            for p in parts:
+                for e2, tok, slot in p[5]:
+                    if e2 == e:
+                        p[7].index_add_(0, tok, expert(p[0][tok], p[6][tok, slot, None]).to(moe.num.hi))
+    for j, p in enumerate(parts):
+        y = moe.combine(p[7], p[0]).view(p[8])
+        states[j] = (block.after_ffn(y, p[1], p[2], p[3]), p[4], states[j][2], states[j][3])
+    return [p[7] for p in parts]
+
+
+class _OnDevice:
+    """A module's buffers (an expert's quantised matrices) copied to `device` for the length of a with-block, then
+    pointed back at their pinned-RAM originals."""
+
+    def __init__(self, module, device):
+        self.module, self.device, self.saved = module, device, []
+
+    def __enter__(self):
+        for mod in self.module.modules():
+            for name, b in list(mod._buffers.items()):
+                if b is not None and b.device != torch.device(self.device):
+                    self.saved.append((mod, name, b))
+                    mod._buffers[name] = b.to(self.device, non_blocking=True)
+        return self.module
+
+    def __exit__(self, *exc):
+        for mod, name, b in self.saved:
+            mod._buffers[name] = b
+
+
+def train_step_streamed(top: Model, cut: Cut, adapters: Adapters, batches: list[Example], step: int, lr: float,
+                        device="cuda", keep="cpu", update: bool = True) -> float:
+    """train_step's step for a GPU that can't hold a layer's 7.2 GB of routed experts: they stay in (pinned) RAM and
+    each comes to the GPU once per layer for the forward and once for the backward, running every micro-batch's
+    tokens routed to it, expert-major. Everything else of the model (0.2 GB a layer, the head) is on `device`; what
+    each layer keeps for its backward (its input, the experts' summed output) waits in `keep`.
+
+    The forward is train_step's exactly (each micro-batch's tokens go through each expert alone, in the same order).
+    The backward is the same arithmetic split into stages: after the MoE; the routed experts, one at a time; the
+    router and the shared expert; then everything before the MoE. Its gradients sum in another order than autograd's
+    whole-layer backward, so they agree with train_step's to rounding, not to the bit (tests: 1e-6 of B in float32)."""
+    cut.check()
+    order = [str(i) for i in cut.trained]
+    count = sum(int(ex.mask.sum()) for ex in batches)
+    move = (lambda t, where: None if t is None else t.to(where, non_blocking=True))
+    states = [(ex.x.to(device), ex.pre.to(device), dataclasses.replace(ex.side), Choices(candidates=ex.candidates))
+              for ex in batches]
+    saved = {}
+    for name in order:
+        for j, (x, pre, side, _) in enumerate(states):
+            saved[name, j] = [move(x, keep), move(pre, keep), dataclasses.replace(side)]
+        routed = forward_streamed(top.layers[name], states, device)
+        for j, r in enumerate(routed):
+            saved[name, j].append(move(r, keep))
+    total, grads = 0.0, []
+    for j, (x, pre, _, _) in enumerate(states):
+        x, pre = x.detach().requires_grad_(), pre.detach().requires_grad_()
+        loss, _ = top.loss(x, pre, batches[j].targets.to(device), batches[j].mask.to(device))
+        (loss / count).backward()
+        total += float(loss.detach())
+        grads.append((x.grad, pre.grad))
+    for name in reversed(order):
+        block, below = top.layers[name], int(name) != cut.first
+        moe, hi, parts = block.ffn, block.ffn.num.hi, []
+        for j in range(len(batches)):
+            x_in, pre_in, side, routed = saved[name, j]
+            choices = states[j][3]
+            with torch.no_grad():  # the MoE's input again, to differentiate the stages after it
+                h, x_mid, post, comb, ffn_pre = block.before_ffn(x_in.to(device), pre_in.to(device),
+                                                                 dataclasses.replace(side), choices)
+            flat = h.reshape(-1, h.size(-1)).detach().requires_grad_()
+            routed = routed.to(device).requires_grad_()
+            x_mid, post, comb = (t.detach().requires_grad_() for t in (x_mid, post, comb))
+            out = block.after_ffn(moe.combine(routed, flat).view(h.shape), x_mid, post, comb)
+            torch.autograd.backward(out, grads[j][0])  # through the shared expert too
+            with torch.no_grad():
+                chosen, g = moe.route(flat.detach(), choices)
+            parts.append([flat.detach(), flat.grad, routed.grad, move(x_mid.grad, keep), move(post.grad, keep),
+                          move(comb.grad, keep), moe.assignments(chosen), x_in, pre_in, side, h.shape, g])
+        gates = [p[11] for p in parts]  # the gates' values; their gradient gathers in dgates
+        dgates = [torch.zeros_like(g) for g in gates]
+        for e in sorted({e for p in parts for e, _, _ in p[6]}):
+            with _OnDevice(moe.experts[e], device) as expert:
+                for p, g, dg in zip(parts, gates, dgates):
+                    for e2, tok, slot in p[6]:
+                        if e2 == e:
+                            xe = p[0][tok].requires_grad_()
+                            ge = g[tok, slot, None].detach().requires_grad_()
+                            torch.autograd.backward(expert(xe, ge).to(hi), p[2][tok])
+                            p[1].index_add_(0, tok, xe.grad)
+                            dg[tok, slot] += ge.grad[:, 0]
+        for j, (p, dg) in enumerate(zip(parts, dgates)):
+            flat = p[0].clone().requires_grad_()
+            torch.autograd.backward(moe.route(flat, states[j][3])[1], dg)
+            dh = (p[1] + flat.grad).view(p[10])
+            x_in, pre_in, side = p[7], p[8], p[9]
+            x_in = x_in.to(device).detach().requires_grad_(below)
+            pre_in = pre_in.to(device).detach().requires_grad_(below)
+            h, x_mid, post, comb, ffn_pre = block.before_ffn(x_in, pre_in, dataclasses.replace(side), states[j][3])
+            torch.autograd.backward([h, x_mid, post, comb, ffn_pre],
+                                    [dh, p[3].to(device), p[4].to(device), p[5].to(device), grads[j][1]])
+            grads[j] = (x_in.grad, pre_in.grad)
+    if update:
+        adam(adapters, step, lr)
     return total / count
 
 

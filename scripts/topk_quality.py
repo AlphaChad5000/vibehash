@@ -7,7 +7,10 @@ computed once and shipped as the job's data. This measures the price on a model 
 Hugging Face transformers and PEFT, as a fine-tune's users would, and Vibe Hash's own recipe (finetune.py): LoRA rank 16,
 alpha 32 on q, k, v and o, A frozen and only B trained, Adam, loss on the assistant's replies only. The same steps and
 data for every run; held-back chats scored on their replies before training and every half epoch. Prints a table and
-writes it as JSON next to the data.
+writes it as JSON next to the data after each run, and a rerun skips the runs already there (so it can be stopped and
+resumed between runs). Kept under --max-gb of GPU memory (an out-of-memory error rather than spilling into system RAM,
+which slows the whole PC): logits are made only for the reply tokens. Six runs of Qwen3-0.6B on the everyday chats,
+2 epochs at batch 8: about 20 minutes on an idle RTX 4070 SUPER (an estimate: 536 steps of ~1,600 tokens a run).
 """
 import argparse
 import json
@@ -63,11 +66,13 @@ def batches(rows, batch: int, pad: int, rng=None):
 
 
 def loss_of(model, ids, mask):
-    """Summed cross-entropy over the reply tokens (each predicted from what precedes it), and their count."""
-    logits = model(input_ids=ids).logits[:, :-1].float()
+    """Summed cross-entropy over the reply tokens (each predicted from what precedes it), and their count. The head is
+    applied to those positions only: a batch's full logits would be gigabytes."""
+    hidden = model.model(input_ids=ids).last_hidden_state[:, :-1]
     want = mask[:, 1:]
-    lse = torch.logsumexp(logits[want], -1)
-    picked = logits[want].gather(1, ids[:, 1:][want][:, None])[:, 0]
+    logits = model.lm_head(hidden[want]).float()
+    lse = torch.logsumexp(logits, -1)
+    picked = logits.gather(1, ids[:, 1:][want][:, None])[:, 0]
     return (lse - picked).sum(), int(want.sum())
 
 
@@ -123,13 +128,15 @@ def main():
     ap.add_argument("--data", default=str(HOME / "datasets-src" / "everyday.jsonl"))
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--lrs", default="2e-4,1e-3")
-    ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--max-gb", type=float, default=9.5)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
     torch.backends.cuda.matmul.allow_tf32 = False
     dev = "cuda"
+    torch.cuda.set_per_process_memory_fraction(min(1.0, args.max_gb * 2**30 / torch.cuda.get_device_properties(0).total_memory))
     tok = AutoTokenizer.from_pretrained(args.model)
     rows = chats(Path(args.data), tok, args.seq_len)
     random.Random(1).shuffle(rows)
@@ -143,19 +150,24 @@ def main():
     tops = [None, max(1, round(layers * 0.2)), max(1, round(layers * 0.1))]
     print(f"{Path(args.model).name}: {layers} layers; {len(train)} chats to train on, {len(val)} held back; "
           f"{args.epochs} epochs of batch {args.batch}; GPU {torch.cuda.get_device_name()}", flush=True)
-    results = []
+    out = Path(args.data).with_name(f"topk_quality_{Path(args.model).name}.json")
+    results = json.loads(out.read_text()) if out.exists() else []
+    done = {(r["lr"], r["top"], r["steps"]) for r in results}
+    steps = math.ceil(len(train) / args.batch) * args.epochs
     for lr in (float(x) for x in args.lrs.split(",")):
         for top in tops:
+            if (lr, top, steps) in done:
+                print(f"have lr {lr:g}, top {top}: skipped", flush=True)
+                continue
             r = run(load, tok, train, val, top, lr, args.epochs, args.batch, args.seed, dev)
             results.append(r)
+            out.write_text(json.dumps(results, indent=1))
             print(json.dumps(r), flush=True)
     print(f"\n{'lr':>7} {'layers':>7} {'B weights':>10} {'start':>7} " + " ".join(
         f"{'@' + str(s):>7}" for s, _ in results[0]["curve"][1:]) + f" {'seconds':>8}")
     for r in results:
         print(f"{r['lr']:>7.0e} {r['layers']:>7} {r['trained_weights']:>10} {r['curve'][0][1]:>7.4f} " + " ".join(
             f"{v:>7.4f}" for _, v in r["curve"][1:]) + f" {r['seconds']:>8.1f}")
-    out = Path(args.data).with_name(f"topk_quality_{Path(args.model).name}.json")
-    out.write_text(json.dumps(results, indent=1))
     print("wrote", out)
 
 

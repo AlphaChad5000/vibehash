@@ -83,6 +83,7 @@ LORA_MODULES = {"wq_a": "attn.wq_a", "wq_b": "attn.wq_b", "wkv": "attn.wkv", "wo
                 "w1": "ffn.shared_experts.w1", "w2": "ffn.shared_experts.w2", "w3": "ffn.shared_experts.w3"}
 LORA_TARGETS = ("wq_a", "wq_b", "wkv", "wo_b")  # the default: attention, as finetune.py's q, k, v, o
 HEAD_CHUNK = 512  # positions whose logits are made at once
+VOCAB_CHUNK = 8192  # head rows cast to float32 at once: 168 MB of DeepSeek-V4.1's
 IMAGE_ONLY = (".gate.bias_vl",)  # checkpoint tensors only image tokens use
 
 
@@ -857,9 +858,18 @@ class MoE(nn.Module):
         return s.sigmoid() if cfg.score_func == "sigmoid" else F.softplus(s).sqrt()
 
     def forward(self, x, choices: Choices):
+        hi, shape = self.num.hi, x.shape
+        x = x.reshape(-1, self.cfg.dim)
+        chosen, gates = self.route(x, choices)
+        y = torch.zeros_like(x, dtype=hi)
+        for e, tok, slot in self.assignments(chosen):
+            y.index_add_(0, tok, self.experts[e](x[tok], gates[tok, slot, None]).to(hi))
+        return self.combine(y, x).view(shape)
+
+    def route(self, x, choices: Choices):
+        """x [tokens, dim] -> (chosen experts [tokens, k], their gates [tokens, k]): the committed choice if there
+        is one, else the biased scores' top-k (recorded in choices); the gates from the unbiased scores."""
         cfg, hi, k = self.cfg, self.num.hi, self.cfg.n_activated_experts
-        shape = x.shape
-        x = x.reshape(-1, cfg.dim)
         scores = self.scores(x)
         chosen = choices.experts.get(self.layer)
         if chosen is not None:
@@ -875,18 +885,23 @@ class MoE(nn.Module):
         gates = scores.gather(1, chosen)
         if cfg.norm_topk_prob and k > 1:
             gates = gates / (gates.sum(dim=-1, keepdim=True) + 1e-20)  # 1e-20, not norm_eps: as in training
-        gates = gates * cfg.route_scale
-        y = torch.zeros_like(x, dtype=hi)
-        flat = chosen.flatten()
-        order = torch.argsort(flat, stable=True)  # by expert, then by token, as torch.where(indices == e) lists them
-        start = 0
-        for e, n in enumerate(torch.bincount(flat, minlength=cfg.n_routed_experts).tolist()):
+        return chosen, gates * cfg.route_scale
+
+    def assignments(self, chosen) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+        """[(expert, its tokens, the slot each chose it in)], experts ascending, tokens ascending within each: the
+        order the routed experts' outputs are summed in, as torch.where(indices == e) lists them in the reference."""
+        k, flat = self.cfg.n_activated_experts, chosen.flatten()
+        order = torch.argsort(flat, stable=True)
+        out, start = [], 0
+        for e, n in enumerate(torch.bincount(flat, minlength=self.cfg.n_routed_experts).tolist()):
             if n:
-                tok, slot = order[start:start + n] // k, order[start:start + n] % k
-                y.index_add_(0, tok, self.experts[e](x[tok], gates[tok, slot, None]).to(hi))
+                out.append((e, order[start:start + n] // k, order[start:start + n] % k))
                 start += n
-        y = y + self.shared_experts(x).to(hi)
-        return y.to(x.dtype).view(shape)
+        return out
+
+    def combine(self, routed, x):
+        """The routed experts' sum (in num.hi) plus the shared expert's output on x, in the activation dtype."""
+        return (routed + self.shared_experts(x).to(self.num.hi)).to(x.dtype)
 
 
 # --- engram ----------------------------------------------------------------------------------------------------------
@@ -1069,6 +1084,13 @@ class Block(nn.Module):
         """x [b, s, hc, dim] and pre_mix [b, s, hc] (the previous layer's) -> this layer's (x, pre_mix). `hashes`
         ([b, s, cols]: this layer's slice of engram_hashes) or `rows` (their table rows) feed an engram layer. A
         stream in another dtype (from layers with other Numerics) is cast to this layer's first."""
+        h, x_mid, post, comb, ffn_pre = self.before_ffn(x, pre_mix, side, choices, hashes, rows)
+        return self.after_ffn(self.ffn(h, choices), x_mid, post, comb), ffn_pre
+
+    def before_ffn(self, x, pre_mix, side: Side, choices: Choices, hashes=None, rows=None):
+        """Everything up to the MoE: (its input h [b, s, dim], the stream after attention, the ffn's post and comb
+        coefficients, the pre_mix handed on). With after_ffn and MoE's stages, what forward does, one stage at a
+        time: deepseek_top's expert-major training runs them so."""
         x, pre_mix = x.to(self.num.dtype), pre_mix.to(self.num.hi)
         if self.engram is not None:
             x = self.engram(x, hashes, rows)
@@ -1076,14 +1098,17 @@ class Block(nn.Module):
         attn_pre, post, comb = self.hc_mixes(x, "attn")
         h = self.attn(self.attn_norm(hc_pre(x, pre_mix, hi)), side, choices)
         x = hc_post(h, residual, post, comb, hi)
-        residual = x
         ffn_pre, post, comb = self.hc_mixes(x, "ffn")
-        h = self.ffn(self.ffn_norm(hc_pre(x, attn_pre, hi)), choices)
-        return hc_post(h, residual, post, comb, hi), ffn_pre
+        return self.ffn_norm(hc_pre(x, attn_pre, hi)), x, post, comb, ffn_pre
+
+    def after_ffn(self, y, x_mid, post, comb):
+        return hc_post(y, x_mid, post, comb, self.num.hi)
 
 
 def _cross_entropy(h, t, w):
-    logits = F.linear(h.to(w.dtype), w)
+    """Σ -log softmax(h·wᵀ)[t] for h in its (high) dtype, the head w cast to it VOCAB_CHUNK rows at a time: the
+    head in float32 at once would be 2.6 GB."""
+    logits = torch.cat([F.linear(h, w[v:v + VOCAB_CHUNK].to(h.dtype)) for v in range(0, w.size(0), VOCAB_CHUNK)], -1)
     return (torch.logsumexp(logits, -1) - logits.gather(1, t[:, None])[:, 0]).sum()
 
 
@@ -1142,7 +1167,7 @@ class Model(nn.Module):
         hi = self.head_num.hi
         h = self.norm(hc_pre(x.to(self.head_num.dtype), pre_mix.to(hi), hi))[mask]
         t = targets[mask].to(h.device, torch.long)
-        w = self.head.weight.to(hi)
+        h, w = h.to(hi), self.head.weight
         total = h.new_zeros((), dtype=hi)
         for s0 in range(0, h.size(0), chunk):
             part = (h[s0:s0 + chunk], t[s0:s0 + chunk], w)
