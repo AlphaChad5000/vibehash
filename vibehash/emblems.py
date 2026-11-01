@@ -2,8 +2,13 @@
 
 When a job fine-tunes an open-weight model, the forge works that model's emblem instead of a blade, so it's plain at
 a glance which model is being trained. Each one is a simple rendering of its maker's logo, at most 18 by 10 pixels,
-in their colours, with no wordmarks or slogans, used only to say whose model it is. Makers without one here get a
-generic gem, and jobs trained from a CSV file (the only kind today) keep the blade.
+in their colours, with no wordmarks or slogans, used only to say whose model it is. They go by model family (an
+organisation and the start of a model's name), so only that maker's own models of that family get one; anything else
+gets a generic gem, and jobs trained from a CSV file (the only kind today) keep the blade. The owner chose to keep
+them as drawn, logo-like ones included (2026-11-01).
+
+Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for
+identification. Vibe Hash isn't affiliated with or endorsed by them.
 
 The pixels are drawn two to a character cell with half blocks: the top pixel as the foreground of "▀", the bottom one
 as its background. Without colour, or in ASCII, the shapes still read in "█▀▄" or "#~_".
@@ -149,9 +154,13 @@ EMBLEMS = {e.name: e for e in (
             "......dd......"),
 )}
 
-# Whose emblem a Hugging Face organisation's models get (in lower case).
-ORGS = {"deepseek-ai": "deepseek", "meta-llama": "meta", "facebook": "meta", "qwen": "qwen", "google": "gemma",
-        "openai": "openai", "microsoft": "microsoft", "mistralai": "mistral", "huggingfacetb": "huggingface"}
+# Whose emblem a model gets: its family, as (organisation, the start of its name), in lower case. Only these: Google's
+# T5 or ViT aren't Gemma, and Meta's Prompt-Guard isn't Llama, so they get the generic gem, as do others' repackagings.
+FAMILIES = (("deepseek-ai", ("deepseek",), "deepseek"), ("meta-llama", ("llama", "meta-llama"), "meta"),
+            ("qwen", ("qwen",), "qwen"), ("google", ("gemma",), "gemma"), ("openai", ("gpt-oss",), "openai"),
+            ("microsoft", ("phi",), "microsoft"),
+            ("mistralai", ("mistral", "mixtral", "ministral", "magistral", "devstral", "codestral"), "mistral"),
+            ("huggingfacetb", ("smollm",), "huggingface"))
 
 
 def for_base(base: str | None) -> Emblem | None:
@@ -163,9 +172,10 @@ def for_base(base: str | None) -> Emblem | None:
 
     model = catalog.find(base)
     repo = model.repo if model else base.strip()
-    repo = repo[3:] if repo.lower().startswith("hf:") else repo
-    org = repo.split("/", 1)[0].lower() if "/" in repo else ""
-    return EMBLEMS[ORGS.get(org, "generic")]
+    repo = (repo[3:] if repo.lower().startswith("hf:") else repo).split("@")[0].lower()
+    org, _, name = repo.partition("/")
+    family = next((e for o, starts, e in FAMILIES if org == o and name.startswith(starts)), "generic")
+    return EMBLEMS[family]
 
 
 def cells(e: Emblem) -> list[list[tuple[tuple | None, tuple | None]]]:

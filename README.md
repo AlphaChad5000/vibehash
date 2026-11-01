@@ -125,12 +125,20 @@ gpt-oss, GLM and DeepSeek), smallest first, with what Hugging Face says about
 each: parameters, experts, weight size, licence and whether it's gated. It
 also shows how many graphics cards of 12, 24 or 32 GB a team would need to
 hold the model. The answers are cached for a day; `--refresh` asks again, and
-`--json` is for scripts. `train --base qwen3-0.6b` takes a name from that
+`--json` is for scripts. Where Hugging Face is out of reach it gives up after
+one short timeout and shows what it said last time. `train --base qwen3-0.6b` takes a name from that
 list, an `org/name` or a huggingface.co address, shows what fine-tuning that
 model would take, and stops there: it posts nothing and spends nothing. Run
-in a terminal without a CSV file, `train` offers the same choice as a
-numbered menu, with today's CSV model first. [FINETUNING.md](FINETUNING.md)
-describes what's coming.
+in a terminal with no data file, `train` offers the same choice as a
+numbered menu, with today's CSV model first. A data file without `--base` is
+read as a table, as before. [FINETUNING.md](FINETUNING.md)
+describes what's coming. When a fine-tune trains, its dashboard forges the
+model maker's emblem in place of the blade (`scripts/preview_forge.py NAME`
+shows one now).
+
+Disclaimer: All product names, logos, and brands are property of their
+respective owners and are used purely for identification. Vibe Hash isn't
+affiliated with or endorsed by them.
 
 In a terminal, `worker` and `testnet` show a live mining dashboard: a drill
 boring through rock while you train, the round and phase, your speed, units
