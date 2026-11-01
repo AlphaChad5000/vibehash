@@ -1,0 +1,368 @@
+<!doctype html>
+<!-- The Vibe Hash whitepaper: docs/whitepaper.pdf is printed from this file. After editing it, print it
+     again from the repository's folder, in PowerShell, with Microsoft Edge (any Chromium browser's Save as PDF,
+     headers and footers off, gives the same pages):
+       & "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" --headless=new --no-pdf-header-footer `
+         --print-to-pdf="$PWD\docs\whitepaper.pdf" "file:///$PWD/docs/whitepaper.html"
+     Its numbers come from DESIGN.md, SHARDING.md and DEEPSEEK.md; keep them in step. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vibe Hash: Proof of Useful Work by Verifiable Neural Network Training</title>
+<meta name="author" content="Cole Heideman">
+<style>
+  @page {
+    size: letter;
+    margin: 1in 1.05in 1in 1.05in;
+    @bottom-center { content: counter(page); font: 11pt "Times New Roman", Times, serif; }
+  }
+  html { font: 12pt/1.32 "Times New Roman", Times, serif; color: #000; }
+  body { margin: 0; }
+  p { margin: 0 0 0.62em; text-align: justify; hyphens: auto; }
+  h1 { font-size: 17pt; font-weight: bold; text-align: center; margin: 0.15in 0 0.22in; line-height: 1.2; }
+  .byline { text-align: center; margin: 0 0 0.3in; line-height: 1.35; }
+  .byline .who { font-size: 12pt; }
+  .byline .where { font-size: 10.5pt; }
+  .abstract { margin: 0 0.5in 0.28in; }
+  .abstract p { font-size: 11pt; line-height: 1.3; }
+  h2 { font-size: 12pt; font-weight: bold; margin: 0.95em 0 0.45em; break-after: avoid; }
+  ul { margin: 0 0 0.62em; padding-left: 1.4em; }
+  li { margin: 0 0 0.3em; text-align: justify; }
+  .eq { text-align: center; margin: 0.55em 0 0.75em; font-style: normal; }
+  .eq i, p i { font-style: italic; }
+  figure { margin: 0.7em 0 0.85em; text-align: center; break-inside: avoid; }
+  figure svg { display: block; margin: 0 auto; max-width: 100%; }
+  figcaption { font-size: 10.5pt; margin-top: 0.35em; }
+  table { border-collapse: collapse; margin: 0.4em auto 0.8em; font-size: 11pt; break-inside: avoid; }
+  th, td { padding: 1px 12px; text-align: right; }
+  th { font-weight: normal; font-style: italic; border-bottom: 1px solid #000; }
+  td:first-child, th:first-child { text-align: center; }
+  pre { font: 9.5pt/1.3 Consolas, "Courier New", monospace; margin: 0.35em 0 0.75em 0.4in; break-inside: avoid; }
+  .refs p { text-indent: -1.9em; padding-left: 1.9em; text-align: left; font-size: 11pt; margin-bottom: 0.45em; }
+  .note { font-size: 10pt; margin-top: 1.2em; text-align: left; }
+  .keep { break-inside: avoid; }
+  svg text { font-family: "Times New Roman", Times, serif; }
+</style>
+</head>
+<body>
+
+<h1>Vibe Hash: Proof of Useful Work by<br>Verifiable Neural Network Training</h1>
+<div class="byline">
+  <div class="who">Cole Heideman</div>
+  <div class="where">vibehash.org</div>
+</div>
+
+<div class="abstract">
+<p><b>Abstract.</b> Proof-of-work secures a ledger by making blocks expensive to produce, but the work itself is
+thrown away. We propose a network in which the work is the training of neural networks that people pay to have
+trained. Training is useful, but unlike hashing it cannot be checked at a glance. We divide each job into small,
+deterministic units of stochastic gradient descent. A worker commits to a Merkle tree over the checkpoints its unit
+passes through before a public random beacon, unknown until every commitment is in, chooses which segments will be
+checked. A randomly chosen staked verifier replays those segments and compares the result within a tolerance that
+absorbs rounding differences between processors but not skipped work. Faking part of a unit is caught with
+probability at least equal to the part faked, and costs the round's pay and half the cheater's stake, so cheating
+does not pay whenever honest work does. Every unit that verifies is paid in proportion to its floating-point
+operations: there is no lottery, and a laptop earns the same rate per operation as the largest machine on the
+network. Validators replay each round from its signed record before voting on its block, so no single node can bend
+the rules in its own favour.</p>
+</div>
+
+<h2>1. Introduction</h2>
+<p>Bitcoin [1] showed that a ledger can be kept without a trusted party by having nodes compete to find hashes below
+a target. The hashes have no use beyond the competition, and the competition is a lottery: each block's reward goes
+to one winner, which has pushed mining into pools and onto specialised hardware. Meanwhile, training machine-learning
+models has become one of the largest uses of computation in the world, while most capable processors, the graphics
+cards in gaming PCs, laptops and home servers, sit idle most of the day.</p>
+<p>What is needed is a way to pay for training the way Bitcoin pays for hashing, without trusting the people who do
+it. The difficulty is verification. A hash is checked by computing one more hash; a step of training is checked only
+by doing it again. Work on proof of learning [3] has shown that a training run can be audited by replaying parts of it
+from saved checkpoints. In this paper we make that audit the core of a consensus protocol. Work is cut into units
+small enough for a slow laptop to finish within a round. Every unit is committed to before anyone knows which part of
+it will be checked. The check is a replay assigned at random, and the incentives make an honest unit worth more than a
+faked one. Because work is checked rather than raced, everyone whose work passes is paid in proportion to it.</p>
+
+<h2>2. Jobs and Work Units</h2>
+<p>A requester posts a job: a model specification, the hash of a dataset, training settings, a fee per round and a
+budget held in escrow. The network trains the job in rounds. Each round starts from the job's current weights
+<i>W<sub>r</sub></i> and divides the work into units of the form: starting from <i>W<sub>r</sub></i>, run <i>S</i>
+steps of stochastic gradient descent with batches chosen by the seed <i>σ</i>, saving a checkpoint every <i>c</i>
+steps. The batch of each step is derived from <i>σ</i> and the step number alone, so any part of a unit can be
+replayed on its own.</p>
+<p>Units are deliberately small: the slowest eligible machine must finish one before the deadline. A faster machine
+receives more units, not larger ones, and a unit is never given to a machine without the memory to hold it. A
+worker's share grows with what it has delivered. A newcomer starts with a few units, may take at most twice as many in
+the next round if it delivered all of them, and drops back to what it delivered if it misses a deadline, so claiming
+more speed than one has gains nothing. At the end of the round, the accepted units are averaged into
+<i>W</i><sub><i>r</i>+1</sub>, as in federated averaging [6]. The requester pays only for the share of each round that
+verified, and the trained weights are public: every worker receives them each round anyway.</p>
+
+<h2>3. Commitments</h2>
+<p>A unit with a checkpoint every <i>c</i> steps passes through checkpoints <i>C</i><sub>0</sub>, …,
+<i>C<sub>k</sub></i>, which divide it into <i>k</i> segments. The worker hashes each checkpoint, builds a Merkle tree
+[2] over the hashes, and before the compute deadline publishes a signed commitment</p>
+<p class="eq"><i>H</i>( unit ‖ public key ‖ Merkle root ‖ salt ).</p>
+
+<figure>
+<svg width="560" height="188" viewBox="0 -10 560 188" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#000"/></marker></defs>
+  <!-- the chain of checkpoints -->
+  <g stroke="#000" fill="none" stroke-width="1">
+    <rect x="10" y="14" width="44" height="30"/><rect x="72" y="14" width="44" height="30"/>
+    <rect x="134" y="14" width="44" height="30"/><rect x="196" y="14" width="44" height="30"/>
+    <rect x="258" y="14" width="44" height="30"/><rect x="320" y="14" width="44" height="30"/>
+    <rect x="382" y="14" width="44" height="30"/><rect x="444" y="14" width="44" height="30"/>
+    <rect x="506" y="14" width="44" height="30"/>
+  </g>
+  <!-- challenged segments: shaded between their checkpoints -->
+  <g fill="#b0b0b0" stroke="none">
+    <rect x="72" y="4" width="106" height="6"/><rect x="258" y="4" width="168" height="6"/>
+  </g>
+  <g font-size="10.5" text-anchor="middle"><text x="125" y="3" dy="-1">replayed</text><text x="342" y="3" dy="-1">replayed</text></g>
+  <g stroke="#000" stroke-width="1" marker-end="url(#ar)">
+    <line x1="54" y1="29" x2="71" y2="29"/><line x1="116" y1="29" x2="133" y2="29"/><line x1="178" y1="29" x2="195" y2="29"/>
+    <line x1="240" y1="29" x2="257" y2="29"/><line x1="302" y1="29" x2="319" y2="29"/><line x1="364" y1="29" x2="381" y2="29"/>
+    <line x1="426" y1="29" x2="443" y2="29"/><line x1="488" y1="29" x2="505" y2="29"/>
+  </g>
+  <g text-anchor="middle" font-style="italic">
+    <text x="32" y="34">C<tspan baseline-shift="sub" font-size="9">0</tspan></text><text x="94" y="34">C<tspan baseline-shift="sub" font-size="9">1</tspan></text><text x="156" y="34">C<tspan baseline-shift="sub" font-size="9">2</tspan></text><text x="218" y="34">C<tspan baseline-shift="sub" font-size="9">3</tspan></text>
+    <text x="280" y="34">C<tspan baseline-shift="sub" font-size="9">4</tspan></text><text x="342" y="34">C<tspan baseline-shift="sub" font-size="9">5</tspan></text><text x="404" y="34">C<tspan baseline-shift="sub" font-size="9">6</tspan></text><text x="466" y="34">C<tspan baseline-shift="sub" font-size="9">7</tspan></text>
+    <text x="528" y="34">C<tspan baseline-shift="sub" font-size="9">8</tspan></text>
+  </g>
+  <!-- hashes into a tree -->
+  <g stroke="#000" stroke-width="0.8">
+    <line x1="32" y1="44" x2="155" y2="98"/><line x1="94" y1="44" x2="155" y2="98"/><line x1="156" y1="44" x2="155" y2="98"/>
+    <line x1="218" y1="44" x2="280" y2="98"/><line x1="280" y1="44" x2="280" y2="98"/><line x1="342" y1="44" x2="280" y2="98"/>
+    <line x1="404" y1="44" x2="466" y2="98"/><line x1="466" y1="44" x2="466" y2="98"/><line x1="528" y1="44" x2="466" y2="98"/>
+    <line x1="155" y1="112" x2="280" y2="140"/><line x1="280" y1="112" x2="280" y2="140"/><line x1="466" y1="112" x2="280" y2="140"/>
+  </g>
+  <g fill="#fff" stroke="#000"><rect x="125" y="98" width="60" height="16"/><rect x="250" y="98" width="60" height="16"/>
+    <rect x="436" y="98" width="60" height="16"/><rect x="232" y="140" width="96" height="22"/></g>
+  <g text-anchor="middle" font-size="12"><text x="155" y="110">hash</text><text x="280" y="110">hash</text><text x="466" y="110">hash</text>
+    <text x="280" y="155">Merkle root</text></g>
+  <text x="352" y="155" font-size="12">→ committed before the beacon</text>
+</svg>
+<figcaption>Figure 1: A unit's checkpoints, bound to one Merkle root before the beacon. Here the beacon then picks
+the shaded segments, <i>C</i><sub>1</sub>→<i>C</i><sub>2</sub>, <i>C</i><sub>4</sub>→<i>C</i><sub>5</sub> and
+<i>C</i><sub>5</sub>→<i>C</i><sub>6</sub>, to replay.</figcaption>
+</figure>
+
+<p>The commitment reveals nothing about the result, so it cannot be copied, and it binds the worker to every
+checkpoint before anyone knows which will be examined. The first checkpoint must hash to the job's current weights,
+so a unit cannot start from invented ones. Workers upload their checkpoints to the round's node as content-addressed
+blobs before committing, which makes the reveal that follows a short message and counts the upload as part of the
+work.</p>
+
+<h2>4. The Beacon</h2>
+<p>After the compute deadline the round's randomness is</p>
+<p class="eq"><i>beacon</i> = <i>H</i>( previous block ‖ round secret ‖ all commitments ).</p>
+<p>The round secret is chosen by the validator leading the round when it opens it. The secret's hash is published at
+once, and the secret itself only in the sealed round's record. Without it, a worker who could see every commitment,
+for instance one alone in a round, could re-salt its own commitment until the beacon chose only segments it had
+computed honestly. Workers compare the published hash with the record, so the leader cannot change the secret after
+seeing the commitments either. From the beacon follow, for each unit, which <i>q</i> of its <i>k</i> segments are
+checked (three of eight by default) and who checks them, and from the secret, where test submissions are planted.</p>
+
+<h2>5. Verification</h2>
+<p>Workers reveal the Merkle root, the salt, the final weights, and the checkpoints at both ends of every challenged
+segment with their Merkle proofs. A reveal that does not match its commitment is fraud. The checks, cheapest
+first:</p>
+<ul>
+<li><b>Sanity.</b> The final weights must be finite, must equal the last checkpoint, and must differ from the start by
+a plausible amount. This stops garbage, and inflated updates meant to poison the model, without any replay.</li>
+<li><b>Replay.</b> The assigned verifier re-runs each challenged segment from <i>C<sub>i</sub></i> and compares the
+result with <i>C</i><sub><i>i</i>+1</sub>. It must lie within the job's tolerance and within 1% of how far the segment
+actually moved the weights. The first condition absorbs rounding differences between processors. The second stops a
+worker from resubmitting untrained weights for a segment whose honest update is smaller than the tolerance, which
+happens late in training.</li>
+<li><b>Replication.</b> A random fraction of units is secretly given to two workers. Their final weights must agree;
+if they don't, a full replay decides who lied.</li>
+<li><b>Canaries.</b> The protocol slips known-bad tasks into verifiers' queues: copies of real tasks with one segment's
+update rescaled. They keep the structure of honest training and their positions come from the round secret, so they
+cannot be told apart from real work. A verifier that approves one is slashed, so approving without replaying does not
+pay.</li>
+<li><b>Arbitration.</b> A rejection is a claim, not a verdict. The node replays the disputed segment itself, and a
+verifier who rejected honest work is slashed for the false accusation.</li>
+</ul>
+<p>Committing and then not revealing forfeits the worker's whole round, but it is not slashed, because it cannot be
+told apart from a machine that crashed or lost its connection. Section 11 shows it is still unprofitable.</p>
+
+<h2>6. Rounds and Consensus</h2>
+<p>Each round produces one block. The block's summary carries the hash of the round's record: the workers' signed
+registrations, commitments, reveals and verdicts, the round's rules, and the outcome of each check. Every choice made
+in the round is drawn from public seeds by a deterministic generator: which units each worker gets, which are
+duplicated, who checks whom, where the canaries go, which job runs. Anyone can therefore run the round again from its
+record and confirm that the block's summary follows from the signed messages.</p>
+<figure>
+<svg width="560" height="92" viewBox="0 0 560 92" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <!-- 38 s drawn to scale: 3 + 20 + 5 + 10 -->
+  <g stroke="#000" stroke-width="1">
+    <rect x="10" y="18" width="40" height="28" fill="#fff"/>
+    <rect x="50" y="18" width="270" height="28" fill="#e6e6e6"/>
+    <rect x="320" y="18" width="68" height="28" fill="#fff"/>
+    <rect x="388" y="18" width="135" height="28" fill="#e6e6e6"/>
+  </g>
+  <g text-anchor="middle" font-size="12.5">
+    <text x="30" y="37">reg.</text><text x="185" y="37">compute</text><text x="354" y="37">reveal</text><text x="455" y="37">verify</text>
+  </g>
+  <g text-anchor="middle" font-size="11">
+    <text x="30" y="12">3 s</text><text x="185" y="12">20 s</text><text x="354" y="12">5 s</text><text x="455" y="12">10 s</text>
+  </g>
+  <line x1="523" y1="32" x2="548" y2="32" stroke="#000"/><path d="M548,28 L556,32 L548,36 z"/>
+  <text x="540" y="62" text-anchor="middle" font-size="11">block</text>
+  <g font-size="10.5" text-anchor="middle">
+    <text x="185" y="62">train units, upload checkpoints, commit</text>
+    <text x="354" y="62">beacon; reveal</text>
+    <text x="455" y="62">replay challenged</text><text x="455" y="75">segments</text>
+    <text x="30" y="62">sign up</text>
+  </g>
+</svg>
+<figcaption>Figure 2: A round with the default phase lengths, drawn to scale. Jobs with larger models get longer
+phases, sized so a modest computer on a home connection can still move its checkpoints in time.</figcaption>
+</figure>
+<p>Validators hold stake and take turns leading rounds, in a stake-weighted order fixed by the block height alone. The
+leader runs the round with the workers and proposes the block together with its record. Every other validator
+applies the block and replays the record before voting, and voting follows Tendermint [4]. A block is final once
+validators holding more than two thirds of the stake have signed it, and those signatures are its commit
+certificate. A leader that pays itself extra, favours a worker or forges a verdict fails the replay, is voted down,
+and the next validator in the order leads instead. Rewards and slashes are never taken from the proposer: every node
+derives them from the round's summary and the chain's state. Useful work decides who is paid; stake decides who
+votes.</p>
+<p>A node signs a receipt for every registration, commitment, reveal and verdict it accepts, naming the message's
+hash. A receipt for a message missing from its round's record is signed proof that the node dropped it.</p>
+
+<h2>7. Incentive</h2>
+<p>Each round has a pool, made of the block subsidy and the fee the job releases for the work that verified:</p>
+<p class="eq"><i>pool</i> = <i>subsidy</i>(<i>height</i>) + min( <i>escrow</i>, <i>fee</i> × <i>accepted units</i> / <i>units per round</i> ).</p>
+<p>Eighty percent goes to workers in proportion to their verified training operations, fifteen percent to verifiers
+in proportion to the operations they replayed, both weighted by reputation, and five percent to the block's
+proposer. Anything unclaimed is burned rather than given to the proposer, so a proposer gains nothing by rejecting
+good work. Reputation is a multiplier between 0.5 and 1.0. It starts at 0.8, rises by 0.02 in each round with
+verified work, falls by 0.05 for a missed deadline, and drops to 0.5 on fraud. It moves per round rather than per
+unit, so a laptop builds it exactly as fast as a large machine.</p>
+<p>Fraud costs half of the offender's stake, including coins still waiting in the 20-round unbonding queue, so a
+cheater cannot withdraw ahead of the verdict. Half of the slashed stake goes to whoever caught it and half is burned.
+The subsidy follows Bitcoin's shape stretched to Vibe Hash's block time: 3.125 VIBE a block, halving every 3,320,000
+blocks, which is about four years at 38-second rounds, with at most 21,000,000 VIBE ever. Amounts are integers of
+10<sup>−8</sup> VIBE and rounding remainders are burned, so the supply is exactly the genesis allocation plus subsidies
+minus burns.</p>
+<p>Pay per verified operation is the same for every machine. A laptop earns less in total because it does less work,
+but at the same rate, and every round in which it completes work rather than almost never, so no pool is needed.</p>
+
+<h2>8. A Fair Start</h2>
+<p>Bitcoin needed no stake: a hash proves itself, so anyone could mine from the first block. Work that is only
+spot-checked needs a bond the cheater stands to lose, and if every stake has to be handed out in the genesis block,
+the first coins are a premine. Instead, anyone may register without stake, and pay to a worker below the minimum
+stake of 5 VIBE goes into its stake until it reaches the minimum. Until then the worker takes only units staked
+workers did not need, and never checks anyone else's work, so a swarm of free identities cannot approve each other's
+fakes. The first validators vote with bootstrap stake, which can never be withdrawn or spent and is burned if they
+leave, so it is outweighed as others earn stake and join. Every spendable coin starts from work.</p>
+
+<h2>9. Arithmetic Across Devices</h2>
+<p>Replays must agree across very different hardware. Every checkpoint is rounded to the job's precision before it is
+hashed, so a 32-bit job's Merkle leaves are the same whether its weights came from a graphics card or a CPU. Workers
+on graphics cards disable reduced-precision matrix modes and request deterministic kernels. Measured on a consumer
+NVIDIA graphics card against the reference CPU implementation, replays of segments of 5 to 500 steps on models of 69 thousand to
+2.2 million weights differed by 4×10<sup>−9</sup> to 8×10<sup>−8</sup>, between 1,250 and 22,000 times inside the
+tolerance of 10<sup>−4</sup>, and the same card gave identical bits on every run. The same measurements show why the
+update condition of Section 5 is needed: one honest 5-step segment of the 2.2-million-weight model moved the weights
+by only 4.3×10<sup>−5</sup>, less than the tolerance.</p>
+
+<h2>10. Models Larger Than One Computer</h2>
+<p>A unit as described is the whole model, which limits a job to what one machine can hold. Larger models are split
+into shards, contiguous blocks of layers, and a unit is trained by a team with one worker per shard, as a pipeline
+[7]: activations flow forward from shard to shard and gradients flow back. Done in the same order, this is the same
+arithmetic one machine would do, and ends at exactly the same bits. Each worker commits to its shard's checkpoints and
+to every tensor that crossed its edges. A unit's work becomes a grid of cells, each one shard over one segment, and a
+checker replays a single cell holding only that shard. When two neighbours disagree about what crossed between them,
+their signed edge messages show which one lied.</p>
+<figure>
+<svg width="380" height="122" viewBox="0 0 380 122" xmlns="http://www.w3.org/2000/svg" font-size="12">
+  <g stroke="#000" fill="#fff" stroke-width="1">
+    <rect x="70" y="10" width="300" height="96"/>
+  </g>
+  <g stroke="#000" stroke-width="0.7">
+    <line x1="107.5" y1="10" x2="107.5" y2="106"/><line x1="145" y1="10" x2="145" y2="106"/><line x1="182.5" y1="10" x2="182.5" y2="106"/>
+    <line x1="220" y1="10" x2="220" y2="106"/><line x1="257.5" y1="10" x2="257.5" y2="106"/><line x1="295" y1="10" x2="295" y2="106"/>
+    <line x1="332.5" y1="10" x2="332.5" y2="106"/>
+    <line x1="70" y1="34" x2="370" y2="34"/><line x1="70" y1="58" x2="370" y2="58"/><line x1="70" y1="82" x2="370" y2="82"/>
+  </g>
+  <rect x="220" y="34" width="37.5" height="24" fill="#bfbfbf" stroke="#000"/>
+  <g font-size="11" text-anchor="end"><text x="62" y="26">shard 1</text><text x="62" y="50">shard 2</text><text x="62" y="74">shard 3</text><text x="62" y="98">shard 4</text></g>
+  <g font-size="11" text-anchor="middle"><text x="220" y="120">segments of one unit →</text></g>
+</svg>
+<figcaption>Figure 3: A sharded unit as a grid of cells. A checker replays one cell, here shard 2 over segment 5,
+holding only that shard.</figcaption>
+</figure>
+<p>For the largest open models, the useful job is fine-tuning: the original weights stay frozen and small low-rank
+adapters are trained [5], which also keeps the checkpoints that move between workers small. As an example, a
+763-billion-parameter mixture-of-experts model stored in 510 GB needs, by this method, a team of 40 graphics cards
+with 12 GB of memory each, 20 with 24 GB or 14 with 32 GB, while its adapters come to about 160 MB. Such teams are
+limited by their network links rather than their processors, so training is spread across many teams at once. The
+team protocol works in simulation and is not yet run by the network.</p>
+
+<h2>11. Calculations</h2>
+<p>Suppose a worker skips the training of <i>m</i> of a unit's <i>k</i> segments and makes up their checkpoints. The
+beacon checks <i>q</i> distinct segments, unknown to the worker when it commits, so the worker escapes only if all
+<i>q</i> fall among the <i>k</i> − <i>m</i> segments it trained:</p>
+<p class="eq"><i>P</i>(escape) = C(<i>k</i> − <i>m</i>, <i>q</i>) / C(<i>k</i>, <i>q</i>) &nbsp;≤&nbsp; (1 − <i>m</i>/<i>k</i>)<sup><i>q</i></sup>.</p>
+<p>With the defaults <i>k</i> = 8 and <i>q</i> = 3:</p>
+<pre>from math import comb
+
+def caught(m, k=8, q=3):
+    return 1 - comb(k - m, q) / comb(k, q)
+
+for m in range(1, 9):
+    print(m, m / 8, round(caught(m), 4))</pre>
+<table>
+<tr><th>m</th><th>fraction skipped</th><th>P(caught)</th></tr>
+<tr><td>1</td><td>0.125</td><td>0.3750</td></tr>
+<tr><td>2</td><td>0.250</td><td>0.6429</td></tr>
+<tr><td>3</td><td>0.375</td><td>0.8214</td></tr>
+<tr><td>4</td><td>0.500</td><td>0.9286</td></tr>
+<tr><td>5</td><td>0.625</td><td>0.9821</td></tr>
+<tr><td>6–8</td><td>≥ 0.750</td><td>1.0000</td></tr>
+</table>
+<p>In every row the probability of being caught is at least the fraction skipped. Replicated units and canaries only
+add to it. Now let <i>u</i> be the cost of computing one unit, <i>R</i> the worker's pay for the whole round and
+<i>s</i> its stake. Skipping <i>m</i>/<i>k</i> of a unit saves (<i>m</i>/<i>k</i>)·<i>u</i>, and being caught loses
+<i>R</i> + <i>s</i>/2, so cheating pays only if</p>
+<p class="eq">(<i>m</i>/<i>k</i>) · <i>u</i> &nbsp;&gt;&nbsp; <i>P</i>(caught) · ( <i>R</i> + <i>s</i>/2 ).</p>
+<p>Since <i>P</i>(caught) ≥ <i>m</i>/<i>k</i>, that requires <i>u</i> &gt; <i>R</i> + <i>s</i>/2: one unit would have to
+cost more than the pay for the whole round plus half the stake. If that were so, no one would mine honestly either. A
+worker that commits, sees which segments are challenged and withholds its reveal avoids the slash but loses
+<i>R</i> with the same probability, so backing out pays only if <i>u</i> &gt; <i>R</i>, which is likewise a network
+nobody would mine on.</p>
+
+<h2>12. Conclusion</h2>
+<p>We have proposed a system that pays for the training of neural networks without trusting those who do it. Work is
+divided into deterministic units, each committed to through a Merkle tree before a beacon nobody can predict chooses
+which segments are replayed, and a randomly chosen verifier repeats them within a tolerance that admits honest
+rounding but not skipped work. Stake, reputation and test submissions make cheating, lazy checking and false
+accusations each cost more than they could gain. Because the work is checked rather than raced, everyone whose work
+passes is paid in proportion to it, and an old laptop earns the same rate as the largest machine on the network.
+Validators replay every round from its signed record before agreeing on its block, so the rules hold without a central
+coordinator. Useful work decides who is paid, and stake decides who votes. A test network implementing this design
+runs at vibehash.org; it trains small models today, its coin VIBE has no cash value, and the software has not been
+audited.</p>
+
+<div class="refs keep">
+<h2>References</h2>
+<p>[1] S. Nakamoto, "Bitcoin: A Peer-to-Peer Electronic Cash System," 2008.</p>
+<p>[2] R. C. Merkle, "Protocols for public key cryptosystems," in Proc. 1980 Symposium on Security and Privacy, IEEE
+Computer Society, pages 122–133, April 1980.</p>
+<p>[3] H. Jia, M. Yaghini, C. A. Choquette-Choo, N. Dullerud, A. Thudi, V. Chandrasekaran and N. Papernot,
+"Proof-of-Learning: Definitions and Practice," in IEEE Symposium on Security and Privacy, 2021.</p>
+<p>[4] E. Buchman, J. Kwon and Z. Milosevic, "The latest gossip on BFT consensus," arXiv:1807.04938, 2018.</p>
+<p>[5] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang and W. Chen, "LoRA: Low-Rank Adaptation of
+Large Language Models," in International Conference on Learning Representations, 2022.</p>
+<p>[6] H. B. McMahan, E. Moore, D. Ramage, S. Hampson and B. Agüera y Arcas, "Communication-Efficient Learning of Deep
+Networks from Decentralized Data," in Artificial Intelligence and Statistics, 2017.</p>
+<p>[7] Y. Huang et al., "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism," in Advances
+in Neural Information Processing Systems, 2019.</p>
+</div>
+
+<p class="note">Disclaimer: All product names, logos, and brands are property of their respective owners and are used
+purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</p>
+
+</body>
+</html>

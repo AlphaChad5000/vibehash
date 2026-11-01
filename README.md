@@ -10,7 +10,8 @@ rounds and vote on every block (BFT consensus, so no single node is in charge),
 real worker clients that talk to them over HTTP, wallets, and a persistent
 chain that anyone can audit.
 See [DESIGN.md](DESIGN.md) for the protocol, economics, threat model, and
-what's still needed before a mainnet (§9).
+what's still needed before a mainnet (§9). The [whitepaper](docs/whitepaper.pdf)
+sets out the design in eight pages.
 
 ## Install
 
