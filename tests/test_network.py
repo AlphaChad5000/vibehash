@@ -318,6 +318,42 @@ class CommandLineTests(unittest.TestCase):
         self.assertGreater(float(re.findall(r"worker-1 ([\d.]+)", out)[-1]), 0, out)  # the first round back gets worked
 
 
+class DistantWorkerTest(unittest.TestCase):
+    def test_many_units_are_revealed_in_time_over_a_slow_link(self):
+        """A worker 50 ms from the node with 12 units: revealed one at a time, each asking again about checkpoints it
+        uploaded during compute, they took longer than the reveal phase, and missing it forfeits the round (as the
+        public network showed on 2026-11-01). Reveals now go out together, as one message each. The link also drops
+        two reveals, one on the way and one's reply (as it did the next day): each is sent again, and not lost."""
+        node, api, req, workers, clients, stop, *_ = start_network(
+            self, 1, times=PhaseTimes(register_s=1.0, compute_s=8.0, reveal_s=1.5, verify_s=2.0, idle_s=0.3),
+            config=CoordinatorConfig(canaries_per_round=0, newcomer_units=12))
+        far = clients[0].node
+        drops, lock = ["on the way", "reply"], threading.Lock()
+
+        def far_open(request, near=far._open):
+            time.sleep(0.05)
+            with lock:
+                drop = drops.pop(0) if request.full_url.endswith("/reveal") and drops else None
+            if drop == "on the way":
+                raise ConnectionResetError("dropped on the way")
+            reply = near(request)
+            if drop == "reply":
+                reply.close()
+                raise ConnectionResetError("reply dropped")
+            return reply
+        far._open = far_open
+        job = TrainingJob("far-job", req.address, budget=60 * SYN_PER_VIBE, fee_per_round=10 * SYN_PER_VIBE,
+                          units_per_round=12, steps_per_unit=10, checkpoint_every=5)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        start = node.chain.tip.height
+        run_until(node, clients, stop, start + 3)
+        worked = [b.summary for b in node.chain.blocks[start + 1:] if b.summary and (b.summary.accepted_units or b.summary.missed)]
+        self.assertTrue(worked, "no round was worked")
+        self.assertEqual([s.missed for s in worked], [[]] * len(worked))
+        self.assertIn(12, [s.accepted_units for s in worked])
+        self.assertEqual(drops, [])
+
+
 class LiveNetworkTest(unittest.TestCase):
     """A real node on localhost, real HTTP, worker clients (one cheating), uploaded data."""
 
