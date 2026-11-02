@@ -336,7 +336,8 @@ so its referee fetched what it needed from Hugging Face by byte range.
     each time down to the embedding). Worker-4 slashed for a false accusation, burned.
   - Worker-6 recorded as missing its checks. Four units accepted and paid; worker-4 (slashed) went unpaid.
 - **The audit:** `chain verify` in the PyTorch-free venv replayed every round, round 4's disputes move by move with
-  the referee re-run from the record, and redid 12 weight-based checks: valid, and PyTorch never loaded.
+  the referee re-run from the record, and redid 11 weight-based checks (it said 12, counting the averaged model
+  twice, a bug since fixed): valid, and PyTorch never loaded.
 - **Not shown on the real model:** worker-7 didn't check worker-5's claim in round 4, so its silence as a challenger
   is shown only in tests (`test_silent_parties_lose`). The run stopped after round 4, so there's no new adapter to
   measure in PEFT. Training now runs op by op, and its gradients match the autograd training the jury runs below
