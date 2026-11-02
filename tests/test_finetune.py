@@ -1009,6 +1009,49 @@ class NodeFreeRoundTests(unittest.TestCase):
             self.replays([rep])
         self.assertLess(len(canonical(rep.record)), 200_000)
 
+    def test_accusing_in_vain_again_and_again_costs_disputes(self):
+        """The second review's finding 9: withdrawing costs a checker that round's pay and reputation, and the
+        reputation it has lost since it started takes disputes away (coordinator.games_allowed), down to one a round."""
+        from vibehash.coordinator import MAX_GAMES, games_allowed
+
+        self.assertEqual([games_allowed(r) for r in (1.0, 0.8, 0.75, 0.7, 0.65, 0.6, 0.5)], [MAX_GAMES, 4, 3, 2, 1, 1, 1])
+        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        liar = self.workers[-1].address
+        for chain in (self.proto.chain, self.before):  # (the replay starts from the same reputation)
+            chain.state.reputation[liar] = 0.65  # three rounds' worth lost: one dispute
+        rep = self.round()
+        rejected = [t for t in self.tasks.values() if t.verifier == liar and t.verdict is not None and not t.verdict[0]]
+        self.assertGreater(len(rejected), 1)
+        self.assertEqual(sum(g.challenger == liar for g in self.games.values()), 1)
+        self.assertIn(liar, rep.block.summary.missed)  # it withdrew them: less reputation, fewer disputes next round
+        self.replays([rep])
+
+    def test_a_cheat_that_also_accused_falsely_still_pays_its_catcher(self):
+        """The second review's finding 9: an offender pays one slash a round, its first, and false accusations were
+        listed before fraud, so a cheater that also lost a dispute it started had its catcher's bounty burned."""
+        from vibehash.program import Op, Program
+        from vibehash.tracer import node_at
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        cheat, job = self.workers[-1].address, self.job
+
+        def moves(g, who):  # the cheater plays its accusations to the end (the first child, the first tile)
+            if who != cheat or g["turn"] != "pick":
+                return "default"
+            node, _ = node_at(Program.of(job, int(g["seed"])), g["root"], g["path"])
+            g0, g1 = g["groups"][0]
+            atom = node.atoms[g0] if g1 - g0 == 1 else None
+            return {"pick": 0, **({"tile": 0} if isinstance(atom, Op) and atom.out else {})}
+        rep = self.round(moves=moves)
+        mine = [s for s in rep.slashes if s[0] == cheat]
+        reasons = {s[2] for s in mine}
+        self.assertIn("false accusation", reasons)
+        self.assertIn("failed_replay", reasons)
+        self.assertIsNotNone(mine[0][1])  # its first slash, the one the ledger takes, has its catcher
+        self.replays([rep])
+
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
         challenger. Both are slashed as if they had lost at the referee."""

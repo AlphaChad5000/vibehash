@@ -80,7 +80,16 @@ SHARDED_RECORD_VERSION = 3
 FINETUNE_RECORD_VERSION = 4
 CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
 SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
-MAX_GAMES = 4  # disputes one checker can open in a round; its further rejections are ignored
+MAX_GAMES = 4  # disputes one checker can open in a round (games_allowed); its further rejections are ignored
+
+
+def games_allowed(rep: float) -> int:
+    """Disputes a checker with reputation `rep` may open in a round: MAX_GAMES from the reputation a newcomer starts
+    with, one fewer for each round's worth of reputation it has lost since (economics.REP_LOSS_MISSED: a round in which
+    it withdrew a rejection, or missed a deadline), and never fewer than one. So accusing again and again costs more:
+    each round of it takes a dispute away, as well as that round's pay for checking and some of its pay rate."""
+    lost = max(0, round((econ.REP_START - rep) / econ.REP_LOSS_MISSED))
+    return max(1, MAX_GAMES - lost)
 # Staked workers able to run a fine-tune that must register before its round assigns work: a holder and one checker.
 # With the node refereeing disputes, a claim's verdict is right whenever one of its checkers is honest and online, so
 # one checker is enough to start; from three workers on, each claim gets two, so one going quiet leaves the other.
@@ -1263,8 +1272,10 @@ class Coordinator:
         opened = defaultdict(int)
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
-                if opened[t.verifier] >= MAX_GAMES:  # one challenger can't load a round with disputes: the rest
-                    continue  # of its rejections are ignored (their claims stand on other verdicts)
+                # One challenger can't load a round with disputes, fewer the more it has accused in vain: the rest of
+                # its rejections are ignored (their claims stand on other verdicts).
+                if opened[t.verifier] >= games_allowed(self.chain.state.rep(t.verifier)):
+                    continue
                 opened[t.verifier] += 1
                 self._open_game(job, (t.unit.unit_id, t.submitter), t.verifier, "dispute", ["segment", t.verdict[1]])
         for uid, holders in sorted(r.holders.items()):
@@ -1766,6 +1777,9 @@ class Coordinator:
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
                                             "no checker whose verdicts count answered for it")
         r.record["games"] = [g.entry() for _, g in sorted(r.games.items())]
+        # An offender pays one slash a round, its first (ledger._slash_txs): one with a catcher goes before a burn, or
+        # a cheater that also accused falsely (or approved a canary) would keep its catcher from the bounty.
+        r.slashes.sort(key=lambda s: s[1] is None)
 
         accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
         offenders = {s[0] for s in r.slashes} | r.forfeit

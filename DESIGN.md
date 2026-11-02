@@ -694,6 +694,13 @@ Each step:
      a worker could bait an honest checker into a dispute it can't win (the residual below) and collect.
    - **The challenger withdrew:** no slash; it's unpaid for checking and marked as missing that round. The claim
      stands on its other verdicts (accepted if another counted checker approved it, else unchecked).
+   - **Accusing again and again costs more:** every round a checker withdraws (or misses a deadline) costs it
+     reputation, its pay rate on everything, and `coordinator.games_allowed` gives it one dispute fewer a round for
+     each round's worth lost since it started (4 at a newcomer's 0.8, then 3, 2, 1; never fewer than one, so an honest
+     checker can always dispute). Within a round, 4 at most: a griefer makes a defender split and upload for at most
+     that many, and loses its round's pay for it.
+   - **One slash a round:** an offender pays only its first (`ledger._slash_txs`), so slashes with a catcher go first.
+     A cheater that also lost a dispute it started still pays its catcher (the second review's finding 9).
    - **The referee couldn't reach the weights:** the Hub was unreachable, so the claim ends unchecked and nobody is
      slashed.
    - **A checker that approved a claim found bad isn't slashed.** The referee finds an op a few ulps out of bounds,
@@ -785,8 +792,10 @@ once a round would be a ledger change.
     dispute's root states, and `games`: each dispute's signed moves, its outcome and the referee's words. No weights (a
     replay fetches and checks its own) and no evidence (the evidence move names its blob, which a validator fetches
     from the proposer with the game's checkpoints): a record stays small whatever the model (the second review's
-    finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round; its other rejections are
-    ignored.
+    finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round, fewer once it has accused in
+    vain (`games_allowed`); its other rejections are ignored, and their claims stand on their other verdicts. That
+    trades a little of the guarantee for liveness: an honest checker that finds more bad claims in one round than it
+    may dispute leaves the rest to their other checkers.
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
     the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
     without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each
