@@ -6,9 +6,9 @@ site it's /guide/, so it needs that wrapper itself, plus what search engines and
 
     python scripts/build_site.py SITE_DIR
 
-writes index.html, guide/index.html, the one-line installers (install.ps1 and install.sh), CNAME and .nojekyll into
-SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org, which GitHub Pages serves at https://vibehash.org. Commit
-and push SITE_DIR to publish.
+writes index.html (and og.png, its link preview), guide/index.html, the one-line installers (install.ps1 and install.sh),
+CNAME and .nojekyll into SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org, which GitHub Pages serves at
+https://vibehash.org. Commit and push SITE_DIR to publish.
 """
 import html
 import re
@@ -56,7 +56,9 @@ def build(guide: Path, front: Path, out: Path) -> None:
 """
     (out / "guide").mkdir(parents=True, exist_ok=True)
     (out / "guide" / "index.html").write_text(page, encoding="utf-8", newline="\n")
-    (out / "index.html").write_bytes(front.read_bytes())
+    for f in front.parent.iterdir():  # the front page and what it links: og.png, the link preview (docs/brand/og.html)
+        if f.is_file():
+            (out / f.name).write_bytes(f.read_bytes())
     (out / "CNAME").write_text(DOMAIN + "\n", encoding="utf-8", newline="\n")  # GitHub Pages' custom domain
     (out / ".nojekyll").write_text("", encoding="utf-8")  # serve the files as they are
     for script in ("install.ps1", "install.sh"):  # irm https://vibehash.org/install.ps1 | iex, and curl … | sh
