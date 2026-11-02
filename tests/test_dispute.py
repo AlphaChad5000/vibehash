@@ -548,7 +548,7 @@ class StateCheckTests(unittest.TestCase):
         z = np.zeros((8, 64), dtype=np.float32)
         manifest, blobs = dispute.state_manifest({"x": x, "z": z, "zt": z.reshape(64, 8)})
         for tb in (TraceBlobs(BlobStore(tempfile.mkdtemp())), _MemoryBlobs()):
-            fake = types.SimpleNamespace(trace_blobs=tb, _get_trace=tb.get_bytes)
+            fake = types.SimpleNamespace(trace_blobs=tb, _get_trace=tb.get_bytes, _trace_size=tb.size)
             for raw in blobs.values():
                 tb.put_bytes(raw)
             root = tb.put_bytes(manifest)
