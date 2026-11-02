@@ -9,7 +9,12 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://vibehash.org/">
 <meta property="og:title" content="Vibe Hash: mining that trains real AI models">
-<meta property="og:description" content="Computers earn VIBE by training small, checkable pieces of AI models instead of hashing.">
+<meta property="og:description" content="Gaming PCs earn VIBE by training checkable pieces of AI models instead of hashing. Right now they're teaching DeepSeek V4.1 Flash to think shorter, in pieces small enough that nobody holds the whole model.">
+<meta property="og:image" content="https://vibehash.org/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Vibe Hash: mining that trains real AI models. Now training DeepSeek V4.1 Flash to think shorter.">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3 4'%3E%3Cpath fill='%23f1b23c' d='M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -66,6 +71,9 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--gold); outline-
 .hero { padding-block: 56px 64px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; max-width: 46rem; }
 .hero h1 { font-size: clamp(2.3rem, 6vw, 3.9rem); font-weight: 770; font-stretch: 110%; line-height: 1.02; letter-spacing: -0.03em; }
 .hero h1 em { font-style: normal; color: var(--signal); }
+.now { justify-self: start; display: inline-flex; align-items: center; gap: 10px; max-width: 100%; padding: 6px 14px; border: 1px solid var(--band-rule); border-radius: 99px; background: var(--term); color: var(--band-ink); text-decoration: none; font-size: 0.95rem; }
+.now:hover { border-color: var(--signal); }
+.now .dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
 .lede { font-size: 1.2rem; color: var(--band-ink-2); max-width: 38rem; }
 .install { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; max-width: 40rem; }
 .os { display: flex; gap: 4px; }
@@ -93,6 +101,9 @@ section { padding-block: 64px 8px; }
 .stat dd span { font-size: 1.1rem; font-weight: 600; margin-left: 6px; color: var(--ink-2); letter-spacing: 0; }
 .callout { margin-top: 16px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; background: var(--gold-wash); border-radius: 10px; padding: 14px 18px; }
 .callout a { font-weight: 700; }
+.callout.deepseek { margin-top: 28px; max-width: 46rem; display: block; }
+.callout.deepseek h3 { margin-bottom: 4px; }
+.callout.deepseek p { color: var(--ink-2); }
 
 .jobs { display: grid; gap: 16px; margin-top: 28px; }
 .job { border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: grid; grid-template-columns: 1fr minmax(0, 300px); gap: 12px 32px; align-items: center; }
@@ -189,6 +200,7 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
       </nav>
     </div>
     <div class="hero">
+      <a class="now" id="now" href="#network" hidden><span class="dot"></span><span id="now-text"></span></a>
       <h1>Mining that trains <em>real AI models</em></h1>
       <p class="lede">Instead of burning electricity on hashes nobody uses, your computer trains small, checkable pieces of AI models, and earns VIBE for every piece that checks out.</p>
       <div class="install">
@@ -243,6 +255,12 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
       </li>
       <li><h3>Start mining</h3><p>Say yes when setup asks. <kbd>Ctrl</kbd>+<kbd>C</kbd> stops it, and <code class="vh" data-cmd="worker">python -m vibehash worker</code> starts it again any time. If your computer calls Python something else, the installer tells you what to type instead.</p></li>
     </ol>
+    <div class="callout deepseek">
+      <div>
+        <h3>Mining the DeepSeek job</h3>
+        <p>It takes an NVIDIA graphics card with 8 GB or more (RTX 20-series or newer), 16 GB of memory (32 GB is faster) and about 40 GB free on an SSD. Your PC downloads about 30 GB of the model, after asking. You choose where it goes and how much space it may use, and it's deleted when the job ends, unless you'd rather keep it for next time. No PC ever holds the whole 510 GB model. Other graphics cards and processors keep earning on the network's other jobs.</p>
+      </div>
+    </div>
     <div class="handy">
       <p><code class="vh" data-cmd="balance">python -m vibehash balance</code> <span>what you've earned</span></p>
       <p><code class="vh" data-cmd="devices">python -m vibehash devices</code> <span>what this computer can train on</span></p>
@@ -256,17 +274,18 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
     <div class="steps">
       <div class="step"><b>1</b><h3>Get a piece of work</h3><p>Each round, about every 40 seconds, the network hands your computer a few training steps of a model someone has paid to have trained.</p></div>
       <div class="step"><b>2</b><h3>Train it</h3><p>On your graphics card if you have one, or your processor if not. An old laptop and a gaming rig earn the same rate per unit of work.</p></div>
-      <div class="step"><b>3</b><h3>Get checked, get paid</h3><p>Other miners redo random bits of your work. Work that checks out is paid by how much you did; cheaters lose their stake.</p></div>
+      <div class="step"><b>3</b><h3>Get checked, get paid</h3><p>Other miners redo random bits of your work. If one disagrees, the network narrows it down to a single calculation and redoes just that. Work that checks out is paid by how much you did; cheaters lose their stake.</p></div>
     </div>
   </section>
 
   <section class="wrap" aria-labelledby="next-title">
-    <h2 id="next-title">What's next</h2>
+    <h2 id="next-title">What's live, and what's next</h2>
     <div class="next">
       <ul>
-        <li><strong>Fine-tuning open models.</strong> Teach models like Qwen your own data, trained by the network. Built, and in review now.</li>
-        <li><strong>DeepSeek V4.1 Flash, in pieces.</strong> A 510 GB model cut into parts small enough for a gaming PC, so no one has to hold it all. In development.</li>
-        <li><strong>More validators.</strong> Today one node runs the network; the goal is that nobody controls it.</li>
+        <li><strong>Live: fine-tuning open models.</strong> Teach a model like Qwen your own text. The network trains an add-on for it and you download the result. The node that runs the network never runs the model.</li>
+        <li><strong>Live: DeepSeek V4.1 Flash, in pieces.</strong> The first job teaches it to think shorter. Its 510 GB are cut so that no miner holds more than about 30 GB: the bottom layers are prepared once, in pieces anyone can run, and miners train the top four.</li>
+        <li><strong>Next: the full set.</strong> The first job is a 1,500-problem pilot. The full 7,473 come next, reusing the pilot's prepared pieces.</li>
+        <li><strong>Next: nobody in charge.</strong> Today one node runs the network and one storage bucket holds the hand-offs. More validators, and miners hosting the hand-offs, take that away.</li>
       </ul>
       <p><a href="/guide/">Read the guide</a> for how rounds, checks, payment and penalties work.</p>
     </div>
@@ -389,6 +408,7 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
   var FEATURED = [{
     match: "think-shorter",
     title: "Teaching DeepSeek V4.1 Flash to think shorter",
+    short: "DeepSeek V4.1 Flash learns to think shorter",
     blurb: "Long thinking is what makes answers slow. Miners' gaming PCs are training an add-on that teaches DeepSeek V4.1 Flash to reach the right answer in a few short steps. Nobody holds the whole 510 GB model: its bottom 36 layers are prepared once, in pieces anyone can run, and miners train the top 4.",
     // The first job is the pilot: 1,500 GSM8K training problems, scored on 500 held back (docs/datasets/think-shorter.md).
     examples: 1500, heldBack: 500, unit: "problems",
@@ -507,6 +527,10 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
     var feat = pickFeatured(net.jobs), slot = $("featured"), jobs = $("jobs");
     slot.textContent = ""; jobs.textContent = "";
     if (feat) slot.appendChild(featuredCard(feat, net));
+    var info = feat && infoFor(feat), now = $("now");
+    now.hidden = !feat || feat.status === "finished";
+    if (feat) $("now-text").textContent = (feat.prep && !feat.prep.done.every(function (x) { return x >= 1; }) ? "Preparing: " : "Now training: ") +
+      (info ? info.short : feat.model.replace(/^fine-tune of /, ""));
     net.jobs.filter(function (j) { return j !== feat && (j.status !== "finished" || j.rounds_trained); }).slice(0, 6)
       .forEach(function (j) { jobs.appendChild(jobCard(j, net)); });
     var list = $("miner-list"), top = m.top_miners || [], most = top.length ? top[0].flops : 0;
