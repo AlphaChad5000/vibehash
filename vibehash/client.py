@@ -270,8 +270,11 @@ class WorkerClient:
 
     def __init__(self, node_url: str, keys: KeyPair, memory_mb: int | None = None, flops_override: float | None = None,
                  poll_s: float = 0.5, behavior: str = "honest", verifier_behavior: str = "honest", device: str = "auto",
-                 cache_dir: str | Path | None = None):
+                 cache_dir: str | Path | None = None, deepseek: bool = False):
+        """`deepseek`: take DeepSeek jobs' work, whose model files (~30 GB) it fetches into the model store
+        (modelstore.py) without asking: the owner said yes (`worker --deepseek yes`, or the menu's item)."""
         self.home = self.node = NodeClient(node_url)
+        self.deepseek = deepseek
         self.backend = get_backend(device, log)
         self.memory_override = memory_mb
         self.flops_override = flops_override

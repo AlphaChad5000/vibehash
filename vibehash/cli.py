@@ -309,8 +309,12 @@ def cmd_worker(a, keys: KeyPair | None = None):
     from . import minerui
 
     url = node_of(a)
+    if getattr(a, "deepseek", None):
+        settings.save(deepseek=a.deepseek)  # remembered: the next `vibehash worker` does the same
+    deepseek = (getattr(a, "deepseek", None) or settings.load().get("deepseek", "ask")) == "yes"
     try:
-        w = WorkerClient(url, keys or load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir)
+        w = WorkerClient(url, keys or load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir,
+                         deepseek=deepseek)
     except RuntimeError as e:
         sys.exit(f"error: {e}")
     status = w.node.status()
@@ -1539,6 +1543,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-mb", type=int, help="override detected memory"); p.add_argument("--flops", type=float, help="override benchmark")
     p.add_argument("--cache-dir", help="where checkpoints and datasets are kept (default ~/.vibehash/cache)")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
+    p.add_argument("--deepseek", choices=["ask", "yes", "no"], default=None,
+                   help="take DeepSeek work (its ~30 GB of model files): ask once (the default), yes without asking "
+                        "(unattended), or no. Remembered")
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
