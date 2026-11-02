@@ -50,6 +50,19 @@ MODULE_OF = {"q": "self_attn.q_proj", "k": "self_attn.k_proj", "v": "self_attn.v
 DEFAULT_TARGETS = ("q", "k", "v", "o")  # FINETUNING.md: the attention projections, unless flags say otherwise
 OPTIMIZERS = {"adam": (0.9, 0.999, 1e-8)}  # name -> (beta1, beta2, eps); the name in a spec fixes all three
 DIMS = ("family", "vocab", "hidden", "layers", "heads", "kv_heads", "head_dim", "ffn", "tied")
+
+
+def ipow(x: float, n: int) -> float:
+    """x to a whole power n ≥ 0, by squaring: IEEE multiplications only, so every platform gets the same bits. Python's
+    ** calls the C library's pow, which isn't correctly rounded everywhere, and what's computed from Adam's betas (the
+    program's constants, the reveal check's bound) must be the same on every node."""
+    out = 1.0
+    while n:
+        if n & 1:
+            out *= x
+        x *= x
+        n >>= 1
+    return out
 EVAL_BATCH = 8  # validation sequences scored at once
 HEAD_TOKENS = 512  # llm.HEAD_CHUNK: tokens whose logits are made at once
 MAX_VAL = 128  # sequences held back at most: the node scores them every round
@@ -206,10 +219,10 @@ class LoraSpec:
         (1-β1)/√(1-β2) · √(Σ_{k<t} (β1²/β2)^k) · √(1-β2^t) / (1-β1^t), which is 1 at t = 1 and grows slowly
         (16.6 in all for 16 steps; Kingma & Ba's 3.16 a step is its limit). eps only makes steps shorter."""
         b1, b2, _ = OPTIMIZERS[self.optimizer]
-        total, geometric = 0.0, 0.0
+        total, geometric, ratio = 0.0, 0.0, b1 * b1 / b2
         for t in range(1, steps + 1):
-            geometric += (b1 * b1 / b2) ** (t - 1)
-            total += (1 - b1) / math.sqrt(1 - b2) * math.sqrt(geometric) * math.sqrt(1 - b2 ** t) / (1 - b1 ** t)
+            geometric += ipow(ratio, t - 1)
+            total += (1 - b1) / math.sqrt(1 - b2) * math.sqrt(geometric) * math.sqrt(1 - ipow(b2, t)) / (1 - ipow(b1, t))
         return lr * total
 
     def sane(self, start: np.ndarray, final: np.ndarray, lr: float, steps: int, ratio: float) -> bool:

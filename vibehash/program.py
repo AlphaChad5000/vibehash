@@ -24,7 +24,7 @@ from typing import Callable
 import numpy as np
 
 from .arch import EMBED, HEAD, MODULES, NORM, Arch
-from .finetune import OPTIMIZERS
+from .finetune import OPTIMIZERS, ipow
 from .model import batch_indices
 
 K = 64  # most children one split has
@@ -154,7 +154,8 @@ class Program:
     def adam_step(self, t: int) -> Node:
         def build():
             a = self.adam
-            c = {"c1": f32(1 - a["b1"] ** (t + 1)), "c2": f32(1 - a["b2"] ** (t + 1)), "eps": a["eps"], "lr": a["lr"]}
+            c = {"c1": f32(1 - ipow(a["b1"], t + 1)), "c2": f32(1 - ipow(a["b2"], t + 1)), "eps": a["eps"],
+                 "lr": a["lr"]}
             ops, r = [], self.spec.rank
             for n, o, _ in self.mods:
                 s = (o, r)

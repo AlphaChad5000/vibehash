@@ -143,6 +143,20 @@ class SpecTests(unittest.TestCase):
                 got = tuple(dispute_size(spec, b, s, per)[0] for b, per, s in ((4, 4, 4), (64, 64, 2), (1024, 10_000, 1)))
                 self.assertEqual(got, want, (d["layers"], targets))
 
+    def test_adams_constants_are_the_same_bits_everywhere(self):
+        """The second review: Python's ** calls the C library's pow, which isn't correctly rounded on every platform,
+        and Adam's bias corrections are the program's constants (and the reveal check's bound). finetune.ipow uses
+        multiplications alone; the float32 constants it gives are those of the exact powers."""
+        from fractions import Fraction
+
+        from vibehash.program import f32
+        b1, b2, _ = ft.OPTIMIZERS["adam"]
+        for b in (f32(b1), f32(b2)):
+            for n in range(0, 2000, 7):
+                exact = Fraction(b) ** n
+                self.assertLess(abs(Fraction(ft.ipow(b, n)) - exact), exact * Fraction(1, 2 ** 40))
+                self.assertEqual(f32(1 - ft.ipow(b, n)), f32(float(1 - exact)))
+
     def test_mlp_specs_are_unchanged(self):
         """Fine-tunes have a spec of their own; MLP jobs' specs keep exactly the fields they had."""
         mlp = TrainingJob("j", "", 1, 1, spec=ModelSpec(4, (8,), 3, "float32"))
