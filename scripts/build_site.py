@@ -7,8 +7,8 @@ site it's /guide/, so it needs that wrapper itself, plus what search engines and
     python scripts/build_site.py SITE_DIR
 
 writes index.html (and og.png, its link preview), guide/index.html, the one-line installers (install.ps1 and install.sh),
-CNAME and .nojekyll into SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org, which GitHub Pages serves at
-https://vibehash.org. Commit and push SITE_DIR to publish.
+the whitepaper (whitepaper.pdf), CNAME and .nojekyll into SITE_DIR, a checkout of github.com/AlphaChad5000/vibehash.org,
+which GitHub Pages serves at https://vibehash.org. Commit and push SITE_DIR to publish.
 """
 import html
 import re
@@ -63,7 +63,9 @@ def build(guide: Path, front: Path, out: Path) -> None:
     (out / ".nojekyll").write_text("", encoding="utf-8")  # serve the files as they are
     for script in ("install.ps1", "install.sh"):  # irm https://vibehash.org/install.ps1 | iex, and curl … | sh
         (out / script).write_bytes((guide.parent.parent / script).read_bytes())
-    print(f"wrote index.html, guide/index.html ({len(page.encode()):,} bytes), install.ps1, install.sh, CNAME and .nojekyll")
+    (out / "whitepaper.pdf").write_bytes((guide.parent / "whitepaper.pdf").read_bytes())  # vibehash.org/whitepaper.pdf
+    print(f"wrote index.html, guide/index.html ({len(page.encode()):,} bytes), install.ps1, install.sh, whitepaper.pdf, "
+          "CNAME and .nojekyll")
 
 
 if __name__ == "__main__":
