@@ -67,7 +67,10 @@ EVAL_BATCH = 8  # validation sequences scored at once
 HEAD_TOKENS = 512  # llm.HEAD_CHUNK: tokens whose logits are made at once
 MAX_VAL = 128  # sequences held back at most: the node scores them every round
 SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
-MAX_SEQ_LEN = 4096  # a dispute's evidence for an attention tile grows with it (dispute.evidence_cap: ~100 MB at 4096)
+# Launch limits: a dispute's evidence for an attention tile, and the states a defender uploads, grow with the sequence
+# (dispute.evidence_cap: ~50 MB at 2048 tokens; an attention tensor is heads x T^2 floats) and with the model.
+MAX_SEQ_LEN = 2048
+MAX_BASE_PARAMS = 4_500_000_000  # Qwen3-4B (4.02B) and smaller
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
 TOLERANCE = 1e-4
@@ -133,6 +136,9 @@ class LoraSpec:
             out.append(f"model must give {', '.join(DIMS)} (family one of {', '.join(FAMILIES)})")
         elif m["heads"] % m["kv_heads"] or m["head_dim"] % 2:
             out.append("query heads must be a multiple of key/value heads, and head_dim even")
+        elif self.base_params > MAX_BASE_PARAMS:
+            out.append(f"base models are at most {MAX_BASE_PARAMS / 1e9:g}B parameters for now; "
+                       f"this one is {self.base_params / 1e9:.1f}B")
         if type(self.rank) is not int or not 1 <= self.rank <= 256:
             out.append("LoRA rank must be 1-256")
         if not 0 < self.alpha <= 4096:
@@ -174,6 +180,13 @@ class LoraSpec:
     def n_adapter(self) -> int:
         """Trained weights: every B, [out, rank]."""
         return sum(out for _, out, _ in self.modules()) * self.rank
+
+    @property
+    def base_params(self) -> int:
+        """The base model's weights in all, the embedding and head included (arch.Arch.n_weights)."""
+        m = self.model
+        layer = sum(math.prod(self.shape(t)) for t in TARGETS) + 2 * m["hidden"]
+        return m["layers"] * layer + m["vocab"] * m["hidden"] * (1 if m["tied"] else 2) + m["hidden"]
 
     @property
     def n_params(self) -> int:

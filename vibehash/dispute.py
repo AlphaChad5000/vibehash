@@ -294,7 +294,7 @@ def evidence_cap(op, tile, outside: Outside) -> int:
     """The most evidence a defender may send for one tile of `op`: MAX_EVIDENCE, plus twice the bytes of the leaves the
     referee reads for it (each leaf with its share of the proof's hashes, which is less than its own bytes for any
     tensor the node holds). Attention's backward over a long sequence reads every query position of every head in a
-    group: about 100 MB at 4096 tokens. Which leaves the referee reads depends on the op's shapes and the job's tokens,
+    group: about 50 MB at 2048 tokens. Which leaves the referee reads depends on the op's shapes and the job's tokens,
     never on the numbers, so a run on zeros finds them (a second for the largest)."""
     if not op.out:
         return MAX_EVIDENCE

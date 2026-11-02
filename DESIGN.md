@@ -631,8 +631,10 @@ Each step:
      - **Its size:** up to `dispute.MAX_EVIDENCE` (32 MB), or for a tile that reads more, `evidence_cap`: 32 MB plus
        twice the bytes of the leaves the referee reads, found by running it on zeros (which leaves it reads depends
        on shapes and tokens, never on the numbers). Attention's backward reads every query position of a group's
-       heads: on Qwen2.5-3B at 4096 tokens, 96 MB of leaves. A job's `seq_len` is at most `finetune.MAX_SEQ_LEN` =
-       4096 to keep that bounded.
+       heads: on Qwen2.5-3B, 48 MB of leaves at 2048 tokens (96 MB at 4096). At launch a job's `seq_len` is at most
+       `finetune.MAX_SEQ_LEN` = 2048, and its base model at most `MAX_BASE_PARAMS` (4.5B: Qwen3-4B and smaller), which
+       also keeps the states a defender uploads in bounds (an attention tensor, heads × T² floats, is 512 MB at 32
+       heads and 2048 tokens). Longer sequences and bigger models can come later.
    - **Its length:** a split and a pick for each 64-fold narrowing at each level from its root down to an op (one
      at least, to descend), then the evidence. `program.dispute_size` counts the most from the job's spec: on Qwen3-4B,
      15 moves at 4 steps a segment, 17 at 64, 21 for one segment of 10,000 steps (13 to 19 on Qwen3-0.6B). Each move

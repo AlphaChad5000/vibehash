@@ -177,6 +177,9 @@ class SpecTests(unittest.TestCase):
             "targets": lambda d: d["lora"].update(targets=["q", "lm_head"]),
             "no targets": lambda d: d["lora"].update(targets=[]),
             "seq_len": lambda d: d.update(seq_len=8),
+            "seq_len past the launch limit": lambda d: d.update(seq_len=ft.MAX_SEQ_LEN + ft.SEQ_STEP),
+            "a base model past 4B": lambda d: d["model"].update(hidden=4096, ffn=12288, heads=32, head_dim=128,
+                                                                  layers=36),  # Qwen3-8B's shape
             "optimizer": lambda d: d.update(optimizer="sgd"),
             "precision": lambda d: d.update(precision="float64"),
             "data kind": lambda d: d.update(data={"kind": "npz", "sha256": "b" * 64}),

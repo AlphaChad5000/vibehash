@@ -595,13 +595,13 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual((verdict, "too big" in why), ("challenger", True))
 
     def test_the_cap_stays_bounded_at_the_longest_sequences(self):
-        """The reviewer's sizes (t_evidence_size): at MAX_SEQ_LEN, Qwen2.5-3B's attention tiles read 96 MB, past the old
+        """The reviewer's sizes (t_evidence_size): at MAX_SEQ_LEN, Qwen2.5-3B's attention tiles read 48 MB, past the old
         32 MB; their cap allows them and stays a few hundred MB."""
         from vibehash import finetune
         from vibehash.program import Op
 
         T = finetune.MAX_SEQ_LEN
-        for H, KV, hd, MB in ((32, 8, 128, 48), (16, 2, 128, 96)):  # Qwen3-4B, Qwen2.5-3B
+        for H, KV, hd, MB in ((32, 8, 128, 24), (16, 2, 128, 48)):  # Qwen3-4B, Qwen2.5-3B
             shapes = {"ds": (H * T, T), "qr": (T, H * hd)}
             op = Op("attn_dk", "dk", ("ds", "qr"), {"H": H, "KV": KV, "hd": hd, "c": 0.125}, (), (T, KV * hd),
                     (shapes["ds"], shapes["qr"]))
