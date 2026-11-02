@@ -157,10 +157,7 @@ class DeepSeekWork:
         graph = job.spec.graph(job.data.tokens)
         gu, store, weights = graph.units[task["prep"]], self.store(), self.weights_for(job)
         self.names.setdefault(rnd, {})[task["unit"]["unit_id"]] = gu.name
-        try:
-            raw = store.get(task["commit"])
-        except OSError:
-            return False
+        raw = str(task.get("commitment", "")).encode()
         if hashlib.sha256(raw).hexdigest() != task["root"]:
             return False
         commit = json.loads(raw)

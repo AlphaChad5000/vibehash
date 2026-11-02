@@ -342,6 +342,18 @@ class StoreTests(unittest.TestCase):
     def parts(self):
         return [int(e[2]["partNumber"]) for e in self.s3.log if "partNumber" in e[2]]
 
+    def test_capped_reads_and_short_lived_writes(self):
+        """The fourth review's findings 3 and 4: the node reads a miner's object only if it's no bigger than it can
+        be (its size asked first), and a write's link lives only as long as the node gives it (its compute phase)."""
+        store = self.store()
+        store.put("c", b"x" * 100)
+        self.assertEqual(store.get("c", cap=100), b"x" * 100)
+        with self.assertRaises(ValueError):
+            store.get("c", cap=99)
+        with self.assertRaises(FileNotFoundError):
+            store.get("nothing", cap=99)
+        self.assertIn("X-Amz-Expires=5&", self.s3.signer()("PUT", "c", {}, expires=5))
+
     def test_small_and_missing(self):
         st = self.store()
         st.put("c00000/x", b"hello")

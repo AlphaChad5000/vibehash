@@ -83,6 +83,7 @@ BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"r
           "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"},
           "move": {"round", "game", "n", "move"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
+MAX_COMMITMENT = 2**20  # a prep unit's commitment in the bucket: roots, digests and a leaf a record, a few KB
 MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
 # What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
 # a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
@@ -284,8 +285,29 @@ class Node:
                  rep.block.height, rep.block.summary.accepted_units, fraud, acc, rep.pool / SYN_PER_VIBE)
 
     def prep_store(self, job) -> dsg.PresignedStore:
-        """A DeepSeek job's objects in the bucket, under its id, as this node reaches them (signing its own links)."""
-        return dsg.PresignedStore(lambda m, n, q=None: self.bucket(m, f"{job.job_id}/{n}", q))
+        """A DeepSeek job's objects in the bucket, under its id, as this node reaches them (signing its own links):
+        two tries, a minute each, no long waits, since the node may be holding its lock."""
+        return dsg.PresignedStore(lambda m, n, q=None: self.bucket(m, f"{job.job_id}/{n}", q), tries=2,
+                                  wait=lambda s: time.sleep(min(s, 1.0)), timeout=60)
+
+    def _prep_commitment(self, body: dict) -> bytes | None:
+        """A prep unit's commitment from the bucket, for its reveal: read before the coordinator's lock is taken (a
+        slow bucket mustn't freeze the node), and no bigger than MAX_COMMITMENT. None if it can't be had."""
+        d = body.get("reveal")
+        if self.bucket is None or not isinstance(d, dict) or not d.get("prep"):
+            return None
+        c = self.coord
+        with c.lock:
+            r = c.r
+            if r is None or body.get("round") != r.round_no or str(d.get("unit_id")) not in r.prep:
+                return None
+            job = c.job(r.job_id)
+            name = dsg.unit_commit(c.prep(job).graph.units[r.prep[str(d["unit_id"])]])
+        try:
+            return self.prep_store(job).get(name, cap=MAX_COMMITMENT)
+        except (OSError, ValueError) as e:
+            log.info("a prep unit's commitment %s: %s", name, e)
+            return None
 
     def times_for(self, job) -> PhaseTimes:
         """A round's phase lengths for `job`: this node's, or longer where the job's size needs it (or the job asks
@@ -763,6 +785,7 @@ class Node:
         if len(canonical(env)) > {"reveal": MAX_REVEAL, "move": MAX_MOVE, "sign": MAX_REVEAL}.get(kind, MAX_MESSAGE):
             raise WireError(f"{kind} message too large")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
+        commitment = self._prep_commitment(body) if kind == "reveal" else None
         with c.lock:
             r = c.r
             if r is None or body.get("round") != r.round_no:
@@ -799,7 +822,10 @@ class Node:
                     except (TypeError, IndexError, ValueError) as e:
                         raise WireError(f"a link request is [method, name, query]: {e}") from None
                     c.may_sign(addr, method, name, query)
-                    urls.append(self.bucket(method, f"{r.job_id}/{name}", {k: str(v) for k, v in query.items()}))
+                    # A write's link dies with the compute phase it was for: nothing lands in a unit's objects after it.
+                    left = max(1, int(self.phase_ends - time.time())) if method in ("PUT", "POST") else None
+                    urls.append(self.bucket(method, f"{r.job_id}/{name}", {k: str(v) for k, v in query.items()},
+                                            expires=left))
                 return {"urls": urls}
             if kind == "reveal" and isinstance(body.get("reveal"), dict) and body["reveal"].get("prep"):
                 d = body["reveal"]  # a DeepSeek prep unit's: the root of its commitment in the bucket, and the salt
@@ -813,7 +839,7 @@ class Node:
                 if rv.worker != addr:
                     raise ProtocolError("can only reveal for yourself")
                 wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": root.hex(), "salt": salt.hex(), "prep": True}
-                verdict = c.reveal(rv, wire=wire)
+                verdict = c.reveal(rv, wire=wire, commitment=commitment)
                 return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "reveal":
                 d = body["reveal"]

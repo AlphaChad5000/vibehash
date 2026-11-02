@@ -86,6 +86,10 @@ FINETUNE_RECORD_VERSION = 4
 CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
 SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
 MAX_GAMES = 4  # disputes one checker can open in a round (games_allowed); its further rejections are ignored
+# The pilot's rule (DEEPSEEK.md §8): a rejected prep unit isn't refereed. It ends unchecked and is redone, nobody
+# paid or slashed for it, until a prep game's moves are timed from its states' real size (one 4K-token chunk's state is
+# 320 MB and more, and a move is timed for a LoRA adapter's) and the bf16 tolerance is measured across devices.
+PREP_GAMES = False
 
 
 def games_allowed(rep: float) -> int:
@@ -264,6 +268,7 @@ class _Round:
     # A DeepSeek prep round's: each unit's graph unit (deepseek_rounds.py), and each claim's revealed commitment.
     prep: dict[str, str] = field(default_factory=dict)
     prep_commits: dict[tuple[str, str], dict] = field(default_factory=dict)
+    prep_raw: dict[tuple[str, str], bytes] = field(default_factory=dict)  # each's bytes, which its checkers get
 
     @property
     def v4(self) -> bool:
@@ -863,9 +868,10 @@ class Coordinator:
         return r.beacon
 
     @_locked
-    def reveal(self, rv: Reveal, wire: dict | None = None) -> Verdict | None:
+    def reveal(self, rv: Reveal, wire: dict | None = None, commitment: bytes | None = None) -> Verdict | None:
         """Cheap checks happen immediately. Returns a fraud verdict, or None if it goes on to replay.
-        `wire` is the reveal as sent (with its checkpoints' blob ids), kept in the record."""
+        `wire` is the reveal as sent (with its checkpoints' blob ids), kept in the record. `commitment`: a prep
+        unit's commitment, which the node read from the bucket (Node._prep_commitment; None if it couldn't)."""
         r = self._need(Phase.REVEAL)
         key = (rv.unit_id, rv.worker)
         if key not in r.commitments:
@@ -877,7 +883,7 @@ class Coordinator:
             raise ProtocolError("this round's job is sharded: its members reveal cells (reveal_shard)")
         unit = r.units[rv.unit_id]
         if rv.unit_id in r.prep:
-            return self._prep_reveal(job, key, rv, wire)
+            return self._prep_reveal(job, key, rv, wire, commitment)
         r.record["reveals"].append(wire if wire is not None else
                                    {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(), "salt": rv.salt.hex()})
         if self.recheck is not None and wire is not None:  # rechecking: load the checkpoints it points to
@@ -902,9 +908,10 @@ class Coordinator:
         r.reveals[key] = rv
         return None
 
-    def _prep_reveal(self, job: TrainingJob, key, rv: Reveal, wire: dict | None) -> Verdict | None:
+    def _prep_reveal(self, job: TrainingJob, key, rv: Reveal, wire: dict | None, raw: bytes | None) -> Verdict | None:
         """A prep unit's reveal: the root and salt its commitment hashed, the root being the sha256 of the unit's
-        commitment in the bucket, which a live node reads and checks is that unit's (deepseek_rounds.check_commit)."""
+        commitment in the bucket, which a live node has read (`raw`) and checks is that unit's
+        (deepseek_rounds.check_commit)."""
         r = self.r
         r.record["reveals"].append(wire if wire is not None else
                                    {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(),
@@ -916,13 +923,11 @@ class Coordinator:
             if self.prep_store is None:
                 return "ok"  # a replay: the record vouches for it
             gu = self.prep(job).graph.units[r.prep[rv.unit_id]]
-            try:
-                raw = self.prep_store(job).get(dsg.unit_commit(gu))
-            except OSError:
+            if raw is None:
                 return "missing"
             why = self.prep(job).check_commit(gu, raw, rv.merkle_root)
             if why is None:
-                r.prep_commits[key] = json.loads(raw)
+                r.prep_commits[key], r.prep_raw[key] = json.loads(raw), raw
             return "ok" if why is None else why
         outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
         if outcome == "missing":  # not slashed: an upload can fail; it's unpaid and the unit goes out again
@@ -1211,15 +1216,13 @@ class Coordinator:
 
     def prep_task(self, t: VerifyTask) -> dict:
         """What a checker needs for a prep task: the unit to replay, and the commitment to check against (the
-        submitter's, or a canary's donor's), by its object in the bucket and its root."""
+        submitter's, or a canary's donor's), its bytes and root. The bytes come inline, with no object name or donor
+        id that would tell a canary from a claim (the fourth review's finding 6)."""
         r = self.r
-        job = self.job(r.job_id)
-        donor = t.donor or t.unit.unit_id
-        source = r.units[donor]
-        rv = r.reveals.get((donor, t.submitter))
-        gu = self.prep(job).graph.units[r.prep[donor]]
-        return {"prep": r.prep[t.unit.unit_id], "commit": dsg.unit_commit(gu),
-                "root": rv.merkle_root.hex() if rv is not None else "", "of": source.unit_id}
+        key = (t.donor or t.unit.unit_id, t.submitter)
+        rv = r.reveals.get(key)
+        return {"prep": r.prep[t.unit.unit_id], "commitment": r.prep_raw.get(key, b"").decode(),
+                "root": rv.merkle_root.hex() if rv is not None else ""}
 
     def _finetune_canaries(self, job: TrainingJob, draw: Draw, pool, checkers: dict[str, set[str]], n: int,
                            kind: str) -> list[VerifyTask]:
@@ -1398,7 +1401,7 @@ class Coordinator:
         job = self.job(r.job_id)
         r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
         opened = defaultdict(int)
-        if r.prep:
+        if r.prep and PREP_GAMES:
             self._prep_disputes(job, opened)
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
@@ -1451,9 +1454,11 @@ class Coordinator:
             def check(key=key):  # (a replay takes the outcome from the record: it needn't read the job's text)
                 return self._handoff(job, key, self.prep(job).graph.units[r.prep[key[0]]])
             outcome = self._claim("handoff", f"{key[0]}/{key[1]}", check)
+            if outcome.startswith("unchecked") and key not in r.results:  # the bucket's fault as likely as the miner's
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None, outcome)
+            elif outcome != "ok" and key not in r.results:
+                self._fraud(key, Verdict.FAILED_REPLAY, outcome, catcher=t.verifier, verifier=t.verifier)
             if outcome != "ok":
-                if key not in r.results:
-                    self._fraud(key, Verdict.FAILED_REPLAY, outcome, catcher=t.verifier, verifier=t.verifier)
                 continue
             if opened[t.verifier] >= games_allowed(self.chain.state.rep(t.verifier)):  # as for a training round's
                 continue
@@ -1461,7 +1466,8 @@ class Coordinator:
             self._open_prep_game(job, key, t.verifier)
 
     def _handoff(self, job: TrainingJob, key, gu) -> str:
-        """"ok" if a layers unit's outputs in the bucket are the last state it committed to, else why not."""
+        """"ok" if a layers unit's outputs in the bucket are the last state it committed to, else why not: fraud if
+        an object isn't the one committed to (Tampered) or the state isn't, "unchecked: ..." if they can't be read."""
         from .deepseek_graph import Missing, Tampered, handed_root, records_root
         from .deepseek_program import PrepProgram
 
@@ -1477,8 +1483,10 @@ class Coordinator:
                 root = handed_root(store, PrepProgram.of(job.spec, job.data, above), want)
             else:
                 root = records_root(store, PrepProgram.of(job.spec, job.data, gu), want)
-        except (Tampered, Missing, OSError, KeyError, ValueError) as e:
-            return f"its outputs can't be read as the state it committed to: {e}"
+        except Tampered as e:
+            return f"its outputs aren't the objects it committed to: {e}"
+        except (Missing, OSError, KeyError, ValueError) as e:
+            return f"unchecked: its outputs can't be read: {e}"
         return "ok" if root == commit["roots"][-1] else "its outputs aren't the last state it committed to"
 
     def _open_prep_game(self, job: TrainingJob, key, challenger: str) -> None:
@@ -1969,8 +1977,10 @@ class Coordinator:
             if t.kind == "score":
                 scores.append((t.verifier, t.score))
                 continue
-            # a prep unit's checker replays all of it
-            verifier_flops[t.verifier] += t.unit.flops if t.kind == "prep" else replay_cost(job, len(t.segments))
+            # A prep unit's checker replays all of it. Its rejection isn't refereed in the pilot (PREP_GAMES), so it's
+            # never upheld, and unpaid: rejecting costs a griefer its pay (the fourth review's finding 8).
+            if t.kind != "prep" or t.canary or t.verdict[0]:
+                verifier_flops[t.verifier] += t.unit.flops if t.kind == "prep" else replay_cost(job, len(t.segments))
             if t.canary:
                 if t.verdict[0]:
                     r.slashes.append([t.verifier, None, "approved a canary"])
@@ -1989,10 +1999,11 @@ class Coordinator:
             if r.prep and key in r.results:  # found bad already: its outputs aren't its state (_prep_disputes)
                 continue
             lost = [g for g in games[key] if g.outcome == "challenger"]
-            rejected = bool(r.prep) and r.prep[key[0]].startswith("rows") and any(not t.verdict[0] for t in answered[key])
-            if rejected:  # (deepseek_rounds: no game to settle it, so nobody is paid or slashed for it)
+            rejected = bool(r.prep) and (not PREP_GAMES or r.prep[key[0]].startswith("rows")) \
+                and any(not t.verdict[0] for t in answered[key])
+            if rejected:  # (no game settles it, so nobody is paid or slashed for it, and it's redone)
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
-                                            "a checker rejected it, and rows units aren't refereed yet")
+                                            "a checker rejected it, and prep units aren't refereed in the pilot")
             elif lost:
                 g = lost[0]
                 self._fraud(key, Verdict.FAILED_REDUNDANCY if g.why == "replicas" else Verdict.FAILED_REPLAY,

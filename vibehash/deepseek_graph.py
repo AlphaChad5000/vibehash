@@ -345,8 +345,9 @@ class PresignedStore:
 
     PART = 64 * 2**20  # S3 takes parts of 5 MiB to 5 GiB, at most 10,000: up to 640 GB at this size
 
-    def __init__(self, sign, tries: int = 8, part: int = PART, journal: Path | None = None, wait=time.sleep):
-        self.sign, self.tries, self.part, self.wait = sign, tries, part, wait
+    def __init__(self, sign, tries: int = 8, part: int = PART, journal: Path | None = None, wait=time.sleep,
+                 timeout: float = 600):
+        self.sign, self.tries, self.part, self.wait, self.timeout = sign, tries, part, wait, timeout
         self.journal = Path(journal) if journal else None
 
     def _call(self, method: str, name: str, query: dict | None = None, data: bytes | None = None,
@@ -356,7 +357,7 @@ class PresignedStore:
             req = urllib.request.Request(self.sign(method, name, query or {}), data=data, method=method,
                                          headers=headers or {})
             try:
-                with urllib.request.urlopen(req, timeout=600) as r:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     return r.read(), r.headers
             except urllib.error.HTTPError as e:
                 if e.code == 404 or attempt == self.tries - 1:
@@ -427,7 +428,15 @@ class PresignedStore:
             return None
         return int(headers.get("Content-Length", -1))
 
-    def get(self, name: str) -> bytes:
+    def get(self, name: str, cap: int | None = None) -> bytes:
+        """An object; with `cap`, only one of at most `cap` bytes (its size asked first: an object a miner wrote,
+        read by the node)."""
+        if cap is not None:
+            size = self._size(name)
+            if size is None:
+                raise FileNotFoundError(name)
+            if size > cap:
+                raise ValueError(f"{name} is {size} bytes, more than the {cap} it can be")
         first, headers = self._call("GET", name, headers={"Range": f"bytes=0-{self.part - 1}"})
         total = int(headers["Content-Range"].rsplit("/", 1)[1]) if headers.get("Content-Range") else len(first)
         pieces, at = [first], len(first)
@@ -479,9 +488,9 @@ class Signer:
         self.host, self.region, self.access_key, self.secret_key = host, region, access_key, secret_key
         self.prefix, self.expires, self.scheme = prefix, expires, scheme
 
-    def __call__(self, method: str, name: str, query: dict | None = None) -> str:
+    def __call__(self, method: str, name: str, query: dict | None = None, expires: int | None = None) -> str:
         return presign(method, self.host, self.prefix + name, self.region, self.access_key, self.secret_key,
-                       self.expires, query=query, scheme=self.scheme)
+                       expires or self.expires, query=query, scheme=self.scheme)
 
 
 def presign(method: str, host: str, key: str, region: str, access_key: str, secret_key: str, expires: int = 3600,

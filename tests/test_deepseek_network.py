@@ -3,9 +3,9 @@
 
 - LocalRunTests: the job is posted; prep rounds hand out the work graph's ready units, workers run them through the
   bucket and commit to their commitments, and two checkers replay each. One worker bends one op of its first unit
-  (layer 1's MoE output, its state roots its own work's): a checker rejects it, the node referees the dispute down to
-  that op (in the reference's bf16) and slashes it, and the unit goes out again. Once every unit is in, the node
-  pins the records' root, one machine's to the bit, and the job's rounds train from the records, op by op
+  (layer 1's MoE output, its state roots its own work's): a checker rejects it, and the unit ends unchecked and goes
+  out again, nobody paid or slashed for it (the pilot's rule: prep units aren't refereed). Once every unit is in, the
+  node pins the records' root, one machine's to the bit, and the job's rounds train from the records, op by op
   (deepseek_program.py): claims checked, paid, and scored on the held-back sequences. The same worker trains with one
   op's output scaled; a checker rejects its claim and the node referees the dispute down to that op
   (referee_deepseek.py) and slashes it. Another worker rejects an honest claim, finds no op the referee would refuse,
@@ -149,7 +149,7 @@ class LocalRunTests(unittest.TestCase):
         ours = next(j for j in node._network(node.chain.tip, time.time())["jobs"] if j["id"] == JOB)
         self.assertEqual(ours["prep"]["pieces_done"], ours["prep"]["pieces_total"])
 
-        # The cheat: its bent prep unit was rejected, refereed down to the op it bent, slashed, and went out again.
+        # The cheat: its bent prep unit was rejected and went out again, unrefereed (coordinator.PREP_GAMES).
         self.assertTrue(bent, "the cheat ran a layers unit")
         first = next(r for r in preps if r["round"] == bent["round"])
         self.assertIn(bent["unit"], first["prep"]["units"].values())
@@ -158,13 +158,10 @@ class LocalRunTests(unittest.TestCase):
         rejections = [v for v in first["verdicts"] if not v["body"]["ok"]]
         self.assertTrue(rejections, first["verdicts"])
         by_height = {b.height: api.get(f"/round/{b.height}/record") for b in node.chain.blocks if b.summary}
-        prep_games = [g for r in preps for g in r.get("games", [])]
-        self.assertTrue(any(g["defender"] == workers[2].address and g["outcome"] == "challenger"
-                            and g["detail"].startswith("ds_moe_sum") for g in prep_games),
-                        [(g["defender"][:12], g["outcome"], g["detail"][:80]) for g in prep_games])
+        self.assertEqual([g for r in preps for g in r.get("games", [])], [])
         prep_slashes = [s for b in node.chain.blocks if b.summary and by_height[b.height].get("prep")
                         for s in b.summary.slashes]
-        self.assertEqual([(s[0], s[2]) for s in prep_slashes], [(workers[2].address, "failed_replay")])
+        self.assertEqual(prep_slashes, [])
         sealed = next(b.summary for b in node.chain.blocks if b.summary and b.summary.params_hash and
                       api.get(f"/round/{b.height}/record")["round"] == bent["round"])
         self.assertTrue(sealed.verifier_flops, "the checkers were paid")
