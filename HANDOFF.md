@@ -47,12 +47,16 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `wire.py` | Signed envelopes (chain id + timestamp), blob-reference openings. |
 | `wallet.py` | scrypt + AES-256-GCM key files. |
 | `hardware.py` | RAM detection, benchmark on the chosen backend. |
-| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`. `--node` / `--wallet` default to what setup saved. |
+| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`, `selftest` (selftest.py). `--node` / `--wallet` default to what setup saved. |
 | `tabular.py` | `vibehash train` / `job download` / `predict`: CSV → standardised dataset (80/20 split), and self-contained model `.npz` files (weights, widths, scaling, column and class names; loaded without pickle). `train` keeps a receipt in `~/.vibehash/jobs/<job>/job.json`; `job download` merges it into the model file. Sample data in `vibehash/data/` (package data). |
 | `minerui.py` | Live terminal dashboard for `worker` / `testnet`: animated mine (drill speed follows `WorkerStats.busy`, cart fills with committed units, gold popup on payouts), round/phase bar, earnings, and an event feed that captures the `vibehash.worker` / `vibehash.node` loggers. Alternate screen, ANSI only, Unicode with a pure-ASCII fallback, `NO_COLOR`; off when stdout isn't a TTY or with `--plain`. `tests/test_minerui.py` checks every frame fits 40/66/120-column terminals. The Claude Code tool shell sets `NO_COLOR=1`, so previews from there come out colourless. |
 | `trainui.py` | Live dashboard for job posters: `train` shows it after posting, `job watch [JOB]` brings it back. A forge in the mine: the model is a blade that grows with accuracy, hammered when it's the job's turn; per-round accuracy and loss charts, budget left, an event feed. Polls `/status` every 1.5 s and `/job` on new blocks; `--plain` or a pipe gives log lines. A fine-tune (a job whose spec names a `base`, or `JobWatch(base=...)`) forges its model maker's emblem instead (`emblems.py`): the forge grows to 9 rows, and the emblem takes on its colours from left to right as accuracy climbs. |
 | `termui.py` | What the two dashboards share: colours, the rock, the banner, the phase bar, the feed, the alternate screen. |
-| `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. |
+| `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. On a RunPod pod (`$RUNPOD_POD_ID`, a `/workspace` folder) the home is `/workspace/.vibehash`, the only place a restart keeps (`pod_volume`), unless `~/.vibehash` already holds a setup. |
+| `selftest.py` | `vibehash selftest` (and the menu's "Check this computer"): Python and packages, PyPI's newest release, every device's self-test, PyTorch's CUDA build against the driver, GPU memory free; **a real fruit-demo unit** (the public job's spec, and its dataset: the packaged fruit.csv makes it byte for byte) on the worker's device, checked as verifiers check it with every segment replayed on the CPU, and whether it repeats bit for bit; a LoRA step on a tiny Qwen3 built in memory (put into `finetune._runtimes` directly, so nothing is fetched) replayed on the CPU; `--model NAME` for one real unit (asked first). The node's /status, round trip, clock skew from its HTTP `Date` header (`clock_skew`, which `worker` also checks before it starts), download speed, Hugging Face; the wallet read without its password; disk for the cache and model store; then what the computer can take (`finetune_need` sizes Qwen3-0.6B/4B from baked shapes with `finetune.memory_mb`; `deepseek_worker.can_take`) and the next command. Exit 0 only if it can mine. `--json`. Tests: `tests/test_selftest.py` (no GPU or internet). |
+| `advice.py` | Plain-language problems and what to do, a line or two each: a node out of reach (DNS, refused, timeout with the dorm-Wi-Fi hint, TLS/captive portal), the clock, a different network, out of GPU memory, a full disk, no stake on a network without earn-in, a job waiting for staked workers (by this worker's stake and memory). `explain(e)` maps exceptions to them; every command's error exit, setup, the worker loop (`WorkerClient._say`, at most once a minute for the same problem) and selftest use it. |
+| `unattended.py` | No terminal (nohup, Docker, a pod): `interactive()` (Windows calls NUL a terminal and getpass then waited for ever; it asks the console), `need()` (the one-line error naming the variable or flag), `save_words` (a new wallet's words to `recovery-words-ADDRESS.txt`, 0600, when output isn't a terminal, with a loud note in the log), `WorkerLock` (one worker per wallet: a second would prune the first's checkpoints and register as the same worker). |
+| `filelock.py` | Locks between processes (msvcrt / fcntl, released when the process ends): `hub.TensorCache.fetch` holds one per commit, and `modelstore.Store.acquire` one per store (in the temp folder), so workers on one computer don't fetch the same files at once. |
 | `gpusetup.py` | GPU detection without PyTorch (nvidia-smi, OS device list, ROCm). Picks PyTorch builds by driver CUDA version and compute capability, **probes PyTorch's index** (`pip index versions`) for what's published, installs, and self-tests in a fresh subprocess (Windows locks loaded DLLs). The build table needs updating when CUDA versions change. |
 | `protocol.py` | In-process driver for `simulate.py` and the tests. |
 | `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Jobs use `llm.py`; this is its float64 reference in `test_finetune` and the basis for sharded transformers. |
@@ -114,6 +118,26 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Unreleased: `vibehash selftest`, and setup and the worker for tonight's machines (branch `selftest-setup`).** For
+the owner's mixed Windows laptops and desktops and RunPod pods:
+- `selftest` (code map), in the menu as "Check this computer". On the 4070 SUPER it takes about 10 s.
+- Unattended: on Windows, `setup < NUL` (and so any setup or worker with no console) waited for ever in getpass; now
+  nothing asks without a terminal (`unattended.interactive`), a missing password stops setup and the worker at once
+  naming `VIBEHASH_PASSWORD`, and a new wallet's words go to a private file rather than the log. `setup --deepseek
+  yes|no` saves the worker's DeepSeek answer.
+- RunPod: `install.sh` keeps a PyTorch the Python already has exactly as it is (pip constraints pin `torch==` it,
+  and NumPy below 2 if it was 1), gives an externally managed Python's venv `--system-site-packages` when that
+  Python has PyTorch, and on a pod puts the settings in `/workspace/.vibehash` (settings.py does the same). Tested
+  against a stand-in python3 in four environments under Git Bash; not on a real pod.
+- Several GPUs: one worker per GPU, each with its own wallet (`worker --help`, README "Several GPUs"). A second worker
+  with the same wallet is refused (`WorkerLock`), and model downloads are locked between processes.
+- Errors newcomers hit (advice.py): node out of reach, clock skew (the worker checks it at start), a different
+  network, GPU out of memory and a full disk (no traceback), a job waiting for staked workers (once a job, with this
+  worker's stake and memory; selftest adds how long the stake should take at the network's recent pace).
+- Seen on the public node while testing (2026-11-02, height ~7214): the pilot's rounds take ~1,520 s while it waits
+  (fruit-demo's take ~39 s), so a newcomer gets one fruit-demo round every ~26 minutes, and earning the 5 VIBE stake
+  takes about two of them alone, more when miners share them. That's the node's round loop (another branch).
 
 **Unreleased: a prep round ends its compute phase once every unit is committed.** The phase is a unit's deadline,
 never under 10 minutes (deepseek_graph.deadline), and it used to run out in full, so a round took about 660 s however
