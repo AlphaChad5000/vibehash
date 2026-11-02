@@ -211,6 +211,25 @@ class PlanTests(unittest.TestCase):
         self.assertIn(split.stream_name(0, 9), gone)  # everyone who reads it is past their window
         self.assertNotIn(split.rows_name(0, 1, 0), gone)  # its rows unit isn't accepted yet
 
+    def test_summary_for_the_front_page(self):
+        graph = split.plan(self.cut, [[0], [1]], split.pieces(36, 9))
+        line = split.Line(graph)
+        self.assertEqual(line.summary(0.0), {"layers": 36, "done": [0.0] * 36, "pieces_done": 0, "pieces_total": 8,
+                                             "miners": 0})
+        for u in [u for u in line.claimable() if u.kind == "rows"]:
+            line.claim(u.name)
+            line.done(u.name, "rows-miner", 10.0)
+            line.accept(u.name)
+        for chunk, miner, t in ((0, "alice", 100.0), (1, "bob", 900.0)):
+            name = f"layers-00-09-c{chunk:05d}"
+            line.claim(name)
+            line.done(name, miner, t)
+        line.accept("layers-00-09-c00000")
+        got = line.summary(1000.0)
+        self.assertEqual(got["done"], [0.5] * 9 + [0.0] * 27)  # one of layers 0-8's two chunks accepted
+        self.assertEqual((got["pieces_done"], got["pieces_total"]), (1, 8))
+        self.assertEqual(got["miners"], 1)  # bob, in the last 10 minutes (alice and the rows miner earlier)
+
     def test_deadlines(self):
         line = split.Line(split.plan(self.cut, [[0]], split.pieces(36, 4)))
         name = line.claimable()[0].name

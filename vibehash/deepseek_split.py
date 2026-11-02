@@ -231,6 +231,7 @@ class Line:
         self.graph = graph
         self.state = {name: "pending" for name in graph.units}
         self.due: dict[str, float | None] = {}
+        self.ran: dict[str, tuple[str | None, float]] = {}  # unit -> (who finished it, when)
 
     def claimable(self, holds=None) -> list[Unit]:
         """Pending units whose inputs are all written, for a miner holding layers `holds` (None: any)."""
@@ -258,8 +259,25 @@ class Line:
             self.state[n] = "pending"
         return late
 
-    def done(self, name: str) -> None:
+    def done(self, name: str, miner: str | None = None, now: float = 0.0) -> None:
         self.state[name] = "done"
+        self.ran[name] = (miner, now)
+
+    def summary(self, now: float, recent: float = 600.0) -> dict:
+        """The job summary's "prep" field, which the front page draws as the assembly line (netstats documents it):
+        {"layers": how many frozen layers, "done": the fraction of each one's units accepted, bottom first,
+        "pieces_done" and "pieces_total" (layers units accepted, and all of them), "miners": how many miners
+        finished a unit in the last `recent` seconds}."""
+        pieces = [u for u in self.graph.units.values() if u.kind == "layers"]
+        layers = max(u.b for u in pieces)
+        done = []
+        for layer in range(layers):
+            mine = [u for u in pieces if u.a <= layer < u.b]
+            done.append(sum(self.state[u.name] == "accepted" for u in mine) / len(mine))
+        lately = {m for name, (m, t) in self.ran.items() if m is not None and now - t <= recent
+                  and self.state[name] in ("done", "accepted")}
+        return {"layers": layers, "done": done, "pieces_done": sum(self.state[u.name] == "accepted" for u in pieces),
+                "pieces_total": len(pieces), "miners": len(lately)}
 
     def accept(self, name: str) -> list[str]:
         """The unit is past its window: -> the objects that can now be deleted."""

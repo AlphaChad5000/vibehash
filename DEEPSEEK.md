@@ -921,7 +921,13 @@ costs nothing. What the job has to record:
      a challenge by replaying a unit (`replay`, `state_before`); claim
      deadlines; each unit's stats.
    - Still to do, once PR #5 merges: wiring the units into the node (claims,
-     presigned URLs, windows, pay).
+     presigned URLs, windows, pay). The front page's featured-job panel
+     (`docs/site/index.html`) reads it from GET /network. So the node puts
+     `Line.summary` into that job's summary as its "prep" field (in
+     `Node._network`, or through a hook in `netstats.job_summary`). The field
+     is the frozen layers, each one's fraction of units accepted, pieces done of
+     total, and how many miners ran one in the last 10 minutes; netstats
+     documents it.
    - Still to do, later:
      - hosts run by miners (each uploader's own storage, or peer to peer) behind
        `Mirrors`, to retire the bucket as a central point;
@@ -930,7 +936,17 @@ costs nothing. What the job has to record:
        29.6 GB), which would cut a cut's 28 KB a token to 17 KB if harmless.
 6. *A DeepSeek unit kind,* once PR #5 merges: a spec with the cut and targets,
    the record dataset in place of token ids, `train_step_streamed` behind
-   `train_segment`, and miners' data shards.
+   `train_segment`, and miners' data shards. For the front page:
+   - The spec carries "base", so netstats reports a fine-tune with metric
+     "loss".
+   - It also carries "batch_size" and "steps_per_unit", so "examples" is units
+     × batch × steps.
+   - The scorers' median held-back loss goes into `store.job_rounds` as PR #5's
+     fine-tunes do it. That gives the loss curve and the "N× as likely, token by
+     token" figure.
+   - The first job's id contains "think-shorter": the page matches its title,
+     blurb and sample on that. If it trains on a pilot subset rather than all
+     7,473 GSM8K problems, the page needs the size.
 7. *The referee's DeepSeek ops* in numpy (the table above), for the dispute game.
 8. *The job flow:* where the datasets live (42 GB per million tokens: the
    bucket while training, or a public HF dataset for a reusable one, pinned by
