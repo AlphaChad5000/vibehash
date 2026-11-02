@@ -80,6 +80,7 @@ SHARDED_RECORD_VERSION = 3
 FINETUNE_RECORD_VERSION = 4
 CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
 SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
+MAX_GAMES = 4  # disputes one checker can open in a round; its further rejections are ignored
 # Staked workers able to run a fine-tune that must register before its round assigns work: a holder and one checker.
 # With the node refereeing disputes, a claim's verdict is right whenever one of its checkers is honest and online, so
 # one checker is enough to start; from three workers on, each claim gets two, so one going quiet leaves the other.
@@ -1259,8 +1260,12 @@ class Coordinator:
             return False
         job = self.job(r.job_id)
         r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
+        opened = defaultdict(int)
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
+                if opened[t.verifier] >= MAX_GAMES:  # one challenger can't load a round with disputes: the rest
+                    continue  # of its rejections are ignored (their claims stand on other verdicts)
+                opened[t.verifier] += 1
                 self._open_game(job, (t.unit.unit_id, t.submitter), t.verifier, "dispute", ["segment", t.verdict[1]])
         for uid, holders in sorted(r.holders.items()):
             keys = [(uid, a) for a in holders if (uid, a) in r.reveals]
@@ -1327,6 +1332,17 @@ class Coordinator:
             a, b = self._claim("game", gid, ends)
         g = dg.Game(gid, uid, defender, challenger, why, list(root), a, b, seed=r.units[uid].seed)
         r.games[gid] = g.start(self._program(job, uid))
+
+    def _replay_bytes(self, blob_id: str) -> bytes | None:
+        """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
+        None when it can't be had (an old round past its window): the game then can't be refereed again."""
+        get = getattr(self.roots, "bytes", None)
+        if get is None:
+            return None
+        try:
+            return get(blob_id)
+        except Exception:  # noqa: BLE001 - pruned or unreachable: as a checkpoint that's gone
+            return None
 
     def _replay_ends(self, job: TrainingJob, key: tuple[str, str], root: list) -> list[str]:
         """A game's starting and ending state roots, rebuilt from the checkpoints its claim's reveal names (fetched
@@ -1405,8 +1421,13 @@ class Coordinator:
         job = self.job(r.job_id)
         move, outside = body.get("move"), None
         if isinstance(move, dict) and "evidence" in move:
-            if not self.replaying:
-                evidence = self._get_trace(str(move["evidence"]))
+            evidence = self._replay_bytes(str(move["evidence"])) if self.replaying else self._get_trace(str(move["evidence"]))
+            if self.replaying and evidence is None:  # gone with its round's window: the record's outcome, unchecked
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
+                self.unchecked += 1
+                g.moves.append(envelope if envelope is not None else {"from": addr, **body})
+                return g.view()
             outside = dg.Outside(job.spec, job.data, self._weight_source(job))
         try:
             dg.play(g, self._program(job, g.unit), addr, move, evidence=evidence, outside=outside,

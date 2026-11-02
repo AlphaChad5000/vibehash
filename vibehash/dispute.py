@@ -431,7 +431,7 @@ class Game:
         """The game as the round's record keeps it."""
         return {"id": self.gid, "unit": self.unit, "defender": self.defender, "challenger": self.challenger,
                 "why": self.why, "root": list(self.root), "a": self.origin[0], "b": self.origin[1],
-                "moves": list(self.moves), "evidence": merkle.b64(self.evidence) if self.evidence is not None else None,
+                "moves": list(self.moves),  # (an evidence move names its blob, which validators fetch: not inlined)
                 "outcome": self.outcome, "detail": self.detail}
 
 

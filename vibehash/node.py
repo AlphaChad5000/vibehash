@@ -1050,3 +1050,13 @@ class LeaderBlobs:
                 raise ProtocolError("the proposer has no address to fetch its checkpoints from")
             self.node.peers.client(url, timeout=120).download("blob", blob_id, store, size=job.checkpoint_bytes)
         return np.asarray(store.load(blob_id, job.wire_dtype, job.spec.n_params), dtype=np.float64)
+
+    def bytes(self, blob_id: str) -> bytes:
+        """A dispute's evidence, by its id (checked on arrival)."""
+        store = self.node.blobs
+        if not store.has(blob_id):
+            url = self.node.chain.state.validators.get(self.proposer)
+            if not url:
+                raise ProtocolError("the proposer has no address to fetch the evidence from")
+            self.node.peers.client(url, timeout=120).download("blob", blob_id, store)
+        return store.path(blob_id).read_bytes()

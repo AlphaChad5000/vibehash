@@ -23,7 +23,7 @@ from vibehash import finetune as ft
 from vibehash.blobs import file_sha256
 from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair
-from vibehash.ledger import Chain
+from vibehash.ledger import Chain, canonical
 from vibehash.model import Dataset, ModelSpec
 from vibehash.tasks import MAX_SPEC_BYTES, InvalidJob, TrainingJob, load_dataset
 from vibehash.verification import adam_impossible, rescale_update, reproduces
@@ -633,6 +633,9 @@ class ProtocolTests(unittest.TestCase):
             def array(self, bid, job):
                 return proto.checkpoints.array(bid, job)
 
+            def bytes(self, bid):
+                return proto.coord._get_trace(bid)
+
             def attach(self, j):
                 j.attach_data(load_dataset(path), sha)
         chain, stats = copy.deepcopy(before), {}
@@ -833,6 +836,9 @@ class NodeFreeRoundTests(unittest.TestCase):
             def array(self, bid, job):
                 return p.checkpoints.array(bid, job)
 
+            def bytes(self, bid):
+                return p.coord._get_trace(bid)
+
             def attach(self_, j):
                 j.attach_data(load_dataset(self.path), self.sha)
         chain, stats = copy.deepcopy(self.before), {}
@@ -908,7 +914,8 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertTrue(set(paid) >= {w.address for w in self.workers[:5]} & {k[1] for k in res})
         games = rep.record["games"]
         self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
-        self.assertTrue(all(e["evidence"] for e in games if e["outcome"] in ("challenger", "defender")))
+        refereed = [e for e in games if e["outcome"] in ("challenger", "defender")]
+        self.assertTrue(all("evidence" in e["moves"][-1]["body"]["move"] and "evidence" not in e for e in refereed))
         self.replays([rep])
         # What a validator votes by: a plain replay. Its referee needs the job's data (which sequences a step trains
         # on), which a node passes as its store.
@@ -941,6 +948,9 @@ class NodeFreeRoundTests(unittest.TestCase):
             def array(self_, bid, job):
                 return p.checkpoints.array(bid, job)
 
+            def bytes(self_, bid):
+                return p.coord._get_trace(bid)
+
             def attach(self_, j):
                 j.attach_data(load_dataset(self.path), self.sha)
 
@@ -962,6 +972,23 @@ class NodeFreeRoundTests(unittest.TestCase):
         env = games[0]["moves"][0]
         r = receipts.make(keys, p.chain.chain_id, rep.block.height, rep.record["attempt"], "move", env)
         self.assertEqual(receipts.audit(r, rep.block, rep.record)[0], "recorded")
+
+    def test_one_checker_opens_few_disputes(self):
+        """The second review's finding 3: a checker that rejects everything opens at most coordinator.MAX_GAMES
+        disputes a round (here patched to 1); its other rejections are ignored. Records hold no weights and no
+        evidence (the evidence move names its blob), so a round with disputes stays small whatever the model."""
+        from unittest import mock
+
+        with mock.patch("vibehash.coordinator.MAX_GAMES", 1):
+            self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                         canaries_per_round=0)
+            liar = self.workers[-1].address
+            rep = self.round()
+            rejected = [t for t in self.tasks.values() if t.verifier == liar and t.verdict is not None and not t.verdict[0]]
+            self.assertGreater(len(rejected), 1)
+            self.assertEqual(sum(g.challenger == liar for g in self.games.values()), 1)
+            self.replays([rep])
+        self.assertLess(len(canonical(rep.record)), 200_000)
 
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
@@ -1140,8 +1167,10 @@ class NodeFreeRoundTests(unittest.TestCase):
             for bid in [x["final"], *(v[0] for v in x["openings"].values())]:
                 arrays[bid] = self.proto.checkpoints.array(bid, self.job)
         with open(d / "round.pkl", "wb") as f:
+            evidence = {m["body"]["move"]["evidence"]: self.proto.coord._get_trace(m["body"]["move"]["evidence"])
+                        for e in rep.record["games"] for m in e["moves"] if "evidence" in m["body"]["move"]}
             pickle.dump({"before": self.before, "block": rep.block, "record": rep.record, "arrays": arrays,
-                         "path": str(self.path), "sha": self.sha}, f)
+                         "path": str(self.path), "sha": self.sha, "evidence": evidence}, f)
         script = BLOCK_TORCH + """
 import copy, hashlib, pickle
 from vibehash import node, coordinator, replay, storage, finetune, dispute, referee  # noqa: F401
@@ -1152,6 +1181,7 @@ from vibehash.ledger import canonical
 d = pickle.load(open(sys.argv[1], "rb"))
 class Recheck:
     def array(self, bid, job): return d["arrays"][bid]
+    def bytes(self, bid): return d["evidence"][bid]
     def attach(self, j): j.attach_data(load_dataset(d["path"]), d["sha"])
 stats = {}
 problems = replay_block(copy.deepcopy(d["before"]), d["block"], copy.deepcopy(d["record"]), Recheck(), stats)

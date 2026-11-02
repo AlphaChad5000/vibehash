@@ -760,8 +760,11 @@ once a round would be a ledger change.
   It's unreleased, so this redefines it.
   - **What the record adds:** scorers' verdicts carrying `score` beside the checkers' (`verdicts`), the median
     `score`, under `checks/redundancy` whether each replicated unit's replicas agreed, under `checks/game` each
-    dispute's root states, and `games`: each dispute's signed moves, its evidence, its outcome and the referee's words.
-    No weights: a replay fetches and checks its own.
+    dispute's root states, and `games`: each dispute's signed moves, its outcome and the referee's words. No weights (a
+    replay fetches and checks its own) and no evidence (the evidence move names its blob, which a validator fetches
+    from the proposer with the game's checkpoints): a record stays small whatever the model (the second review's
+    finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round; its other rejections are
+    ignored.
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
     the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
     without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each

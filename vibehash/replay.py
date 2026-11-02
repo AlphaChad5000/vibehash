@@ -37,7 +37,7 @@ from . import shards as sh
 from .coordinator import Coordinator, CoordinatorConfig, ProtocolError
 from .crypto import h256
 from .ledger import Block, Chain, canonical
-from .merkle import MerkleError, unb64
+from .merkle import MerkleError
 from .tasks import InvalidJob, Reveal
 from .wire import WireError, commitment_in, open_envelope
 
@@ -100,10 +100,9 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
                 raise ProtocolError("the record's disputes aren't the ones the round had")
             for gid in sorted(entries):
                 e = entries[gid]
-                evidence = unb64(e["evidence"], 64 * 2**20) if e.get("evidence") else None
                 for env in e["moves"]:
                     addr, body = _sender(env, "move", chain, c.r.round_no)
-                    c.submit_move(addr, body, envelope=env, evidence=evidence)
+                    c.submit_move(addr, body, envelope=env)
         elif record.get("games"):
             raise ProtocolError("the record has disputes, but the round had none")
         replayed = c.replayed_summary(s.proposer)
