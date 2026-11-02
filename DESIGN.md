@@ -649,7 +649,10 @@ Each step:
        accuse.
      - **When the phase ends** with a game unfinished, the party whose move it is loses only if that move's own
        deadline has passed. If it hasn't, the game ends unchecked (`dispute.cut_short`), and nobody is slashed: the
-       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes.
+       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes,
+       but only where it can be true: the phase has room for the game's most moves, so a game can be cut short in
+       time only once it has made all but one of them. Before that, some move overran, and the party whose move it
+       is loses (the third review).
 5. **The referee** works out, in float64, each output number's exact value given the defender's own inputs, and a bound
    on how far an honest float32 computation of it can land (`referee.E`, running error analysis). Each op is the
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
@@ -809,7 +812,9 @@ once a round would be a ledger change.
     finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round, fewer once it has accused in
     vain (`games_allowed`); its other rejections are ignored, and their claims stand on their other verdicts. That
     trades a little of the guarantee for liveness: an honest checker that finds more bad claims in one round than it
-    may dispute leaves the rest to their other checkers.
+    may dispute leaves the rest to their other checkers. So a cheat whose fifth bad claim is checked by the same
+    honest checker and by a colluder who approves it gets that claim accepted (it is still slashed for the four
+    disputed ones, and loses its stake on the first).
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
     the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
     without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each

@@ -1231,11 +1231,20 @@ class NodeFreeRoundTests(unittest.TestCase):
     def test_a_phase_cut_short_blames_only_a_party_past_its_deadline(self):
         """The second review's finding 6: a dispute phase that ends with games unfinished judged them all by silence,
         though a party's own move may not have been due yet. Now each game goes by its own deadline: past it, the party
-        loses; before it, the game ends unchecked and nobody is slashed. A validator replays both."""
+        loses; before it, the game ends unchecked and nobody is slashed. A validator replays both. The third review:
+        a game can be cut short in time only near its end (it has made all but one of the moves the phase has room
+        for), so before that the party whose move it is loses, and a validator doesn't take the leader's word for an
+        unchecked end. Here the phase's room is one move, so that two stalled games show both outcomes."""
+        from unittest import mock
+
         from vibehash import dispute as dg
 
         self.network([("honest", "honest")] * 2 + [("honest", "false_accuser")], replication_rate=0.0,
                      canaries_per_round=0)
+        lengths = TrainingJob.phase_lengths
+        room = mock.patch.object(TrainingJob, "phase_lengths", lambda job: lengths(job) | {"moves": 1})
+        room.start()
+        self.addCleanup(room.stop)
         order = []
 
         def moves(g, who):
@@ -1254,6 +1263,13 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertIn(late.defender, slashed)
         self.assertNotIn(waiting.defender, slashed - {late.defender})
         self.replays([rep])
+        room.stop()
+        most = self.job.phase_lengths()["moves"]
+        for made, outcome in ((0, "challenger"), (most - 2, "challenger"), (most - 1, "unchecked")):
+            g = dg.Game("g", "u", "D", "C", "dispute", ["segment", 0], "a" * 64, "b" * 64, deadline=100.0)
+            g.moves = [{}] * made
+            dg.cut_short(g, 50.0, most)
+            self.assertEqual(g.outcome, outcome, made)
 
     def test_replicas_that_disagree_dispute_each_other(self):
         """Every unit replicated, one segment challenged: a tampering worker's unit and its honest twin's disagree, so

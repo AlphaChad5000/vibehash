@@ -1497,8 +1497,9 @@ class Coordinator:
         """The dispute phase is over: each unfinished game is judged by its own move's deadline (dispute.cut_short)."""
         r = self.r
         if r is not None and self.phase == Phase.DISPUTE:
+            most = self.job(r.job_id).phase_lengths().get("moves", 0)
             for g in r.games.values():
-                dg.cut_short(g, now)
+                dg.cut_short(g, now, most)
 
     def disputes_done(self) -> bool:
         r = self.r
@@ -1732,8 +1733,10 @@ class Coordinator:
         median goes into the record, for people: nothing is paid by it."""
         r = self.r
         job = self.job(r.job_id)
+        most = job.phase_lengths().get("moves", 0)
         for g in r.games.values():
-            if g.turn != "done" and self.replaying:  # the leader's clock: its phase ended before the move was due
+            # The leader's clock: its phase ended before the move was due, which it can be only near the game's end.
+            if g.turn != "done" and self.replaying and len(g.moves) >= most - 1:
                 entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
                 if (entry.get("outcome"), entry.get("detail")) == ("unchecked", dg.PHASE_ENDED):
                     g.end("unchecked", dg.PHASE_ENDED)
