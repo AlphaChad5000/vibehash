@@ -37,7 +37,7 @@ import numpy as np
 from . import merkle, referee
 from .merkle import LEAF, MerkleError
 
-MAX_EVIDENCE = 32 * 2**20  # a tile's inputs: a few MB at most (an attention column over every query position)
+MAX_EVIDENCE = 32 * 2**20  # a tile's inputs, for most ops; a tile that reads more is allowed evidence_cap's
 MAX_WEIGHTS = 256 * 2**20  # base-model weights one tile can need (a whole projection, for its backward)
 MAX_MOVES = 40
 
@@ -278,6 +278,32 @@ def diff_problem(op, before: dict, after: dict) -> str | None:
     return None
 
 
+class _Blank:
+    """Zeros of a shape, read by slices, as Inputs reads a whole array."""
+
+    def __init__(self, shape):
+        self.shape = shape
+
+    def __getitem__(self, idx):
+        r, c = idx
+        return np.zeros((len(range(*r.indices(self.shape[0]))), len(range(*c.indices(self.shape[1])))), dtype=np.float32)
+
+
+def evidence_cap(op, tile, outside: Outside) -> int:
+    """The most evidence a defender may send for one tile of `op`: MAX_EVIDENCE, plus twice the bytes of the leaves the
+    referee reads for it (each leaf with its share of the proof's hashes, which is less than its own bytes for any
+    tensor the node holds). Attention's backward over a long sequence reads every query position of every head in a
+    group: about 100 MB at 4096 tokens. Which leaves the referee reads depends on the op's shapes and the job's tokens,
+    never on the numbers, so a run on zeros finds them (a second for the largest)."""
+    if not op.out:
+        return MAX_EVIDENCE
+    shapes = dict(zip(op.ins, op.ishapes))
+    x = Inputs(shapes, outside, full={n: _Blank(s) for n, s in shapes.items()})
+    with np.errstate(all="ignore"):
+        referee.judge(op, x, tile, np.zeros(LEAF))
+    return MAX_EVIDENCE + 2 * 4 * LEAF * sum(len(v) for v in x.used.values())
+
+
 def _proof(arr: np.ndarray, idx) -> tuple[dict, bytes]:
     tree = merkle.levels(merkle.leaf_hashes(arr))
     idx = sorted(set(idx))
@@ -306,7 +332,8 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
 def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) -> tuple[str, str]:
     """The referee's verdict on a game's last move: ("defender" | "challenger" | "unchecked", why)."""
     try:
-        header, chunks = merkle.unpack(evidence, MAX_EVIDENCE)
+        limit = MAX_EVIDENCE if len(evidence) <= MAX_EVIDENCE else evidence_cap(op, tile, outside)
+        header, chunks = merkle.unpack(evidence, limit)
         before_m, after_m = chunks.get("manifest:in", b""), chunks.get("manifest:out", b"")
         if merkle.state_root(before_m) != a or merkle.state_root(after_m) != b:
             return "challenger", "the evidence is for other states than the ones the defender posted around the op"

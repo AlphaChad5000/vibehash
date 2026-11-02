@@ -54,6 +54,7 @@ EVAL_BATCH = 8  # validation sequences scored at once
 HEAD_TOKENS = 512  # llm.HEAD_CHUNK: tokens whose logits are made at once
 MAX_VAL = 128  # sequences held back at most: the node scores them every round
 SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
+MAX_SEQ_LEN = 4096  # a dispute's evidence for an attention tile grows with it (dispute.evidence_cap: ~100 MB at 4096)
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
 TOLERANCE = 1e-4
@@ -125,8 +126,8 @@ class LoraSpec:
             out.append("LoRA alpha must be in (0, 4096]")
         if not self.targets or not set(self.targets) <= set(TARGETS):
             out.append(f"LoRA targets must be some of {', '.join(TARGETS)}")
-        if type(self.seq_len) is not int or not 16 <= self.seq_len <= 32768:
-            out.append("seq_len must be 16-32768")
+        if type(self.seq_len) is not int or not 16 <= self.seq_len <= MAX_SEQ_LEN:
+            out.append(f"seq_len must be 16-{MAX_SEQ_LEN}")
         if self.optimizer not in OPTIMIZERS:
             out.append(f"optimizer must be one of {', '.join(OPTIMIZERS)}")
         if self.precision != "float32":
@@ -909,7 +910,7 @@ def plan(data_path: str | Path, ref: str, *, hub=None, job_id: str = "fine-tune"
         raise DataError(f"{repo} has no tokenizer.json, which turning text into training data needs")
     template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else None
     tokenizer = ChatTokenizer(files["tokenizer.json"], json.loads(files.get("tokenizer_config.json", b"{}")), template)
-    limit = min(max_len, int(config.get("max_position_embeddings") or max_len))
+    limit = min(max_len, MAX_SEQ_LEN, int(config.get("max_position_embeddings") or max_len))
     prepared = prepare(data_path, tokenizer, mbytes, config_bytes, max_len=limit)
     defaults = settings_for(dims)
     spec = LoraSpec(base=f"hf:{repo}@{commit}", manifest=hashlib.sha256(mbytes).hexdigest(), dims=dims, rank=rank,

@@ -1522,7 +1522,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rank", type=int, default=16, help="fine-tunes: LoRA rank (default 16)")
     p.add_argument("--lr", type=float, help="fine-tunes: Adam's learning rate (default: by model size)")
     p.add_argument("--max-len", type=int, default=1024, help="fine-tunes: longest sequence in tokens; longer chats are "
-                   "cut (default 1024)")
+                   "cut (default 1024, at most 4096)")
     p.add_argument("--units", type=int, default=8, help="fine-tunes: units of training a round (default 8)")
     p.add_argument("--yes", "-y", action="store_true", help="fine-tunes: don't ask before checking weights or posting")
     p.add_argument("--label", help="the column to predict (default: the last one)")

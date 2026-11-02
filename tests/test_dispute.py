@@ -460,3 +460,56 @@ class BoundTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvidenceTests(unittest.TestCase):
+    """The second review's finding 4: attention's backward over a long sequence reads every query position of a group's
+    heads, more than MAX_EVIDENCE, so an honest defender's evidence was refused. A tile's cap now grows with what the
+    referee reads for it (dispute.evidence_cap), and a job's sequences are at most finetune.MAX_SEQ_LEN."""
+
+    def test_long_attention_evidence_is_judged_and_oversized_evidence_isnt(self):
+        from vibehash.program import Op
+
+        H, KV, hd, T = 64, 2, 64, 512  # small, but a tile reads 40 MB: 64 heads' columns over 512 positions
+        G, c = H // KV, referee.f32(1 / np.sqrt(hd))
+        rng = np.random.default_rng(4)
+        ds = (rng.normal(0, 0.01, (H * T, T))).astype(np.float32)
+        qr = rng.normal(0, 1, (T, H * hd)).astype(np.float32)
+        a = (ds * np.float32(c)).reshape(H, T, T)
+        dk = np.concatenate([np.concatenate(list(a[g * G:(g + 1) * G]), axis=0).T
+                             @ np.concatenate([qr[:, h * hd:(h + 1) * hd] for h in range(g * G, (g + 1) * G)], axis=0)
+                             for g in range(KV)], axis=1)
+        op = Op("attn_dk", "dk", ("ds", "qr"), {"H": H, "KV": KV, "hd": hd, "c": c}, (), (T, KV * hd),
+                ((H * T, T), (T, H * hd)))
+        before, out = {"ds": ds, "qr": qr}, dispute.Outside(None, None, None)
+        after = {**before, "dk": dk}
+        ms = (dispute.state_manifest(before)[0], dispute.state_manifest(after)[0])
+        roots = [merkle.state_root(m) for m in ms]
+        for tile in (0, merkle.n_leaves(T, KV * hd) - 1):
+            evidence, ok, why = dispute.make_evidence(op, tile, before, after, ms, out)
+            self.assertTrue(ok, why)
+            self.assertGreater(len(evidence), dispute.MAX_EVIDENCE)
+            self.assertEqual(dispute.judge_evidence(op, tile, *roots, evidence, out)[0], "defender")
+        cap = dispute.evidence_cap(op, tile, out)
+        self.assertLess(cap, 3 * len(evidence))
+        header, chunks = merkle.unpack(evidence, cap)
+        padded = merkle.pack(header, {**chunks, "pad": bytes(cap - len(evidence))})
+        verdict, why = dispute.judge_evidence(op, tile, *roots, padded, out)
+        self.assertEqual((verdict, "too big" in why), ("challenger", True))
+
+    def test_the_cap_stays_bounded_at_the_longest_sequences(self):
+        """The reviewer's sizes (t_evidence_size): at MAX_SEQ_LEN, Qwen2.5-3B's attention tiles read 96 MB, past the old
+        32 MB; their cap allows them and stays a few hundred MB."""
+        from vibehash import finetune
+        from vibehash.program import Op
+
+        T = finetune.MAX_SEQ_LEN
+        for H, KV, hd, MB in ((32, 8, 128, 48), (16, 2, 128, 96)):  # Qwen3-4B, Qwen2.5-3B
+            shapes = {"ds": (H * T, T), "qr": (T, H * hd)}
+            op = Op("attn_dk", "dk", ("ds", "qr"), {"H": H, "KV": KV, "hd": hd, "c": 0.125}, (), (T, KV * hd),
+                    (shapes["ds"], shapes["qr"]))
+            cap = dispute.evidence_cap(op, 0, dispute.Outside(None, None, None))
+            self.assertEqual(cap, dispute.MAX_EVIDENCE + 2 * MB * 2**20)
+            self.assertLess(cap, 256 * 2**20)
+        self.assertTrue(any("seq_len" in p for p in
+                            finetune.LoraSpec("x/y", "r", {}, seq_len=T + finetune.SEQ_STEP).problems()))

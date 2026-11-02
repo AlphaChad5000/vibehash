@@ -628,6 +628,11 @@ Each step:
    - **evidence** (the defender), once the pick is one op: the two states' manifests, and with Merkle multiproofs, the
      numbers of the op's inputs the referee needs and the tile itself. The node checks the op changed exactly its
      output and dropped what it should, then `referee.judge` recomputes the tile.
+     - **Its size:** up to `dispute.MAX_EVIDENCE` (32 MB), or for a tile that reads more, `evidence_cap`: 32 MB plus
+       twice the bytes of the leaves the referee reads, found by running it on zeros (which leaves it reads depends
+       on shapes and tokens, never on the numbers). Attention's backward reads every query position of a group's
+       heads: on Qwen2.5-3B at 4096 tokens, 96 MB of leaves. A job's `seq_len` is at most `finetune.MAX_SEQ_LEN` =
+       4096 to keep that bounded.
    - **Its length:** a game takes about 5 or 6 splits, as many picks and the evidence; `node.DISPUTE_MOVES` = 14 is the
      most. Each move has `move_s` to be made, as long as the verify phase.
    - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede instead of picking.
