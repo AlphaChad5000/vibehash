@@ -41,9 +41,9 @@ Any other OpenAI-compatible provider works too: set `LLM_BASE_URL` (the part bef
 ## Tonight's run
 
 You'll need Python with this repository's requirements, plus `pip install -e ".[finetune]"` so `train` can read
-chats. The `answer` step also needs PyTorch, transformers and peft; this PC's GPU venv,
-`%USERPROFILE%\.vibehash\venv`, has them. The public node can't run fine-tunes until its upgrade, so use a local
-testnet:
+chats. The `answer` step also needs PyTorch, transformers and peft. This PC's GPU venv has all of it, so on this PC use
+`& "$env:USERPROFILE\.vibehash\venv\Scripts\python.exe"` (PowerShell) wherever the lines below say `python`. The public node can't run
+fine-tunes until its upgrade, so use a local testnet:
 
 ```bash
 # window 1: a node and three GPU workers

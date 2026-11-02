@@ -57,6 +57,8 @@ def settings(env=None) -> dict:
     API, keyed by MODEL_API_KEY (or META_API_KEY), and Muse Spark unless LLM_MODEL says otherwise."""
     env = os.environ if env is None else env
     base = (env.get("LLM_BASE_URL") or META_BASE).strip().rstrip("/")
+    if base.endswith("/chat/completions"):  # the whole endpoint, pasted from a provider's docs
+        base = base[:-len("/chat/completions")]
     meta = urllib.parse.urlsplit(base).hostname == urllib.parse.urlsplit(META_BASE).hostname
     key = env.get("LLM_API_KEY") or (next((env[k] for k in META_KEYS if env.get(k)), "") if meta else "")
     model = env.get("LLM_MODEL") or (META_MODEL if meta else "")
@@ -120,8 +122,8 @@ def _advice(status: int, message: str, code, s: dict) -> str:
                 "availability depends on the country you call from (US developers first), and team settings can "
                 "block a model too")
     if status == 404 or "model_not_found" in low:
-        return (f"{where} has no model called {model!r} (404): check LLM_MODEL against the provider's model list "
-                "(Meta's: muse-spark-1.1, muse-spark-1.2, muse-spark-1.3)")
+        return (f"{where} has no model called {model!r}, or no /chat/completions (404): check LLM_MODEL against the "
+                "provider's model list (Meta's: muse-spark-1.1, muse-spark-1.2, muse-spark-1.3), and LLM_BASE_URL")
     if status == 429:
         return (f"{where} is rate limiting this key (429) and kept doing so after {RETRIES} retries: wait a minute "
                 "and run it again")
