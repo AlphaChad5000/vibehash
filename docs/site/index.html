@@ -262,6 +262,7 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
       </div>
     </div>
     <div class="handy">
+      <p><code class="vh" data-cmd="">python -m vibehash</code> <span>a menu of all of this: pick with the arrow keys</span></p>
       <p><code class="vh" data-cmd="balance">python -m vibehash balance</code> <span>what you've earned</span></p>
       <p><code class="vh" data-cmd="devices">python -m vibehash devices</code> <span>what this computer can train on</span></p>
       <p><code class="vh" data-cmd="setup">python -m vibehash setup</code> <span>change the network, wallet or GPU support</span></p>
@@ -316,7 +317,7 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
     document.querySelectorAll(".os button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.os === os)); });
     $("cmd").textContent = CMDS[os][0];
     $("cmd-note").firstChild.textContent = CMDS[os][1] + " ";
-    document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = (os === "win" ? "python" : "python3") + " -m vibehash " + c.dataset.cmd; });
+    document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = ((os === "win" ? "python" : "python3") + " -m vibehash " + c.dataset.cmd).trim(); });
   }
   document.querySelectorAll(".os button").forEach(function (b) { b.addEventListener("click", function () { pick(b.dataset.os); }); });
   pick(/Win/i.test(navigator.userAgent) ? "win" : "unix");
