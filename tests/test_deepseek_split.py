@@ -8,10 +8,10 @@
   parts and come down in ranges, through a link that drops every third request; an upload cut off part way resumes
   from its journal, sending only the parts not yet acknowledged; a signed URL can't be bent to another method or part.
 - SplitTests (small config, CPU): a prep split into pieces of 1 and 2 layers, the engram table in several row
-  ranges, writes exactly deepseek_prep's records and Merkle root, whatever order its units run in, and through the
-  bucket too. No host needs trusting: an altered hand-off is caught and another host's copy used, and a withheld one
-  is made again. A replay agrees with an honest unit, and finds the layer a bent one disagrees at, with an agreed
-  state entering it.
+  ranges, writes exactly the records and Merkle root of the stack run as one piece, whatever order its units run in,
+  and through the bucket too. No host needs trusting: an altered hand-off is caught and another host's copy used, and
+  a withheld one is made again. A replay agrees with an honest unit to the bit, and refuses roots that aren't the
+  states its inputs make and its outputs hand on.
 """
 import datetime
 import hashlib
@@ -397,8 +397,7 @@ class SplitTests(unittest.TestCase):
         self.seqs = prep.load_dataset(self.tmp / "data.npz")
         self.tmap = token_map_for(self.cfg)
         self.chunks = prep.blocks_of(self.seqs, 40)
-        self.whole = prep.run(prep.LocalSource(self.state), prep.LocalUploader(self.tmp / "whole" / "repo"), self.seqs,
-                              self.cut, self.tmp / "whole" / "work", block_tokens=40, token_map=self.tmap)
+        self.whole, self.whole_store = self.split("whole", split.pieces(4, 4))  # one piece: the whole frozen stack
 
     def split(self, name, bounds, ranges=3):
         store = split.LocalStore(self.tmp / name / "store")
@@ -407,13 +406,13 @@ class SplitTests(unittest.TestCase):
         return m, store
 
     def assert_same(self, m, store):
+        """The records and root of the stack run as one piece, to the bit: a state root after a layer doesn't depend
+        on where the pieces end."""
         self.assertEqual(m["root"], self.whole["root"])
         self.assertEqual([b["leaves"] for b in m["blocks"]], [b["leaves"] for b in self.whole["blocks"]])
-        repo = self.tmp / "whole" / "repo"
         for c in range(len(self.chunks)):
-            bin_name, meta_name = split.block_names(c)
-            self.assertEqual(store.get(bin_name), (repo / bin_name).read_bytes(), c)
-            self.assertEqual(store.get(meta_name), (repo / meta_name).read_bytes(), c)
+            for name in split.block_names(c):
+                self.assertEqual(store.get(name), self.whole_store.get(name), (c, name))
 
     def test_one_layer_pieces(self):
         self.assertGreater(len(self.chunks), 1)
@@ -505,33 +504,33 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(any("partNumber" in e[2] for e in s3.log))  # streams big enough to go up in parts
         self.assertTrue(all(k.startswith("job-1/") for k in s3.objects))
 
-    def test_replay_answers_a_challenge(self):
+    def test_a_replay_checks_a_unit(self):
+        """A unit run again from its inputs: the same state roots, to the bit. Its first root must be the state its
+        inputs make, and its last the state its outputs hand on, whatever hardware checks it."""
         bounds = split.pieces(4, 2)
         _, store = self.split("replay", bounds)
-        unit = split.plan(self.cut, self.chunks, bounds, 3, align=1).units["layers-02-04-c00000"]
-        commit = json.loads(store.get(split.commit_name(0, 2)))
-        kw = dict(token_map=self.tmap, work=self.tmp / "replay" / "work", ranges=3, align=1,
-                  want=json.loads(store.get(split.commit_name(0, 0)))["outputs"])
-        src, j = prep.LocalSource(self.state), len(self.chunks[0]) - 1
-        args = (src, store, self.seqs, self.chunks, self.cut, unit)
-        self.assertEqual(split.replay(*args, commit, **kw), {"agrees": True, "disagree": [], "outputs": []})
-        stats = commit["stats"]
+        units = split.plan(self.cut, self.chunks, bounds, 3, align=1).units
+        src = prep.LocalSource(self.state)
+        want = json.loads(store.get(split.commit_name(0, 0)))["outputs"]
+        kw = dict(token_map=self.tmap, work=self.tmp / "replay" / "work", ranges=3, align=1)
+        for name, w in (("layers-00-02-c00000", None), ("layers-02-04-c00000", want)):
+            unit = units[name]
+            commit = json.loads(store.get(split.commit_name(0, unit.a)))
+            self.assertEqual(len(commit["roots"]), 1 + (unit.a == 0) + unit.b - unit.a)
+            args = (src, store, self.seqs, self.chunks, self.cut, unit)
+            self.assertEqual(split.replay_close(*args, commit, 0.0, want=w, **kw), {"agrees": True, "worst": 0.0,
+                                                                                     "where": ""})
+        first = json.loads(store.get(split.commit_name(0, 0)))
+        stats = first["stats"]
         self.assertEqual(stats["tokens"], 2 * sum(len(self.seqs[i][0]) for i in self.chunks[0]))
-        self.assertGreater(stats["read_bytes"], 0)
         self.assertIn("peak_gpu_gb", stats)
-        bent = json.loads(json.dumps(commit))  # a holder who bent layer 3 of the chunk's last sequence
-        bent["layer_hashes"][j][1] = "00" * 32
-        bent["leaves"][j] = "00" * 32
-        found = split.replay(*args, bent, **kw)
-        self.assertFalse(found["agrees"])
-        self.assertEqual(found["disagree"], [(j, 3)])
-        self.assertEqual(found["outputs"], ["leaves"])
-        state, h = split.state_before(*args, j, 3, **kw)  # what both sides hand the referee
-        self.assertEqual(h, commit["layer_hashes"][j][0])  # agreed: layer 2's committed hash
-        self.assertTrue({"x", "pre"} <= set(state))
-        first, h = split.state_before(*args, j, 2, **kw)
-        self.assertIsNone(h)  # the piece's input: a checked object
-        self.assertTrue(torch.equal(first["x"], split.decode(store.get(split.stream_name(0, 2)))[f"{j}.x"]))
+        args = (src, store, self.seqs, self.chunks, self.cut, units["layers-00-02-c00000"])
+        for k, where in ((0, "the state it starts from"), (-1, "the state it hands on")):
+            bent = json.loads(json.dumps(first))  # roots that aren't its work's, outputs that are
+            bent["roots"][k] = "00" * 32
+            self.assertEqual(split.replay_close(*args, bent, 1.0, **kw)["where"], where)
+        later = json.loads(store.get(split.commit_name(0, 2)))
+        self.assertEqual(later["roots"][0], first["roots"][-1])  # one unit's last state is the next one's first
 
     def test_trainers_read_checked_records(self):
         m, store = self.split("read", split.pieces(4, 2))

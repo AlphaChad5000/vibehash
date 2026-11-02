@@ -1,9 +1,9 @@
 """vibehash/deepseek_worker.py: a worker's side of a DeepSeek job, on the tiny config (CPU).
 
 - PrepTests: a worker runs the prep's units one by one, as the node hands them out, through the bucket (FakeS3, every
-  link signed), each checking its inputs against their writers' digests: the records and root are the one-PC prep's.
-  A checker's replay agrees to the bit on the same hardware, passes outputs that differ as other hardware's would,
-  and fails ones bent further.
+  link signed), each checking its inputs against their writers' digests: the records and root are the same however
+  the frozen layers are cut into pieces. A checker's replay agrees to the bit on the same hardware, passes outputs
+  that differ as other hardware's would, and fails ones bent further.
 - TakeTests: when a PC can't take DeepSeek work, it's told why and that it keeps earning on other jobs; Flash's
   files for a piece are the layers' own, its embedding and tokenizer only where needed.
 """
@@ -71,11 +71,13 @@ class PrepTests(unittest.TestCase):
         last = [c for n, c in commits.items() if graph.units[n].kind == "layers" and graph.units[n].b == self.spec.cut]
         seqs = dw.sequences(self.tokens)
         m = split.manifest(self.spec.top, seqs, self.tokens.chunks(self.spec.chunk_tokens), last)
-        whole = prep.run(prep.LocalSource(deepseek.random_weights(self.spec.cfg, 0)),
-                         prep.LocalUploader(self.tmp / "one-pc"), prep.load_dataset(self.path), self.spec.top,
-                         self.tmp / "one-pc-work", block_tokens=self.spec.chunk_tokens,
-                         token_map=self.weights.token_map(self.tmp))
-        self.assertEqual(m["root"], whole["root"])  # the one-PC prep's records, to the bit
+        # the same prep on one PC, in pieces of one layer (its state roots don't depend on the pieces)
+        whole = split.run_local(prep.LocalSource(deepseek.random_weights(self.spec.cfg, 0)),
+                                split.LocalStore(self.tmp / "one-pc"), prep.load_dataset(self.path),
+                                self.tokens.chunks(self.spec.chunk_tokens), self.spec.top, split.pieces(self.spec.cut, 1),
+                                self.weights.token_map(self.tmp), self.tmp / "one-pc-work", ranges=self.spec.row_ranges,
+                                align=self.spec.align)
+        self.assertEqual(m["root"], whole["root"])  # the same records, to the bit
 
     def test_checking_a_unit(self):
         graph, commits = self.prep_all()

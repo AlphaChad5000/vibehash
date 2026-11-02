@@ -600,3 +600,90 @@ class RecordReader:
 
     def record_np(self, seq: int) -> dict:
         return unpack_np(self.record_bytes(seq))
+
+
+# --- a prep unit's hand-off, as the node checks it: no PyTorch -----------------------------------------------------
+
+_HANDOFF = {"bfloat16": 2, "float32": 4, "int64": 8, "int32": 4, "int16": 2, "bool": 1, "uint8": 1}
+
+
+def decode_np(data: bytes) -> dict:
+    """A hand-off object (deepseek_split.encode's: byte planes, then zstd or zlib) as float32 NumPy arrays, exactly."""
+    import zlib
+
+    import numpy as np
+
+    line, blob = data.split(b"\n", 1)
+    head = json.loads(line)
+    if head.get("format") != "vibehash-deepseek-split/1":
+        raise ValueError("not a hand-off object")
+    out, at = {}, 0
+    for name, dtype, shape, n in head["tensors"]:
+        size = _HANDOFF[dtype]
+        raw = blob[at:at + n]
+        at += n
+        if head["codec"] == "zstd":
+            from compression import zstd
+            raw = zstd.decompress(raw)
+        else:
+            raw = zlib.decompress(raw)
+        b = np.ascontiguousarray(np.frombuffer(raw, np.uint8).reshape(size, -1).T).reshape(-1)
+        if dtype == "bfloat16":
+            a = (b.view("<u2").astype(np.uint32) << 16).view(np.float32)
+        else:
+            a = b.view({"float32": "<f4", "int64": "<i8", "int32": "<i4", "int16": "<i2", "bool": "u1",
+                        "uint8": "u1"}[dtype]).astype(np.float32)
+        out[name] = a.reshape(shape)
+    return out
+
+
+def handed_root(store, prog_above, want: dict) -> str:
+    """The state root of what a layers unit hands on, from its output objects (and the side channels below it that
+    cross the same cut): the state the unit above starts from (deepseek_split._start's, in NumPy). `prog_above`: a
+    deepseek_program.PrepProgram of the piece above. A unit's last committed root must be this: its outputs are its
+    last state. Raises Tampered if an object isn't the one committed to."""
+    import numpy as np
+
+    from . import dispute, merkle
+    from .deepseek_program import SIDE_PREFIX
+
+    def get(name):
+        data = store.get(name)
+        got = decode_np(data)
+        if name in want and want[name] != _digest_np(got, data):
+            raise Tampered(name)
+        return got
+    c, a, n = prog_above.unit_.chunk, prog_above.a, len(prog_above.T)
+    s = get(stream_name(c, a))
+    st = {"h": np.concatenate([s[f"{j}.x"].reshape(prog_above.T[j], -1) for j in range(n)]),
+          "p": np.concatenate([s[f"{j}.pre"].reshape(prog_above.T[j], -1) for j in range(n)])}
+    for kind, src in prog_above.side_kinds(a).items():
+        obj = get(side_name(c, kind, src))
+        for j in range(n):
+            if prog_above.n_comp(j, src):
+                st[f"{SIDE_PREFIX[kind]}{j}"] = obj[str(j)].reshape(prog_above.side_shape(kind, j, src))
+    m, _ = dispute.state_manifest(st)
+    return merkle.state_root(m)
+
+
+def _digest_np(got: dict, data: bytes) -> str:
+    """deepseek_split.digest of an object decoded with decode_np: its tensors' names, dtypes, shapes and bytes."""
+    import numpy as np
+
+    head = json.loads(data.split(b"\n", 1)[0])
+    h = hashlib.sha256(b"vibehash-deepseek-split/1")
+    line, blob = data.split(b"\n", 1)
+    at = 0
+    for name, dtype, shape, n in head["tensors"]:
+        h.update(json.dumps([name, f"torch.{dtype}", list(shape)]).encode())
+        raw = blob[at:at + n]
+        at += n
+        if head["codec"] == "zstd":
+            from compression import zstd
+            raw = zstd.decompress(raw)
+        else:
+            import zlib
+            raw = zlib.decompress(raw)
+        size = _HANDOFF[dtype]
+        h.update(np.ascontiguousarray(np.frombuffer(raw, np.uint8).reshape(size, -1).T).tobytes())
+    return h.hexdigest()

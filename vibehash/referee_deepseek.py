@@ -618,6 +618,8 @@ def op_ds_engram_rows(op, x, r, c0, c1):
     concatenated [cols · head_dim]. The rows follow from the text alone: ins (tokens [T, 1]); the token map (token id
     to normalised id) is read as a table (attrs token_map), the rows as attrs table's .weight and .scale."""
     a = op.attrs
+    if "pad" not in a:  # the pad token's normalised id, looked up like the tokens' (attrs pad_id)
+        a = {**a, "pad": int(_lookup(x, a["token_map"], a["pad_id"]))}
     ids = [int(_lookup(x, a["token_map"], _token(x, op.ins[0], t))) for t in range(max(0, r - a["n"] + 1), r + 1)]
     rows = engram_rows(ids, 0, a)
     hd = op.shape[1] // len(rows)
@@ -1416,9 +1418,42 @@ def op_ds_moe_dx(op, x, r, c0, c1):
         y = o if y is None else rf.add(y, o)
     return _acc(op, x, r, c0, c1, y, 2)
 
+
+
+def op_ds_tokens(op, x, r, c0, c1):
+    """The chunk's token ids, sequence after sequence (attrs seqs), from the job's token file. Exact."""
+    t = x.outside.data.tokens
+    starts = np.concatenate([[0], np.cumsum(t.lengths)]).astype(np.int64)
+    for s in op.attrs["seqs"]:
+        n = int(t.lengths[int(s)])
+        if r < n:
+            return E(np.array([float(t.tokens[starts[int(s)] + r])])[c0:c1])
+        r -= n
+    raise rf.Missing(f"token {r} of the chunk")
+
+
+def op_ds_tile(op, x, r, c0, c1):
+    """A row's n copies side by side: Model.start's stream, its hc copies of the embedding. Exact."""
+    width = op.ishapes[0][1]
+    row = x.row(op.ins[0], r)
+    return E(np.tile(row, op.attrs["n"])[c0:c1]) if width else E(np.zeros(c1 - c0))
+
+
+def op_ds_onehot(op, x, r, c0, c1):
+    """Model.start's pre_mix: 1 in column attrs col, 0 elsewhere. Exact."""
+    row = np.zeros(op.shape[1])
+    row[op.attrs["col"]] = 1.0
+    return E(row[c0:c1])
+
+
+def op_ds_cols(op, x, r, c0, c1):
+    """Columns [c0, c1) of a tensor: the ffn split's pre, the next layer's pre_mix. Exact."""
+    a0 = op.attrs["c0"]
+    return E(x.get(op.ins[0], r, r + 1, a0 + c0, a0 + c1)[0])
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
 EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows", "ds_rows", "ds_unrows", "ds_record", "ds_slice",
-         "ds_cat", "ds_reshape"}
+         "ds_cat", "ds_reshape", "ds_tokens", "ds_tile", "ds_onehot", "ds_cols"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
 # (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
 # two bf16 numbers can be refused exactly.

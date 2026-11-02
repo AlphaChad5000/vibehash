@@ -10,6 +10,7 @@ activation dtype and its result is widened back, exactly.
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -33,6 +34,10 @@ class Executor(tr.Executor):
         self.where: tuple = ()
         self._head: tuple = (None, None)
         self._records: dict[int, dict] = {}
+        # a prep unit's engram rows: deepseek_prep.Slice by layer (the rows units' hand-offs) and the token map;
+        # without them, the tables and "engram.token_map" in the weights (tests' random weights)
+        self.slices: dict = {}
+        self.token_map: torch.Tensor | None = None
 
     def w(self, name: str) -> torch.Tensor:
         return self.state[name]
@@ -585,6 +590,86 @@ def r_ds_head_grad(ex, op, st):
     if len(rows):
         q[rows, tgt[rows] - b0] -= 1
     return _acc(st, op, 3, (q * op.attrs["ic"]) @ w)
+
+
+# --- a prep unit's: the embedding, engram, the compressor, candidate blocks -------------------------------------------
+
+def r_ds_tokens(ex, op, st):
+    t = ex.prog.data.tokens
+    starts = np.concatenate([[0], np.cumsum(t.lengths)]).astype(np.int64)
+    ids = np.concatenate([t.tokens[starts[s]:starts[s] + int(t.lengths[s])] for s in op.attrs["seqs"]])
+    return torch.from_numpy(ids.astype(np.float32))[:, None].to(ex.device)
+
+
+def r_ds_embed(ex, op, st):
+    tok = st[op.ins[0]][:, 0].long()
+    return _out(F.embedding(tok, ex.w(op.attrs.get("weight", "embed.weight")).to(ex.device)).to(_num(op).dtype))
+
+
+def r_ds_tile(ex, op, st):
+    x = st[op.ins[0]]
+    return x.unsqueeze(1).repeat(1, op.attrs["n"], 1).flatten(1)
+
+
+def r_ds_onehot(ex, op, st):
+    out = torch.zeros(op.shape, device=ex.device, dtype=_F32)
+    out[:, op.attrs["col"]] = 1
+    return out
+
+
+def r_ds_cols(ex, op, st):
+    return st[op.ins[0]][:, op.attrs["c0"]:op.attrs["c1"]]
+
+
+def r_ds_engram_rows(ex, op, st):
+    """Engram.rows of one sequence's n-grams (engram_hashes from its tokens), from the rows units' slices."""
+    a, num, cfg = op.attrs, _num(op), ex.spec.cfg
+    layer = a["layer"]
+    tok = st[op.ins[0]][:, 0].long()[None].cpu()
+    tmap = ex.token_map if ex.token_map is not None else ex.w("engram.token_map")
+    hashes = ds.engram_hashes(tok, tmap.cpu(), cfg)[:, :, cfg.engram_layer_ids.index(layer)]
+    if layer in ex.slices:
+        rows = ex.slices[layer].rows(hashes, num.dtype)
+    else:
+        base = f"layers.{layer}.engram.embed"
+        v = F.embedding(hashes, ex.w(base + ".weight")).float().unflatten(-1, (-1, ds.BLOCK))
+        rows = (v * F.embedding(hashes, ex.w(base + ".scale")).float().unsqueeze(-1)).flatten(-2).to(num.dtype)
+    return _out(rows[0].flatten(1).to(ex.device))
+
+
+def r_ds_engram_gate(ex, op, st):
+    """Engram.forward after its wkv, as written there."""
+    a, num = op.attrs, _num(op)
+    hi = num.hi
+    x, kv = _in(st, op, 0), _in(st, op, 1)
+    dim = kv.shape[1] - x.shape[1]
+    hc = x.shape[1] // dim
+    key, value = kv.split([hc * dim, dim], dim=-1)
+    key = key.to(hi).unflatten(-1, (hc, dim))
+    h = x.view(-1, hc, dim).to(hi)
+    rstd = torch.rsqrt(h.square().mean(-1) + a["eps"]) * torch.rsqrt(key.square().mean(-1) + a["eps"])
+    dot = (h * (_vec(ex, a["q_weight"], hi) * _vec(ex, a["k_weight"], hi)) * key).sum(-1) * rstd * dim ** -0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    return _out((h + gate.unsqueeze(-1) * value.to(hi).unsqueeze(-2)).to(x.dtype).flatten(1))
+
+
+def r_ds_compress(ex, op, st):
+    """Compressor.forward's pooling (ratio > 1) of one sequence, before its norm."""
+    a, num = op.attrs, _num(op)
+    x = _in(st, op)
+    r, hi = a["ratio"], num.hi
+    n = x.shape[0] // r
+    h = x.to(hi)
+    kv = F.linear(h, ex.w(a["wkv"]).to(ex.device, hi))[:n * r].unflatten(0, (n, r))
+    score = F.linear(h, ex.w(a["wgate"]).to(ex.device, hi))[:n * r].unflatten(0, (n, r))
+    return _out((kv * score.softmax(dim=1)).sum(dim=1).to(x.dtype))
+
+
+def r_ds_candidates(ex, op, st):
+    a = op.attrs
+    score = st[op.ins[0]]
+    visible = (torch.arange(1, score.shape[0] + 1, device=score.device) // a["ratio"]).unsqueeze(-1)
+    return ds.candidate_blocks(score[None], visible, a["topk_blocks"], a["block"])[0].to(_F32)
 
 
 RUN = {name[2:]: fn for name, fn in globals().items() if name.startswith("r_ds_")}

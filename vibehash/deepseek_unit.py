@@ -98,6 +98,7 @@ def runtime(spec: DeepSeekSpec, device: str, weights=None) -> _Runtime:
     with _lock:
         rt = _runtimes.get(key)
         if rt is None:
+            ds.configure_torch()  # float32 accumulation everywhere a trace is made: the referee's bounds assume it
             if weights is None:
                 if spec.config_name != "tiny":
                     raise RuntimeError("Flash's top layers must be fetched first (the worker's model files)")
