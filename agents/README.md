@@ -32,8 +32,8 @@ export MODEL_API_KEY="paste-the-key-here"          # bash
 ```
 
 That's all Muse Spark needs. `MODEL_API_KEY` is the name Meta's docs use, and `META_API_KEY` works too. The default
-model is `muse-spark-1.1`. Meta recommends `muse-spark-1.3` for new work at the same price, so you can set
-`LLM_MODEL=muse-spark-1.3`. `LLM_REASONING_EFFORT=low` makes replies faster and cheaper.
+model is `muse-spark-1.3`, the one Meta recommends for new work (`LLM_MODEL=muse-spark-1.1` picks an older one at
+the same price). `LLM_REASONING_EFFORT=low` makes replies faster and cheaper.
 
 Any other OpenAI-compatible provider works too: set `LLM_BASE_URL` (the part before `/chat/completions`),
 `LLM_API_KEY` and `LLM_MODEL`. These also override the Meta defaults. A Meta key is only ever sent to Meta.
@@ -42,8 +42,9 @@ Any other OpenAI-compatible provider works too: set `LLM_BASE_URL` (the part bef
 
 You'll need Python with this repository's requirements, plus `pip install -e ".[finetune]"` so `train` can read
 chats. The `answer` step also needs PyTorch, transformers and peft. This PC's GPU venv has all of it, so on this PC use
-`& "$env:USERPROFILE\.vibehash\venv\Scripts\python.exe"` (PowerShell) wherever the lines below say `python`. The public node can't run
-fine-tunes until its upgrade, so use a local testnet:
+`& "$env:USERPROFILE\.vibehash\venv\Scripts\python.exe"` (PowerShell) wherever the lines below say `python`. The lines below use a local
+testnet, where the VIBE is play money; on the public network leave out `--node` and `--wallet` (it needs two staked GPU
+workers before a fine-tune trains: TONIGHT.md):
 
 ```bash
 # window 1: a node and three GPU workers

@@ -5,8 +5,8 @@ Meta's Model API speaks it, and it's the default here: Muse Spark at https://api
 
     MODEL_API_KEY   your Meta key, from the API keys tab of the Model API dashboard at https://dev.meta.ai (the name
                     Meta's own docs use; META_API_KEY, LiteLLM's name, works too). That's all Muse Spark needs.
-    LLM_MODEL       another model: muse-spark-1.1 is the default, and Meta's docs recommend muse-spark-1.3 for new
-                    work at the same price.
+    LLM_MODEL       another model: muse-spark-1.3 is the default, the one Meta's docs recommend for new work (1.1
+                    and 1.2 cost the same).
 
 Any other OpenAI-compatible provider works by setting all three of these, which also override the Meta defaults:
 
@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 
 META_BASE = "https://api.meta.ai/v1"
-META_MODEL = "muse-spark-1.1"
+META_MODEL = "muse-spark-1.3"
 META_KEYS = ("MODEL_API_KEY", "META_API_KEY")  # Meta's docs' name, then LiteLLM's
 TIMEOUT_S = 600  # a reasoning model writing 60 examples can think for minutes before it sends a byte
 RETRIES = 3  # after the first try, for 429 and 5xx (Meta's docs: 3-5 attempts, exponential backoff with jitter)

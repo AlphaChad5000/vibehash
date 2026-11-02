@@ -145,9 +145,9 @@ class LLMCallTests(AgentTest):
             with self.subTest(name):
                 s = llm_call.settings({name: "k1"})
                 self.assertEqual((s["base_url"], s["model"], s["key"], s["provider"]),
-                                 ("https://api.meta.ai/v1", "muse-spark-1.1", "k1", "meta"))
-        s = llm_call.settings({"MODEL_API_KEY": "k1", "LLM_MODEL": "muse-spark-1.3", "LLM_API_KEY": "k2"})
-        self.assertEqual((s["model"], s["key"]), ("muse-spark-1.3", "k2"))  # LLM_* still win
+                                 ("https://api.meta.ai/v1", "muse-spark-1.3", "k1", "meta"))
+        s = llm_call.settings({"MODEL_API_KEY": "k1", "LLM_MODEL": "muse-spark-1.1", "LLM_API_KEY": "k2"})
+        self.assertEqual((s["model"], s["key"]), ("muse-spark-1.1", "k2"))  # LLM_* still win
         s = llm_call.settings({"MODEL_API_KEY": "k1", "LLM_BASE_URL": "https://api.meta.ai/v1/chat/completions/"})
         self.assertEqual((s["base_url"], s["key"], s["provider"]), ("https://api.meta.ai/v1", "k1", "meta"))
         self.assertNotIn("key", llm_call.describe({"MODEL_API_KEY": "k1"}))
