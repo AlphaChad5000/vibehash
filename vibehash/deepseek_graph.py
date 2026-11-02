@@ -607,10 +607,20 @@ class RecordReader:
 _HANDOFF = {"bfloat16": 2, "float32": 4, "int64": 8, "int32": 4, "int16": 2, "bool": 1, "uint8": 1}
 
 
-def decode_np(data: bytes) -> dict:
-    """A hand-off object (deepseek_split.encode's: byte planes, then zstd or zlib) as float32 NumPy arrays, exactly."""
+def inflate(raw: bytes, codec: str) -> bytes:
+    """A hand-off tensor's bytes, decompressed. zlib is the protocol's only codec (zstd needs Python 3.14, and the
+    node runs 3.12): anything else, or bytes that don't inflate, is a ValueError."""
     import zlib
+    if codec != "zlib":
+        raise ValueError(f"a hand-off's codec is zlib, not {codec!r}")
+    try:
+        return zlib.decompress(raw)
+    except zlib.error as e:
+        raise ValueError(f"a hand-off that doesn't decompress: {e}") from None
 
+
+def decode_np(data: bytes) -> dict:
+    """A hand-off object (deepseek_split.encode's: byte planes, then zlib) as float32 NumPy arrays, exactly."""
     import numpy as np
 
     line, blob = data.split(b"\n", 1)
@@ -620,13 +630,8 @@ def decode_np(data: bytes) -> dict:
     out, at = {}, 0
     for name, dtype, shape, n in head["tensors"]:
         size = _HANDOFF[dtype]
-        raw = blob[at:at + n]
+        raw = inflate(blob[at:at + n], head["codec"])
         at += n
-        if head["codec"] == "zstd":
-            from compression import zstd
-            raw = zstd.decompress(raw)
-        else:
-            raw = zlib.decompress(raw)
         b = np.ascontiguousarray(np.frombuffer(raw, np.uint8).reshape(size, -1).T).reshape(-1)
         if dtype == "bfloat16":
             a = (b.view("<u2").astype(np.uint32) << 16).view(np.float32)
@@ -703,14 +708,8 @@ def _digest_np(got: dict, data: bytes) -> str:
     at = 0
     for name, dtype, shape, n in head["tensors"]:
         h.update(json.dumps([name, f"torch.{dtype}", list(shape)]).encode())
-        raw = blob[at:at + n]
+        raw = inflate(blob[at:at + n], head["codec"])
         at += n
-        if head["codec"] == "zstd":
-            from compression import zstd
-            raw = zstd.decompress(raw)
-        else:
-            import zlib
-            raw = zlib.decompress(raw)
         size = _HANDOFF[dtype]
         h.update(np.ascontiguousarray(np.frombuffer(raw, np.uint8).reshape(size, -1).T).tobytes())
     return h.hexdigest()

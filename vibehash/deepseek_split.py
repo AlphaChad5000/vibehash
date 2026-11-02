@@ -17,8 +17,9 @@ The units of the work graph `plan` makes:
 
 Hand-offs are exact. The stream stays bf16 between frozen layers, so the records are the model's own; what FP8 at every cut would cost the model isn't measured (scripts/deepseek_stream_stats.py: its
 stand-in chain of real layers is thrown as far by a 0.4% nudge as by FP8). It's compressed losslessly instead: byte
-planes, then zstd, to about 0.68 of its size. A commitment hashes what was decoded, not the compressed bytes, so the
-codec can change without changing a hash.
+planes, then zlib, the protocol's only codec (every Python has it; zstd took it to 0.68 of its size, but the node's
+Python has no zstd). A commitment hashes what was decoded, not the compressed bytes, so the codec can change without
+changing a hash.
 
 There is no preparer: the protocol knows only units, and a big machine simply takes many of them. Anyone who can
 hold a piece's layers can run a unit, replay it to check it, or challenge it; the node only schedules and referees.
@@ -65,34 +66,19 @@ from .deepseek_graph import (  # noqa: F401 - re-exported: the graph and storage
     block_names, Unit, Graph, plan, Line, deadline, Tampered, Missing, Mirrors, LocalStore, PresignedStore, Signer,
     presign, rows_commit_name, unit_commit, check_block, unpack_np, RecordReader)
 
-try:
-    from compression import zstd as _zstd  # Python 3.14's standard library
-except ImportError:
-    try:
-        import zstandard
-
-        class _zstd:  # the zstandard package (pip install zstandard), for older Pythons
-            compress = staticmethod(lambda data, level: zstandard.ZstdCompressor(level=level).compress(data))
-            decompress = staticmethod(lambda data: zstandard.ZstdDecompressor().decompress(data))
-    except ImportError:
-        _zstd = None
-
 FORMAT = "vibehash-deepseek-split/1"
-CODEC = "zstd" if _zstd is not None else "zlib"
+CODEC = "zlib"  # the only one: a node or miner on any Python reads every hand-off
 
 
 # --- hand-offs: one object per (what, chunk), lossless ------------------------------------------------------------------
 
 def _compress(data: bytes) -> bytes:
-    return _zstd.compress(data, 3) if CODEC == "zstd" else zlib.compress(data, 6)
+    return zlib.compress(data, 6)
 
 
 def _decompress(data: bytes, codec: str) -> bytes:
-    if codec == "zstd":
-        if _zstd is None:
-            raise RuntimeError("this hand-off is zstd-compressed: it needs Python 3.14, or `pip install zstandard`")
-        return _zstd.decompress(data)
-    return zlib.decompress(data)
+    from .deepseek_graph import inflate
+    return inflate(data, codec)
 
 
 def encode(tensors: dict[str, torch.Tensor]) -> bytes:

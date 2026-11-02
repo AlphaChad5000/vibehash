@@ -311,6 +311,19 @@ class PresignTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {**env, "VIBEHASH_BUCKET_SECRET": ""}, clear=False):
             self.assertIsNone(bucket_from_env())  # no key yet: the node runs no DeepSeek prep
 
+    def test_zlib_is_the_only_codec(self):
+        """The fourth review's finding 2: a hand-off in another codec, or one that doesn't inflate, is a ValueError the
+        node's checks catch (zstd's import needed Python 3.14; the node runs 3.12)."""
+        import zlib
+
+        from vibehash import deepseek_graph as dsg
+        head = b'{"format":"vibehash-deepseek-split/1","codec":"%s","tensors":[["x","float32",[1],%d]]}\n'
+        body = zlib.compress(b"\0\0\x80\x3f")
+        self.assertEqual(dsg.decode_np(head % (b"zlib", len(body)) + body)["x"].tolist(), [1.0])
+        for bad in (head % (b"zstd", len(body)) + body, head % (b"zlib", 4) + b"junk"):
+            with self.assertRaises(ValueError):
+                dsg.decode_np(bad)
+
 
 @unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
 class StoreTests(unittest.TestCase):
