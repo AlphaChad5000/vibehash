@@ -483,13 +483,108 @@ def op_ds_swiglu(op, x, r, c0, c1):
     return cast(h, _num(op))
 
 
+# --- sparse attention -------------------------------------------------------------------------------------------------
+
+KERNEL_BLOCK = 64  # deepseek.KERNEL_BLOCK: keys the reference's kernel takes at a time
+
+
+def _emax(a: E) -> E:
+    """The max of approximate values: within the largest of their bounds of the max of the exact ones."""
+    if a.v.size == 0:
+        return E(np.array(-np.inf), np.array(0.0))
+    return E(a.v.max(), a.e.max())
+
+
+def attend(qh: np.ndarray, win: np.ndarray, sel: np.ndarray, n_window: int, sink: float, scale_: float, num: str) -> E:
+    """deepseek._attend for one query and one head: its window keys `win` [w, d] (oldest first) and picked keys `sel`
+    [k, d] (the valid ones, in pick order), with the kernel's arithmetic. Scores q·k·scale in float32; each key's
+    probability exp(s - m_key), m_key the running max over the kernel's 64-key blocks up to the key's own (its list
+    position: window keys from 0, picks from n_window); the denominator from those times exp(m_key - m) plus
+    exp(sink - m); the probabilities rounded to the activation dtype before they weight the values; o / denom cast."""
+    c = rf.f32(scale_)
+    keys = np.concatenate([win, sel]) if len(sel) else win
+    slots = np.concatenate([np.arange(len(win)), n_window + np.arange(len(sel))]).astype(np.int64)
+    if len(keys) == 0:  # a query that sees nothing: m = -1e30, o = 0
+        return E(np.zeros(qh.shape[0]))
+    s = rf.scale(rf.contract(E(qh[None]), keys)[0], c)
+    blocks = slots // KERNEL_BLOCK
+    best = [_emax(s[blocks == b]) for b in range(int(blocks.max()) + 1)]
+    run, m_blk = E(np.array(-np.inf), np.array(0.0)), []
+    for b in best:  # cummax, floored at -1e30 as the kernel's running max
+        run = E(np.maximum(run.v, b.v), np.maximum(run.e, b.e)) if np.isfinite(b.v) else run
+        m_blk.append(E(np.maximum(run.v, -1e30), run.e))
+    m = m_blk[-1]
+    m_key = E(np.array([m_blk[b].v for b in blocks]), np.array([m_blk[b].e for b in blocks]))
+    p = rf.exp(rf.sub(s, m_key))
+    rescale = rf.exp(rf.sub(m_key, E(np.full(len(keys), m.v), np.full(len(keys), m.e))))
+    denom = rf.add(rf.esum(rf.mul(p, rescale)[None])[0:1], rf.exp(rf.sub(E(np.array([sink])), E(np.array([m.v]), np.array([m.e])))))
+    pr = rf.mul(cast(p, num), rescale)
+    o = rf.contract(E(pr.v[:len(win)][None], pr.e[:len(win)][None]), win.T)[0]
+    if len(sel):
+        o = rf.add(o, rf.contract(E(pr.v[len(win):][None], pr.e[len(win):][None]), sel.T)[0])
+    return cast(rf.div(o, E(np.full(o.v.shape, denom.v[0]), np.full(o.v.shape, denom.e[0]))), num)
+
+
+def op_ds_attn(op, x, r, c0, c1):
+    """deepseek.sparse_attention for query r, the heads its columns cover: its window (the last `window` tokens up
+    to it) and its picks of the compressed keys (-1: none), with one shared kv head and a sink per head. ins (q
+    [T, heads·hd], kv [T, hd], and with compression comp [n, hd] and picks [T, k]); attrs heads, window, scale, sink,
+    n_window (min(T, window): where the picks' places in the kernel's list start)."""
+    a, num = op.attrs, _num(op)
+    hd = op.ishapes[1][1]
+    win = x.get(op.ins[1], max(0, r - a["window"] + 1), r + 1)
+    sel = np.zeros((0, hd))
+    if len(op.ins) > 2:
+        picks = x.row(op.ins[3], r)
+        valid = [int(p) for p in picks if p >= 0]
+        if len(valid):
+            sel = np.concatenate([x.get(op.ins[2], i, i + 1) for i in valid])
+    sinks = vec(x, a["sink"])
+    parts = []
+    for h, j0, j1 in _segments(c0, c1, hd):
+        qh = x.get(op.ins[0], r, r + 1, h * hd, (h + 1) * hd)[0]
+        parts.append(attend(qh, win, sel, a["n_window"], float(sinks[h]), a["scale"], num)[j0:j1])
+    return rf._cat(*parts)
+
+
+# --- the router ---------------------------------------------------------------------------------------------------------
+
+def op_ds_moe_scores(op, x, r, c0, c1):
+    """MoE.scores after its F.linear: s / gate_temp, then sqrt(softplus(s)) (softplus is s itself beyond 20), or
+    sigmoid; in num.hi. attrs temp, func ("sqrtsoftplus" or "sigmoid")."""
+    a = op.attrs
+    s = E(x.get(op.ins[0], r, r + 1, c0, c1)[0])
+    t = rf.f32(a.get("temp", 1.0))
+    s = rf._r(s.v / t, s.e / t) if t != 1.0 else s
+    if a.get("func", "sqrtsoftplus") == "sigmoid":
+        return sigmoid(s)
+    sp = rf.log(rf.add(E(1.0), rf.exp(s)))
+    big = s.v > 20
+    return rf.sqrt(E(np.where(big, s.v, sp.v), np.where(big, s.e, sp.e)))
+
+
+def op_ds_bias(op, x, r, c0, c1):
+    """scores + bias (the gate's, which steers which experts are chosen): a float32 add."""
+    return rf.add(E(x.get(op.ins[0], r, r + 1, c0, c1)[0]), E(vec(x, op.attrs["bias"])[c0:c1]))
+
+
+def op_ds_gates(op, x, r, c0, c1):
+    """MoE.route's gates: the unbiased scores of the chosen experts, normalised by their sum + 1e-20 when attrs
+    norm, times route_scale; in num.hi. ins (scores [T, E], chosen [T, k])."""
+    a = op.attrs
+    chosen = x.row(op.ins[1], r).astype(np.int64)
+    g = E(np.array([x.get(op.ins[0], r, r + 1, int(c), int(c) + 1)[0, 0] for c in chosen]))
+    if a.get("norm", True) and len(chosen) > 1:
+        g = rf.div(g, rf.add(rf.esum(g[None])[0:1], E(np.array([rf.f32(1e-20)]))))
+    return rf.scale(g, rf.f32(a.get("route_scale", 1.0)))[c0:c1]
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
 EXACT = {"ds_round_fp8", "ds_round_fp4"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
 # (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
 # two bf16 numbers can be refused exactly.
 CAST = {"ds_qlinear", "ds_scale", "ds_rmsnorm", "ds_rope", "ds_hc_pre", "ds_hc_post", "ds_compress", "ds_index_scores",
-        "ds_swiglu", "ds_dense"}
+        "ds_swiglu", "ds_dense", "ds_attn"}
 
 
 def bf16_only(op, said: np.ndarray):

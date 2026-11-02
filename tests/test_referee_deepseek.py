@@ -45,11 +45,12 @@ class ForwardOpTests(unittest.TestCase):
             said = flat[leaf * merkle.LEAF:(leaf + 1) * merkle.LEAF].astype(np.float64)
             ok, why = rf.judge(op, x, leaf, said)
             self.assertTrue(ok, f"{label}: {why}")
-            j = len(said) // 2
+            j = int(np.argmax(np.where(np.isfinite(said), np.abs(said), -1)))  # the largest: the least cancellation
             if np.isfinite(said[j]) and said[j] != 0:
                 t = said.copy()
                 loose = op.attrs.get("num", "ref") == "f32" or op.kind in ("ds_hc_mixes", "ds_hc_split") or op.attrs.get("hi")
-                t[j] *= 1.5 if op.kind in rf.EXACT else 1.001 if loose else 1.03
+                # (attention's output is a weighted sum of values that mostly cancel: its float32 bound is ~0.5%)
+                t[j] *= 1.5 if op.kind in rf.EXACT else 1.03 if not loose else 1.01 if op.kind == "ds_attn" else 1.001
                 tampered += 1
                 caught += not rf.judge(op, x, leaf, t)[0]
         # (a sum with heavy cancellation can hide a 0.1% change in its bound: hc_mixes' 256-term dot products)
@@ -155,3 +156,44 @@ class ForwardOpTests(unittest.TestCase):
             hsw = (gate * (F.silu(g2) * u2)).to(dt)
             self.judge(mk("ds_swiglu", "y", ["g", "u", "gate"], {"limit": L, "num": numname}, hsw.shape, [gg.shape, uu.shape, gate.shape]),
                       {"g": gg, "u": uu, "gate": gate}, hsw, "swiglu")
+
+    def test_attention_and_the_router(self):
+        cfg, state = self.cfg, self.state
+        g = torch.Generator().manual_seed(5)
+        for numname, num in (("ref", ds.Numerics()), ("f32", ds.Numerics(torch.float32, quantize=False))):
+            dt = num.dtype
+            T, H, hd, n, k, W = 150, cfg.n_heads, cfg.head_dim, 40, 3, 70  # several of the kernel's 64-key blocks
+            q = torch.randn(1, T, H, hd, generator=g).to(dt)
+            kv = num.fp8(torch.randn(1, T, hd, generator=g).to(dt))
+            comp = num.fp4(torch.randn(1, n, hd, generator=g).to(dt), 16, True)
+            vis = (torch.arange(1, T + 1) // 2).clamp(max=n)
+            picks = torch.full((1, T, k), -1, dtype=torch.long)
+            for i in range(T):
+                c = sorted(torch.randperm(int(vis[i]), generator=g)[:k].tolist()) if vis[i] else []
+                picks[0, i, :len(c)] = torch.tensor(c, dtype=torch.long)
+            sink = state["layers.1.attn.attn_sink"]
+            for cmp_, pk in ((comp, picks), (None, None)):
+                o = ds.sparse_attention(q, kv, cmp_, pk, sink, hd ** -0.5, W, num)[0].flatten(1)
+                ins = ["q", "kv"] + (["c", "p"] if cmp_ is not None else [])
+                before = {"q": q[0].flatten(1), "kv": kv[0]}
+                ishapes = [before["q"].shape, before["kv"].shape]
+                if cmp_ is not None:
+                    before |= {"c": cmp_[0], "p": pk[0].float()}
+                    ishapes += [cmp_[0].shape, pk[0].shape]
+                attrs = {"heads": H, "window": W, "scale": hd ** -0.5, "sink": "layers.1.attn.attn_sink",
+                         "n_window": min(T, W), "num": numname}
+                self.judge(mk("ds_attn", "o", ins, attrs, o.shape, ishapes), before, o, f"attn {numname}")
+            m = ds.Model(cfg, layers=[1], num=num, embed=False, head=False, engram_table=False)
+            m.load_state_dict({kk: v for kk, v in state.items() if kk.startswith("layers.1.")}, strict=False)
+            moe = m.layers["1"].ffn
+            xx = torch.randn(20, cfg.dim, generator=g).to(dt)
+            lg = F.linear(xx.to(num.hi), moe.gate.weight.to(num.hi))
+            sc = moe.scores(xx)
+            self.judge(mk("ds_moe_scores", "s", ["l"], {"temp": cfg.gate_temp, "func": cfg.score_func}, sc.shape, [lg.shape]),
+                       {"l": lg}, sc, "moe_scores")
+            biased = sc + moe.gate.bias.to(num.hi)
+            self.judge(mk("ds_bias", "b", ["s"], {"bias": "layers.1.ffn.gate.bias"}, biased.shape, [sc.shape]), {"s": sc},
+                       biased, "bias")
+            chosen, gates = moe.route(xx, ds.Choices())
+            self.judge(mk("ds_gates", "g", ["s", "c"], {"norm": cfg.norm_topk_prob, "route_scale": cfg.route_scale},
+                          gates.shape, [sc.shape, chosen.shape]), {"s": sc, "c": chosen.float()}, gates, "gates")
