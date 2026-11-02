@@ -555,9 +555,6 @@ class BoundTests(unittest.TestCase):
         self.assertGreaterEqual(referee.SPREAD_C * referee.MARGIN, 3 * 2.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class EvidenceTests(unittest.TestCase):
     """The second review's finding 4: attention's backward over a long sequence reads every query position of a group's
@@ -641,3 +638,7 @@ class StateCheckTests(unittest.TestCase):
                     Coordinator._check_states(fake, [root])
                 tb.forget()
                 self.assertEqual(tb.roots, {})
+
+
+if __name__ == "__main__":
+    unittest.main()
