@@ -744,6 +744,11 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
   - `/job/<id>` doesn't build the weights of a job that hasn't trained yet:
     it reports their size, and `/job/<id>/model` answers 404 until there's a
     trained model.
+  - `/network`, what vibehash.org's live panel shows (miners lately, every
+    job and how it's going; `netstats.py`), is worked out at most once a block
+    or a minute, however many pages ask. Every `GET` answer is public, so it
+    carries `Access-Control-Allow-Origin: *` and any web page may read it;
+    `PUT` and `POST` answers don't.
   - A dataset's arrays are checked from their headers before loading, and
     one that would unpack to more than 64 times its file size (or 64 MB, if
     larger) is refused. Only the upload that completes a dataset checks it,
