@@ -16,6 +16,9 @@ become permanent clutter on someone's C: drive. So (DEEPSEEK.md §8, "Model file
    everything, or one job's files; `usage` is the disk use the worker's dashboard shows.
 5. No partial download left behind. A download goes to its .part file and resumes from there (deepseek.fetch_file
    does). It's in the index while under way, so `clear`, `job_ended` and `sweep` remove a partial nobody resumes.
+6. Nothing else touched. The store lives in a folder of its own (`dedicated`: <chosen>/vibehash-models, never a
+   drive's root, the home folder or Downloads), deletes only the files its index names, and removes only the
+   folders it made inside its own.
 
 The worker's prompt, `vibehash cache`, the dashboard and setup call this once PR #5's worker merges; the fine-tune
 path can use it the same way. `Store.from_settings` reads the policy from config.json.
@@ -74,6 +77,13 @@ def folder_on(root: Path) -> Path:
     return home / "models" if same else Path(root) / "vibehash-models"
 
 
+def dedicated(folder) -> Path:
+    """The store's own folder for `folder`: itself if it's one (a vibehash-models folder, or Vibe Hash's models
+    folder), else its vibehash-models subfolder."""
+    p = Path(folder).expanduser()
+    return p if p.name == "vibehash-models" or p == settings.home() / "models" else p / "vibehash-models"
+
+
 def default_folder() -> Path:
     """On the drive with the most room."""
     found = drives()
@@ -118,7 +128,7 @@ class Store:
     files: dict = field(default_factory=dict)  # name -> {"size", "jobs", "used", "kind", "what", "partial"}
 
     def __post_init__(self):
-        self.folder = Path(self.folder)
+        self.folder = dedicated(self.folder)
         try:
             self.files = json.loads((self.folder / INDEX).read_text())["files"]
         except (OSError, ValueError, KeyError):
@@ -146,6 +156,8 @@ class Store:
         os.replace(tmp, self.folder / INDEX)
 
     def path(self, name: str) -> Path:
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise ValueError(f"{name!r} isn't a name inside the store")
         return self.folder / name
 
     def _on_disk(self, name: str) -> int:
@@ -168,10 +180,14 @@ class Store:
         return sum(self._taken(n) for n in self.files)
 
     def _delete(self, name: str) -> None:
-        for p in [self.path(name)] + [self.path(name + suffix) for suffix in PARTIALS]:
-            p.unlink(missing_ok=True)
         self.files.pop(name, None)
-        self._tidy(self.path(name).parent)
+        try:
+            paths = [self.path(name)] + [self.path(name + suffix) for suffix in PARTIALS]
+        except ValueError:  # a name outside the store (a damaged index): forgotten, nothing deleted
+            return
+        for p in paths:
+            p.unlink(missing_ok=True)
+        self._tidy(paths[0].parent)
 
     def _tidy(self, parent: Path) -> None:
         """Remove folders left empty, up to the store's own."""
@@ -253,6 +269,7 @@ class Store:
             chosen = folder_on(found[int(answer) - 1][0])
         else:
             chosen = Path(answer).expanduser()
+        chosen = dedicated(chosen)
         if chosen != self.folder:
             if self.files:
                 say(f"The {gb(self.usage())} in {self.folder} is deleted; jobs download their files into {chosen}.")
@@ -329,26 +346,15 @@ class Store:
         return gone
 
     def sweep(self) -> list[str]:
-        """Delete model files no job has used for `idle_days` (unless `keep`), and stray partial downloads: run it
-        when the worker starts and now and then. -> the files deleted."""
+        """Delete model files no job has used for `idle_days` (unless `keep`), and partial downloads nobody resumed
+        (the index names each while it's under way): the worker runs it when it starts. -> the files deleted."""
         cutoff = self.clock() - self.idle_days * 86400
         gone = [n for n, e in self.files.items()
                 if e.get("used", 0) < cutoff and (not self.keep or e.get("partial") or e["kind"] == "temporary")]
         for n in gone:
             self._delete(n)
-        for p in self._partials():  # partial downloads the index doesn't know (from before it, or another tool)
-            rel = p.relative_to(self.folder).as_posix()
-            if rel.rsplit(".", 1)[0] not in self.files:
-                p.unlink(missing_ok=True)
-                self._tidy(p.parent)
-                gone.append(rel)
         self._save()
         return gone
-
-    def _partials(self) -> list[Path]:
-        if not self.folder.exists():
-            return []
-        return [p for p in self.folder.rglob("*") if p.is_file() and p.name.endswith(PARTIALS)]
 
     def clear(self, job: str | None = None) -> int:
         """Remove every file in the store (job=None), partial downloads included, or one job's (files another job
@@ -357,9 +363,6 @@ class Store:
         if job is None:
             for n in list(self.files):
                 self._delete(n)
-            for p in self._partials():
-                p.unlink(missing_ok=True)
-                self._tidy(p.parent)
         else:
             for n, e in list(self.files.items()):
                 if job in e["jobs"]:

@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from . import deepseek_graph as dsg
@@ -28,6 +29,7 @@ class DeepSeekWork:
         self._games: dict = {}
         self._prep_weights: dict = {}
         self.wants: dict[int, dict] = {}  # round -> the accepted objects' digests, as the assignment gave them
+        self._looked = 0.0  # when ended() last asked the node
         self.prep_cheat = None  # tests only: graph unit name -> a tamper (tracer.Executor's) for its run, or None
 
     # --- taking the job ---
@@ -47,6 +49,36 @@ class DeepSeekWork:
             if not ok:
                 return why
         return None
+
+    def sweep(self) -> None:
+        """When the worker starts: model files no job has used for a week, and downloads nobody resumed, go."""
+        try:
+            gone = modelstore.Store.from_settings().sweep()
+        except OSError as e:
+            log.warning("couldn't tidy the model files: %s", e)
+            return
+        if gone:
+            log.info("deleted %d model file(s) no job used for a week", len(gone))
+
+    def ended(self, current: str | None) -> None:
+        """A DeepSeek job this worker took that has ended (its escrow spent): its model files go, unless kept
+        (modelstore's job_ended). The node is asked at most once a minute, while rounds are for another job or none."""
+        if time.time() - self._looked < 60:
+            return
+        self._looked = time.time()
+        for job_id, w in list(self.weights.items()):
+            if job_id == current:
+                continue
+            try:
+                if self.client.node.get(f"/job/{job_id}")["escrow"] > 0:
+                    continue
+            except Exception as e:  # noqa: BLE001 - unreachable, or gone: the week's sweep has it
+                log.debug("job %s: %s", job_id, e)
+                continue
+            if w.store is not None:
+                gone = w.store.job_ended(job_id)
+                log.info("job %s has ended: deleted its %d model file(s)", job_id, len(gone))
+            del self.weights[job_id]
 
     def weights_for(self, job: TrainingJob):
         from .deepseek_worker import Weights

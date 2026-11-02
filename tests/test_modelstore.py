@@ -155,13 +155,30 @@ class PartialTests(Base):
         st = self.store()
         with self.assertRaises(ConnectionError):
             st.acquire(st.plan("job-a", {"a/1": 300}), fetcher({"a/1": 300}, self.log, stop_at=10))
-        stray = st.folder / "older" / "file.bin.part"
-        stray.parent.mkdir(parents=True)
-        stray.write_bytes(b"x")
         self.assertIn("a download under way", st.entries()[0]["why"])
-        self.assertEqual(st.sweep(), ["older/file.bin.part"])  # a partial nothing will resume
-        self.assertEqual(st.clear(), 10)
+        self.clock.t += 8 * 86400
+        self.assertEqual(st.sweep(), ["a/1"])  # a partial nobody resumed for a week
         self.assertEqual([p for p in st.folder.rglob("*") if p.name != ms.INDEX], [])
+
+    def test_only_its_own_files(self):
+        """The fourth review's finding 1: given a drive's root (a folder standing in for one), the store keeps to
+        <root>/vibehash-models, and sweep and clear leave what its index doesn't name, and folders it didn't make."""
+        root = self.tmp / "root"
+        (root / "Downloads").mkdir(parents=True)
+        (root / "Downloads" / "big-video.mp4.part").write_bytes(b"x")
+        st = ms.Store(root, cap=1000, clock=self.clock)
+        self.assertEqual(st.folder, root / "vibehash-models")
+        with self.assertRaises(ConnectionError):
+            st.acquire(st.plan("job-a", {"a/1": 300}), fetcher({"a/1": 300}, self.log, stop_at=10))
+        (st.folder / "theirs.part").write_bytes(b"x")
+        st.files["../victim"] = {"size": 1, "jobs": ["job-a"], "kind": "model", "what": "", "used": 0}
+        (st.folder.parent / "victim").write_bytes(b"keep")
+        self.clock.t += 8 * 86400
+        st.sweep()
+        st.clear()
+        self.assertEqual(sorted(p.relative_to(root).as_posix() for p in root.rglob("*")),
+                         ["Downloads", "Downloads/big-video.mp4.part", "vibehash-models",
+                          "vibehash-models/store.json", "vibehash-models/theirs.part", "victim"])
 
     def test_clear_one_job(self):
         st = self.store()
@@ -200,7 +217,7 @@ class AskTests(Base):
     def test_settings(self):
         settings.save(models={"folder": str(self.tmp / "m"), "cap_gb": 40, "keep": True})
         st = ms.Store.from_settings()
-        self.assertEqual((st.folder, st.cap, st.keep), (self.tmp / "m", 40 * ms.GB, True))
+        self.assertEqual((st.folder, st.cap, st.keep), (self.tmp / "m" / "vibehash-models", 40 * ms.GB, True))
 
     def test_drives(self):
         found = ms.drives()

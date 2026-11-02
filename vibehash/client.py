@@ -482,6 +482,8 @@ class WorkerClient:
             self.secret_commits.setdefault((rnd, s.get("attempt")), s["beacon_commit"])
             for old in [k for k in self.secret_commits if k[0] < rnd - 100]:  # rounds we never sent anything in
                 del self.secret_commits[old]
+        if self.ds.weights:  # a DeepSeek job's model files go when it ends
+            self.ds.ended(s.get("job_id") if rnd is not None else None)
         if rnd is None or key in self.done:
             return
         if st.round != rnd:
@@ -697,6 +699,8 @@ class WorkerClient:
 
     def run(self, stop=None) -> None:
         log.info("worker %s starting on %s (%s)", self.keys.address, self.backend.describe(), hardware.describe())
+        if self.deepseek:
+            self.ds.sweep()
         while stop is None or not stop.is_set():
             try:
                 self.step()

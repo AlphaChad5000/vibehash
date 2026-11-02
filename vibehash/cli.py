@@ -507,7 +507,7 @@ def _setup_models(a) -> None:
             print()
             return ""
     if a.models_dir:
-        store.folder = Path(a.models_dir).expanduser().resolve()
+        store.folder = modelstore.dedicated(Path(a.models_dir).expanduser().resolve())
     elif not saved and sys.stdin.isatty() and not a.yes:
         print("   Big models (like DeepSeek's, ~30 GB) are downloaded only when you take their work, and deleted when the\n"
               "   job ends or after a week without mining it. Where should they go?")
