@@ -65,7 +65,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 `tests/` (`test_core.py`, `test_network.py`, `test_gpu.py`), `docs/guide.html`
-(user-facing guide, published as a claude.ai artifact), `docs/whitepaper.pdf` (the design in eight pages, in the
+(user-facing guide, published as a claude.ai artifact), `docs/whitepaper.pdf` (the design in ten pages, in the
 style of Bitcoin's; printed from `docs/whitepaper.html`, whose first lines say how, and copied to
 vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 `pyproject.toml` (package `vibehash`, console script `vibehash`).
