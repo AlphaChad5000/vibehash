@@ -390,10 +390,11 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
     match: "think-shorter",
     title: "Teaching DeepSeek V4.1 Flash to think shorter",
     blurb: "Long thinking is what makes answers slow. Miners' gaming PCs are training an add-on that teaches DeepSeek V4.1 Flash to reach the right answer in a few short steps. Nobody holds the whole 510 GB model: its bottom 36 layers are prepared once, in pieces anyone can run, and miners train the top 4.",
-    examples: 7473, heldBack: 1319, unit: "problems",
-    sample: { q: "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
-              think: "Natalia sold 48 / 2 = 24 clips in May. Natalia sold 48 + 24 = 72 clips altogether in April and May.",
-              a: "The answer is 72.", source: "A training example from GSM8K (MIT licence)" }
+    // The first job is the pilot: 1,500 GSM8K training problems, scored on 500 held back (docs/datasets/think-shorter.md).
+    examples: 1500, heldBack: 500, unit: "problems",
+    sample: { q: "Twice Angie's age, plus 4, is 20. How old is Angie?",
+              think: "Twice Angie's age is 20-4=16. Angie is 16/2=8.",
+              a: "The answer is 8.", source: "One of the pilot's training problems, from GSM8K (MIT licence)" }
   }];
   function infoFor(j) {
     for (var i = 0; i < FEATURED.length; i++) { if (j.id.indexOf(FEATURED[i].match) >= 0) return FEATURED[i]; }
