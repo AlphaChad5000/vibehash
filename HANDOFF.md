@@ -41,13 +41,14 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `node.py` | HTTP node. JSON for small messages; `/blob/<sha>` and `/dataset/<sha>` for chunked binary transfer (GET status, GET `?offset=`, signed PUT). On a validator chain: `_lead` runs the round when it's our turn and proposes it, `_validate` (apply + replay) decides our vote, `_commit` adopts final blocks, `_sync` catches up from peers, `_ensure_params` / `_fetch_missing_data` pull trained weights and datasets from peers. |
 | `consensus.py` | Tendermint Algorithm 1 (`Engine`: proposals, prevote/precommit, locking, timeouts, round skipping), stake-weighted `proposer_order`, `check_certificate`. Transport-agnostic: node.py feeds it messages and ticks. |
 | `p2p.py` | `Peers`: `--peer` addresses plus validators' on-chain addresses; background POST fan-out with a back-off for unreachable peers. |
-| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only) and `WorkerClient` (worker loop). |
+| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only) and `WorkerClient` (worker loop). The loop notes each round into `record` (a `records.RoundLog` when the command keeps one, else nothing) and writes its line once the round's block is final. |
+| `records.py` | What's kept on disk so a night of mining can be read afterwards (README, "Logs and records"). Workers: `Session` (made by `worker` and `testnet`) attaches `LogFile` to the dashboard feed's loggers (`logs/worker-DATE.log`, 10 MB then `.1`, 14 days kept, control characters written out by `clean`) and gives each client a `RoundLog` (`logs/rounds.jsonl`: a line per round, pay read from the round's block by `settle`: its reward and slash txs and its summary; units accepted are the worker's FLOPs over a unit's). Posters: `history_rows` from `/job` plus each round's block (time, its `fee_release`), budget left worked back from the escrow; `JobHistory` keeps `jobs/JOB/history.csv`/`.jsonl` current for `trainui.JobWatch`; `fetch_history` for `job history`; `write_report` puts the history and a `TRAINING.md` beside a downloaded model. `testnet` logs its nodes to `node.log` too. Tested: `tests/test_records.py`, and end to end in `test_network.CommandLineTests`. |
 | `worker.py` | Training, commit, reveal, verify. Cheat behaviours exist **for tests only**. `blobs=` spills checkpoints to disk. |
 | `storage.py` | SQLite chain and weights; datasets and blobs directories. The chain is re-validated on start-up. |
 | `wire.py` | Signed envelopes (chain id + timestamp), blob-reference openings. |
 | `wallet.py` | scrypt + AES-256-GCM key files. |
 | `hardware.py` | RAM detection, benchmark on the chosen backend. |
-| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`. `--node` / `--wallet` default to what setup saved. |
+| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`, `job history [JOB] [--csv FILE] [--json]` (records.py). `--node` / `--wallet` default to what setup saved. |
 | `tabular.py` | `vibehash train` / `job download` / `predict`: CSV → standardised dataset (80/20 split), and self-contained model `.npz` files (weights, widths, scaling, column and class names; loaded without pickle). `train` keeps a receipt in `~/.vibehash/jobs/<job>/job.json`; `job download` merges it into the model file. Sample data in `vibehash/data/` (package data). |
 | `minerui.py` | Live terminal dashboard for `worker` / `testnet`: animated mine (drill speed follows `WorkerStats.busy`, cart fills with committed units, gold popup on payouts), round/phase bar, earnings, and an event feed that captures the `vibehash.worker` / `vibehash.node` loggers. Alternate screen, ANSI only, Unicode with a pure-ASCII fallback, `NO_COLOR`; off when stdout isn't a TTY or with `--plain`. `tests/test_minerui.py` checks every frame fits 40/66/120-column terminals. The Claude Code tool shell sets `NO_COLOR=1`, so previews from there come out colourless. |
 | `trainui.py` | Live dashboard for job posters: `train` shows it after posting, `job watch [JOB]` brings it back. A forge in the mine: the model is a blade that grows with accuracy, hammered when it's the job's turn; per-round accuracy and loss charts, budget left, an event feed. Polls `/status` every 1.5 s and `/job` on new blocks; `--plain` or a pipe gives log lines. A fine-tune (a job whose spec names a `base`, or `JobWatch(base=...)`) forges its model maker's emblem instead (`emblems.py`): the forge grows to 9 rows, and the emblem takes on its colours from left to right as accuracy climbs. |
@@ -114,6 +115,18 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Unreleased: records of what happened (branch `record-training`).** For a night of mining on home PCs and rented
+pods with nobody watching a terminal: every `vibehash worker` and testnet worker keeps the dashboard feed's events in
+`~/.vibehash/logs/worker-DATE.log` and a JSON line per round in `logs/rounds.jsonl` (what it was given and did, the
+seconds it took, and what the round's block paid it or slashed, and why), says where at start and sums the session up
+at the end; a testnet logs its nodes to `node.log` in its folder. A job's rounds go to `~/.vibehash/jobs/JOB/history.csv`
+as `train` and `job watch` follow it, `job history` fetches them from the node for any job, and `job download` puts
+them and a `TRAINING.md` beside the model. Workers only ask the node for their account once a round beyond what they
+already asked (the receipts' audit fetches the round's block). The DeepSeek prep units' own stats (seconds, tokens a
+second, peak GPU memory) go into the round's line; fine-tune and DeepSeek training units have no such stats yet, so
+their lines have the seconds alone. `job history fruit-demo` was tried read-only on the public node (7,178 rounds, 37
+that trained, the budget worked back to its 5,000 VIBE exactly); a worker's records have only run on local networks.
 
 **Unreleased: a prep round ends its compute phase once every unit is committed.** The phase is a unit's deadline,
 never under 10 minutes (deepseek_graph.deadline), and it used to run out in full, so a round took about 660 s however

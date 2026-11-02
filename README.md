@@ -113,8 +113,9 @@ costs before posting. In a terminal it then follows the job live until the
 budget is spent: a forge where the model is a blade that grows with its
 accuracy, accuracy and loss charted round by round, the units accepted, the
 budget left, and whether it's the job's turn to train. Ctrl+C stops watching,
-not training; `job watch` picks it up again and `job status` prints a
-summary. `job download` saves the model as one file (`my-data-model.npz`),
+not training; `job watch` picks it up again, `job status` prints a
+summary and `job history` the rounds one by one. `job download` saves the
+model as one file (`my-data-model.npz`, with how it was trained beside it),
 and `predict` labels new rows (`--out predictions.csv` saves them all).
 `python -m vibehash example` writes a sample, `fruit.csv`, to try first. On
 your own testnet, pay with its requester wallet by adding
@@ -197,6 +198,47 @@ with ROCm on Linux), checks which PyTorch builds are currently published for
 your driver and Python version, installs the newest one that fits, and
 self-tests it. `vibehash devices` shows what's usable. Workers use the first
 GPU they find; `--device cpu|cuda|xpu|mps` overrides it.
+
+## Logs and records
+
+What a worker or a job poster does is also kept in files, so a night of
+mining can be looked at afterwards by someone who wasn't watching. They're in
+`~/.vibehash` (or `$VIBEHASH_HOME`), and they're written whether the dashboard
+is on or not: with `--plain`, piped, in tmux or over SSH.
+
+- `logs/worker-DATE.log` (DATE is the day the worker started): what the
+  mining dashboard's feed shows, one line each with the time. A file stops at
+  10 MB and starts again, keeping the one before as `worker-DATE.1.log`, and
+  only the last 14 days are kept.
+- `logs/rounds.jsonl`: a line for each round a worker took part in. It names
+  the computer (`host`), the wallet (`worker`), the node and chain, the round
+  and job and what kind of job it was. Then what happened: units given,
+  trained, committed, revealed and accepted, and why not when the node said;
+  checks done; seconds spent training and uploading; what the round's block
+  paid (`earned_vibe`, `paid`) or took (`slashed`); and the balance and stake
+  after it. `outcome` says it in words. Each line is one JSON object, so a
+  text editor shows it, and files from several computers can be put together.
+- `vibehash worker` prints where these go when it starts, and a summary when
+  you stop it: rounds, units accepted, VIBE earned. `vibehash testnet` also
+  keeps its node's log in `node.log` in the testnet's folder.
+- `jobs/JOB/history.csv` (and `history.jsonl`): a job's rounds one by one:
+  round (its block's height), time, units accepted, loss and accuracy on the
+  held-back data, VIBE paid and budget left. `train` and `job watch` keep it up
+  to date while they follow the job. `job history` fetches it from the node for
+  any job, including one posted from another computer, prints the latest
+  rounds and saves the rest; `--csv FILE` writes it where you want it, and
+  `--json` prints all of it for scripts:
+
+```bash
+python -m vibehash job history fruit-demo --csv fruit-demo.csv
+```
+
+`job download` writes the same history beside the model it saves
+(`my-data-model-training-history.csv`, or `training-history.csv` inside a
+fine-tune's adapter folder), with a short `TRAINING.md` saying how it was
+trained: the base model, the data, the rounds, accuracy or loss from the first
+round to the last, the VIBE spent, the node and chain, and the dates. Every
+fact in it comes from the node or from the receipt `train` kept.
 
 ## Publishing a release
 
@@ -432,6 +474,7 @@ SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 | `vibehash/ratelimit.py` | Per-client rate limits, connection caps and timeouts for the node's server |
 | `vibehash/tls.py` | HTTPS: server contexts, self-signed certificates, certificate pinning for clients |
 | `vibehash/client.py` | HTTP client and the worker loop, with live `WorkerStats` |
+| `vibehash/records.py` | What's kept on disk: workers' event logs and a line per round, a job's history, the page beside a downloaded model |
 | `vibehash/minerui.py` | The terminal mining dashboard (plain ANSI, ASCII fallback) |
 | `vibehash/trainui.py` | The terminal training dashboard: a job followed live from the node, politely, with a log-line mode |
 | `vibehash/emblems.py` | Pixel-art emblems of the model makers, which the training dashboard forges instead of a blade for a fine-tune (`scripts/preview_forge.py NAME` plays one) |
