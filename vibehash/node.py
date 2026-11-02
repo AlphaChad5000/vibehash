@@ -39,13 +39,13 @@ import logging
 import ssl
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
 from . import economics as econ
-from . import receipts
+from . import netstats, receipts
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
@@ -136,6 +136,8 @@ class Node:
         self.phase_ends = 0.0
         self._model_lock = threading.Lock()
         self._model_cache: tuple = (None, b"", "")
+        self._network_lock = threading.Lock()
+        self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self.stopping = threading.Event()
         self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
         self.threads: list[threading.Thread] = []
@@ -622,6 +624,36 @@ class Node:
                 self._model_cache = ((job_id, height), data, hashlib.sha256(data).hexdigest())
             return height, self._model_cache[1], self._model_cache[2]
 
+    def network(self) -> dict:
+        """The website's live panel: miners lately, every job and how it's going (netstats.py). Worked out at most once
+        a block, or a minute, whichever comes first, however many pages ask."""
+        tip, now = self.chain.tip, time.time()
+        with self._network_lock:
+            if self._network_cache[0] != tip.hash or now - self._network_cache[1] > 60:
+                self._network_cache = (tip.hash, now, self._network(tip, now))
+            return self._network_cache[2]
+
+    def _network(self, tip: Block, now: float) -> dict:
+        s, blocks = self.chain.state, self.chain.blocks[:tip.height + 1]
+        recent = []  # the last day's blocks, and at least 50 to time them by
+        for b in reversed(blocks):
+            if now - b.timestamp > netstats.DAY_S and len(recent) >= 50:
+                break
+            recent.append({"height": b.height, "timestamp": b.timestamp, "summary": asdict(b.summary) if b.summary else None})
+        recent.reverse()
+        with self.coord.lock:
+            r = self.coord.r
+            current = r.job_id if r else None
+            rnd = {"no": r.round_no if r else None, "phase": self.coord.phase.value, "job_id": current}
+        jobs = [netstats.job_summary(j, json.loads(spec), s.escrow.get(j, 0), self.store.job_rounds(j), current,
+                                     lambda h: blocks[h].timestamp if 0 <= h < len(blocks) else None)
+                for j, spec in list(s.jobs.items())]
+        order = {"training": 0, "open": 1, "finished": 2}
+        jobs.sort(key=lambda j: (order[j["status"]], -j["escrow"], j["id"]))
+        return {"chain_id": self.chain.chain_id, "height": tip.height, "time": tip.timestamp, "now": now,
+                "subsidy": s.subsidy(tip.height + 1), "validators": len(s.validator_set()), "round": rnd,
+                "miners": netstats.summarize(recent, now), "jobs": jobs}
+
     def job_model(self, job_id: str, offset: int) -> bytes:
         if job_id not in self.chain.state.jobs:
             raise KeyError(job_id)
@@ -791,6 +823,8 @@ def _handler(node: Node):
         def _send(self, code: int, payload, content_type="application/json"):
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(code)
+            if self.command == "GET":  # everything a GET answers is public: any web page may read it
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -866,6 +900,8 @@ def _handler(node: Node):
                     return node.status()
                 if parts == ["genesis"]:
                     return node.genesis
+                if parts == ["network"]:
+                    return node.network()
                 if parts == ["blocks"]:
                     lo = _number(q.get("from", ["0"])[0], "from")
                     hi = min(_number(q.get("to", [str(lo + 99)])[0], "to"), lo + 99, node.chain.tip.height)

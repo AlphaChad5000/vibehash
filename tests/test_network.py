@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -403,6 +405,22 @@ class LiveNetworkTest(unittest.TestCase):
         self.assertLess(st.stake(workers[3].address), 10 * VIBE, "cheater wasn't slashed")
         self.assertEqual(st.balance(workers[3].address), 0)
         self.assertLess(st.escrow["e2e-job"], job.budget)
+
+        # The website's live panel: who mined lately and how the job is doing, readable from any web page.
+        with urllib.request.urlopen(node.url + "/network", timeout=10) as resp:
+            self.assertEqual(resp.headers["Access-Control-Allow-Origin"], "*")
+            net = json.loads(resp.read())
+        self.assertGreaterEqual(net["miners"]["online"], 3)
+        self.assertEqual(net["height"], node.chain.tip.height)
+        j = next(j for j in net["jobs"] if j["id"] == "e2e-job")
+        self.assertGreaterEqual(j["rounds_trained"], 1)
+        self.assertEqual(j["metric"], "accuracy")
+        self.assertTrue(j["history"])
+        post = urllib.request.Request(node.url + "/tx", data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as bad:  # a malformed tx; what matters is its headers
+            urllib.request.urlopen(post, timeout=10)
+        with bad.exception as e:
+            self.assertIsNone(e.headers["Access-Control-Allow-Origin"])  # only GETs are open to other sites
 
         # An outside auditor downloads every block, re-validates from genesis, and replays every round from its
         # record: the slashed cheater, the paid workers and everything else must follow from the signed messages.
