@@ -1114,7 +1114,8 @@ def cmd_chain_verify(a):
                     # The round's checkpoints are with the validator that led it.
                     source = NodeClient(leader) if leader and leader.rstrip("/") != node.url else node
                     kept = _Downloaded(source, Path(scratch.name)) if window and block.height >= first_kept else None
-                    found = replay_block(chain, block, record_of(block.height), kept, recheck_stats if kept else None)
+                    found = replay_block(chain, block, record_of(block.height), kept, recheck_stats if kept else None,
+                                         datasets=_Downloaded(source, Path(scratch.name)))  # (disputes' referee)
                     problems += [f"block {block.height}: {p}" for p in found]
                     replayed += 1
                     rechecked_rounds += kept is not None

@@ -316,6 +316,32 @@ The node checks hashes, Merkle proofs and Adam's arithmetic bound, referees disp
 for Qwen3-4B). It needs no PyTorch, and of the weights only what a disputed op reads. A rechecking `chain verify`
 needs neither: the record keeps the weights its referee used.
 
+**Proven with disputes**, on a local network whose node ran in the venv with no PyTorch, with an empty weight cache
+so its referee fetched what it needed from Hugging Face by byte range.
+- **The setup:** seven staked workers shared the 4070 SUPER: three honest; worker-4 rejecting everything it checks;
+  worker-5 scaling one op's output (the attention's value gradient in layer 1's backward, one sequence of one step of
+  each segment) by 1.25 and defending that training; worker-6 never answering; worker-7 never moving in a dispute it
+  starts. Qwen3-0.6B, the same chats at 192 tokens, 6 units a round.
+- **Round 3 (first attempt):** four disputes, all decided right in three minutes. Worker-5 lost both it defended,
+  each on its tampered op; worker-4 lost both its own to honest workers. The node then refused its own block: a plain
+  replay, which validators vote by, didn't have the job's dataset that the referee needs. That's fixed (the node
+  passes its store), and `test_disputes_catch_a_tampered_op_and_false_accusations` now replays as a validator does.
+  The restart lost that attempt.
+- **Round 4:** two disputes, settled in two and a half minutes:
+  - **worker-4 against worker-5** (worker-4's blanket rejection happened to be right): won by the challenger after 9
+    moves: segment 0 → step 2 → sequence 1 → layer 1's backward → op 38 → tile 48 → evidence. The referee: `attn_dv →
+    b.dv`, said −1.12e-4, exact −8.97e-5, allowed ±3.7e-9, **6,040 times outside**. Worker-5 slashed, worker-4 its
+    catcher.
+  - **worker-4 against worker-2:** won by worker-2 after 7 moves (worker-4, finding nothing, picked the first child
+    each time down to the embedding). Worker-4 slashed for a false accusation, burned.
+  - Worker-6 recorded as missing its checks. Four units accepted and paid; worker-4 (slashed) went unpaid.
+- **The audit:** `chain verify` in the PyTorch-free venv replayed every round, round 4's disputes move by move with
+  the referee re-run from the record, and redid 12 weight-based checks: valid, and PyTorch never loaded.
+- **Not shown on the real model:** worker-7 didn't check worker-5's claim in round 4, so its silence as a challenger
+  is shown only in tests (`test_silent_parties_lose`). The run stopped after round 4, so there's no new adapter to
+  measure in PEFT. Training now runs op by op, and its gradients match the autograd training the jury runs below
+  measured to ~1e-6.
+
 **Proven with juries** (since replaced by disputes) on a local network whose node ran in a Python with no PyTorch
 installed:
 

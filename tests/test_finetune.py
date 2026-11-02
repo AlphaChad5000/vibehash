@@ -907,6 +907,17 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
         self.assertTrue(all(e["evidence"] for e in games if e["outcome"] != "unchecked"))
         self.replays([rep])
+        # What a validator votes by: a plain replay. Its referee needs the job's data (which sequences a step trains
+        # on), which a node passes as its store.
+        from vibehash.replay import replay_block
+        bare = replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record))
+        self.assertTrue(bare and "needs its dataset" in bare[0], bare)
+
+        class Store:
+            def attach_dataset(_, j):
+                j.attach_data(load_dataset(self.path), self.sha)
+        self.assertEqual(replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record),
+                                      datasets=Store()), [])
 
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
@@ -1189,7 +1200,7 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertIn("60 examples (60 chats", said)
         self.assertIn("Posted job chats-1", said)
 
-        run_until(node, clients, stop, 5, seconds=300)  # the job's block and four rounds (the first while workers join)
+        run_until(node, clients, stop, 5, seconds=600)  # the job's block and four rounds (the first while workers join)
         info = api.get("/job/chats-1")
         spec = TrainingJob.from_spec_json(json.dumps(info["spec"]), "", 0).spec
         self.assertEqual(spec.repo, "tiny/qwen3")

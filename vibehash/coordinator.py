@@ -340,6 +340,7 @@ class Coordinator:
         # party has for each move.
         self.trace_blobs = None
         self.weight_source = None
+        self.datasets = None  # a replay's: where a fine-tune's data comes from (.attach(job) or .attach_dataset(job))
         self.move_s = 60.0
         self._programs: dict = {}
         self.disputes: list[str] = []  # recorded results a recheck contradicted
@@ -1277,7 +1278,7 @@ class Coordinator:
 
         key = (job.job_id, uid)
         if key not in self._programs:
-            if job.data is None:
+            if getattr(job, "_data", None) is None:
                 self._attach(job)
             self._programs[key] = Program.of(job, self.r.units[uid].seed)
         return self._programs[key]
@@ -1285,9 +1286,11 @@ class Coordinator:
     def _attach(self, job: TrainingJob) -> None:
         """A replay needs a fine-tune's data to referee its disputes (which sequences a step trains on, and how long
         they are); a plain replay never needed it otherwise."""
-        for src in (self.recheck, self.store):
+        for src in (self.recheck, self.datasets, self.store):
+            if src is None:
+                continue
             try:
-                (src.attach if src is self.recheck else src.attach_dataset)(job)
+                (src.attach if hasattr(src, "attach") else src.attach_dataset)(job)
                 return
             except Exception:  # noqa: BLE001 - try the next place
                 continue

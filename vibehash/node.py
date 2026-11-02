@@ -385,7 +385,8 @@ class Node:
                 apply_block(self.chain.state, block, self.chain.chain_id, tip)
                 if block.summary is not None:
                     record = value.get("record")
-                    problems = ["no round record"] if not isinstance(record, dict) else replay_block(self.chain, block, record)
+                    problems = (["no round record"] if not isinstance(record, dict)
+                                else replay_block(self.chain, block, record, datasets=self.store))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -481,7 +482,7 @@ class Node:
                 problem = check_certificate(d.get("certificate"), block.height, block.hash.hex(),
                                             self.chain.state.validator_set(), self.chain.chain_id)
             if problem is None and record is not None:
-                problem = "; ".join(replay_block(self.chain, block, record)) or None
+                problem = "; ".join(replay_block(self.chain, block, record, datasets=self.store)) or None
         if problem:
             log.error("refusing block %d from %s: %s", block.height, peer.url, problem)
             return False
