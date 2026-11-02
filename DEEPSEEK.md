@@ -985,24 +985,35 @@ merge). [x] done, [ ] to do.
   - [x] Trainers and scorers read records from the bucket, each checked against
     the pinned root (`deepseek_split.read_block`).
 - Units and the node:
-  - [ ] The DeepSeek job kind in the spec checks: prep, then training.
+  - [x] The DeepSeek job kind in the spec checks (`deepseek_job.DeepSeekSpec`, a `LoraSpec`, so its training
+    rounds are a fine-tune's; `tasks.py` parses and validates it). A node without it refuses the spec.
+  - [x] The node needs no PyTorch for it: `deepseek_config.py` and `deepseek_graph.py`.
   - [ ] Prep units as claims in the work graph: presigned links for each
     unit's own objects, deadlines, challenge windows, `Line.summary` in the job
     summary.
-  - [ ] The DeepSeek training unit kind: records shards, `train_step_streamed`
-    with mapped experts, `Meter`'s stats, held-back loss into
-    `store.job_rounds`.
-  - [ ] The judge (PR #5's bisection game, op table, record version 4) merged
-    in, and the referee's DeepSeek ops.
+  - [x] The DeepSeek training unit (`deepseek_unit.py`): records read from the
+    bucket and checked, `train_segment` as a fine-tune's (replays to the bit),
+    the scorers' held-back loss. `model.train_segment` and `TrainingJob.evaluate`
+    dispatch to it.
+  - [ ] Its rounds after the prep: the pinned root, records shards per miner,
+    `Meter`'s stats, held-back loss into `store.job_rounds`.
+  - [x] The judge (PR #5's bisection game, op table, record version 4) merged
+    in (2026-11-01).
+  - [ ] The referee's DeepSeek ops, and disputes of prep units and DeepSeek
+    training units through the judge.
 - The worker:
   - [x] `modelstore` (below), memory-mapped experts (16 GB of RAM).
-  - [ ] The worker asks before the ~30 GB download, with an unattended yes,
-    through `modelstore`. `vibehash cache` and `vibehash cache clear` come in,
-    as do disk use on the dashboard and the location question in setup.
-  - [ ] It says clearly when a PC can't take DeepSeek work (no NVIDIA GPU with
-    8 GB, under 16 GB of RAM, or the files don't fit), and keeps earning on
-    other jobs.
-  - [ ] The menu item.
+  - [x] Setup's step 4 asks where big models go and how much space they may
+    use (once; flags set it). `vibehash cache` shows them; `cache clear [JOB]`
+    removes them.
+  - [x] Running and checking prep units (`deepseek_worker.py`), the model files
+    fetched through `modelstore` (asked first, within the cap).
+  - [x] What to tell a PC that can't take DeepSeek work (`can_take`: no NVIDIA
+    GPU with 6 GB for the prep or 8 for training, under 16 GB of RAM, or the files
+    don't fit), and that it keeps earning on other jobs.
+  - [ ] The worker's steps for DeepSeek units in `client.py`, the download
+    prompt and its unattended flag, and disk use on the dashboard.
+  - [ ] The menu item (main's terminal menu, `menu.py`).
 - Storage:
   - [x] Multipart, resumable, presigned (`PresignedStore`, `Signer`), tested
     against a local fake S3.
