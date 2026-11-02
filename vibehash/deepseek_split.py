@@ -19,12 +19,21 @@ stand-in chain of real layers is thrown as far by a 0.4% nudge as by FP8). It's 
 planes, then zstd, to about 0.68 of its size. A commitment hashes what was decoded, not the compressed bytes, so the
 codec can change without changing a hash.
 
-Storage is a Store (put, get, has, delete). PresignedStore uses URLs the node signs (`presign`: S3's query-string
-signature, which DigitalOcean Spaces takes), so miners need no storage account of their own; LocalStore is a folder.
-`Line` is the node's side: which units can be claimed, optimistic consumption of outputs not yet past their
-challenge window, rollback when a challenge succeeds, and which objects can be deleted.
+There is no preparer: the protocol knows only units, and a big machine simply takes many of them. Anyone who can
+hold a piece's layers can run a unit, replay it to check it, or challenge it; the node only schedules and referees.
 
-Wiring into the node waits for PR #5's work units; run_local runs a whole plan on one machine (tests, dev).
+Storage is a Store (put, get, has, delete), and nothing about a host is trusted. A reader checks every object
+against the digest its writer committed to (`want`, from the node), so a host that alters one is caught
+(Tampered). Mirrors reads from the first of several hosts with the committed copy: the bucket, the writer's own
+storage, peers. So a host can only withhold, and a withheld object can be made again by anyone holding its piece,
+from its inputs, to the bit (Line.redo). v1's host is a bucket the operator pays for: PresignedStore uses URLs the
+node signs (`presign`: S3's query-string signature, which DigitalOcean Spaces takes), so miners need no storage
+account of their own. LocalStore is a folder. `Line` is the node's side: which units can be claimed, optimistic
+consumption of outputs not yet past their challenge window, rollback when a challenge succeeds, redoing a unit
+whose output went missing, and which objects can be deleted.
+
+Wiring into the node waits for PR #5's work units. run_local runs a whole plan on one machine, in order: a dev and
+test tool, not a role.
 """
 from __future__ import annotations
 
@@ -243,6 +252,12 @@ class Line:
                 gone.append(i)
         return gone
 
+    def redo(self, name: str) -> None:
+        """What the unit wrote went missing (withheld, or lost) before every reader had it: it runs again. Units are
+        deterministic, so it writes the same objects to the bit, and nothing downstream changes. If its own inputs
+        are gone too, their writers are redone first, back to the token ids and the public weights if need be."""
+        self.state[name] = "pending"
+
     def overturn(self, name: str) -> list[str]:
         """A challenge against the unit succeeded: it and everything downstream go back to pending. -> them."""
         back = [name] + self.graph.downstream(name)
@@ -306,6 +321,40 @@ def digest(tensors: dict[str, torch.Tensor]) -> str:
 
 
 # --- storage -----------------------------------------------------------------------------------------------------------
+
+class Tampered(Exception):
+    """An object isn't what its writer committed to: every host that had it altered it."""
+
+
+class Missing(LookupError):
+    """No host has an object: the node redoes the unit that wrote it (Line.redo)."""
+
+
+class Mirrors:
+    """Several hosts for the same objects, tried in order: the bucket, the writer's own storage, peers. A unit
+    writes to the first. Reading (`_get`) takes the first copy that matches its committed digest, skipping hosts
+    that don't have it or altered it."""
+
+    def __init__(self, *stores):
+        self.stores = stores
+
+    def put(self, name: str, data: bytes) -> None:
+        self.stores[0].put(name, data)
+
+    def get(self, name: str) -> bytes:
+        for s in self.stores:
+            try:
+                return s.get(name)
+            except OSError:
+                continue
+        raise Missing(name)
+
+    def has(self, name: str) -> bool:
+        return any(s.has(name) for s in self.stores)
+
+    def delete(self, name: str) -> None:
+        self.stores[0].delete(name)
+
 
 class LocalStore:
     """A folder standing in for the bucket (tests, one machine)."""
@@ -393,10 +442,24 @@ def presign(method: str, host: str, key: str, region: str, access_key: str, secr
 
 # --- running units -------------------------------------------------------------------------------------------------------
 
-def _get(store, name: str, digests: dict) -> dict[str, torch.Tensor]:
-    got = decode(store.get(name))
-    digests[name] = digest(got)
-    return got
+def _get(store, name: str, digests: dict, want: dict | None = None) -> dict[str, torch.Tensor]:
+    """An object's tensors from the first host whose copy matches the digest its writer committed to (want[name];
+    none: any copy)."""
+    altered = False
+    for host in (store.stores if isinstance(store, Mirrors) else (store,)):
+        try:
+            got = decode(host.get(name))
+        except OSError:  # this host hasn't got it (a 404 is an OSError too)
+            continue
+        except ValueError:  # not even an object
+            altered = True
+            continue
+        d = digest(got)
+        if want is None or name not in want or d == want[name]:
+            digests[name] = d
+            return got
+        altered = True
+    raise Tampered(name) if altered else Missing(name)
 
 
 def _put(store, name: str, tensors: dict, digests: dict) -> None:
@@ -431,9 +494,11 @@ def run_rows(source, store, seqs, chunks, cut: top.Cut, layer: int, r: int, toke
 
 def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=None, work: Path | None = None,
               device="cpu", whole_layer_gb: float = 14.0, fp8: bool = False, ranges: int = 15,
-              align: int = ROWS_PER_PIECE) -> dict:
-    """A layers unit (piece [a, b) over chunk c, as `plan` made it), reading its inputs from `store` and writing its
-    outputs there, the arithmetic deepseek_prep's (run_layer), to the bit. -> its commitment, also stored."""
+              align: int = ROWS_PER_PIECE, want: dict | None = None) -> dict:
+    """A layers unit (piece [a, b) over chunk c, as `plan` made it), reading its inputs from `store` (a host, or
+    Mirrors of several) and writing its outputs there, the arithmetic deepseek_prep's (run_layer), to the bit. want:
+    {object: digest} from its inputs' writers' commitments, which the node holds; an input that doesn't match is
+    Tampered. -> its commitment, also stored."""
     a, b, c = unit.a, unit.b, unit.chunk
     cfg, num, members = cut.cfg, ds.Numerics(), chunks[c]
     need, inputs, outputs = needs(cut, a, b), {}, {}
@@ -447,12 +512,12 @@ def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=N
             pre[..., 0] = 1
             states.append((x.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1), pre, Side(), Choices()))
     else:
-        got = _get(store, stream_name(c, a), inputs)
+        got = _get(store, stream_name(c, a), inputs, want)
         states = [(got[f"{j}.x"], got[f"{j}.pre"], Side(), Choices()) for j in range(len(members))]
         for kind, src in need.items():
             if kind == "engram":
                 continue
-            got = _get(store, side_name(c, kind, src), inputs)
+            got = _get(store, side_name(c, kind, src), inputs, want)
             for j, (_, _, side, choices) in enumerate(states):
                 t = got.get(str(j))  # absent: the sequence had none (candidate blocks of a short one)
                 if kind == "candidates":
@@ -461,7 +526,8 @@ def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=N
                     setattr(side, kind, t)
     slices = {}
     for layer in need.get("engram", []):
-        parts = [_get(store, rows_name(c, layer, r), inputs) for r in range(len(row_ranges(cfg, layer, ranges, align)))]
+        parts = [_get(store, rows_name(c, layer, r), inputs, want)
+                 for r in range(len(row_ranges(cfg, layer, ranges, align)))]
         slices[layer] = prep.Slice(*(torch.cat([p[k] for p in parts]).numpy() for k in ("ids", "weight", "scale")))
     hashes = [[] for _ in members]
     for layer in range(a, b):
@@ -516,16 +582,19 @@ def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=N
 
 def run_local(source, store, seqs, chunks, cut: top.Cut, bounds, token_map=None, work: Path | None = None,
               device="cpu", fp8: bool = False, ranges: int = 15, align: int = ROWS_PER_PIECE) -> dict:
-    """Every unit of a plan, in order, on this machine; then the manifest, as deepseek_prep.run's. -> it."""
+    """Every unit of a plan, in order, on this machine, each checking its inputs against their writers'
+    commitments; then the manifest, as deepseek_prep.run's. -> it. A dev and test tool: on the network, a machine
+    that can take every unit takes them as units like anyone else's."""
     graph = plan(cut, chunks, bounds, ranges, align)
     work = Path(work) if work else ds.settings.home() / "split"
-    commits = {}
+    commits, committed = {}, {}
     for u in graph.order():
         if u.kind == "rows":
             commits[u.name] = run_rows(source, store, seqs, chunks, cut, u.a, u.b, token_map, work, ranges, align)
         else:
             commits[u.name] = run_piece(source, store, seqs, chunks, cut, u, token_map, work, device, fp8=fp8,
-                                        ranges=ranges, align=align)
+                                        ranges=ranges, align=align, want=committed)
+        committed.update(commits[u.name]["outputs"])
     return manifest(cut, seqs, chunks, [commits[u.name] for u in graph.order()
                                         if u.kind == "layers" and u.b == cut.first], fp8)
 

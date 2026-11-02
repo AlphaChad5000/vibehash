@@ -5,7 +5,8 @@
 - CodecTests: hand-offs decode to exactly what was encoded, and a commitment doesn't depend on the compression.
 - PresignTests: the S3 signature is AWS's own worked example's.
 - SplitTests (small config, CPU): a prep split into pieces of 1 and 2 layers, the engram table in several row
-  ranges, writes exactly deepseek_prep's records and Merkle root, whatever order its units run in.
+  ranges, writes exactly deepseek_prep's records and Merkle root, whatever order its units run in. No host needs
+  trusting: an altered hand-off is caught and another host's copy used, and a withheld one is made again.
 """
 import datetime
 import json
@@ -207,6 +208,41 @@ class SplitTests(unittest.TestCase):
         self.assert_same(m, store)
         self.assertFalse(store.has(split.stream_name(0, 1)))  # the frontier only: read by everyone, then deleted
         self.assertTrue(store.has(split.block_names(0)[0]))  # the records stay
+
+    def test_hosts_need_no_trust(self):
+        """A host that alters a hand-off is caught, and another host's copy is used instead; a host that withholds
+        one costs only a rerun of the unit that wrote it, which anyone holding its layers can do, to the bit."""
+        bounds = split.pieces(4, 2)
+        _, bucket = self.split("trust", bounds)
+        graph = split.plan(self.cut, self.chunks, bounds, 3, align=1)
+        src, work = prep.LocalSource(self.state), self.tmp / "trust" / "work"
+        made = json.loads(bucket.get(split.commit_name(0, 0)))["outputs"]
+        name, records = split.stream_name(0, 2), bucket.get(split.block_names(0)[0])
+        own = split.LocalStore(self.tmp / "trust" / "own")  # the writer's own copy
+        own.put(name, bucket.get(name))
+        bad = split.decode(bucket.get(name))
+        bad["0.x"] = bad["0.x"].clone()
+        bad["0.x"].view(-1)[0] += 1
+        bucket.put(name, split.encode(bad))
+
+        def last(store):
+            return split.run_piece(src, store, self.seqs, self.chunks, self.cut, graph.units["layers-02-04-c00000"],
+                                   self.tmap, work, ranges=3, align=1, want=made)
+        with self.assertRaises(split.Tampered):
+            last(bucket)
+        last(split.Mirrors(bucket, own))  # the altered copy skipped
+        self.assertEqual(bucket.get(split.block_names(0)[0]), records)
+        bucket.delete(name)
+        with self.assertRaises(split.Missing):  # withheld everywhere
+            last(bucket)
+        line = split.Line(graph)
+        line.redo("layers-00-02-c00000")
+        self.assertEqual(line.state["layers-00-02-c00000"], "pending")
+        split.run_piece(src, bucket, self.seqs, self.chunks, self.cut, graph.units["layers-00-02-c00000"], self.tmap,
+                        work, ranges=3, align=1)  # rerun by anyone holding layers 0-1
+        self.assertEqual(split.digest(split.decode(bucket.get(name))), made[name])
+        last(bucket)
+        self.assertEqual(bucket.get(split.block_names(0)[0]), records)
 
     def test_commitment_chain(self):
         _, store = self.split("chain", split.pieces(4, 1))

@@ -351,22 +351,22 @@ table); other GPU vendors; the tilelang kernels themselves; decoding. And
 
 **Status (2026-11-01): designed and prototyped on one PC; the speed and quality
 runs wait for the PC to be free.** Code in `vibehash/deepseek_top.py`, tests in
-`tests/test_deepseek_top.py`. The prep is split into small units that miners
-run (`vibehash/deepseek_split.py`, "The split prep" below), by the owner's
-decision; the one-PC prep stays as the fallback. Numbers marked *estimate*
-aren't measured yet.
+`tests/test_deepseek_top.py`. The prep is mining work: small units that anyone
+holding their layers can run, check or challenge (`vibehash/deepseek_split.py`,
+"The split prep" below). There is no preparer role. The one-PC prep is a dev
+and test tool. Numbers marked *estimate* aren't measured yet.
 
 **Why this shape.** Miners won't give up 350 GB of SSD, so each should need
 about a game install's worth. And teams passing activations live (§2–§3) are
 network-bound by 20–200×. So the first project freezes the bottom `40 − K`
 layers (K = 4 by default, chosen per job) and trains LoRA only on the top K.
-The frozen part's output for the job's text never changes. So one machine with
-the whole model, the preparer, computes what crosses the cut once per dataset,
-and publishes it as the job's data with a Merkle root. Miners download a shard
-of it plus the top K layers. Then they train like PR #5's fine-tune units:
-alone, with no traffic between miners but checkpoints. The prep itself is
-mining work too: cut into units of a few layers that ordinary miners run, handing
-off through storage ("The split prep" below).
+The frozen part's output for the job's text never changes. So what crosses the
+cut is computed once per dataset and published as the job's data with a Merkle
+root. Miners download a shard of it plus the top K layers. Then they train like
+PR #5's fine-tune units: alone, with no traffic between miners but checkpoints.
+The computing once, the prep, is mining work too. It's cut into units of a few
+layers that ordinary miners run, handing off through storage ("The split prep"
+below). One person or one machine doing it would break "nobody controls it".
 
 **What crosses the cut** (`Cut.crossing`, from the config). At every cut from
 24 to 36, the first trained layer is an index source that reuses layer 20's
@@ -414,7 +414,7 @@ same inputs, CPU against CUDA):
 
 bf16's rounding of every activation, amplified by Adam's normalised steps, makes
 a replay on other hardware useless as a check. Float32 brings it to where PR
-#5's float32 units are. So the preparer runs the frozen layers in the
+#5's float32 units are. So the prep's units run the frozen layers in the
 reference's arithmetic, and miners run the top layers and the head in float32
 (`Model(layer_num=..., head_num=...)` mixes the two; still exact, tested). The
 frozen FP8 and FP4 weights dequantise into float32 exactly. The cost is a small
@@ -434,17 +434,17 @@ LoRA. Saved in PEFT's format under the checkpoint's module names, with
   with Merkle proofs against the job's root, not the whole dataset. A dispute
   goes to PR #5's bisection game, which narrows to one op the node recomputes
   on its CPU.
-- *The precompute is refereed the same way.* The preparer commits, per record
-  (one sequence) and per frozen layer, a 32-byte hash of that layer's output:
+- *The prep is refereed the same way.* Whoever runs a prep unit commits, per
+  sequence and per frozen layer it ran, a 32-byte hash of that layer's output:
   stream, pre_mix, the side channels it produces, and its choices (routing,
-  picks, candidate blocks). The record's leaf is the hash of those hashes and of
-  the record's bytes. That's 1.2 KB a sequence for 36 layers.
-  - A challenger disputes a record. The game first bisects over layers, to the
-    first one whose output the two disagree on given an agreed input, then over
-    that layer's ops.
-  - The preparer stores no intermediate streams. It keeps the token ids and the
-    model, and recomputes any record's layers when asked. Its code is
-    deterministic, so its recomputation hashes the same, in seconds per record.
+  picks, candidate blocks). A record's leaf is the hash of all 36 layers' hashes
+  and of the record's bytes. That's 1.2 KB a sequence.
+  - Anyone who can hold a unit's layers can replay it and challenge it. The game
+    first bisects over the unit's layers, to the first one whose output the two
+    disagree on given an agreed input, then over that layer's ops.
+  - A unit's inputs stay in storage until every unit reading them is past its
+    window, so both sides replay from them. Units are deterministic, so a replay
+    hashes the same, in seconds.
 - *The referee's DeepSeek-specific ops*, beyond Qwen's. Every one has small
   inputs, so the node can do them on a CPU:
 
@@ -466,9 +466,9 @@ LoRA. Saved in PEFT's format under the checkpoint's module names, with
   layer's intermediate tensors, hundreds of MB each for a 4K-token record. That's
   work for them, not the node.
 - *The weak spot.* A float op is judged within a tolerance, and the reference's
-  arithmetic differs by about 1% a layer between devices (§4). So a preparer
-  could bend each frozen layer's output within that. A check that is bitwise on
-  the preparer's own hardware class would close the gap.
+  arithmetic differs by about 1% a layer between devices (§4). So a unit's
+  holder could bend each frozen layer's output within that. A replay that is
+  bitwise, by a checker on the same hardware class, would close the gap.
 
 **Miners' requirements.** A step is layer-major, as `train_step` does it: each
 trained layer runs every micro-batch, then the next layer, then the backward in
@@ -530,9 +530,11 @@ forward.
   - A checker fetches only the records of the segment it replays (16K tokens is
     0.7 GB).
 
-**The one-PC prep: the fallback and the dev tool** (`vibehash/deepseek_prep.py`;
-the output isn't trusted, it's checked like any work). One command, on a rented
-GPU or a home PC:
+**The one-PC prep: a dev and test tool** (`vibehash/deepseek_prep.py`). The
+protocol has no path for it. On the network, a machine big enough for every
+unit takes them as units, like anyone else, and they're checked unit by unit.
+The command runs the whole prep on one machine, to try things and to test the
+split prep against:
 
     pip install torch huggingface_hub tokenizers vibehash
     hf auth login        # the runner's own token: the output goes to their own repo
@@ -571,29 +573,21 @@ rerun, ends with the same root as an uninterrupted one (`tests/test_deepseek_pre
 The tables touch nearly every 64 MiB piece for any real dataset, since hashed rows
 have no locality. So the table stream is ~203 GB whatever the dataset's size.
 
-*Estimate* for a rented L40S (48 GB, ~$1.57/h). Assumptions:
-- 1.7× a 4070 SUPER's speed, from memory bandwidth (864 vs 504 GB/s), since the code
-  is bound by dequantising and memory traffic, not FLOPs;
-- whole layers on the GPU;
-- 250 MB/s from the Hub and 150 MB/s to it.
+*Notes, not paths:* a rented cloud GPU and Hugging Face Jobs (compute next to
+the weights) were weighed for the whole prep and dropped, since one machine
+doing it is a central point. For the record, an *estimate* for a rented L40S
+(48 GB, ~$1.57/h), at 1.7× a 4070 SUPER from memory bandwidth, and 250 MB/s
+from the Hub, 150 MB/s to it: ~2.3 h and ~$3.60 for 1M tokens, ~17 h and ~$27
+for 10M.
 
-| | 1M tokens | 10M tokens |
-|---|---|---|
-| Download (470 GB) | 0.5 h | 0.5 h |
-| Prep (36 layers) | 1.6 h | 16 h |
-| Upload (42 GB per million) | 0.1 h | 0.8 h |
-| **Total, cost** | **~2.3 h, ~$3.60** | **~17 h, ~$27** |
-| Disk to provision | 300 GB | 420 GB |
-
-A home runner on a link like the owner's dorm network (70 MB/s down) takes ~1.9 h to
-download. Upload is their bottleneck: 42 GB per million tokens at 20 Mbit/s is
-4.7 hours, so `--fp8` (2.5 h) suits them.
-
-**The split prep: the main path** (decided 2026-11-01; prototype in
-`vibehash/deepseek_split.py`, tests in `tests/test_deepseek_split.py`, numbers from
-`scripts/deepseek_split_plan.py`). Even 70 GB a person is too much. So the prep is cut
-into small units that ordinary miners run, connected by stored hand-offs. The
-one-PC prep above stays as the fallback and the dev tool.
+**The split prep: the design** (settled by the owner, 2026-11-01; prototype in
+`vibehash/deepseek_split.py`, tests in `tests/test_deepseek_split.py`, numbers
+from `scripts/deepseek_split_plan.py`). One person or one machine doing the prep
+would break "nobody controls it", and even 70 GB a person is too much. So:
+- The protocol knows only units. There's no preparer role: a big machine simply
+  takes many units, even all of them in a row, with no special path.
+- Anyone who can hold a unit's layers can run it, check it, or challenge it.
+- The node only schedules and referees.
 
 *The shape.* The bottom is frozen, so a unit's output depends only on its inputs.
 Nobody needs anyone else online: each output waits in storage for the unit that
@@ -779,8 +773,20 @@ node referees on its CPU (the table above).
   - The job pins the dataset's root once the last unit's window closes: one
     window at the end, not one per piece.
 
-*Hosting the hand-offs.* The 2 GB node can't hold them.
-- **(a) A DigitalOcean Spaces bucket the operator pays for: recommended.**
+*Hosting the hand-offs.* The 2 GB node can't hold them, and no host has to be
+trusted (`tests/test_deepseek_split.py`):
+- Every reader checks each object against the digest its writer committed to,
+  which the node holds. A host that alters one is caught (`Tampered`).
+- A reader takes the first host with the committed copy (`Mirrors`: the bucket,
+  the writer's own storage, peers).
+- A withheld object is made again, to the bit, by anyone holding its piece
+  (`Line.redo`). If its inputs are gone too, their writers are redone first,
+  back to the token ids and the public weights if need be. Withholding costs
+  recomputation, not data.
+
+So hosts that miners run can slot in later, without changing units or
+commitments. The options:
+- **(a) For v1: a DigitalOcean Spaces bucket the operator pays for.**
   - The node signs a URL per object and method, so miners need no account
     (`presign`: S3's Signature Version 4, checked against AWS's worked example;
     `PresignedStore` uses the URLs).
@@ -800,9 +806,20 @@ node referees on its CPU (the table above).
     the storage included. They still need an HF account per uploader, and they
     document no presigned URLs.
   - HF is the right home for a reusable dataset's *records*, not for hand-offs.
-- **(c) Peer to peer, later.** The next piece's holder pulls from the producer.
-  That saves the egress bill, but the producer must stay online until its output
-  is read, which loses "nobody online together". Worth it only for big jobs.
+- **(c) Peer to peer, later.** The next piece's holder pulls from the producer,
+  or from any miner who kept a copy. That saves the egress bill and the central
+  host. A producer that must stay online until its output is read loses "nobody
+  online together", so peers should mirror each other's outputs: any copy
+  matching the digest will do.
+
+**Known centralization points.**
+- **The bigger one: the public network has a single validator today.**
+- **The hand-off bucket.** It can't alter data undetected, but it can withhold
+  or delete it, and its operator can stop paying. What that costs is
+  recomputation, as above. The way out is (b) or (c) behind `Mirrors`.
+- **The weights' source.** DeepSeek's weights and engram tables come from one
+  Hugging Face repo, pinned by commit and checked by sha256. The licence is MIT,
+  so anyone may mirror them: a convenience, not a dependency.
 
 *Pay.* Prep units are mining work like any other: a layers unit earns by
 layer-tokens (G × its chunk), and a rows unit by the gigabytes it streamed.
@@ -819,7 +836,7 @@ should count hand-off bytes too.
 - Popular open datasets could be prepped once, and their records kept public on
   HF, pinned by root, for every job that trains on them.
 
-*One machine, one layer at a time* (a fallback, not built). Each layer runs over
+*One machine, one layer at a time* (a note, not built). Each layer runs over
 the whole dataset, then is deleted, and the next is fetched.
 - Peak disk is one layer plus the dataset's states: 7.4 GB + 42 GB per million
   tokens (28 GB compressed).
@@ -827,7 +844,8 @@ the whole dataset, then is deleted, and the next is fetched.
   layer 20's keys) and the slices.
 - So ~50 GB for 1M tokens, and ~430 GB for 10M (~290 GB compressed). The
   download stays 470 GB.
-- It's the split prep with one miner holding every piece in turn.
+- It's the split prep with one miner taking every unit in turn, with no special
+  path.
 
 **The training footprint.** Trained layers change every step, so they stay
 inside one miner: no live relay. The per-miner knob is K, counting the 1.3 GB
@@ -854,14 +872,18 @@ Qwen3-4B in float32 won't fit under 10 GB of GPU memory.
 4. *Train the top 4 for real.* Their 30.9 GB are downloaded (2026-11-01). Still
    to do: loss on real chats, which needs a prep's records, and DeepSeek's own
    top-4 vs top-8 (60.4 GB, not downloaded).
-5. *The prep, for real.* Prototyped, both ways. The split prep (`deepseek_split`)
-   is the main path: the work graph, exact lossless hand-offs, presigned
-   storage, optimistic consumption with rollback, tested exact to the one-PC
-   prep. The one-PC `deepseek_prep` is one resumable command, with its table
-   streaming tried on the real Hub. Still to do:
+5. *The prep, for real.* The split prep (`deepseek_split`) is the design,
+   prototyped and tested exact to the one-PC prep. It has the work graph, exact
+   lossless hand-offs checked against their writers' digests, untrusted hosts
+   behind `Mirrors`, presigned storage, and optimistic consumption with
+   rollback and redo. The one-PC `deepseek_prep` is the dev and test tool: one
+   resumable command, with its table streaming tried on the real Hub. Still to
+   do:
    - wiring the split's units into the node after PR #5 merges: claims,
      presigned URLs, windows, pay;
    - multipart uploads, so a 1.8 GB hand-off survives a flaky link;
+   - hosts run by miners (each uploader's own storage, or peer to peer) behind
+     `Mirrors`, to retire the bucket as a central point;
    - a run on real weights, piece by piece;
    - answering challenges by replaying a unit;
    - FP8 hand-offs measured on consecutive real bottom layers (layers 0–3,
@@ -875,6 +897,6 @@ Qwen3-4B in float32 won't fit under 10 GB of GPU memory.
    root), and the pre-flight's numbers.
 
 Skipped for this route: engram slices (§5 step 4: no trained layer reads a
-table, and the preparer holds the tables), pipeline cells and teams (steps
+table, and the rows units stream the tables), pipeline cells and teams (steps
 5–6), worker-to-worker transport, and FP8 edges as live traffic (only as a
 dataset format).
