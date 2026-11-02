@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import crypto, hardware, mnemonic, settings, tls
+from . import crypto, hardware, mnemonic, modelstore, settings, tls
 from . import economics as econ
 from . import fees
 from . import wallet as wallets
@@ -450,7 +450,10 @@ def cmd_setup(a):
     else:
         _setup_gpu(a.yes)
 
-    print("\n4. Stake")
+    print("\n4. Space for big models")
+    _setup_models(a)
+
+    print("\n5. Stake")
     staked = False
     if status is None:
         print("   skipped (no node yet)")
@@ -484,6 +487,60 @@ def cmd_setup(a):
         cmd_worker(parser().parse_args(["worker", "--node", url, "--wallet", str(path)]), keys)  # no second password
     else:
         print(f"\nAll set. Start earning with:\n   {prog()} worker")
+
+
+def _setup_models(a) -> None:
+    """Where big model files (DeepSeek's ~30 GB) go, how much space they may take, and whether they're kept after a
+    job ends (modelstore.py). Asked once; flags set them outright; re-running setup with no flags keeps them."""
+    saved = settings.load().get("models")
+    store = modelstore.Store.from_settings()
+    if a.models_dir:
+        store.folder = Path(a.models_dir).expanduser().resolve()
+    elif not saved and sys.stdin.isatty() and not a.yes:
+        print("   Big models (like DeepSeek's, ~30 GB) are downloaded only when you take their work, and deleted when the\n"
+              "   job ends or after a week without mining it. Where should they go?")
+        store.choose(ask=lambda q: input("   " + q), say=lambda m: print("   " + m))
+    if a.models_gb:
+        store.cap = int(a.models_gb * modelstore.GB)
+    elif not saved and sys.stdin.isatty() and not a.yes:
+        answer = input(f"   How much space may they use, in GB? (Enter: {store.cap / modelstore.GB:.0f}) ").strip()
+        if answer:
+            try:
+                store.cap = int(float(answer) * modelstore.GB)
+            except ValueError:
+                print(f"   kept {store.cap / modelstore.GB:.0f} GB")
+    if a.keep_models is not None:
+        store.keep = a.keep_models == "yes"
+    elif not saved and sys.stdin.isatty() and not a.yes:
+        store.keep = input("   Keep them after a job ends, to save downloading them again on a slow link? They'd\n"
+                           "   stay until you run `vibehash cache clear`. [y/N] ").strip().lower() in ("y", "yes")
+    store.remember()
+    print(f"   {store.folder}, up to {store.cap / modelstore.GB:.0f} GB, "
+          + ("kept after a job ends" if store.keep else "deleted when the job ends") + f" (`{prog()} cache` shows them)")
+
+
+def cmd_cache(a):
+    """What the model store holds (where, how big, why), or `cache clear [JOB]` to remove it."""
+    store = modelstore.Store.from_settings()
+    if a.action == "clear":
+        freed = store.clear(a.job)
+        print(f"removed {freed / modelstore.GB:.1f} GB" + (f" of job {a.job}'s files" if a.job else "")
+              + f" from {store.folder}")
+        return
+    if a.action == "sweep":
+        gone = store.sweep()
+        print(f"removed {len(gone)} file(s) no job has used for a week, and stray partial downloads")
+        return
+    entries = store.entries()
+    print(f"{store.folder}: {store.usage() / modelstore.GB:.1f} GB of the {store.cap / modelstore.GB:.0f} GB you allow"
+          + ("; kept after jobs end" if store.keep else "; deleted when their jobs end"))
+    if a.json:
+        print(json.dumps(entries, indent=1))
+        return
+    if not entries:
+        print("nothing stored")
+    for e in entries:
+        print(f"  {e['bytes'] / modelstore.GB:7.2f} GB  {e['name']}\n             {e['what']}: {e['why']}")
 
 
 def cmd_balance(a):
@@ -1385,6 +1442,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="find the GPU and install PyTorch for it")
     p.add_argument("--stake", type=to_syn, help="stake this much VIBE without asking")
     p.add_argument("--yes", action="store_true", help="install GPU support without asking")
+    p.add_argument("--models-dir", help="where big model files go (default: the drive with the most room)")
+    p.add_argument("--models-gb", type=float, help="the most space they may use, in GB (default 40)")
+    p.add_argument("--keep-models", choices=["yes", "no"], help="keep them after a job ends (default no)")
     p.set_defaults(fn=cmd_setup)
     p.add_argument("--tls-fingerprint", metavar="SHA256", help="trust the https node's certificate with this fingerprint "
                    "(how workers trust a self-signed testnet node; ask its operator)")
@@ -1479,6 +1539,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-dir", help="where checkpoints and datasets are kept (default ~/.vibehash/cache)")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
     p.set_defaults(fn=cmd_worker)
+
+    p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
+    p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show")
+    p.add_argument("job", nargs="?", help="with clear: only this job's files")
+    p.add_argument("--json", action="store_true", help="machine-readable output"); p.set_defaults(fn=cmd_cache)
 
     p = sub.add_parser("devices", help="list the CPUs and GPUs this computer can train on")
     p.add_argument("--json", action="store_true", help="machine-readable output"); p.set_defaults(fn=cmd_devices)
