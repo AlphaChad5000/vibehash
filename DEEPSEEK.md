@@ -976,28 +976,56 @@ The wiring around it, once PR #5 merges:
    scorers' held-back loss on the 500 goes into `store.job_rounds`.
 5. **The result:** the adapter in PEFT's format, `layers_to_transform` 36–39.
 
-For launch day, the same wiring PR also needs:
-- **The worker's model files kept by `vibehash/modelstore.py`**, as "Model files
-  on a miner's PC" below has it. The worker asks before the ~30 GB download
-  (with an unattended yes), and `vibehash cache` and `vibehash cache clear`
-  come in, as do disk use on the dashboard and the location question in setup.
-- **The worker says clearly when a PC can't take DeepSeek work** (no NVIDIA GPU
-  with 8 GB, under 16 GB of RAM, or under ~40 GB free on an SSD). It keeps
-  earning on other jobs.
-- **A "Mining the DeepSeek job" section in `docs/guide.html`**, in the guide's
-  voice, keeping its ids and JS working, with main merged first. It covers:
-  - the job (the think-shorter pilot) and its requirements;
-  - what the worker downloads and when;
-  - prep pieces and training units, from a miner's point of view;
-  - where the data comes from: the bucket, through links from the node;
-  - how to follow it: the front page's featured panel and `job watch`;
-  - where the model files go, how much space they may take, and when they're
-    deleted (below).
-- **The front page's requirements** come from this section. They're "an NVIDIA
-  card with 8 GB or more (RTX 20-series or newer), 16 GB of memory (32 GB is
-  faster), about 40 GB free on an SSD, about 30 GB downloaded once". They hold
-  with the mapped experts above. A miner who trains alone on all the pilot's
-  records needs up to 45 GB.
+**The launch checklist** (the wiring branch, `claude/deepseek-wiring`, stacked on
+PR #5 with this PR merged in; started 2026-11-01 without waiting for PR #5 to
+merge). [x] done, [ ] to do.
+- Data and records:
+  - [x] The pilot's token file (`make_think_shorter.py`), and the job's spec
+    (above).
+  - [x] Trainers and scorers read records from the bucket, each checked against
+    the pinned root (`deepseek_split.read_block`).
+- Units and the node:
+  - [ ] The DeepSeek job kind in the spec checks: prep, then training.
+  - [ ] Prep units as claims in the work graph: presigned links for each
+    unit's own objects, deadlines, challenge windows, `Line.summary` in the job
+    summary.
+  - [ ] The DeepSeek training unit kind: records shards, `train_step_streamed`
+    with mapped experts, `Meter`'s stats, held-back loss into
+    `store.job_rounds`.
+  - [ ] The judge (PR #5's bisection game, op table, record version 4) merged
+    in, and the referee's DeepSeek ops.
+- The worker:
+  - [x] `modelstore` (below), memory-mapped experts (16 GB of RAM).
+  - [ ] The worker asks before the ~30 GB download, with an unattended yes,
+    through `modelstore`. `vibehash cache` and `vibehash cache clear` come in,
+    as do disk use on the dashboard and the location question in setup.
+  - [ ] It says clearly when a PC can't take DeepSeek work (no NVIDIA GPU with
+    8 GB, under 16 GB of RAM, or the files don't fit), and keeps earning on
+    other jobs.
+  - [ ] The menu item.
+- Storage:
+  - [x] Multipart, resumable, presigned (`PresignedStore`, `Signer`), tested
+    against a local fake S3.
+  - [ ] On the node: the bucket's keys, which the owner sets up at launch.
+- Docs:
+  - [ ] A "Mining the DeepSeek job" section in `docs/guide.html`, in the
+    guide's voice, keeping its ids and JS working. It covers:
+    - the job (the think-shorter pilot) and its requirements;
+    - what the worker downloads and when;
+    - prep pieces and training units, from a miner's point of view;
+    - where the data comes from: the bucket, through links from the node;
+    - how to follow it: the front page's featured panel and `job watch`;
+    - where the model files go, how much space they may take, and when
+      they're deleted (below).
+  - [x] The front page's requirements, from this section: "an NVIDIA card with
+    8 GB or more (RTX 20-series or newer), 16 GB of memory (32 GB is faster),
+    about 40 GB free on an SSD, about 30 GB downloaded once". They hold with
+    the mapped experts above. A miner who trains alone on all the pilot's
+    records needs up to 45 GB.
+- Proof:
+  - [ ] A full local run: node, prep miners, trainers and a dispute, on the
+    small config.
+  - [ ] Then on real layers, if they fit on one PC.
 
 **Model files on a miner's PC** (`vibehash/modelstore.py`, built and tested in
 `tests/test_modelstore.py`). The owner's rule: the ~30 GB must never become

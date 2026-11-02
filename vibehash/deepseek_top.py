@@ -38,7 +38,8 @@ import torch
 
 from . import deepseek as ds
 from .crypto import merkle_root
-from .deepseek import Choices, Config, Model, Side
+from .deepseek import Choices, Model, Side
+from .deepseek_config import Cut  # noqa: F401 - re-exported: top.Cut
 
 OPTIMIZER = (0.9, 0.999, 1e-8)  # Adam's beta1, beta2, eps: finetune.py's "adam"
 # How the trained layers compute. The reference's bf16 with FP8 rounding (the preparer's, for the frozen layers) makes
@@ -49,79 +50,6 @@ RECORD_FORMAT = "vibehash-deepseek-top/1"
 
 
 # --- the cut -----------------------------------------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Cut:
-    """Layers [0, first) frozen and precomputed, [first, n_layers) trained."""
-    cfg: Config
-    first: int
-
-    def __post_init__(self):
-        if not 0 < self.first < self.cfg.n_layers:
-            raise ValueError(f"a cut must leave layers on both sides: first trained layer {self.first} of "
-                             f"{self.cfg.n_layers}")
-
-    @property
-    def trained(self) -> range:
-        return range(self.first, self.cfg.n_layers)
-
-    def crossing(self, stop: int | None = None) -> dict[str, int | list[int]]:
-        """What the trained layers reuse from below the cut, besides the stream and pre_mix: {"compress_kv": its
-        source layer, "index_k": ..., "picks": ..., "candidates": ..., "engram": [trained engram layers, which need
-        table rows]}, each present only when it crosses. With `stop`, what layers [first, stop) alone reuse (a piece
-        of the split prep, deepseek_split)."""
-        cfg, out = self.cfg, {}
-        for layer in range(self.first, self.cfg.n_layers if stop is None else stop):
-            if cfg.ratio(layer):
-                kv, ix = cfg.source(layer, "kv"), cfg.source(layer, "index")
-                if kv < self.first:
-                    out.setdefault("compress_kv", kv)
-                    if layer in cfg.index_source_layers:  # it picks with the kv source's index keys
-                        out.setdefault("index_k", kv)
-                if ix < self.first:
-                    out.setdefault("picks", ix)
-                if layer in cfg.index_source_layers and 0 <= cfg.candidate_source_layer < self.first:
-                    out.setdefault("candidates", cfg.candidate_source_layer)
-            if layer in cfg.engram_layer_ids:
-                out.setdefault("engram", []).append(layer)
-        return out
-
-    def bytes_per_token(self, fp8_stream: bool = False, seq_len: int = 4096) -> dict[str, float]:
-        """What a precomputed token costs, by part, as pack writes it. Compressed and index keys are kept in bf16
-        (1 KB a token at ratio 1), though they're exactly FP4 values: packed as such they'd take 0.5625 bytes a value
-        (the "fp4" figures). Candidate blocks matter only for sequences beyond candidate_topk_blocks blocks, and are
-        then a block number each (2 bytes)."""
-        cfg, c = self.cfg, self.crossing()
-        width = cfg.hc_mult * cfg.dim
-        out = {"tokens": 4.0 + 1 / 8,  # an int32 id, and a bit saying whether its successor is learned
-               "stream": width * (1 + 1 / ds.BLOCK) if fp8_stream else 2.0 * width,
-               "pre_mix": 4.0 * cfg.hc_mult}
-        if "compress_kv" in c:
-            out["compress_kv"] = 2.0 * cfg.head_dim / cfg.ratio(c["compress_kv"])
-            out["compress_kv (fp4)"] = 0.5625 * cfg.head_dim / cfg.ratio(c["compress_kv"])
-        if "index_k" in c:
-            out["index_k"] = 2.0 * cfg.index_head_dim / cfg.ratio(c["index_k"])
-            out["index_k (fp4)"] = (0.5 + 1 / ds.BLOCK) * cfg.index_head_dim / cfg.ratio(c["index_k"])
-        if "picks" in c:
-            out["picks"] = (2.0 if seq_len <= 2**15 else 4.0) * cfg.index_topk
-        if "candidates" in c:
-            reach = cfg.candidate_topk_blocks * cfg.candidate_block_size * cfg.ratio(c["candidates"])
-            out["candidates"] = 2.0 * cfg.candidate_topk_blocks if seq_len > reach else 0.0
-        out["total"] = sum(v for k, v in out.items() if "(fp4)" not in k)
-        return out
-
-    def check(self) -> None:
-        """Refuse a cut whose trained layers would need a compressed-keys gradient carried between them."""
-        cfg = self.cfg
-        for src in self.trained:
-            if src in cfg.kv_source_layers and src != self.first:
-                users = [layer for layer in self.trained if layer > src and cfg.ratio(layer)
-                         and cfg.source(layer, "kv") == src]
-                if users:
-                    raise NotImplementedError(f"layer {src} is a trained kv source above trained layer {self.first},"
-                                              f" and layers {users} reuse its compressed keys: their gradient would "
-                                              "have to be carried between trained layers. Cut at or above it")
-
 
 # --- the preparer's side: precomputing -----------------------------------------------------------------------------------
 
