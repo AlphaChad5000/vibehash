@@ -1016,7 +1016,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         from unittest import mock
 
         with mock.patch("vibehash.coordinator.MAX_GAMES", 1):
-            self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+            self.network([("honest", "honest")] * 2 + [("honest", "false_accuser")], replication_rate=0.0,
                          canaries_per_round=0)
             liar = self.workers[-1].address
             rep = self.round()
@@ -1032,7 +1032,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         from vibehash.coordinator import MAX_GAMES, games_allowed
 
         self.assertEqual([games_allowed(r) for r in (1.0, 0.8, 0.75, 0.7, 0.65, 0.6, 0.5)], [MAX_GAMES, 4, 3, 2, 1, 1, 1])
-        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+        self.network([("honest", "honest")] * 2 + [("honest", "false_accuser")], replication_rate=0.0,
                      canaries_per_round=0)
         liar = self.workers[-1].address
         for chain in (self.proto.chain, self.before):  # (the replay starts from the same reputation)
@@ -1050,7 +1050,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         from vibehash.program import Op, Program
         from vibehash.tracer import node_at
 
-        self.network([("honest", "honest")] * 5 + [("tamper", "false_accuser")], replication_rate=0.0,
+        self.network([("honest", "honest")] * 2 + [("tamper", "false_accuser")], replication_rate=0.0,
                      canaries_per_round=0)
         cheat, job = self.workers[-1].address, self.job
 
@@ -1108,8 +1108,10 @@ class NodeFreeRoundTests(unittest.TestCase):
 
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
-        challenger. Both are slashed as if they had lost at the referee."""
-        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+        challenger. Both are slashed as if they had lost at the referee. Three workers, so a claim's checkers are the
+        other two and the accuser checks every claim it doesn't hold: two disputes or more whatever the draws (with six
+        workers it sometimes checked only one, and CI's runs failed on order[1])."""
+        self.network([("honest", "honest")] * 2 + [("honest", "false_accuser")], replication_rate=0.0,
                      canaries_per_round=0)
         liar = self.workers[-1].address
         order = []
@@ -1141,7 +1143,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         from vibehash import dispute as dg, merkle
         from vibehash.coordinator import ProtocolError
 
-        self.network([("honest", "honest")] * 5 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        self.network([("honest", "honest")] * 2 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
         c, tried = self.proto.coord, set()
         big = c._put_trace(bytes(merkle.MAX_MANIFEST + 1))
 
@@ -1173,7 +1175,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         loses; before it, the game ends unchecked and nobody is slashed. A validator replays both."""
         from vibehash import dispute as dg
 
-        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+        self.network([("honest", "honest")] * 2 + [("honest", "false_accuser")], replication_rate=0.0,
                      canaries_per_round=0)
         order = []
 
@@ -1222,20 +1224,32 @@ class NodeFreeRoundTests(unittest.TestCase):
         must satisfy, which spotted most of the old, rescaled canaries. Today's are real training under another unit's
         seed, so it approves one and is slashed; and once it has, its approvals count for nothing (a claim only it
         approved ends unchecked)."""
+        from unittest import mock
+
+        from vibehash.coordinator import Coordinator
+
         self.network([("honest", "honest")] * 7 + [("honest", "knowing")])
         knowing = self.workers[-1].address
+        # Which checker gets a canary is a draw, and which round the knowing one first got one depended on the
+        # training's float bits (CI's wheels differ), so it wasn't always within the test's rounds. Here the canaries
+        # go to the knowing checker, in the round and its replay alike. (It never compares a canary with work of its
+        # own, so whether it holds or checks the units doesn't matter to it.)
+        plant = Coordinator._finetune_canaries
+
+        def to_knowing(c, job, draw, pool, *rest):
+            return plant(c, job, draw, lambda near: [knowing], *rest)
+        steer = mock.patch.object(Coordinator, "_finetune_canaries", to_knowing)
+        steer.start()
+        self.addCleanup(steer.stop)
 
         def answer(t, w):  # everyone as their behaviour says; the knowing checker's rejections are noted
             got = w.verify(self.job, t.unit, t.openings, t.segments)
             if w.address == knowing:
                 flagged.append(not got[0])
             return got
-        flagged, reports = [], []
-        for _ in range(5):
-            reports.append(self.round(answer))
-            if any(s[0] == knowing and s[2] == "approved a canary" for s in reports[-1].slashes):
-                break
-        caught = reports[-1]
+        flagged = []
+        caught = self.round(answer)
+        reports = [caught]
         self.assertTrue(any(s[0] == knowing and s[2] == "approved a canary" for s in caught.slashes),
                         "the knowing checker was given a canary and approved it")
         self.assertFalse(any(flagged), "honest work and canaries both pass Adam's invariants")
