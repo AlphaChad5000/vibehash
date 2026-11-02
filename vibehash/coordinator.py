@@ -329,6 +329,32 @@ def score_cost(job: TrainingJob) -> int:
     return job.spec.flops_per_step(MAX_VAL) // 3 if job.finetune else 0
 
 
+def _piece(name: str) -> str:
+    """The frozen layers a prep unit needs: a layers unit's piece ("layers-00-03" of "layers-00-03-c00012"), or a rows
+    unit itself (it streams a table range and keeps nothing)."""
+    return name.rsplit("-c", 1)[0] if name.startswith("layers") else name
+
+
+def _spread(units: list) -> list:
+    """Ready prep units taken a piece at a time, round robin, each piece's in its own order. Taking the graph's order
+    as it is would fill rounds with the bottom piece's chunks, so every miner would fetch every piece in turn."""
+    groups: dict[str, list] = {}
+    for u in units:
+        groups.setdefault(_piece(u.name), []).append(u)
+    out, queues = [], list(groups.values())
+    while queues:
+        for q in queues:
+            out.append(q.pop(0))
+        queues = [q for q in queues if q]
+    return out
+
+
+def _affinity(piece: str, addr: str) -> bytes:
+    """A miner's standing for a piece (lower first): the same miners get a piece round after round, so each fetches
+    the few pieces it's given once and keeps them, instead of every piece (rendezvous hashing)."""
+    return h256(f"prep-piece|{piece}|{addr}".encode())
+
+
 def _size(mb: int) -> str:
     return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb} MB"
 
@@ -638,7 +664,7 @@ class Coordinator:
             # A prep round: its units are the work graph's ready ones (deepseek_rounds.py), or the record's, by id.
             recorded = self.replaying["prep"]["units"] if self.replaying else None
             names = [None] * len(recorded) if recorded is not None else \
-                [u.name for u in self.prep(job).ready()[:min(dsr.MAX_PREP_UNITS, job.units_per_round)]]
+                [u.name for u in _spread(self.prep(job).ready())[:min(dsr.MAX_PREP_UNITS, job.units_per_round)]]
             units = []
             for i, name in enumerate(names):  # each at the job's unit work: the ledger bounds a round's by it
                 u = dataclasses.replace(WorkUnit.make(job, round_no, i, start_hash), memory_mb=PREP_MEMORY_MB)
@@ -746,9 +772,12 @@ class Coordinator:
 
         def pick(unit: WorkUnit, exclude: set[str]) -> str | None:
             # Staked workers first: those earning their stake in only get what's left, so they can't crowd them out.
+            # A prep unit goes to the miners its piece stands with (_affinity), so pieces stay where they're held.
             fits = [a for a in order if a not in exclude and r.regs[a].memory_mb >= unit.memory_mb
                     and used[a] + unit.flops <= capacity[a]]
-            return min(fits, key=lambda a: (not staked(a), (used[a] + unit.flops) / capacity[a])) if fits else None
+            piece = _piece(r.prep[unit.unit_id]) if unit.unit_id in r.prep else None
+            return min(fits, key=lambda a: (not staked(a), _affinity(piece, a) if piece else b"",
+                                            (used[a] + unit.flops) / capacity[a])) if fits else None
 
         for unit in r.units.values():
             holders = []

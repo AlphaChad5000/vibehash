@@ -115,6 +115,13 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 
 ## Current state
 
+**Release 0.5.6 (2026-11-02): prep pieces stay with their miners.** A prep round now takes ready units a piece at a
+time (round robin), and each piece goes first to the miners it stands with by rendezvous hashing (coordinator._spread,
+_affinity). So a miner fetches the few pieces it's given once, instead of every 29.6 GB piece in turn, which needed
+about 350 GB and a 45 MB/s link per prep miner. A miner's first download of a piece still has to fit one compute phase;
+giving it its own time is the next step.
+
+
 **Release 0.5.5 (2026-11-02): fine-tuning, the dispute judge, and DeepSeek-V4.1-Flash's first job.** It brings together:
 - PR #5: LoRA fine-tuning of open models where the node never runs the model, plus the bisection dispute judge, after
   two reviews and a re-check;
