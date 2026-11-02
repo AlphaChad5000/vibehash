@@ -191,6 +191,15 @@ def run_unit(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, store, wei
                            ranges=spec.row_ranges, align=spec.align, want=want)
 
 
+def check_rows(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, commit: dict, weights: Weights,
+               work: Path) -> bool:
+    """Check another miner's rows unit: the same rows streamed again, compared to the bit (they're the table's own
+    bytes, the same on any hardware)."""
+    scratch = split.LocalStore(Path(work) / f"rows-{unit.a}-{unit.b}")
+    mine = run_unit(spec, tokens, unit, scratch, weights, Path(work))
+    return mine["outputs"] == commit.get("outputs") and mine["range"] == commit.get("range")
+
+
 def check_unit(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, commit: dict, store, weights: Weights,
                work: Path, want: dict | None = None, device: str = "cpu",
                tolerance: float = PREP_TOLERANCE) -> tuple[bool, str]:

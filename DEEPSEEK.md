@@ -988,19 +988,41 @@ merge). [x] done, [ ] to do.
   - [x] The DeepSeek job kind in the spec checks (`deepseek_job.DeepSeekSpec`, a `LoraSpec`, so its training
     rounds are a fine-tune's; `tasks.py` parses and validates it). A node without it refuses the spec.
   - [x] The node needs no PyTorch for it: `deepseek_config.py` and `deepseek_graph.py`.
-  - [ ] Prep units as claims in the work graph: presigned links for each
-    unit's own objects, deadlines, challenge windows, `Line.summary` in the job
-    summary.
+  - [x] Prep units as claims in the work graph (`deepseek_rounds.py`): a prep
+    round is a version 4 round whose units are the graph's ready ones, one
+    holder each. A miner commits to the sha256 of its unit's commitment in the
+    bucket; the node reads it at the reveal and checks it names the unit's
+    objects; two checkers replay the unit. The node signs links for a unit's own
+    objects only, during compute (`Coordinator.may_sign`, the "sign" message);
+    the compute phase is the unit's deadline; `Line.summary` is the job
+    summary's "prep" field. The last unit's round pins the root and writes the
+    manifest. Tested end to end over HTTP (`tests/test_deepseek_network.py`).
   - [x] The DeepSeek training unit (`deepseek_unit.py`): records read from the
     bucket and checked, `train_segment` as a fine-tune's (replays to the bit),
     the scorers' held-back loss. `model.train_segment` and `TrainingJob.evaluate`
     dispatch to it.
-  - [ ] Its rounds after the prep: the pinned root, records shards per miner,
-    `Meter`'s stats, held-back loss into `store.job_rounds`.
+  - [x] Its rounds after the prep: trainers, checkers and scorers read the
+    records from the bucket against the pinned root (`/job/<id>` gives it), and
+    the scorers' held-back loss goes into `store.job_rounds`, as a fine-tune's.
+  - [ ] Records shards per miner (each now fetches the chunks it trains on),
+    and `Meter`'s stats in the round's record.
   - [x] The judge (PR #5's bisection game, op table, record version 4) merged
     in (2026-11-01).
   - [ ] The referee's DeepSeek ops, and disputes of prep units and DeepSeek
-    training units through the judge.
+    training units through the judge. Until then, the interim rule
+    (`deepseek_rounds.py`, the owner's call): a DeepSeek claim any counted
+    checker rejects ends unchecked, unpaid and unslashed, and its unit goes out
+    again. A cheat gains nothing but is never caught. Two weaknesses:
+    - One checker that rejects everything costs honest miners their pay for
+      those units, and the prep a round's delay each time, with no penalty.
+      Its stake is never at risk, since there's no game to lose.
+    - Prep canaries can be spotted: a canary hands over another unit's
+      commitment, and the commitment names its unit. So they only catch a
+      checker that approves without reading anything. A checker that reads the
+      commitment but doesn't replay goes uncaught; only the any-rejection rule
+      and the second checker stand against it. Real canaries need outputs bent
+      by the node (it can do that in numpy, decoding a hand-off) under names
+      that don't give them away.
 - The worker:
   - [x] `modelstore` (below), memory-mapped experts (16 GB of RAM).
   - [x] Setup's step 4 asks where big models go and how much space they may
@@ -1011,13 +1033,19 @@ merge). [x] done, [ ] to do.
   - [x] What to tell a PC that can't take DeepSeek work (`can_take`: no NVIDIA
     GPU with 6 GB for the prep or 8 for training, under 16 GB of RAM, or the files
     don't fit), and that it keeps earning on other jobs.
-  - [ ] The worker's steps for DeepSeek units in `client.py`, the download
-    prompt and its unattended flag, and disk use on the dashboard.
-  - [ ] The menu item (main's terminal menu, `menu.py`).
+  - [x] The worker's steps for DeepSeek units (`deepseek_client.py`, called from
+    `client.py`): prep units through links the node signs, committed and
+    revealed; other miners' units replayed; records for training rounds. The
+    download is asked once: `worker --deepseek ask|yes|no`, saved.
+  - [ ] Disk use on the dashboard.
+  - [x] The menu item (main's terminal menu, `menu.py`): "Mine the DeepSeek
+    job", and "Model files" under Settings.
 - Storage:
   - [x] Multipart, resumable, presigned (`PresignedStore`, `Signer`), tested
     against a local fake S3.
-  - [ ] On the node: the bucket's keys, which the owner sets up at launch.
+  - [x] The node reads the bucket from the environment (`node.bucket_from_env`:
+    `VIBEHASH_BUCKET_HOST`, `_REGION`, `_KEY`, `_SECRET`).
+  - [ ] The bucket and its keys, which the owner sets up on the node at launch.
 - Docs:
   - [ ] A "Mining the DeepSeek job" section in `docs/guide.html`, in the
     guide's voice, keeping its ids and JS working. It covers:

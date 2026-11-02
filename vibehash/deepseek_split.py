@@ -62,7 +62,7 @@ from .deepseek import Choices, Side
 from .deepseek_graph import (  # noqa: F401 - re-exported: the graph and storage, without PyTorch
     ROWS_PER_PIECE, SIDE, pieces, needs, emits, row_ranges, stream_name, side_name, rows_name, commit_name,
     block_names, Unit, Graph, plan, Line, deadline, Tampered, Missing, Mirrors, LocalStore, PresignedStore, Signer,
-    presign)
+    presign, rows_commit_name, unit_commit)
 
 try:
     from compression import zstd as _zstd  # Python 3.14's standard library
@@ -202,7 +202,9 @@ def run_rows(source, store, seqs, chunks, cut: top.Cut, layer: int, r: int, toke
         _put(store, rows_name(c, layer, r), {"ids": torch.from_numpy(np.ascontiguousarray(ids, np.int64)),
                                              "weight": torch.from_numpy(np.ascontiguousarray(sl.weight[at])),
                                              "scale": torch.from_numpy(np.ascontiguousarray(sl.scale[at]))}, outputs)
-    return {"format": FORMAT, "unit": ["rows", layer, r], "range": [lo, hi], "inputs": {}, "outputs": outputs}
+    commit = {"format": FORMAT, "unit": ["rows", layer, r], "range": [lo, hi], "inputs": {}, "outputs": outputs}
+    store.put(rows_commit_name(layer, r), json.dumps(commit).encode())
+    return commit
 
 
 def _compute(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map, work, device, whole_layer_gb: float,

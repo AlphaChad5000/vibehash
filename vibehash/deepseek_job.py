@@ -82,6 +82,16 @@ class DeepSeekSpec(LoraSpec):
         """Row ranges' alignment: deepseek_prep's 64 MiB pieces of Flash's tables, single rows of the tiny ones."""
         return 1 if self.config_name == "tiny" else ROWS_PER_PIECE
 
+    def prep_seconds(self) -> float:
+        """The compute phase a prep round needs: a unit's transfers and work at the slowest link the network takes
+        (deepseek_graph.deadline), for a chunk's stream in and out (28 KB a token compressed) over `pieces` layers.
+        0 for the tiny config, whose units take a moment (testnets use their own phase lengths)."""
+        if self.config_name == "tiny":
+            return 0.0
+        from .deepseek_graph import deadline
+        stream = 28_300 * self.chunk_tokens
+        return deadline(stream, stream, self.pieces * self.chunk_tokens)
+
     def graph(self, tokens: "TokenFile") -> Graph:
         """The prep's work graph over the job's text: what the node hands out and every worker plans alike."""
         return plan(self.top, tokens.chunks(self.chunk_tokens), pieces(self.cut, self.pieces), self.row_ranges,

@@ -163,6 +163,9 @@ class Worker:
         """A fine-tune's score task: (loss, accuracy) of the round's starting model on the job's held-back data."""
         if self.verifier_behavior in ("lazy", "false_accuser"):
             return 0.01, 0.99  # made up, as a scorer who doesn't run the model would
+        if job.deepseek:  # the top layers, on the held-back sequences' records
+            from . import deepseek_unit
+            return deepseek_unit.evaluate(job.spec, job.data, start, self.backend)
         from . import finetune
         return finetune.evaluate(job.spec, job.data, start, self.backend)
 

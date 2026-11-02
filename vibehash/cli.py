@@ -251,7 +251,7 @@ def _describe_economics(e: econ.Economics) -> str:
 
 def cmd_node(a):
     from .coordinator import CoordinatorConfig
-    from .node import Node, PhaseTimes  # only nodes need the server
+    from .node import Node, PhaseTimes, bucket_from_env  # only nodes need the server
     from .ratelimit import Limits
 
     if crypto.BACKEND != "openssl":
@@ -272,7 +272,8 @@ def cmd_node(a):
             sys.exit(f"error: {e}")
     node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                 keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
-                announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20)).start()
+                announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
+                bucket=bucket_from_env()).start()  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
     if context:
         fp = tls.cert_fingerprint(a.tls_cert)
         print(f"serving HTTPS; certificate sha256 fingerprint {fp}\n"
@@ -498,16 +499,23 @@ def _setup_models(a) -> None:
     job ends (modelstore.py). Asked once; flags set them outright; re-running setup with no flags keeps them."""
     saved = settings.load().get("models")
     store = modelstore.Store.from_settings()
+
+    def reply(question: str) -> str:
+        try:
+            return input("   " + question).strip()
+        except EOFError:  # nothing to read: Windows counts NUL as a terminal
+            print()
+            return ""
     if a.models_dir:
         store.folder = Path(a.models_dir).expanduser().resolve()
     elif not saved and sys.stdin.isatty() and not a.yes:
         print("   Big models (like DeepSeek's, ~30 GB) are downloaded only when you take their work, and deleted when the\n"
               "   job ends or after a week without mining it. Where should they go?")
-        store.choose(ask=lambda q: input("   " + q), say=lambda m: print("   " + m))
+        store.choose(ask=reply, say=lambda m: print("   " + m))
     if a.models_gb:
         store.cap = int(a.models_gb * modelstore.GB)
     elif not saved and sys.stdin.isatty() and not a.yes:
-        answer = input(f"   How much space may they use, in GB? (Enter: {store.cap / modelstore.GB:.0f}) ").strip()
+        answer = reply(f"How much space may they use, in GB? (Enter: {store.cap / modelstore.GB:.0f}) ")
         if answer:
             try:
                 store.cap = int(float(answer) * modelstore.GB)
@@ -516,8 +524,8 @@ def _setup_models(a) -> None:
     if a.keep_models is not None:
         store.keep = a.keep_models == "yes"
     elif not saved and sys.stdin.isatty() and not a.yes:
-        store.keep = input("   Keep them after a job ends, to save downloading them again on a slow link? They'd\n"
-                           "   stay until you run `vibehash cache clear`. [y/N] ").strip().lower() in ("y", "yes")
+        store.keep = reply("Keep them after a job ends, to save downloading them again on a slow link? They'd\n"
+                           "   stay until you run `vibehash cache clear`. [y/N] ").lower() in ("y", "yes")
     store.remember()
     print(f"   {store.folder}, up to {store.cap / modelstore.GB:.0f} GB, "
           + ("kept after a job ends" if store.keep else "deleted when the job ends") + f" (`{prog()} cache` shows them)")

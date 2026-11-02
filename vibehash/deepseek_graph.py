@@ -76,6 +76,16 @@ def commit_name(c: int, a: int) -> str:
     return f"c{c:05d}/commit-{a:02d}.json"
 
 
+def rows_commit_name(layer: int, r: int) -> str:
+    """Where a rows unit's commitment goes (a layers unit's is commit_name)."""
+    return f"rows-{layer:02d}-{r:03d}.json"
+
+
+def unit_commit(unit) -> str:
+    """The object holding a unit's commitment, which its reveal names by hash."""
+    return rows_commit_name(unit.a, unit.b) if unit.kind == "rows" else commit_name(unit.chunk, unit.a)
+
+
 def block_names(c: int) -> tuple[str, str]:
     return f"block-{c:05d}.bin", f"block-{c:05d}.json"
 
