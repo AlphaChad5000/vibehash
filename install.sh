@@ -88,7 +88,7 @@ main() {
     fi
 
     echo "Installing Vibe Hash with $py..."
-    if ! "$py" -m pip install --upgrade --quiet --disable-pip-version-check vibehash; then
+    if ! "$py" -m pip install --upgrade --quiet --disable-pip-version-check "vibehash[finetune]"; then
         echo
         echo "Installing didn't work; pip's message above says why. Check you're online, then run this again."
         exit 1

@@ -74,6 +74,13 @@ class MenuTests(unittest.TestCase):
         self.assertIn("same as:  vibehash send --to ADDRESS --amount VIBE", page)
         self.assertIn("q back", page)
 
+    def test_fine_tune_asks_for_the_chats_and_a_model(self):
+        answers = iter(["my-chats.jsonl", "", ""])
+        with mock.patch("builtins.input", lambda *a: next(answers)):
+            self.assertEqual(menu._finetune(), [["train", "my-chats.jsonl", "--base", "qwen3-0.6b", "--budget", "100"]])
+        with mock.patch("builtins.input", lambda *a: ""):
+            self.assertIsNone(menu._finetune())  # no file, nothing posted
+
     def test_nothing_is_sent_without_a_yes(self):
         answers = iter(["vibe1friend", "2.5", ""])
         with mock.patch("builtins.input", lambda *a: next(answers)):
