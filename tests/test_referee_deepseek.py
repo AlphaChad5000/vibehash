@@ -137,7 +137,6 @@ class ForwardOpTests(unittest.TestCase):
                                                           "ratio": comp.ratio, "num": numname}, pooled.shape, [x.shape]), {"x": x}, pooled, "compress pool")
             # indexer scores
             if att.indexer is not None and numname == "ref":
-                ix = att.indexer
                 qq = num.fp4(torch.randn(1, T, cfg.index_n_heads, cfg.index_head_dim, generator=g).to(dt))
                 kk = num.fp4(torch.randn(1, T // 2, cfg.index_head_dim, generator=g).to(dt))
                 ww = (torch.randn(1, T, cfg.index_n_heads, generator=g)).to(dt)
@@ -209,7 +208,7 @@ class ForwardOpTests(unittest.TestCase):
                                       dispute.Outside(None, None, self.src, keep=False))
 
     def test_choices_are_judged_by_whole_rows(self):
-        cfg, g = self.cfg, torch.Generator().manual_seed(7)
+        g = torch.Generator().manual_seed(7)
         # Experts: a top-k of the biased scores, distinct, any order.
         sc = torch.randn(6, 24, generator=g)
         chosen = sc.topk(4, dim=-1).indices.float().numpy()
@@ -251,3 +250,178 @@ class ForwardOpTests(unittest.TestCase):
         drop = mask.copy()
         drop[30, 28:32] = 0  # query 30's newest position, 30, is in block 7: always kept
         self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": drop}, (30 * n) // 256)[0], "challenger")
+
+
+def np32(t):
+    return t.detach().float().cpu().numpy()
+
+
+@unittest.skipIf(torch is None, "needs PyTorch")
+class RealLayerTests(unittest.TestCase):
+    """The ops on DeepSeek-V4.1-Flash's real layer 2 (a kv and index source: the ratio-2 compressor, its own indexer
+    keys, YaRN; FP8 and FP4 weights at full size), op by op through Block.forward in the reference's arithmetic on
+    CUDA, 256 tokens of README.md: sampled tiles of every op are judged, honest and tampered by 3%. Opt-in: needs the
+    cached layer (tests/test_deepseek.py's RealLayerTests) and a CUDA GPU."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests.test_deepseek import REAL_FILES
+        from vibehash.deepseek_config import Config
+
+        paths = [ds.cache_dir() / f for f in REAL_FILES]
+        if not all(p.exists() for p in paths) or not torch.cuda.is_available():
+            raise unittest.SkipTest("opt-in: the real layer 2 (scripts/deepseek_bench.py --fetch-only) and a CUDA GPU")
+        ds.configure_torch()
+        cls.cfg = Config.flash()
+        cls.state = ds.read_safetensors(paths[0], device="cuda")
+        cls.embed = ds.read_safetensors(paths[1], {"embed.weight"})["embed.weight"]
+        cls.src = rd.StateWeights(cls.state)
+        model = ds.Model(cls.cfg, layers=[2], num=ds.Numerics(), device="meta", embed=False, head=False,
+                         engram_table=False)
+        model.load_weights({k: v for k, v in cls.state.items() if k.startswith("layers.2.")})
+        cls.blk = model.layers["2"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.state = cls.blk = None
+        torch.cuda.empty_cache()
+
+    def judge(self, kind, ins, attrs, out, label, before):
+        before = {k: np32(v).reshape(v.shape[0], -1) if v.dim() > 1 else np32(v)[None] for k, v in before.items()}
+        out = np32(out).reshape(out.shape[0], -1)
+        op = Op(kind, "y", tuple(ins), attrs, (), tuple(out.shape), tuple(before[n].shape for n in ins))
+        x = dispute.Inputs({k: v.shape for k, v in before.items()}, dispute.Outside(None, None, self.src, keep=False), full=before)
+        x.after = dispute.Inputs({"y": out.shape}, x.outside, full={"y": out})
+        n = merkle.n_leaves(*op.shape)
+        flat = out.reshape(-1)
+        tiles = sorted(set(self.rng.choice(n, min(self.samples, n), replace=False).tolist()))
+        fails = caught = tampered = 0
+        used = 0.0
+        for leaf in tiles:
+            said = flat[leaf * merkle.LEAF:(leaf + 1) * merkle.LEAF].astype(np.float64)
+            ok, why = rf.judge(op, x, leaf, said)
+            if not ok:
+                fails += 1
+                print("   honest tile refused:", label, why)
+            else:
+                frac = float(why.split("(")[-1].split(" of")[0]) if "of that)" in why else 0.0
+                used = max(used, frac)
+            if kind in rf.CHOICES:
+                continue
+            j = int(np.argmax(np.where(np.isfinite(said), np.abs(said), -1)))
+            t = said.copy()
+            t[j] *= 1.5 if kind in rf.EXACT else 1.03
+            tampered += 1
+            caught += not rf.judge(op, x, leaf, t)[0]
+        self.assertEqual(fails, 0, label)
+        self.assertEqual(caught, tampered, label)
+        self.assertLess(used, 1.0, label)  # an honest number never needs the referee's margin
+
+    def test_every_forward_op_on_the_real_layer(self):
+        from tests.test_deepseek import readme_tokens
+
+        cfg, num, T, SAMPLES = self.cfg, ds.Numerics(), 256, 6
+        embed, blk = self.embed, self.blk
+        att, ffn = blk.attn, blk.ffn
+        self.rng, self.samples = np.random.default_rng(0), SAMPLES
+        with torch.no_grad():
+            ids = torch.tensor(readme_tokens(T)).cuda()
+            x0 = embed[ids.cpu()].cuda()
+            x = x0[None, :, None].repeat(1, 1, cfg.hc_mult, 1).to(num.dtype)
+            pre_mix = torch.zeros(1, T, cfg.hc_mult, device="cuda")
+            pre_mix[..., 0] = 1
+            hi = num.hi
+            stream = x[0].flatten(1)
+            h = x.flatten(2).to(hi)
+            mixes = F.linear(h, blk.hc_attn_fn.to(hi)) * torch.rsqrt(h.square().mean(-1, keepdim=True) + cfg.norm_eps)
+            self.judge("ds_hc_mixes", ["s"], {"fn": "layers.2.hc_attn_fn", "eps": cfg.norm_eps}, mixes[0], "hc_mixes", {"s": stream})
+            apre, post, comb = ds._sinkhorn_split(mixes, blk.hc_attn_scale.to(hi), blk.hc_attn_base.to(hi), cfg.hc_mult,
+                                                  cfg.hc_sinkhorn_iters, cfg.hc_eps)
+            split = torch.cat([apre, post, comb.flatten(-2)], -1)[0]
+            self.judge("ds_hc_split", ["m"], {"scale": "layers.2.hc_attn_scale", "base": "layers.2.hc_attn_base", "hc": 4,
+                                         "iters": cfg.hc_sinkhorn_iters, "eps": cfg.hc_eps}, split, "hc_split", {"m": mixes[0]})
+            hp = ds.hc_pre(x, pre_mix.to(hi), hi)[0]
+            self.judge("ds_hc_pre", ["s", "p"], {"col": 0}, hp, "hc_pre", {"s": stream, "p": pre_mix[0]})
+            xn = blk.attn_norm(hp)
+            self.judge("ds_rmsnorm", ["h"], {"weight": "layers.2.attn_norm.weight", "eps": cfg.norm_eps}, xn, "attn_norm", {"h": hp})
+            xq = num.fp8(xn)
+            self.judge("ds_round_fp8", ["h"], {}, xq, "round_fp8", {"h": xn})
+            qa = att.wq_a.matmul(xq)
+            self.judge("ds_qlinear", ["x"], {"weight": "layers.2.attn.wq_a"}, qa, "qlinear wq_a (K=5120)", {"x": xq})
+            qr = att.q_norm(qa)
+            self.judge("ds_rmsnorm", ["h"], {"weight": "layers.2.attn.q_norm.weight", "eps": cfg.norm_eps}, qr, "q_norm", {"h": qa})
+            qrq = num.fp8(qr)
+            q = att.wq_b.matmul(qrq)
+            self.judge("ds_qlinear", ["x"], {"weight": "layers.2.attn.wq_b"}, q, "qlinear wq_b (32768 out)", {"x": qrq})
+            cos, sin = ds._rope_table(T, *cfg.rope_args(2))
+            qh = ds._rope(q.unflatten(-1, (cfg.n_heads, cfg.head_dim))[None], cos, sin, num)[0].flatten(-2)
+            self.judge("ds_rope", ["q"], {"rope": cfg.rope_args(2), "hd": cfg.head_dim}, qh, "rope q (YaRN)", {"q": q})
+            kv0 = att.wkv.matmul(xq)
+            kvn = att.kv_norm(kv0)
+            kvr = ds._rope(kvn[None], cos, sin, num)[0]
+            self.judge("ds_rope", ["k"], {"rope": cfg.rope_args(2), "hd": cfg.head_dim}, kvr, "rope kv", {"k": kvn})
+            kv = num.fp8(kvr)
+            r = cfg.ratio(2)
+            latent = att.compressor(x0[None].to(num.dtype))[0]
+            hh = x0[None].to(num.dtype).to(hi)
+            n = T // r
+            kvc = F.linear(hh, att.compressor.wkv.weight.to(hi))[:, :n * r].unflatten(1, (n, r))
+            scc = F.linear(hh, att.compressor.wgate.weight.to(hi))[:, :n * r].unflatten(1, (n, r))
+            pooled = (kvc * scc.softmax(dim=2)).sum(dim=2).to(num.dtype)[0]
+            self.judge("ds_compress", ["x"], {"wkv": "layers.2.attn.compressor.wkv.weight", "wgate": "layers.2.attn.compressor.wgate.weight",
+                                         "ratio": r}, pooled, "compress (pool)", {"x": x0.to(num.dtype)})
+            ccos, csin = cos[:T - T % r:r], sin[:T - T % r:r]
+            comp_r = ds._rope(latent[None], ccos, csin, num)[0]
+            self.judge("ds_rope", ["l"], {"rope": cfg.rope_args(2), "hd": cfg.head_dim, "stride": r}, comp_r, "rope compressed (stride)", {"l": latent})
+            comp = num.fp4(comp_r, 16, e4m3_scale=True)
+            self.judge("ds_round_fp4", ["c"], {"block": 16, "e4m3": True}, comp, "round_fp4 e4m3/16", {"c": comp_r})
+            ix = att.indexer
+            ik = ix.keys(latent[None], ccos, csin)[0]
+            qi = att.indexer.wq_b.matmul(qrq)
+            qir = ds._rope(qi.unflatten(-1, (cfg.index_n_heads, cfg.index_head_dim))[None], cos, sin, num)[0].flatten(-2)
+            qi4 = num.fp4(qir)
+            wproj = F.linear(xn, ix.weights_proj.weight.to(xn.dtype))
+            self.judge("ds_dense", ["x"], {"weight": "layers.2.attn.indexer.weights_proj.weight"}, wproj, "dense weights_proj", {"x": xn})
+            c = cfg.index_head_dim ** -0.5 * cfg.index_n_heads ** -0.5
+            ws = wproj * c
+            score = ix.scores(xn[None], qr[None], ik[None], cos, sin)[0]
+            self.judge("ds_index_scores", ["q", "k", "w"], {"heads": cfg.index_n_heads, "ratio": r}, score, "index_scores",
+                  {"q": qi4, "k": ik, "w": ws})
+            K = min(cfg.index_topk, n)
+            vis = (torch.arange(1, T + 1, device="cuda") // r).unsqueeze(-1)
+            idx = score.topk(K, dim=-1, sorted=False).indices.sort(dim=-1).values
+            picks = torch.where(idx < vis, idx, -1)
+            self.judge("ds_picks", ["s"], {"ratio": r}, picks.float(), "picks (choice)", {"s": score})
+            o = ds.sparse_attention(qh.unflatten(-1, (cfg.n_heads, cfg.head_dim))[None], kv[None], comp[None], picks[None],
+                                    att.attn_sink, cfg.head_dim ** -0.5, cfg.window_size, num)[0].flatten(1)
+            self.judge("ds_attn", ["q", "kv", "c", "p"], {"heads": cfg.n_heads, "window": cfg.window_size, "scale": cfg.head_dim ** -0.5,
+                                                    "sink": "layers.2.attn.attn_sink", "n_window": min(T, cfg.window_size)},
+                  o, "attention (one query, one head)", {"q": qh, "kv": kv, "c": comp, "p": picks.float()})
+            oi = ds._rope(o.unflatten(-1, (cfg.n_heads, cfg.head_dim))[None], cos, sin, num, inverse=True)[0].flatten(-2)
+            oq = num.fp8(oi)
+            woa = att.wo_a.matmul(oq.unflatten(-1, (cfg.o_groups, -1))).flatten(-2)
+            self.judge("ds_qlinear", ["o"], {"weight": "layers.2.attn.wo_a", "groups": cfg.o_groups}, woa, "qlinear wo_a (grouped)", {"o": oq})
+            y = att.wo_b.matmul(num.fp8(woa))
+            hpost = ds.hc_post(y[None], x, post, comb, hi)[0].flatten(1)
+            self.judge("ds_hc_post", ["y", "r", "s"], {"post": 4, "comb": 8}, hpost, "hc_post", {"y": y, "r": stream, "s": split})
+            # the MoE
+            xm = blk.ffn_norm(hp)
+            lg = F.linear(xm.to(hi), ffn.gate.weight.to(hi))
+            self.judge("ds_dense", ["x"], {"weight": "layers.2.ffn.gate.weight", "hi": True}, lg, "dense router (hi)", {"x": xm})
+            sc = ffn.scores(xm)
+            self.judge("ds_moe_scores", ["l"], {"temp": cfg.gate_temp, "func": cfg.score_func}, sc, "moe_scores", {"l": lg})
+            biased = sc + ffn.gate.bias.to(hi)
+            chosen, gates = ffn.route(xm, ds.Choices())
+            self.judge("ds_experts", ["b"], {}, chosen.float(), "experts (choice)", {"b": biased})
+            self.judge("ds_gates", ["s", "c"], {"norm": cfg.norm_topk_prob, "route_scale": cfg.route_scale}, gates, "gates",
+                  {"s": sc, "c": chosen.float()})
+            e, toks, slots = ffn.assignments(chosen)[0]
+            ex = ffn.experts[e]
+            xe = num.fp8(xm[toks])
+            g1 = ex.w1.matmul(xe)
+            self.judge("ds_qlinear", ["x"], {"weight": f"layers.2.ffn.experts.{e}.w1"}, g1, "qlinear expert w1 (FP4)", {"x": xe})
+            u3 = ex.w3.matmul(xe)
+            gate = gates[toks, slots, None]
+            L = cfg.swiglu_limit
+            hsw = (gate * (F.silu(g1.to(hi).clamp(max=L)) * u3.to(hi).clamp(-L, L))).to(num.dtype)
+            self.judge("ds_swiglu", ["g", "u", "gate"], {"limit": L}, hsw, "swiglu (clamps, gate)", {"g": g1, "u": u3, "gate": gate})

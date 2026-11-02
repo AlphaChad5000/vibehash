@@ -403,7 +403,7 @@ def op_ds_hc_split(op, x, r, c0, c1):
 def op_ds_hc_pre(op, x, r, c0, c1):
     """deepseek.hc_pre: Σ_k pre_k · x_k over the stream's hc copies, in num.hi, cast back. ins (stream, mixes);
     attrs col: where pre starts in the mixes' row."""
-    a, dim = op.attrs, op.shape[1]
+    dim = op.shape[1]
     hc, col = op.ishapes[0][1] // dim, op.attrs.get("col", 0)
     pre = x.get(op.ins[1], r, r + 1, col, col + hc)[0]
     xs = np.stack([x.get(op.ins[0], r, r + 1, k * dim + c0, k * dim + c1)[0] for k in range(hc)], -1)  # [cols, hc]
