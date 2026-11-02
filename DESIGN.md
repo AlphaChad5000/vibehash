@@ -765,7 +765,10 @@ within 1.02).
   - **a game's starting states:** a validator rebuilds them from the reveal's checkpoints, fetched from the block's
     proposer (`node.LeaderBlobs`), and refuses a record whose states differ;
   - **outcomes:** it re-runs every referee, so a game the leader marks unchecked, or any edited outcome, doesn't
-    replay to its record.
+    replay to its record. It fetches each game's evidence from the proposer, which keeps it with the round's
+    checkpoints (`storage.record_blobs`); a block whose evidence it can't fetch, it refuses, rather than take the
+    record's word (the third review's finding A). Only a plain replay with nothing to fetch from (an old round, past
+    the window) counts such a game unchecked.
 - **What it still takes:** timing. The leader can drop a move and call it silence, or end the phase early, and a
   replay can't see clocks. Moves now get signed receipts as verdicts do, so a party holding one for a move the record
   lacks proves it was dropped (`receipts.audit`).

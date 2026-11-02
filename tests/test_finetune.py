@@ -1106,6 +1106,45 @@ class NodeFreeRoundTests(unittest.TestCase):
         with self.assertRaises(InvalidJob):  # nobody has it
             PeerDatasets(node).attach(job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": "d" * 64}))
 
+    def test_a_leader_cant_withhold_evidence_and_rewrite_outcomes(self):
+        """The third review's finding A (r3_withheld): the node pruned dispute evidence at the round's end, and a
+        validator that couldn't fetch it took the record's outcome. A leader could flip a cheat's lost games to won,
+        withhold the evidence, and have the honest catchers slashed. Records' evidence is kept now
+        (storage.record_blobs), and a validator refuses a block whose evidence it can't fetch."""
+        from vibehash.crypto import h256
+        from vibehash.ledger import canonical
+        from vibehash.replay import replay_block
+        from vibehash.storage import record_blobs
+
+        self.network([("honest", "honest")] * 2 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        rep = self.round()
+        named = {env["body"]["move"]["evidence"] for g in rep.record["games"] for env in g["moves"]
+                 if "evidence" in env["body"]["move"]}
+        self.assertTrue(named and named <= record_blobs(rep.record))  # kept through the prune
+        self.assertTrue(any(g["outcome"] == "challenger" for g in rep.record["games"]))
+        p, test = self.proto, self
+
+        class Withholding:  # the leader's blobs, but for the evidence
+            def array(self_, bid, job):
+                return p.checkpoints.array(bid, job)
+
+            def bytes(self_, bid):
+                raise ConnectionError("404")
+
+            def attach(self_, j):
+                j.attach_data(load_dataset(test.path), test.sha)
+        flipped = copy.deepcopy(rep.record)
+        for e in flipped["games"]:
+            if e["outcome"] == "challenger":
+                e["outcome"], e["detail"] = "defender", "flipped by the leader"
+        for record in (rep.record, flipped):
+            block = copy.deepcopy(rep.block)  # (a leader that lies seals its forged record's hash)
+            block.summary.record_hash = h256(canonical(record)).hex()
+            problems = replay_block(copy.deepcopy(self.before), block, copy.deepcopy(record), datasets=Withholding(),
+                                    roots=Withholding())
+            self.assertTrue(any("can't be fetched" in x for x in problems), problems)
+        self.replays([rep])  # and with the evidence there, the block replays
+
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
         challenger. Both are slashed as if they had lost at the referee. Three workers, so a claim's checkers are the

@@ -1346,7 +1346,8 @@ class Coordinator:
 
     def _replay_bytes(self, blob_id: str) -> bytes | None:
         """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
-        None when it can't be had (an old round past its window): the game then can't be refereed again."""
+        None when it can't be had: a validator then refuses the block (submit_move), a plain replay counts it
+        unchecked."""
         get = getattr(self.roots, "bytes", None)
         if get is None:
             return None
@@ -1462,7 +1463,11 @@ class Coordinator:
             if not self.replaying:
                 self._check_evidence_size(g, blob, outside)
             evidence = self._replay_bytes(blob) if self.replaying else self._get_trace(blob)
-            if self.replaying and evidence is None:  # gone with its round's window: the record's outcome, unchecked
+            if self.replaying and evidence is None:
+                if getattr(self.roots, "bytes", None) is not None:  # a validator never takes an outcome on trust
+                    raise ProtocolError(f"dispute {g.gid}'s evidence {blob[:12]}… can't be fetched to referee it again")
+                # A plain replay with no blobs to fetch from (an old round, past its window): the record's outcome,
+                # counted unchecked.
                 entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
                 g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
                 self.unchecked += 1

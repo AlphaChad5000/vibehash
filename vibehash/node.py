@@ -58,7 +58,7 @@ from .model import params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
-from .storage import Store
+from .storage import Store, record_blobs
 from .tasks import SYN_PER_VIBE, InvalidJob, Reveal, TrainingJob
 from .wire import MAX_CLOCK_SKEW_S, WireError, blob_openings_in, blob_openings_out, commitment_in, commitment_out, open_envelope
 
@@ -216,13 +216,12 @@ class Node:
         return still()
 
     def _evidence(self) -> set[str]:
-        """Checkpoints recent rounds' records point to, kept for `keep_rounds` rounds so anyone can re-run those
-        rounds' weight-based checks, plus those of blocks we've proposed and the validators are still voting on.
-        Unopened checkpoints and older rounds' are deleted."""
+        """Checkpoints and dispute evidence recent rounds' records point to (storage.record_blobs), kept for
+        `keep_rounds` rounds so anyone can re-run those rounds' checks and referees, plus those of blocks we've
+        proposed and the validators are still voting on. Unopened checkpoints and older rounds' are deleted."""
         keep = self.store.evidence(self.chain.tip.height, self.keep_rounds)
         for _, _, record in list(self.proposed.values()):
-            for rv in record.get("reveals", []):
-                keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+            keep |= record_blobs(record)
         return keep
 
     def _end_round(self) -> None:
