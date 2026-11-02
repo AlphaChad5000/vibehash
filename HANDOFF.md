@@ -183,18 +183,21 @@ Done and tested (as of the last full runs):
      is a bisection game in a `dispute` phase of the same round. The worker posts the states between its training's
      ops (unit → segment → step → sequence → layer → op, up to 64 children a split), the challenger picks where they
      go wrong, and the node recomputes one tile of one op with NumPy (`referee.py`: float64 with a bound on float32
-     rounding; no libm, so every machine agrees). Losers are slashed; a false accusation's slash is burned. The weights
-     it needs come by byte range from the pinned commit (`dispute.HubWeights`); Hub unreachable means unchecked.
+     rounding; no libm, so every machine agrees). Losers are slashed; a false accusation's slash is burned; a checker
+     that finds no number the referee would refuse withdraws (unpaid, not slashed). The weights it needs are fetched
+     whole from the pinned commit and checked against the manifest (`dispute.HubWeights`); Hub unreachable means
+     unchecked.
      - **Training changed with it:** it runs `program.py`'s ops one by one (`tracer.py`), so the states a worker posts
        are its training's own. Gradients match autograd to ~1e-6. It's 2.2× slower a step on Qwen3-0.6B (1.62 s
        against 0.72 s at batch 8); batching a step's sequences in each op is the follow-up.
-     - **Start gate:** `FINETUNE_QUORUM` = 2 (one to train, one to check): one honest checker makes a claim's verdict
-       right now.
+     - **Start gate:** `FINETUNE_QUORUM` = 2 (one to train, one to check): one honest checker is enough for DESIGN's
+       security statement.
      - **New HTTP:** `GET /round/games`, `POST /move`; a dispute's defender may upload its states (quota per round).
-     - **Records:** `games` (signed moves, evidence, the weights used), `checks/game`. Replaying a round with disputes
-       needs the job's dataset (the program), not PyTorch or the Hub.
-     - **Not done:** receipts for moves; a recheck checking the recorded weights against the Hub; measuring how far a
-       worker can steer a segment with every op at its bound (DESIGN §8's residual).
+     - **Records:** `games` (signed moves and outcomes; no weights, and evidence by blob id), `checks/game`. A
+       validator replaying a round with disputes rebuilds each game's starting states from the proposer's checkpoints,
+       fetches the evidence and the job's dataset, and reads only weights it checked; no PyTorch. Moves get receipts.
+     - **Second review** (12 findings): one commit each on the PR. Left as known limits in DESIGN: colluders can tell a
+       canary by its checkpoints' ids; a split can name gigabytes on big adapters with many steps a segment.
      `vibehash node --device` still exists for MLP checks. `testnet --job none` posts no demo job, for `train --base`.
    - **hub.py:** `TensorCache` now fetches 64 MiB runs over six connections (1.5 GB in ~15 s here); manifests pin
      `chat_template.jinja` too.

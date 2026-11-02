@@ -720,8 +720,9 @@ Each step:
      units' workers and checkers aren't its allies. Hiding the ids would mean serving each checkpoint under a
      per-checker name that still proves its content, which isn't cheap; it's left as a known limit.
 8. **Bootstrapping.** A fine-tune's round assigns nothing until `FINETUNE_QUORUM` = 2 staked workers able to run it
-   have registered: one to train a unit and one to check it. With the node refereeing, one honest checker makes a
-   claim's verdict right (below), so that's enough to start, and with two workers each checks the other.
+   have registered: one to train a unit and one to check it. With the node refereeing, one honest checker is enough
+   for the security statement below (work outside the referee's bounds found bad, honest work never), so that's
+   enough to start, and with two workers each checks the other.
    - **From three workers,** each claim gets two checkers, so one going quiet leaves the other.
    - **Canaries** need a worker who neither holds nor checks either of two units, so they start from about five.
    - **Until the quorum,** the round says why (`waiting` in `/status`, on the worker dashboard and in the round
