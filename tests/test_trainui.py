@@ -522,6 +522,7 @@ class CommandTests(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"VIBEHASH_HOME": home.name})
         patch.start()
         self.addCleanup(patch.stop)
+        self.home = home.name
 
     def run_cli(self, node, *argv):
         out = io.StringIO()
@@ -535,6 +536,16 @@ class CommandTests(unittest.TestCase):
         self.assertIn("finished: 10 rounds trained, accuracy 94.5% (best 94.5%); 98.33 VIBE spent", out)
         self.assertIn(f"{JOB} finished: 10 rounds trained", out)
         self.assertRegex(out, rf"Download the model: +\S.* job download {JOB}")
+        # Its rounds were kept as they were read (this node serves no blocks, so they have no times; the fees are the
+        # ledger's, and the budget is worked back from what's left)
+        saved = os.path.join(self.home, "jobs", JOB, "history.csv")
+        self.assertIn(f"Round by round:  {saved}", out)
+        with open(saved, encoding="utf-8") as f:
+            rows = f.read().splitlines()
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[1], "40,,12,1.33,0.4948,10,88.33333332")  # the 98.33 the rounds paid, less the first's 10
+        self.assertEqual(rows[4], "46,,11,0.6732,0.7926,9.16666666,59.16666666")  # 11 of 12 units: 11/12 of the fee
+        self.assertEqual(rows[-1], "58,,12,0.2136,0.9453,10,0")
 
     def test_job_watch_of_a_job_the_node_doesnt_know(self):
         with self.assertRaises(SystemExit) as e:

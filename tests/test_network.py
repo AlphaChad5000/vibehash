@@ -298,7 +298,14 @@ class CommandLineTests(unittest.TestCase):
         status = self.run_cli("job", "status")  # no job id or node: the last job, and the node it went to
         self.assertIn(f"job {job_id}", status)
         self.assertRegex(status, r"rounds     [1-9]\d* done")
+        self.check_job_history(node, job_id, tmp)
         self.run_cli("job", "download", "--out", str(tmp / "fruit-model.npz"))
+        page = (tmp / "fruit-model-TRAINING.md").read_text(encoding="utf-8")  # how it was trained, beside it
+        self.assertIn("fruit.csv: 256 rows to train on, 64 held back", page)
+        self.assertIn(f"on {node.url}, chain `vibehash-localtest`", page)
+        self.assertRegex(page, r"[1-9]\d* of them trained it, with [1-9]\d* units of work accepted")
+        self.assertIn("posted with a budget of 40 VIBE", page)
+        self.assertTrue((tmp / "fruit-model-training-history.csv").read_text().startswith("round,time,units_accepted"))
         result = self.run_cli("predict", str(fruit), "--rows", "3")  # no model named: the one just downloaded
         self.assertGreater(float(re.search(r"([\d.]+)% right", result)[1]), 80)  # four rounds on 256 rows
         self.run_cli("predict", str(tmp / "fruit-model.npz"), str(tmp / "fruit-new.csv"), "--out", str(tmp / "p.csv"))
@@ -306,15 +313,93 @@ class CommandLineTests(unittest.TestCase):
         audit = self.run_cli("chain", "verify", "--node", node.url)  # and anyone can replay how it was trained
         self.assertRegex(audit, r"replayed [1-9]\d* rounds from their records: every decision follows from the signed messages")
 
+    def check_job_history(self, node, job_id, tmp):
+        """`job history`: the rounds from the node, printed and saved in ~/.vibehash/jobs/<job>, for a job posted here
+        or anywhere else."""
+        out = self.run_cli("job", "history")  # the last job, on the node it went to
+        self.assertRegex(out, rf"job {job_id} on {re.escape(node.url)}: [1-9]\d* rounds scored, [1-9]\d* of them trained it")
+        self.assertRegex(out, r"\n +\d+  20\d\d-\d\d-\d\d \d\d:\d\d:\d\d +[1-9]\d* +[\d.]+ +[\d.]+% +[\d.]+ +[\d.]+\n")
+        saved = self.home / "jobs" / job_id / "history.csv"
+        self.assertIn(f"wrote {saved}", out)
+        rows = saved.read_text().splitlines()
+        self.assertEqual(rows[0], "round,time,units_accepted,loss,accuracy,paid_vibe,budget_left_vibe")
+        trained = [r.split(",") for r in rows[1:] if r.split(",")[2] != "0"]
+        self.assertTrue(trained and all(r[1] and float(r[5]) > 0 for r in trained), rows)  # each with its time and fee
+        self.assertTrue((self.home / "jobs" / job_id / "history.jsonl").exists())
+        dump = json.loads(self.run_cli("job", "history", job_id, "--json", "--csv", str(tmp / "h.csv")))
+        self.assertEqual((dump["job"], dump["chain_id"]), (job_id, "vibehash-localtest"))
+        first = dump["rounds"][0]
+        self.assertAlmostEqual(first["budget_left_vibe"] + first["paid_vibe"], 40.0)  # before it, all of the budget
+        self.assertEqual((tmp / "h.csv").read_text().splitlines()[0], rows[0])
+        other = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # another computer: no receipt, no saved node
+        self.addCleanup(other.cleanup)
+        with mock.patch.dict(os.environ, {"VIBEHASH_HOME": other.name}):
+            out = self.run_cli("job", "history", job_id, "--node", node.url)
+            self.assertTrue((Path(other.name) / "jobs" / job_id / "history.csv").exists(), out)
+            code, out = self.run_cli_status("job", "history", "no-such-job", "--node", node.url)
+        self.assertEqual(code, f"error: {node.url} has no job called no-such-job")
+
+    def test_a_worker_keeps_records_and_sums_up(self):
+        """`vibehash worker --plain` says where its logs go, writes a line per round, and sums the session up when it's
+        stopped (Ctrl+C, here raised once two rounds are sealed)."""
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 1)
+        job = TrainingJob("records-job", req.address, budget=60 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        wallets.save(workers[0], tmp / "w.json", None)
+
+        def run(client, stop=None):
+            deadline = time.time() + 90
+            while time.time() < deadline and client.record.rounds < 2:
+                try:
+                    client.step()
+                except NodeError:
+                    pass
+                time.sleep(0.1)
+            raise KeyboardInterrupt
+        with mock.patch.object(WorkerClient, "run", run):
+            out = self.run_cli("worker", "--plain", "--node", node.url, "--wallet", str(tmp / "w.json"), "--device", "cpu",
+                               "--flops", "1e9", "--memory-mb", "8192")
+        logs = self.home / "logs"
+        self.assertIn(f"recording to {logs}: worker-", out)
+        self.assertRegex(out, r"Recorded 2 sealed rounds: [1-9]\d* units accepted, \+[1-9][\d.]* VIBE earned, as the "
+                              r"blocks paid it")
+        lines = [json.loads(x) for x in (logs / "rounds.jsonl").read_text().splitlines()]
+        sealed = [x for x in lines if x["sealed"]]
+        self.assertEqual(len(sealed), 2, lines)
+        self.assertTrue(all(x["worker"] == workers[0].address and x["node"] == node.url and x["job"] == "records-job"
+                            and x["chain_id"] == "vibehash-localtest" and x["committed"] for x in sealed), sealed)
+        s = node.chain.state  # what the lines say it earned is what the chain paid it, beyond its genesis stake
+        self.assertEqual(round(sum(x["earned_vibe"] for x in sealed) * VIBE),
+                         s.balance(workers[0].address) + s.stake(workers[0].address) - 10 * VIBE)
+
     def test_testnet_runs_and_resumes(self):
         # The small job: this tests resuming, not how much a busy CPU can train in 3 seconds.
         fast = ["--dir", str(self.home / "tn"), "--port", "0", "--device", "cpu", "--job", "small",
                 "--register-s", "3", "--compute-s", "3", "--reveal-s", "2", "--verify-s", "2"]
-        out = self.run_cli("testnet", "--rounds", "2", *fast)
+        # With the node's INFO lines on (setUp turns them off), so its log file has something to keep; they go to a
+        # scratch stream rather than the test's output.
+        logging.disable(logging.NOTSET)
+        with mock.patch.object(logging.root, "handlers", []), contextlib.redirect_stderr(io.StringIO()):
+            out = self.run_cli("testnet", "--rounds", "2", *fast)
+        logging.disable(logging.INFO)
         self.assertIn("posted job demo-1", out)
         earned = [float(x) for x in re.findall(r"worker-1 ([\d.]+)", out)]
         self.assertEqual(len(earned), 2)
         self.assertGreater(earned[-1], 0)
+        # Its records: the node's log in the testnet's folder, and each worker's rounds, a JSON line each.
+        self.assertIn("node up at", (self.home / "tn" / "node.log").read_text(encoding="utf-8"))
+        self.assertRegex(out, r"Recorded [1-9]\d* sealed rounds? of 2 workers: \d+ units? accepted, \+[\d.]+ VIBE earned")
+        lines = [json.loads(x) for x in (self.home / "logs" / "rounds.jsonl").read_text().splitlines()]
+        sealed = [x for x in lines if x["sealed"]]
+        self.assertTrue(sealed, lines)
+        workers = {json.loads((self.home / "tn" / f"worker-{i}.json").read_text())["address"] for i in (1, 2)}
+        self.assertEqual({x["worker"] for x in lines}, workers)
+        self.assertTrue(all(x["job"] == "demo-1" and x["kind"] == "mlp" and x["chain_id"].startswith("vibehash-local-")
+                            for x in lines), lines)
+        self.assertTrue(any(x["committed"] and x["accepted"] and x["earned_vibe"] > 0 and x["paid"].get("work", 0) > 0
+                            and x["train_s"] > 0 for x in sealed), sealed)
+        log = next((self.home / "logs").glob("worker-*.log")).read_text(encoding="utf-8")
+        self.assertIn("round", log)  # the feed's events: the node's rounds, in a testnet
         out = self.run_cli("testnet", "--rounds", "1", *fast)  # same chain and job, picked up from disk
         self.assertNotIn("posted job", out)
         self.assertGreater(float(re.findall(r"worker-1 ([\d.]+)", out)[-1]), 0, out)  # the first round back gets worked

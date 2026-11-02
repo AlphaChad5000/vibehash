@@ -29,6 +29,9 @@ class DeepSeekWork:
         self._games: dict = {}
         self._prep_weights: dict = {}
         self.wants: dict[int, dict] = {}  # round -> the accepted objects' digests, as the assignment gave them
+        # The latest prep round's units' own "stats" (seconds, tokens a second, peak GPU memory, transfers), as their
+        # commitments carry them: what the worker's round log (records.RoundLog) keeps. {round: [stats, ...]}
+        self.unit_stats: dict[int, list[dict]] = {}
         self._looked = 0.0  # when ended() last asked the node
         self.prep_cheat = None  # tests only: graph unit name -> a tamper (tracer.Executor's) for its run, or None
 
@@ -113,6 +116,7 @@ class DeepSeekWork:
         graph = job.spec.graph(job.data.tokens)
         weights, store, out = self.weights_for(job), self.store(), []
         self.wants[rnd] = dict(want)
+        self.unit_stats = {rnd: []}
         for u in units:
             gu = graph.units[prep[u.unit_id]]
             self.names.setdefault(rnd, {})[u.unit_id] = gu.name
@@ -122,6 +126,8 @@ class DeepSeekWork:
             cheat = self.prep_cheat(gu.name) if self.prep_cheat is not None else None
             commit = run_unit(job.spec, job.data.tokens, gu, store, weights, self.work(job), want=want,
                               device=self.device(), tamper=cheat)
+            stats = commit.get("stats") if isinstance(commit.get("stats"), dict) else {}
+            self.unit_stats[rnd].append({"unit": gu.name, **stats})
             root, salt = hashlib.sha256(json.dumps(commit).encode()).digest(), os.urandom(16)
             k = self.client.keys
             digest = commit_digest(u.unit_id, k.public, root, salt)
