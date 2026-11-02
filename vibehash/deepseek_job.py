@@ -20,6 +20,7 @@ from functools import lru_cache
 import numpy as np
 
 from .deepseek_config import COMMIT, LORA_MODULES, REPO, Config, Cut, tiny_config
+from .deepseek_graph import ROWS_PER_PIECE, Graph, pieces, plan
 from .finetune import OPTIMIZERS, LoraSpec
 
 KIND = "deepseek"
@@ -75,6 +76,16 @@ class DeepSeekSpec(LoraSpec):
     @property
     def top(self) -> Cut:
         return Cut(self.cfg, self.cut)
+
+    @property
+    def align(self) -> int:
+        """Row ranges' alignment: deepseek_prep's 64 MiB pieces of Flash's tables, single rows of the tiny ones."""
+        return 1 if self.config_name == "tiny" else ROWS_PER_PIECE
+
+    def graph(self, tokens: "TokenFile") -> Graph:
+        """The prep's work graph over the job's text: what the node hands out and every worker plans alike."""
+        return plan(self.top, tokens.chunks(self.chunk_tokens), pieces(self.cut, self.pieces), self.row_ranges,
+                    self.align)
 
     def problems(self) -> list[str]:
         m, out = self.model, []

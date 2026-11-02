@@ -345,6 +345,58 @@ def replay(source, store, seqs, chunks, cut: top.Cut, unit: Unit, commit: dict, 
     return {"agrees": not disagree and not outs, "disagree": disagree, "outputs": outs}
 
 
+def distance(mine: torch.Tensor | None, theirs: torch.Tensor | None) -> float:
+    """How far a replayed output is from a committed one: the relative RMS of numbers (the stream, keys), the share
+    that differ of ids and flags (picks, candidate blocks); infinite if the shapes differ or only one exists."""
+    if mine is None or theirs is None:
+        return 0.0 if mine is None and theirs is None else float("inf")
+    if mine.shape != theirs.shape:
+        return float("inf")
+    if mine.dtype.is_floating_point and mine.dtype.itemsize > 1:
+        a, b = mine.float(), theirs.float()
+        return float((a - b).square().mean().sqrt() / (b.square().mean().sqrt() + 1e-30)) if a.numel() else 0.0
+    return float((mine.view(torch.uint8) != theirs.view(torch.uint8)).float().mean()) if mine.numel() else 0.0
+
+
+def replay_close(source, store, seqs, chunks, cut: top.Cut, unit: Unit, commit: dict, tolerance: float,
+                 token_map=None, work: Path | None = None, device="cpu", whole_layer_gb: float = 14.0,
+                 fp8: bool = False, ranges: int = 15, align: int = ROWS_PER_PIECE, want: dict | None = None) -> dict:
+    """A check across hardware: the unit run again from its checked inputs, its outputs compared with the ones it
+    committed to (read from `store`, checked against the commitment) within `tolerance` (distance), since the
+    reference's arithmetic differs a little between devices. On the same hardware they agree to the bit, and this
+    says so without comparing. -> {"agrees", "worst": the largest distance, "where": which output, and which
+    tensor of it}."""
+    states, hashes, inputs, _ = _compute(source, store, seqs, chunks, cut, unit, token_map, work, device,
+                                         whole_layer_gb, ranges, align, want)
+    objects, leaves = _outputs(store, seqs, chunks, cut, unit, states, hashes, inputs, fp8)
+    if hashes == commit["layer_hashes"] and all(commit["outputs"].get(n) == _digest_of(o) for n, o in objects.items()):
+        return {"agrees": True, "worst": 0.0, "where": ""}
+    worst, where = 0.0, ""
+
+    def note(d: float, label: str) -> None:
+        nonlocal worst, where
+        if d >= worst:
+            worst, where = d, label
+
+    for name, obj in objects.items():
+        if isinstance(obj, dict):
+            theirs = _get(store, name, {}, {name: commit["outputs"].get(name, "missing")})
+            for k in sorted(set(obj) | set(theirs)):
+                note(distance(obj.get(k), theirs.get(k)), f"{name}:{k}")
+        elif name.endswith(".bin"):
+            meta_name = name[:-4] + ".json"
+            data, meta = store.get(name), store.get(meta_name)
+            if hashlib.sha256(data).hexdigest() != commit["outputs"].get(name) or                     hashlib.sha256(meta).hexdigest() != commit["outputs"].get(meta_name):
+                raise Tampered(f"{name} isn't what the unit committed to")
+            ours_meta, their_meta = json.loads(objects[meta_name]), json.loads(meta)
+            for j in range(len(ours_meta["sequences"])):
+                mine = top.unpack(obj[ours_meta["offsets"][j]:ours_meta["offsets"][j + 1]])
+                theirs = top.unpack(data[their_meta["offsets"][j]:their_meta["offsets"][j + 1]])
+                for k in sorted(set(mine) | set(theirs)):
+                    note(distance(mine.get(k), theirs.get(k)), f"{name}:{j}:{k}")
+    return {"agrees": worst <= tolerance, "worst": worst, "where": where}
+
+
 def state_before(source, store, seqs, chunks, cut: top.Cut, unit: Unit, j: int, layer: int, token_map=None,
                  work: Path | None = None, device="cpu", whole_layer_gb: float = 14.0, ranges: int = 15,
                  align: int = ROWS_PER_PIECE, want: dict | None = None) -> tuple[dict, str | None]:
