@@ -1100,8 +1100,9 @@ class TraceBlobs:
     def tensor_root(self, blob_id: str, rows: int, cols: int) -> str | None:
         from .merkle import root_of
 
-        if blob_id not in self.roots:
+        key = (blob_id, rows, cols)  # (a reshape has the same bytes, and another root)
+        if key not in self.roots:
             if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
                 return None
-            self.roots[blob_id] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
-        return self.roots[blob_id]
+            self.roots[key] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
+        return self.roots[key]

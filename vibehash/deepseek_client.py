@@ -24,7 +24,11 @@ class DeepSeekWork:
         self.weights: dict = {}  # job id -> deepseek_worker.Weights
         self.committed: dict[int, list[tuple[WorkUnit, bytes, bytes]]] = {}  # round -> (unit, root, salt)
         self.round: int | None = None
-        self.bend = None  # tests only: (store, unit, commitment) -> a cheat's commitment, its outputs bent to match
+        self.names: dict[int, dict[str, str]] = {}  # round -> {unit id: its graph unit}, ours and those we check
+        self._games: dict = {}
+        self._prep_weights: dict = {}
+        self.wants: dict[int, dict] = {}  # round -> the accepted objects' digests, as the assignment gave them
+        self.prep_cheat = None  # tests only: graph unit name -> a tamper (tracer.Executor's) for its run, or None
 
     # --- taking the job ---
 
@@ -76,15 +80,16 @@ class DeepSeekWork:
         self.round = rnd
         graph = job.spec.graph(job.data.tokens)
         weights, store, out = self.weights_for(job), self.store(), []
+        self.wants[rnd] = dict(want)
         for u in units:
             gu = graph.units[prep[u.unit_id]]
+            self.names.setdefault(rnd, {})[u.unit_id] = gu.name
             if not self._fetch(job, weights, gu):
                 continue
             self.client.stats.activity = f"prep: {gu.name}"
+            cheat = self.prep_cheat(gu.name) if self.prep_cheat is not None else None
             commit = run_unit(job.spec, job.data.tokens, gu, store, weights, self.work(job), want=want,
-                              device=self.device())
-            if self.bend is not None:
-                commit = self.bend(store, gu, commit)
+                              device=self.device(), tamper=cheat)
             root, salt = hashlib.sha256(json.dumps(commit).encode()).digest(), os.urandom(16)
             k = self.client.keys
             digest = commit_digest(u.unit_id, k.public, root, salt)
@@ -119,6 +124,7 @@ class DeepSeekWork:
         self.round = rnd
         graph = job.spec.graph(job.data.tokens)
         gu, store, weights = graph.units[task["prep"]], self.store(), self.weights_for(job)
+        self.names.setdefault(rnd, {})[task["unit"]["unit_id"]] = gu.name
         try:
             raw = store.get(task["commit"])
         except OSError:
@@ -139,6 +145,58 @@ class DeepSeekWork:
         except (Tampered, Missing, KeyError) as e:
             log.info("checked %s: rejected (%s)", gu.name, e)
             return False
+
+    # --- a prep unit's dispute ---
+
+    def prep_game(self, rnd: int, job: TrainingJob, game: dict, remote):
+        """(the program, our Party) for a game over a prep unit (deepseek_program.PrepProgram, deepseek_tracer.Party),
+        made once a game. As its defender, before the first split, our unit's first and last states are run again
+        from its inputs and put on the node, for the challenger to fetch."""
+        import types
+
+        from .deepseek_program import PrepProgram
+        from .deepseek_tracer import Executor, Party
+        from .finetune import device_of
+
+        key = (rnd, game["id"])
+        if key not in self._games:
+            graph = job.spec.graph(job.data.tokens)
+            gu = graph.units[self.names[rnd][game["unit"]]]
+            prog = PrepProgram.of(job.spec, job.data, gu)
+            weights = self.weights_for(job)
+            rt = types.SimpleNamespace(model=None, device=device_of(self.client.backend), weights=self.prep_weights(job))
+            cheat = self.prep_cheat(gu.name) if self.prep_cheat is not None else None
+            party = Party(rt, job.spec, job.data, remote, cheat)
+            if game["defender"] == self.client.keys.address:
+                from . import deepseek_split as split
+                self.round = rnd
+                st = split._start(self.store(), prog, job.spec.top, gu, {}, self.wants.get(rnd), None)
+                st = {k: v.to(rt.device) for k, v in st.items()}
+                party.publish(st)
+                ex = Executor(rt, job.spec, prog, cheat)
+                ex.token_map = weights.token_map(self.work(job))
+                for s in range(prog.segments):  # labelled as its run was (deepseek_split._compute)
+                    node = prog.segment(s)
+                    ex.run_atoms(node, 0, len(node.atoms), st, ())
+                party.publish(st)
+            self._games = {k: v for k, v in self._games.items() if k[0] == rnd}
+            self._games[key] = (prog, party)
+        return self._games[key]
+
+    def prep_weights(self, job: TrainingJob):
+        """The frozen layers' tensors by name, the embedding and the engram token map (and the tables, for the tiny
+        config): what a prep unit's ops and its referee read."""
+        if job.job_id not in self._prep_weights:
+            from . import deepseek_split as split
+            weights = self.weights_for(job)
+            tmap = weights.token_map(self.work(job))
+            if weights.tiny:
+                from . import deepseek as ds
+                self._prep_weights[job.job_id] = {**ds.random_weights(job.spec.cfg, 0), "engram.token_map": tmap}
+            else:
+                self._prep_weights[job.job_id] = split._Weights(weights.source(), self.work(job),
+                                                                {"engram.token_map": tmap})
+        return self._prep_weights[job.job_id]
 
     # --- a training round ---
 

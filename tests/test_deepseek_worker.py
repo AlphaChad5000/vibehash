@@ -20,7 +20,9 @@ try:
     import numpy as np
     from vibehash import deepseek, deepseek_job as dj, deepseek_prep as prep, deepseek_split as split
     from vibehash import deepseek_worker as dw, modelstore
+    from vibehash.deepseek_graph import handed_root
     from vibehash.deepseek_job import TokenFile
+    from vibehash.deepseek_program import PrepProgram
     from tests.test_deepseek_split import FakeS3
 except ImportError:
     torch = None
@@ -87,16 +89,25 @@ class PrepTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "the same, to the bit")
         stream = split.stream_name(0, unit.b)
+        above = next(u for u in graph.units.values() if u.kind == "layers" and u.a == unit.b and u.chunk == 0)
+        above = PrepProgram.of(self.spec, types.SimpleNamespace(tokens=self.tokens), above)
+        honest = self.store.get(stream)
         for scale, holds in ((1.01, True), (1.2, False)):  # as other hardware's arithmetic, then bent
-            got = split.decode(self.store.get(stream))
+            got = split.decode(honest)
             other = {k: (v.float() * scale).to(v.dtype) if k.endswith(".x") else v for k, v in got.items()}
             alt = split.PresignedStore(self.store.sign, part=4096, wait=lambda s: None)
             alt.put(stream, split.encode(other))
             bent = json.loads(json.dumps(commit))
             bent["outputs"][stream] = split.digest(other)
+            bent["roots"][-1] = handed_root(alt, above, bent["outputs"])  # its last state is what it hands on
             ok, why = dw.check_unit(self.spec, self.tokens, unit, bent, alt, self.weights, self.tmp / "check")
             self.assertEqual(ok, holds, why)
             self.assertIn(stream, why)
+            bent["roots"][-1] = commit["roots"][-1]  # outputs that aren't the state it committed to: refused
+            ok, why = dw.check_unit(self.spec, self.tokens, unit, bent, alt, self.weights, self.tmp / "check")
+            self.assertFalse(ok)
+            self.assertIn("hands on", why)
+        self.store.put(stream, honest)
 
 
 @unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")

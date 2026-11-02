@@ -645,6 +645,7 @@ class Coordinator:
             self.r.record["checks"]["game"] = {}  # each dispute's root states, from the checkpoints
         if prep_units:  # a DeepSeek prep round: which unit of the work graph each of its units is
             self.r.record["prep"] = {"units": dict(prep_units)}
+            self.r.record["checks"]["handoff"] = {}  # whether a rejected unit's outputs are its last state
         # Names this attempt at the round, for receipts (receipts.py): a round abandoned and run again under the
         # same number gets a new label, so receipts from the abandoned attempt don't look like censorship.
         if self.replaying:
@@ -1384,8 +1385,8 @@ class Coordinator:
             return False
         job = self.job(r.job_id)
         r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
-        if r.prep:  # prep units aren't refereed yet: a rejected claim ends unchecked (deepseek_rounds)
-            return False
+        if r.prep:
+            self._prep_disputes(job)
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
                 self._open_game(job, (t.unit.unit_id, t.submitter), t.verifier, "dispute", ["segment", t.verdict[1]])
@@ -1408,8 +1409,70 @@ class Coordinator:
         if key not in self._programs:
             if getattr(job, "_data", None) is None:
                 self._attach(job)
-            self._programs[key] = Program.of(job, self.r.units[uid].seed)
+            if uid in self.r.prep:  # a prep unit's (deepseek_program.PrepProgram)
+                from .deepseek_program import PrepProgram
+                self._programs[key] = PrepProgram.of(job.spec, job.data, self.prep(job).graph.units[self.r.prep[uid]])
+            else:
+                self._programs[key] = Program.of(job, self.r.units[uid].seed)
         return self._programs[key]
+
+    def _prep_disputes(self, job: TrainingJob) -> None:
+        """A prep round's rejected layers units (rows units are copies of the tables: a rejected one ends unchecked).
+        First the node checks a claim's outputs are its last committed state (deepseek_graph.handed_root, or
+        records_root for the last piece: its objects decoded in NumPy): if not, the claim is fraud, its catcher the
+        checker. If they are, the dispute is over its computation: a game rooted at the whole unit, from its first
+        committed state to its last, layer by layer, then op by op."""
+        r = self.r
+        for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
+            if t.kind != "prep" or t.canary or t.verdict is None or t.verdict[0] or t.verifier in r.void:
+                continue
+            key = (t.unit.unit_id, t.submitter)
+            if not r.prep[key[0]].startswith("layers") or key not in r.reveals or key in r.results:
+                continue
+
+            def check(key=key):  # (a replay takes the outcome from the record: it needn't read the job's text)
+                return self._handoff(job, key, self.prep(job).graph.units[r.prep[key[0]]])
+            outcome = self._claim("handoff", f"{key[0]}/{key[1]}", check)
+            if outcome != "ok":
+                if key not in r.results:
+                    self._fraud(key, Verdict.FAILED_REPLAY, outcome, catcher=t.verifier, verifier=t.verifier)
+                continue
+            self._open_prep_game(job, key, t.verifier)
+
+    def _handoff(self, job: TrainingJob, key, gu) -> str:
+        """"ok" if a layers unit's outputs in the bucket are the last state it committed to, else why not."""
+        from .deepseek_graph import Missing, Tampered, handed_root, records_root
+        from .deepseek_program import PrepProgram
+
+        commit = self.r.prep_commits.get(key)
+        if commit is None or self.prep_store is None:
+            return "ok"
+        state, store = self.prep(job), self.prep_store(job)
+        want = {**state.want(), **commit["outputs"]}
+        try:
+            if gu.b < job.spec.top.first:
+                above = next(u for u in state.graph.units.values()
+                             if u.kind == "layers" and u.chunk == gu.chunk and u.a == gu.b)
+                root = handed_root(store, PrepProgram.of(job.spec, job.data, above), want)
+            else:
+                root = records_root(store, PrepProgram.of(job.spec, job.data, gu), want)
+        except (Tampered, Missing, OSError, KeyError, ValueError) as e:
+            return f"its outputs can't be read as the state it committed to: {e}"
+        return "ok" if root == commit["roots"][-1] else "its outputs aren't the last state it committed to"
+
+    def _open_prep_game(self, job: TrainingJob, key, challenger: str) -> None:
+        r = self.r
+        uid, defender = key
+        gid = h256(b"game", r.beacon, r.secret, canonical([uid, defender, challenger, ["unit"]])).hex()[:20]
+        if gid in r.games:
+            return
+
+        def ends():
+            roots = r.prep_commits[key]["roots"]
+            return [roots[0], roots[-1]]
+        a, b = self._claim("game", gid, ends)
+        g = dg.Game(gid, uid, defender, challenger, "dispute", ["unit"], a, b, seed=r.units[uid].seed)
+        r.games[gid] = g.start(self._program(job, uid))
 
     def _attach(self, job: TrainingJob) -> None:
         """A replay needs a fine-tune's data to referee its disputes (which sequences a step trains on, and how long
@@ -1528,6 +1591,8 @@ class Coordinator:
                 evidence = self._get_trace(str(move["evidence"]))
                 outside = dg.Outside(job.spec, job.data, self._weight_source(job))
         try:
+            if not self.replaying and g.unit in r.prep and not g.moves:  # a prep game's ends: the defender's to post
+                self._check_states([g.a, g.b])
             dg.play(g, self._program(job, g.unit), addr, move, evidence=evidence, outside=outside,
                     check_states=None if self.replaying else self._check_states)
         except dg.MoveRefused as e:
@@ -1809,11 +1874,13 @@ class Coordinator:
             if g.outcome == "defender":
                 r.slashes.append([g.challenger, None, "false accusation"])
         for key in sorted(r.reveals):
+            if r.prep and key in r.results:  # found bad already: its outputs aren't its state (_prep_disputes)
+                continue
             lost = [g for g in games[key] if g.outcome == "challenger"]
-            rejected = bool(r.prep) and any(not t.verdict[0] for t in answered[key])
+            rejected = bool(r.prep) and r.prep[key[0]].startswith("rows") and any(not t.verdict[0] for t in answered[key])
             if rejected:  # (deepseek_rounds: no game to settle it, so nobody is paid or slashed for it)
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
-                                            "a checker rejected it, and prep units aren't refereed yet")
+                                            "a checker rejected it, and rows units aren't refereed yet")
             elif lost:
                 g = lost[0]
                 self._fraud(key, Verdict.FAILED_REDUNDANCY if g.why == "replicas" else Verdict.FAILED_REPLAY,

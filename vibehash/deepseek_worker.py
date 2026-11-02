@@ -123,9 +123,7 @@ class Weights:
     def token_map(self, work: Path) -> torch.Tensor:
         """The compressed token map engram hashing uses: rebuilt from the tokenizer for Flash; fixed for tiny."""
         if self.tiny:
-            cfg = self.spec.cfg
-            return torch.randint(0, cfg.engram_compressed_vocab_size, (cfg.vocab_size,),
-                                 generator=torch.Generator().manual_seed(1))
+            return tiny_token_map(self.spec.cfg)
         path = self.store.folder / store_name("tokenizer.json")
         return torch.from_numpy(prep.compressed_token_map(path))
 
@@ -178,8 +176,14 @@ def sequences(tokens: TokenFile) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return out
 
 
+def tiny_token_map(cfg) -> torch.Tensor:
+    """The tiny config's engram token map: fixed, as its weights are (tests and local testnets)."""
+    return torch.randint(0, cfg.engram_compressed_vocab_size, (cfg.vocab_size,),
+                         generator=torch.Generator().manual_seed(1))
+
+
 def run_unit(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, store, weights: Weights, work: Path,
-             want: dict | None = None, device: str = "cpu") -> dict:
+             want: dict | None = None, device: str = "cpu", tamper=None) -> dict:
     """Run a prep unit it was given: its inputs from `store` (checked against `want`, their writers' digests), its
     outputs written there. -> its commitment."""
     seqs, chunks = sequences(tokens), tokens.chunks(spec.chunk_tokens)
@@ -188,7 +192,7 @@ def run_unit(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, store, wei
         return split.run_rows(weights.source(), store, seqs, chunks, spec.top, unit.a, unit.b, tmap, work,
                               spec.row_ranges, spec.align)
     return split.run_piece(weights.source(), store, seqs, chunks, spec.top, unit, tmap, work, device,
-                           ranges=spec.row_ranges, align=spec.align, want=want)
+                           ranges=spec.row_ranges, align=spec.align, want=want, tamper=tamper)
 
 
 def check_rows(spec: DeepSeekSpec, tokens: TokenFile, unit: split.Unit, commit: dict, weights: Weights,

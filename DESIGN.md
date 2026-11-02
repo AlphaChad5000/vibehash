@@ -808,6 +808,16 @@ Being explicit about what this is and isn't:
      height. A mainnet needs double-sign slashing, a higher validator stake,
      and a delay before set changes apply. Bootstrap stake (§6) should be
      spread across several independent first validators, not one operator.
+  4. **Hugging Face, for DeepSeek's frozen weights.** The referee reads base
+     weights only from the pinned commit on Hugging Face, never from a party
+     to a dispute. A fine-tune's tensors, and DeepSeek-V4.1-Flash's trained
+     layers and head, are checked against per-tensor sha256 the job pins. The
+     frozen layers and the engram tables (440 GB) are read by range and
+     checked only at the file level, which a range can't be. So the referee
+     trusts Hugging Face to serve its own pinned files. The owner chose this
+     for the pilot (DEEPSEEK.md §8). The way out: anyone downloads the whole
+     model once, on any rented machine, and pins per-tensor and per-piece
+     hashes, which anyone can recheck.
 - **Consensus at scale.** Votes go straight to every validator, which suits
   tens of validators, not thousands, and there's no light-client protocol
   yet. Timeouts are sized for testnets. Pure proof-of-useful-work consensus

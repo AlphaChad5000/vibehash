@@ -2,14 +2,14 @@
 (FakeS3, every link signed), and workers that said yes to DeepSeek work.
 
 - LocalRunTests: the job is posted; prep rounds hand out the work graph's ready units, workers run them through the
-  bucket and commit to their commitments, and two checkers replay each. One worker bends its first unit's output (and
-  its commitment to match): a checker rejects it, it ends unchecked (unpaid, nobody slashed: prep units aren't
-  refereed yet), and the unit goes out again. Once every unit is in, the node pins the records' root, the one-PC
-  prep's to the bit, and the job's rounds train from the records, op by op (deepseek_program.py): claims checked,
-  paid, and scored on the held-back sequences. The same worker trains with one op's output scaled; a checker rejects
-  its claim and the node referees the dispute down to that op (referee_deepseek.py) and slashes it. Another worker
-  rejects an honest claim, loses its dispute and is slashed for a false accusation. An outside auditor replays every
-  round from its record and the token file, the games included.
+  bucket and commit to their commitments, and two checkers replay each. One worker bends one op of its first unit
+  (layer 1's MoE output, its state roots its own work's): a checker rejects it, the node referees the dispute down to
+  that op (in the reference's bf16) and slashes it, and the unit goes out again. Once every unit is in, the node
+  pins the records' root, one machine's to the bit, and the job's rounds train from the records, op by op
+  (deepseek_program.py): claims checked, paid, and scored on the held-back sequences. The same worker trains with one
+  op's output scaled; a checker rejects its claim and the node referees the dispute down to that op
+  (referee_deepseek.py) and slashes it. Another worker rejects an honest claim, loses its dispute and is slashed for a
+  false accusation. An outside auditor replays every round from its record and the token file, the games included.
 """
 import json
 import logging
@@ -83,20 +83,15 @@ class LocalRunTests(unittest.TestCase):
                    for i, (k, (b, v)) in enumerate(zip(workers, behaviors))]
         cheat, bent = clients[2], {}  # clients[1] rejects honest claims
 
-        def bend(store, unit, commit):
-            """The cheat's first layers unit: an output it hands on, scaled up, and its commitment made to match."""
-            if bent or unit.kind != "layers" or unit.b == spec.cut:
-                return commit
-            name = split.stream_name(unit.chunk, unit.b)
-            got = split.decode(store.get(name))
-            other = {k: (v.float() * 1.2).to(v.dtype) if k.endswith(".x") else v for k, v in got.items()}
-            store.put(name, split.encode(other))
-            commit = json.loads(json.dumps(commit))
-            commit["outputs"][name] = split.digest(other)
-            store.put(split.unit_commit(unit), json.dumps(commit).encode())
-            bent.update(unit=unit.name, round=cheat.ds.round)
-            return commit
-        cheat.ds.bend = bend
+        def prep_cheat(name):
+            """The cheat's first prep unit with layer 1: that layer's MoE output scaled, in its run and so in its
+            commitment (its state roots are its own work's), and in its dispute's re-runs."""
+            if not bent and name.startswith("layers-00-"):
+                bent.update(unit=name, round=cheat.ds.round)
+            if bent.get("unit") != name or cheat.ds.round != bent["round"]:  # once: its redo is honest
+                return None
+            return lambda where, op: 1.25 if where[:1] == ("layer 1 after attention",) and op.kind == "ds_moe_sum"                 else None
+        cheat.ds.prep_cheat = prep_cheat
 
         api = NodeClient(node.url)
         sha = api.upload_dataset(req, path)
@@ -153,7 +148,7 @@ class LocalRunTests(unittest.TestCase):
         ours = next(j for j in node._network(node.chain.tip, time.time())["jobs"] if j["id"] == JOB)
         self.assertEqual(ours["prep"]["pieces_done"], ours["prep"]["pieces_total"])
 
-        # The cheat: its bent unit was rejected, unpaid and unslashed, and went out again.
+        # The cheat: its bent prep unit was rejected, refereed down to the op it bent, slashed, and went out again.
         self.assertTrue(bent, "the cheat ran a layers unit")
         first = next(r for r in preps if r["round"] == bent["round"])
         self.assertIn(bent["unit"], first["prep"]["units"].values())
@@ -162,8 +157,13 @@ class LocalRunTests(unittest.TestCase):
         rejections = [v for v in first["verdicts"] if not v["body"]["ok"]]
         self.assertTrue(rejections, first["verdicts"])
         by_height = {b.height: api.get(f"/round/{b.height}/record") for b in node.chain.blocks if b.summary}
-        self.assertEqual([s for b in node.chain.blocks if b.summary and by_height[b.height].get("prep")
-                          for s in b.summary.slashes], [])  # prep units aren't refereed yet: nobody slashed
+        prep_games = [g for r in preps for g in r.get("games", [])]
+        self.assertTrue(any(g["defender"] == workers[2].address and g["outcome"] == "challenger"
+                            and g["detail"].startswith("ds_moe_sum") for g in prep_games),
+                        [(g["defender"][:12], g["outcome"], g["detail"][:80]) for g in prep_games])
+        prep_slashes = [s for b in node.chain.blocks if b.summary and by_height[b.height].get("prep")
+                        for s in b.summary.slashes]
+        self.assertEqual([(s[0], s[2]) for s in prep_slashes], [(workers[2].address, "failed_replay")])
         sealed = next(b.summary for b in node.chain.blocks if b.summary and b.summary.params_hash and
                       api.get(f"/round/{b.height}/record")["round"] == bent["round"])
         self.assertTrue(sealed.verifier_flops, "the checkers were paid")

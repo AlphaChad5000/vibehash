@@ -645,7 +645,8 @@ class WorkerClient:
             if job.deepseek:  # its program and weights (deepseek_tracer), on its records
                 from .deepseek_tracer import Party as DeepSeekParty
                 from .deepseek_unit import runtime as deepseek_runtime
-                self.ds.records(rnd, job)
+                if not self.ds.names.get(rnd):  # a training round's (a prep round's games: deepseek_client.prep_game)
+                    self.ds.records(rnd, job)
                 rt = deepseek_runtime(job.spec, finetune.device_of(self.backend))
                 party = DeepSeekParty(rt, job.spec, job.data, _Remote(self), cheat)
             else:
@@ -658,9 +659,12 @@ class WorkerClient:
                 if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
                     continue  # tests only: a challenger that goes quiet
                 st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
-                prog = Program.of(job, int(g["seed"]))
-                move = (party.pick(prog, g) if g["turn"] == "pick" else {"split": party.split(prog, g)}
-                        if g["turn"] == "split" else {"evidence": party.remote.put(party.evidence(prog, g))})
+                if job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's (deepseek_client)
+                    prog, p = self.ds.prep_game(rnd, job, g, party.remote)
+                else:
+                    prog, p = Program.of(job, int(g["seed"])), party
+                move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g)}
+                        if g["turn"] == "split" else {"evidence": p.remote.put(p.evidence(prog, g))})
                 self.moved.add((rnd, g["id"], g["n"]))
                 self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move})
         finally:

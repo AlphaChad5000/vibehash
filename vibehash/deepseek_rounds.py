@@ -23,6 +23,18 @@ from . import deepseek_graph as g
 from .crypto import merkle_root
 
 MAX_PREP_UNITS = 64  # units a prep round hands out at most
+
+
+def _empty_root() -> str:
+    from . import merkle
+    return merkle.state_root(merkle.manifest_bytes({}))
+
+
+EMPTY_ROOT = _empty_root()  # the state a prep starts from: nothing
+
+
+def _hex64(x) -> bool:
+    return isinstance(x, str) and len(x) == 64 and all(ch in "0123456789abcdef" for ch in x)
 PREP_FORMAT = "vibehash-deepseek-prep/1"  # deepseek_prep's manifest format: the records are the same
 
 
@@ -102,15 +114,35 @@ class PrepState:
         made = set(unit.outputs) - {g.unit_commit(unit)}
         if set(c.get("outputs") or {}) != made:
             return "the commitment doesn't name exactly the objects the unit makes"
+        if unit.kind == "layers":
+            roots = c.get("roots")
+            n = (unit.a == 0) + unit.b - unit.a + 1
+            if not isinstance(roots, list) or len(roots) != n or not all(_hex64(r) for r in roots):
+                return f"a layers unit commits to {n} state roots"
+            if roots[0] != self.first_root(unit):
+                return "its first state isn't the one the unit below handed on"
         if unit.kind == "layers" and unit.b == self.spec.cut:
             members = self.tokens.chunks(self.spec.chunk_tokens)[unit.chunk]
             if not isinstance(c.get("leaves"), list) or len(c["leaves"]) != len(members):
                 return "the last piece's commitment must give a leaf a record"
         return None
 
+    def first_root(self, unit: g.Unit) -> str | None:
+        """The state a layers unit must start from: the empty one at layer 0, else the last state of the accepted
+        unit below it in its chunk (None until that's accepted)."""
+        if unit.a == 0:
+            return EMPTY_ROOT
+        below = next((n for n, u in self.graph.units.items()
+                      if u.kind == "layers" and u.chunk == unit.chunk and u.b == unit.a), None)
+        roots = (self.commits.get(below) or {}).get("roots")
+        return roots[-1] if roots else None
+
     def kept(self, unit: g.Unit, commit: dict) -> dict:
-        """What the record keeps of an accepted commitment: its outputs' digests, and the last piece's leaves."""
+        """What the record keeps of an accepted commitment: its outputs' digests, a layers unit's first and last state
+        roots, and the last piece's leaves."""
         out = {"outputs": dict(commit["outputs"])}
+        if unit.kind == "layers":
+            out["roots"] = [commit["roots"][0], commit["roots"][-1]]
         if unit.kind == "layers" and unit.b == self.spec.cut:
             out["leaves"] = list(commit["leaves"])
         return out

@@ -32,6 +32,9 @@ BASES = {"flash": f"hf:{REPO}@{COMMIT}", "tiny": "hf:vibehash/deepseek-v41-tiny@
 MANIFESTS = {"flash": "5d069a8a464c59210d35973f5c52b0adaf630eb6a013af0b91267382e73c6f29",
              "tiny": hashlib.sha256(b"vibehash deepseek-v41 tiny: random_weights(tiny_config(), 0)").hexdigest()}
 DEEPSEEK_KEYS = {"cut", "pieces", "chunk_tokens", "row_ranges"}
+# Longest sequence a job trains on: a dispute's evidence and states grow with it (attention per query is window +
+# picks wide, not T², but a step's states are T rows), and the pilot's average 171 tokens.
+MAX_SEQ_LEN = 4096
 CUTS = {"flash": 36, "tiny": 4}  # the default cut: Flash's top 4 trained; tiny's top 1 (a lower cut would train a kv
 # source above another trained layer, which Cut.check refuses)
 
@@ -41,22 +44,66 @@ def config(name: str) -> Config:
     return CONFIGS[name]()
 
 
-def weight_source(spec: "DeepSeekSpec"):
-    """Where the node's referee reads a DeepSeek job's weights (dispute.Outside's source). The tiny config's are
-    random_weights(tiny_config(), 0) (tests and local testnets: needs PyTorch). Flash's come from the Hub by byte
-    range, checked against per-tensor hashes, which the pinned weights don't have yet: until they do, a dispute of a
-    Flash unit ends unchecked."""
-    if spec.config_name == "tiny":
-        from .deepseek_unit import tiny_weights
-        from .referee_deepseek import StateWeights
-        return StateWeights(tiny_weights(spec))
-    from .dispute import WeightsUnavailable
+# sha256 of vibehash/data/deepseek_flash_top.json (scripts/deepseek_tensor_manifest.py): every tensor of the files the
+# trained layers (36-39) and the head are in, made from the pinned commit's files, each checked against the Hub's.
+TOP_MANIFESTS = {"flash": "c156899bf976677d9b34da6829c316719bbdfbdd6160c45b608f4feca80c85e3"}
 
-    class _None:
-        def shape(self, name):
-            raise WeightsUnavailable("DeepSeek-V4.1-Flash's per-tensor hashes aren't pinned yet")
-        read = shape
-    return _None()
+
+def weight_source(spec: "DeepSeekSpec"):
+    """Where the node's referee reads a DeepSeek job's weights (dispute.Outside's source); never from a party to a
+    dispute. The tiny config's are random_weights(tiny_config(), 0) and its token map (tests and local testnets: needs
+    PyTorch). Flash's (DEEPSEEK.md §8, "Who the referee trusts for weights"): the trained layers and the head checked
+    tensor by tensor against the pinned manifest (dispute.HubWeights); the frozen layers and the engram tables read
+    by range from the pinned commit on the Hub, checked only at the file level."""
+    if spec.config_name == "tiny":
+        from .deepseek import random_weights
+        from .deepseek_worker import tiny_token_map
+        from .referee_deepseek import StateWeights
+        return StateWeights({**random_weights(spec.cfg, 0), "engram.token_map": tiny_token_map(spec.cfg)})
+    return FlashWeights()
+
+
+class FlashWeights:
+    """DeepSeek-V4.1-Flash's weights for the referee: see weight_source."""
+
+    def __init__(self, hub=None):
+        from pathlib import Path
+
+        from . import hub as hubmod
+        from .dispute import HubWeights
+        data = (Path(__file__).parent / "data" / "deepseek_flash_top.json").read_bytes()
+        self.hub = hub or hubmod.Hub()
+        self.top = HubWeights(hubmod.Manifest.from_bytes(data, TOP_MANIFESTS["flash"]), self.hub)
+
+    def _frozen(self, name):
+        from .dispute import WeightsUnavailable
+        try:
+            wm = self.hub.weight_map(REPO, COMMIT)
+            hdr = self.hub.header(REPO, COMMIT, wm[name])
+            dtype, shape, begin, end = hdr.tensors[name]
+        except Exception as e:  # noqa: BLE001 - the Hub unreachable, or no such tensor
+            raise WeightsUnavailable(f"couldn't read {name}'s place in the pinned files: {e}") from None
+        return wm[name], dtype, tuple(shape), hdr.data_start + begin, end - begin
+
+    def shape(self, name):
+        if name in self.top.manifest.tensors:
+            return self.top.shape(name)
+        _, dtype, shape, _, _ = self._frozen(name)
+        return dtype, shape
+
+    def read(self, name, r0, r1) -> bytes:
+        from .dispute import WeightsUnavailable, _ITEM, _cols
+        if name in self.top.manifest.tensors:
+            return self.top.read(name, r0, r1)
+        file, dtype, shape, at, length = self._frozen(name)
+        width = _cols(shape) * _ITEM.get(dtype, 0)
+        try:
+            raw = self.hub.open(REPO, COMMIT, file).read(at + r0 * width, (r1 - r0) * width)
+        except Exception as e:  # noqa: BLE001
+            raise WeightsUnavailable(f"couldn't fetch {name} from the Hub: {e}") from None
+        if len(raw) != (r1 - r0) * width:
+            raise WeightsUnavailable(f"{name}: the Hub sent {len(raw)} bytes, not {(r1 - r0) * width}")
+        return raw
 
 
 def weights_digest(listing: dict) -> str:
@@ -71,7 +118,7 @@ class DeepSeekSpec(LoraSpec):
     alpha, targets, seq_len, optimizer, seed, precision) and the cut and the prep's shape."""
     cut: int = 36
     pieces: int = 4  # frozen layers a prep unit runs (DEEPSEEK.md §8: G)
-    chunk_tokens: int = 32768
+    chunk_tokens: int = 4096
     row_ranges: int = 15
 
     kind = KIND
@@ -137,8 +184,8 @@ class DeepSeekSpec(LoraSpec):
             out.append("LoRA alpha must be in (0, 4096]")
         if not self.targets or not set(self.targets) <= set(LORA_MODULES):
             out.append(f"LoRA targets must be some of {', '.join(LORA_MODULES)}")
-        if type(self.seq_len) is not int or not 16 <= self.seq_len <= 65536:
-            out.append("seq_len must be 16-65536")
+        if type(self.seq_len) is not int or not 16 <= self.seq_len <= MAX_SEQ_LEN:
+            out.append(f"seq_len must be 16-{MAX_SEQ_LEN}")
         if self.optimizer not in OPTIMIZERS:
             out.append(f"optimizer must be one of {', '.join(OPTIMIZERS)}")
         if self.precision != "float32":
@@ -215,7 +262,7 @@ def is_deepseek_spec(d) -> bool:
 
 
 def spec(name: str = "flash", cut: int | None = None, rank: int = 16, alpha: float = 32.0, targets=None,
-         seq_len: int = 512, seed: int = 11, pieces: int = 4, chunk_tokens: int = 32768,
+         seq_len: int = 512, seed: int = 11, pieces: int = 4, chunk_tokens: int = 4096,
          row_ranges: int = 15) -> DeepSeekSpec:
     """A DeepSeekSpec for a known config (the cut: CUTS)."""
     return DeepSeekSpec(base=BASES[name], manifest=MANIFESTS[name], dims={"family": FAMILY, "config": name},

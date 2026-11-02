@@ -34,4 +34,4 @@ vibehash = "vibehash.cli:main"
 packages = ["vibehash"]
 
 [tool.setuptools.package-data]
-vibehash = ["data/*.csv", "data/*.txt"]  # the sample data `vibehash example` writes out; the BIP39 word list
+vibehash = ["data/*.csv", "data/*.txt", "data/*.json"]  # the sample data `vibehash example` writes out; the BIP39 word list; DeepSeek-V4.1-Flash's per-tensor manifest

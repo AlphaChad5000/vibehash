@@ -660,8 +660,35 @@ def handed_root(store, prog_above, want: dict) -> str:
     for kind, src in prog_above.side_kinds(a).items():
         obj = get(side_name(c, kind, src))
         for j in range(n):
-            if prog_above.n_comp(j, src):
+            if prog_above.kept(a, kind, j, src):
                 st[f"{SIDE_PREFIX[kind]}{j}"] = obj[str(j)].reshape(prog_above.side_shape(kind, j, src))
+    m, _ = dispute.state_manifest(st)
+    return merkle.state_root(m)
+
+
+def records_root(store, prog, want: dict) -> str:
+    """The state root of what the last piece hands to training: its chunk's records (block-NNNNN.bin, checked
+    against `want`), as the state entering the cut. `prog`: the unit's own deepseek_program.PrepProgram. The last
+    piece's last committed root must be this."""
+    import numpy as np
+
+    from . import dispute, merkle
+    from .deepseek_program import SIDE_PREFIX
+
+    bin_name, meta_name = block_names(prog.unit_.chunk)
+    data, meta = store.get(bin_name), store.get(meta_name)
+    for name, raw in ((bin_name, data), (meta_name, meta)):
+        if name in want and hashlib.sha256(raw).hexdigest() != want[name]:
+            raise Tampered(name)
+    offs = json.loads(meta)["offsets"]
+    recs = [unpack_np(data[offs[j]:offs[j + 1]]) for j in range(len(prog.T))]
+    st = {"h": np.concatenate([r["x"].reshape(prog.T[j], -1) for j, r in enumerate(recs)]),
+          "p": np.concatenate([r["pre"].reshape(prog.T[j], -1) for j, r in enumerate(recs)])}
+    cut = prog.cut.first
+    for kind, src in prog.side_kinds(cut).items():
+        for j, r in enumerate(recs):
+            if prog.kept(cut, kind, j, src) and kind in r:
+                st[f"{SIDE_PREFIX[kind]}{j}"] = r[kind].astype(np.float32).reshape(prog.side_shape(kind, j, src))
     m, _ = dispute.state_manifest(st)
     return merkle.state_root(m)
 

@@ -527,6 +527,16 @@ class PrepProgram:
         r = self.cfg.ratio(src)
         return self.T[j] // r if r else 0
 
+    def kept(self, layer: int, kind: str, j: int, src: int) -> bool:
+        """Whether sequence j's side channel `kind` (from layer src) is in the state entering `layer`. At the cut, the
+        state is what the records hold (deepseek_top.crossing_of): candidate blocks only for a sequence with more
+        compressed tokens than the candidate source keeps."""
+        if not self.n_comp(j, src):
+            return False
+        c = self.cfg
+        return not (layer == self.cut.first and kind == "candidates"
+                    and self.n_comp(j, src) <= c.candidate_topk_blocks * c.candidate_block_size)
+
     def side_shape(self, kind: str, j: int, src: int) -> tuple[int, int]:
         c, n = self.cfg, self.n_comp(j, src)
         return {"compress_kv": (n, c.head_dim), "index_k": (n, c.index_head_dim),
@@ -554,7 +564,7 @@ class _PrepBuild:
         out = {"h": (self.N, c.hc_mult * c.dim), "p": (self.N, c.hc_mult)}
         for kind, src in p.side_kinds(p.a).items():
             for j in range(len(self.T)):
-                if self.n_comp(j, src):
+                if p.kept(p.a, kind, j, src):
                     out[f"{SIDE_PREFIX[kind]}{j}"] = p.side_shape(kind, j, src)
         return out
 
@@ -736,7 +746,8 @@ class _PrepBuild:
                   ("a.mo", "a.xm"))
         self.emit("ds_cols", "p", ("a.fs",), {"c0": 0, "c1": hc}, (N, hc), ("a.fs",))
         # the canonical state: what crosses the cut above this layer, nothing else
-        keep = {f"{SIDE_PREFIX[kd]}{j}" for kd in self.p.side_kinds(i + 1) for j in range(n)}
+        keep = {f"{SIDE_PREFIX[kd]}{j}" for kd, src in self.p.side_kinds(i + 1).items() for j in range(n)
+                if self.p.kept(i + 1, kd, j, src)}
         gone = tuple(nm for nm in self.shapes if nm not in ("h", "p") and nm not in keep)
         if gone:
             self.emit("free", "", (), {}, (0, 0), gone)

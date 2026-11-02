@@ -47,7 +47,7 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(back.spec, j.spec)
         self.assertEqual(back.spec_json(), j.spec_json())
         self.assertEqual(json.loads(j.spec_json())["deepseek"],
-                         {"cut": 36, "pieces": 4, "chunk_tokens": 32768, "row_ranges": 15})
+                         {"cut": 36, "pieces": 4, "chunk_tokens": 4096, "row_ranges": 15})
 
     def test_sizes(self):
         s = dj.spec("flash")

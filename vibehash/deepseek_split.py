@@ -275,7 +275,7 @@ def _start(store, prog, cut: top.Cut, unit: Unit, inputs: dict, want: dict | Non
     for kind, src in prog.side_kinds(unit.a).items():
         obj = _get(store, side_name(c, kind, src), inputs, want, io)
         for j in range(n):
-            if prog.n_comp(j, src):
+            if prog.kept(unit.a, kind, j, src):
                 st[f"{SIDE_PREFIX[kind]}{j}"] = obj[str(j)].reshape(prog.side_shape(kind, j, src)).float()
     return st
 
@@ -300,9 +300,9 @@ def _compute(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map, w
     ex.slices, ex.token_map = slices, token_map
     roots = [state_root(st)]
     with torch.no_grad():
-        for s in range(prog.segments):
+        for s in range(prog.segments):  # labelled as a game over the unit labels them (tracer.node_at): no segment
             node = prog.segment(s)
-            ex.run_atoms(node, 0, len(node.atoms), st, (node.label,))
+            ex.run_atoms(node, 0, len(node.atoms), st, ())
             roots.append(state_root(st))
     return prog, st, roots, inputs
 

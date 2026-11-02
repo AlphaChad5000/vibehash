@@ -195,3 +195,110 @@ class GameTests(_Tiny):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
+class PrepGameTests(unittest.TestCase):
+    """Prep units (deepseek_program.PrepProgram, bf16): a unit that scaled one op's output (layer 1's MoE sum) loses
+    its game at that op; an honest one beats a blind challenger; and the node's own check that a unit's outputs are
+    the last state it committed to (deepseek_graph.handed_root) catches outputs bent after the fact."""
+
+    def setUp(self):
+        import types
+
+        from vibehash import deepseek_graph as graph_mod
+        from vibehash.deepseek_worker import tiny_token_map
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.spec = spec = dj.spec("tiny", seq_len=64, pieces=2)
+        g = np.random.default_rng(0)
+        seqs = []
+        for _ in range(5):
+            n = int(g.integers(10, 30))
+            seqs.append((g.integers(0, spec.cfg.vocab_size, n).tolist(), (g.random(n) < 0.5).astype(int).tolist()))
+        path = self.tmp / "data.npz"
+        prep.save_dataset(path, seqs)
+        self.tokens = TokenFile.from_npz(path)
+        self.data = types.SimpleNamespace(tokens=self.tokens)
+        self.seqs = prep.load_dataset(path)
+        self.chunks = self.tokens.chunks(spec.chunk_tokens)
+        self.state = deepseek.random_weights(spec.cfg, 0)
+        self.tmap = tiny_token_map(spec.cfg)
+        self.graph = spec.graph(self.tokens)
+        self.unit = self.graph.units["layers-00-02-c00000"]
+        self.above = self.graph.units["layers-02-04-c00000"]
+        self.rt = types.SimpleNamespace(model=None, device="cpu", weights={**self.state, "engram.token_map": self.tmap})
+        self.gm = graph_mod
+
+    def cheat(self, where, op):
+        return 1.25 if where[:1] == ("layer 1 after attention",) and op.kind == "ds_moe_sum" else None
+
+    def run_unit(self, store, tamper=None):
+        for u in self.graph.order():
+            if u.kind == "rows":
+                split.run_rows(prep.LocalSource(self.state), store, self.seqs, self.chunks, self.spec.top, u.a, u.b,
+                               self.tmap, self.tmp / "work", self.spec.row_ranges, self.spec.align)
+        return split.run_piece(prep.LocalSource(self.state), store, self.seqs, self.chunks, self.spec.top, self.unit,
+                               self.tmap, self.tmp / "work", ranges=self.spec.row_ranges, align=self.spec.align,
+                               tamper=tamper)
+
+    def play(self, commit, cheat=None, policy=None):
+        from vibehash.deepseek_program import PrepProgram
+        from vibehash.deepseek_tracer import Executor
+        prog = PrepProgram.of(self.spec, self.data, self.unit)
+        remote = _Remote()
+        d = Party(self.rt, self.spec, self.data, remote, cheat)
+        c = Party(self.rt, self.spec, self.data, remote)
+        st = {}
+        d.publish(st)  # the defender posts its unit's first and last states (deepseek_client.prep_game)
+        ex = Executor(self.rt, self.spec, prog, cheat)
+        for s in range(prog.segments):
+            node = prog.segment(s)
+            ex.run_atoms(node, 0, len(node.atoms), st, ())
+        d.publish(st)
+        g = dispute.Game("g", "u", "D", "C", "dispute", ["unit"], commit["roots"][0], commit["roots"][-1]).start(prog)
+        weights = referee_deepseek.StateWeights(self.rt.weights)
+        while g.turn != "done":
+            v = g.view()
+            who = "C" if g.turn == "pick" else "D"
+            move = policy(g, who, prog) if policy else "default"
+            if move == "default":
+                p = c if who == "C" else d
+                move = (p.pick(prog, v) if g.turn == "pick" else {"split": p.split(prog, v)} if g.turn == "split"
+                        else {"evidence": remote.put(p.evidence(prog, v))})
+            dispute.play(g, prog, who, move, evidence=remote.blobs.get(move.get("evidence")),
+                         outside=dispute.Outside(self.spec, self.data, weights),
+                         check_states=lambda rs: [remote.get(r) for r in rs])
+            g.moves.append(move)
+        return g
+
+    def test_a_tampered_prep_op_is_found(self):
+        commit = self.run_unit(split.LocalStore(self.tmp / "bad"), self.cheat)
+        g = self.play(commit, self.cheat)
+        self.assertEqual(g.outcome, "challenger", g.detail)
+        self.assertEqual(g.leaf.kind, "ds_moe_sum")
+
+    def test_an_honest_prep_unit_beats_a_blind_challenger(self):
+        def blind(g, who, prog):
+            if who == "D":
+                return "default"
+            child = len(groups(g.lo, g.hi)) - 1
+            g0, g1 = groups(g.lo, g.hi)[child]
+            atom = g.node(prog).atoms[g0] if g1 - g0 == 1 else None
+            return {"pick": child, **({"tile": 0} if isinstance(atom, Op) and atom.out else {})}
+        g = self.play(self.run_unit(split.LocalStore(self.tmp / "good")), policy=blind)
+        self.assertEqual(g.outcome, "defender", g.detail)
+
+    def test_the_node_checks_outputs_are_the_last_state(self):
+        from vibehash.deepseek_program import PrepProgram
+        store = split.LocalStore(self.tmp / "out")
+        commit = self.run_unit(store)
+        above = PrepProgram.of(self.spec, self.data, self.above)
+        self.assertEqual(self.gm.handed_root(store, above, commit["outputs"]), commit["roots"][-1])
+        name = split.stream_name(0, 2)
+        got = split.decode(store.get(name))
+        got["0.x"] = got["0.x"].clone()
+        got["0.x"].view(-1)[0] += 1
+        store.put(name, split.encode(got))
+        self.assertNotEqual(self.gm.handed_root(store, above, {name: split.digest(got)}), commit["roots"][-1])

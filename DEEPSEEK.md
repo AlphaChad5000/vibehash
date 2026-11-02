@@ -851,6 +851,21 @@ commitments. The options:
 - **The weights' source.** DeepSeek's weights and engram tables come from one
   Hugging Face repo, pinned by commit and checked by sha256. The licence is MIT,
   so anyone may mirror them: a convenience, not a dependency.
+- **Who the referee trusts for weights (the owner's choice, option C,
+  2026-11-02).**
+  - No party to a dispute ever supplies weights: the node's referee reads them
+    from the pinned commit on Hugging Face, and a game's record keeps none.
+  - The four trained layers and the head (31 GB) are checked tensor by tensor
+    against `vibehash/data/deepseek_flash_top.json`. That's a per-tensor
+    manifest made from the pinned files (`scripts/deepseek_tensor_manifest.py`,
+    each file's sha256 checked against the Hub's), and its sha256 is pinned in
+    `deepseek_job`.
+  - The frozen layers and the engram tables are read by range and checked only
+    at the file level. So for prep disputes, the referee trusts Hugging Face to
+    serve its own pinned files.
+  - The way out (option B): anyone downloads the whole model once (~470 GB, on
+    any rented machine) and pins per-tensor hashes, plus per-piece hashes for
+    the tables. Anyone can recheck them.
 
 *Pay.* Prep units are mining work like any other: a layers unit earns by
 layer-tokens (G × its chunk), and a rows unit by the gigabytes it streamed.
@@ -954,6 +969,20 @@ tokens, so no picks or candidate blocks cross a cut):
 - **A trainer** downloads 30.9 GB of weights once, plus its share of the train
   records (all 10.7 GB if it trains alone).
 
+**Prep chunks of 4K tokens (the owner's call, 2026-11-02).**
+- Prep units are refereed now. A layers unit computes op by op
+  (`deepseek_program.PrepProgram`) so that any of its ops can be checked, and
+  its states are chunk wide. One float32 stream tensor is 335 MB at 4K tokens
+  and 2.7 GB at 32K.
+- So the pilot preps in 4K-token chunks (`chunk_tokens` 4096): 84 chunks, so
+  756 layers units. The figures above are 32K's.
+- Each unit streams its layers' experts from the miner's disk to its GPU once,
+  8× as often as at 32K: about 10 seconds a unit on NVMe and PCIe 4.
+- Each unit moves about 0.12 GB of hand-offs each way. The bucket's totals
+  don't change.
+- The full set can take bigger chunks later, with states kept in bf16 and
+  streamed.
+
 The full set (7,473 train, 1,319 held back) comes later and reuses the pilot's
 records. A record is its sequence's alone, since a sequence's arithmetic
 doesn't depend on its chunk-mates (tested exact in the split prep). So the full
@@ -1027,16 +1056,26 @@ merge). [x] done, [ ] to do.
       - a trainer that scaled one op loses its game at that op.
     - The local run (`tests/test_deepseek_network.py`) has a tampering
       trainer and a false accuser, both slashed.
-  - [ ] Per-tensor hashes of Flash's trained layers and head. The node's
-    referee needs them to read weight slices by range from the Hub, checked.
-    The job pins only file-level hashes (`MANIFESTS`), so until then a dispute
-    of a Flash training unit ends unchecked (`deepseek_job.weight_source`).
-  - [ ] Prep units refereed: their program in the reference's bf16, chunk
-    wide, and commitments of per-layer state roots. Until then, the interim
-    rule (`deepseek_rounds.py`): a prep claim any counted checker rejects ends
-    unchecked, unpaid and unslashed, and its unit goes out again. A cheat gains
-    nothing but is never caught. The owner wants prep refereed before launch.
-    Two weaknesses until then:
+  - [x] Per-tensor hashes of Flash's trained layers and head
+    (`vibehash/data/deepseek_flash_top.json`, pinned as
+    `deepseek_job.TOP_MANIFESTS`; see "Who the referee trusts for weights"
+    above). `deepseek_job.FlashWeights` is the node's source.
+  - [x] Prep layers units refereed, losers slashed:
+    - Their program (`deepseek_program.PrepProgram`) runs in the reference's
+      bf16, chunk wide, in 4K-token chunks. Its commitments carry a state root
+      before the unit and after each of its layers. A state between layers
+      holds only what crosses the cut above it, so roots don't depend on the
+      pieces.
+    - When a checker rejects one, the node first checks that the unit's outputs
+      in the bucket are its last committed state (`deepseek_graph.handed_root`,
+      `records_root`, in NumPy). If they aren't, that's fraud. If they are, a
+      game runs over the unit, layer by layer, then op by op.
+    - The node also requires each unit's first root to be the last root of the
+      unit below it.
+  - [ ] Rows units (copies of the engram tables) aren't refereed: a rejected
+    one ends unchecked and goes out again. Its consumers read rows only from
+    accepted rows units, and each layer's engram op is refereed against the
+    table itself. Two weaknesses of that rule:
     - One checker that rejects everything costs honest miners their pay for
       those units, and the prep a round's delay each time, with no penalty.
       Its stake is never at risk, since there's no game to lose.
