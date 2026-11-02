@@ -900,6 +900,69 @@ costs nothing. What the job has to record:
   - So the run gives the real speeds, links and memory, which replace this
     section's *estimates*.
 
+**The first job: "think shorter", the pilot** (the owner's choice, 2026-11-01).
+It teaches V4.1-Flash to reach correct answers with much less thinking, from
+GSM8K's short human solutions written in its own thinking-mode template. The
+data is built by `scripts/make_think_shorter.py`; the card is
+`docs/datasets/think-shorter.md` (source, MIT licence, transformation, risks).
+
+| The job's spec | |
+|---|---|
+| Model | `deepseek-ai/DeepSeek-V4.1-Flash` at commit `314113f8` |
+| Trained | the top 4 layers (cut at 36, K = 4): LoRA-FA, rank 16, alpha 32, on `wq_a`, `wq_b`, `wkv` and `wo_b`, in float32 |
+| Data | `think-shorter-pilot.npz`, sha256 `f4d7f822…523a3a`: 2,000 sequences, one example each, 341,753 tokens |
+| Train | the first 1,500 sequences: 252,500 tokens, 122,878 of them learned |
+| Held back | the last 500: 89,253 tokens, for the scorers' loss |
+| Passes | 3 over the 1,500: 4,500 examples, 757,500 tokens |
+| Root | the prep's Merkle root over all 2,000 records, pinned once its last unit's window closes |
+| Id | contains "think-shorter"; the front page's featured panel shows 1,500 and 500 |
+
+The input format is `deepseek_prep`'s, unchanged. Its prep, at G = 4 in
+32K-token chunks (`scripts/deepseek_split_plan.py`; sequences average 171
+tokens, so no picks or candidate blocks cross a cut):
+- **Units:** 11 chunks, so 30 rows units and 99 layers units (9 pieces × 11).
+- **From Hugging Face:**
+  - 267 GB of layers, taken by the 9 pieces' holders at 29.6 GB each, and kept
+    for later jobs;
+  - 203 GB of engram tables, streamed by the rows units at 6.8 GB each. The
+    tables cost the same for any dataset.
+- **The bucket:**
+  - 79 GB of hand-offs out;
+  - 14.4 GB of records (10.7 GB train, 3.8 GB held back), stored for the
+    trainers and scorers;
+  - $5 in all.
+- **A unit** moves ~0.93 GB each way, and gets 39 minutes (`deadline`). A
+  piece's holder that takes all 11 chunks moves 9.6 GB down and 9.5 GB up.
+- **End to end**, *simulated*:
+  - on 100/20 Mbit/s cable, ~3.5 h with 9 miners, 2.2 h with 36;
+  - on fiber, under an hour.
+  - 32K-token chunks fill the line sooner than 64K: 3.5 h against 4.7 h with 9
+    miners. They also halve each hand-off for home links.
+- **A trainer** downloads 30.9 GB of weights once, plus its share of the train
+  records (all 10.7 GB if it trains alone).
+
+The full set (7,473 train, 1,319 held back) comes later and reuses the pilot's
+records. A record is its sequence's alone, since a sequence's arithmetic
+doesn't depend on its chunk-mates (tested exact in the split prep). So the full
+prep runs only the 6,792 new sequences, under a root over all 8,792.
+
+The wiring around it, once PR #5 merges:
+1. **Post the job** with that spec. The node needs only the 1.7 MB token file,
+   checked against its sha256. It plans:
+   - the chunks: `deepseek_prep.blocks_of`, 32K tokens;
+   - the pieces: `pieces(36, 4)`;
+   - the work graph: `plan(...)`, with 15 row ranges a table.
+2. **The prep phase.** `Line` hands out the rows units, then layers units as
+   their inputs land, each with its deadline. The node signs bucket URLs only
+   for each unit's own objects. Challenge windows run, and `Line.summary` is
+   the job summary's "prep" field.
+3. **The root.** When the last window closes, the job pins the manifest's root.
+   The hand-offs are deleted, and the records stay.
+4. **The training phase.** The DeepSeek unit kind trains from the records, each
+   miner on a shard, for 3 passes. Each step reports `Meter`'s stats. The
+   scorers' held-back loss on the 500 goes into `store.job_rounds`.
+5. **The result:** the adapter in PEFT's format, `layers_to_transform` 36–39.
+
 **Build order for this route** (replacing §5's 3–7 for the first project):
 1. Done (§7): `deepseek.py`.
 2. Done, prototype: LoRA on it, precompute, layer-major and expert-major
@@ -908,9 +971,9 @@ costs nothing. What the job has to record:
    stay: `scripts/deepseek_top_bench.py` (speed, with layer 2 standing in for
    each top layer), the streamed schedule's 6 and 8 GB caps, and
    `scripts/topk_quality.py`. Their numbers come from the first live job.
-4. *Train the top 4 for real*, as the first live job. Its 30.9 GB are downloaded
-   (2026-11-01). DeepSeek's own top 4 against top 8 (60.4 GB, not downloaded)
-   is for a later job.
+4. *Train the top 4 for real*, as the first live job: think shorter's pilot
+   (above). Its 30.9 GB are downloaded (2026-11-01). DeepSeek's own top 4
+   against top 8 (60.4 GB, not downloaded) is for a later job.
 5. *The prep, for real.* The split prep (`deepseek_split`) is the design,
    prototyped and tested exact to the one-PC prep. It has the work graph, exact
    lossless hand-offs checked against their writers' digests, untrusted hosts
@@ -945,8 +1008,8 @@ costs nothing. What the job has to record:
      fine-tunes do it. That gives the loss curve and the "N× as likely, token by
      token" figure.
    - The first job's id contains "think-shorter": the page matches its title,
-     blurb and sample on that. If it trains on a pilot subset rather than all
-     7,473 GSM8K problems, the page needs the size.
+     blurb and sample on that. It's the pilot, 1,500 problems and 500 held
+     back, as the page already shows.
 7. *The referee's DeepSeek ops* in numpy (the table above), for the dispute game.
 8. *The job flow:* where the datasets live (42 GB per million tokens: the
    bucket while training, or a public HF dataset for a reusable one, pinned by
