@@ -68,7 +68,39 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--gold); outline-
 .topnav a:hover { color: var(--band-ink); }
 @media (max-width: 560px) { .topnav a.optional { display: none; } .tag { display: none; } }
 
-.hero { padding-block: 56px 64px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; max-width: 46rem; }
+.hero-wrap { display: grid; grid-template-columns: minmax(0, 1fr); gap: 40px; align-items: center; padding-block: 56px 64px; }
+@media (min-width: 980px) { .hero-wrap { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 56px; } }
+.hero { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; max-width: 46rem; }
+.model { margin: 0; border: 1px solid var(--band-rule); border-radius: 16px; background: var(--term); padding: 22px; display: grid; gap: 14px; }
+.model-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 0.9rem; color: var(--band-ink-2); }
+.model-head b { color: var(--band-ink); font: 700 1rem var(--font-display); }
+.bars { display: grid; grid-template-columns: repeat(40, minmax(0, 1fr)); gap: 3px; height: 120px; align-items: end; }
+.bars i { position: relative; height: 100%; border-radius: 3px; background: var(--band-rule); overflow: hidden; }
+.bars i::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 100%; background: var(--signal); transform-origin: bottom; transform: scaleY(0.08); animation: fill 6s ease-in-out infinite; animation-delay: calc(var(--n) * 0.09s); }
+.bars i.top { background: #15301a; box-shadow: inset 0 0 0 1px #80cf88; }
+.bars i.top::after { background: #3fb950; opacity: 0.55; animation-name: pulse-top; }
+@keyframes fill { 0%, 8% { transform: scaleY(0.08); } 45%, 80% { transform: scaleY(1); } 100% { transform: scaleY(0.08); } }
+@keyframes pulse-top { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
+.model-key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.85rem; color: var(--band-ink-2); }
+.model-key span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--signal); }
+.model-key span.k-top::before { background: #3fb950; }
+.model p { font-size: 0.92rem; color: var(--band-ink-2); }
+.pillars { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding-block: 0 8px; }
+@media (max-width: 860px) { .pillars { grid-template-columns: minmax(0, 1fr); } }
+.pillar { border-top: 2px solid var(--signal); padding-top: 14px; display: grid; gap: 6px; }
+.pillar h3 { font-size: 1.05rem; }
+.pillar p { color: var(--ink-2); font-size: 0.95rem; }
+.faq { display: grid; gap: 10px; margin-top: 22px; max-width: 52rem; }
+.faq details { border: 1px solid var(--rule); border-radius: 10px; padding: 14px 18px; }
+.faq summary { cursor: pointer; font-weight: 700; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after { content: "+"; color: var(--gold); font-weight: 700; }
+.faq details[open] summary::after { content: "–"; }
+.faq details p { margin-top: 10px; color: var(--ink-2); }
+footer .cols { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 32px; align-items: baseline; }
+footer .mark { display: inline-flex; align-items: center; gap: 8px; font: 700 1rem var(--font-display); color: var(--ink); }
+footer .mark svg { width: 12px; height: 16px; color: var(--signal); }
+@media (prefers-reduced-motion: reduce) { .bars i::after { animation: none; transform: scaleY(1); } }
 .hero h1 { font-size: clamp(2.3rem, 6vw, 3.9rem); font-weight: 770; font-stretch: 110%; line-height: 1.02; letter-spacing: -0.03em; }
 .hero h1 em { font-style: normal; color: var(--signal); }
 .now { justify-self: start; display: inline-flex; align-items: center; gap: 10px; max-width: 100%; padding: 6px 14px; border: 1px solid var(--band-rule); border-radius: 99px; background: var(--term); color: var(--band-ink); text-decoration: none; font-size: 0.95rem; }
@@ -185,6 +217,86 @@ footer .wrap { padding-block: 24px 40px; display: grid; gap: 10px; font-size: 0.
 footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
 .fine { font-size: 0.8rem; }
 @media (prefers-reduced-motion: reduce) { .live.on .dot { animation: none; } }
+/* Editorial pass: hairlines, type and space instead of boxed cards, pills and tinted panels. */
+main section { border-top: 1px solid var(--rule); margin-top: 72px; padding-top: 28px; }
+main section:first-child { border-top: 0; margin-top: 0; }
+main { counter-reset: sec; }
+main section > h2, main section > .head > h2 { counter-increment: sec; }
+main section > h2::before, main section > .head > h2::before { content: counter(sec, decimal-leading-zero); display: block; font: 600 0.78rem var(--font-mono); letter-spacing: 0.08em; color: var(--gold); margin-bottom: 10px; }
+.stats { background: none; border: 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); border-radius: 0; gap: 0; }
+.stat { background: none; padding: 22px 24px; }
+.stat:first-child { padding-left: 0; }
+.stat + .stat { border-left: 1px solid var(--rule); }
+@media (max-width: 860px) {
+  .stat { padding: 18px 16px 18px 0; }
+  .stat + .stat { border-left: 0; }
+  .stat:nth-child(even) { border-left: 1px solid var(--rule); padding-left: 16px; }
+  .stat:nth-child(n+3) { border-top: 1px solid var(--rule); }
+}
+.callout { background: none; border-radius: 0; border-left: 2px solid var(--signal); padding: 2px 0 2px 16px; margin-top: 20px; }
+.callout.deepseek { padding: 2px 0 2px 16px; }
+.job, .feat { border: 0; border-radius: 0; border-top: 1px solid var(--rule); padding: 26px 0 0; }
+.jobs { gap: 28px; }
+.panel { background: none; border-radius: 0; padding: 14px 0 0; border-top: 1px solid var(--rule); }
+.pill { background: none !important; border-radius: 0; padding: 0; font: 600 0.74rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; }
+.pill::before { content: "\25CF\00A0"; }
+.stages { gap: 4px 0; }
+.stages li { background: none !important; border-radius: 0; padding: 0; font-size: 0.85rem; }
+.stages li + li::before { content: "\00A0\00A0\2192\00A0\00A0"; color: var(--ink-2); font-weight: 400; }
+.bubble { border-radius: 0; padding: 4px 0 4px 14px; }
+.bubble.q { justify-self: start; background: none; border-left: 2px solid var(--rule); }
+.bubble.a { border: 0; border-left: 2px solid var(--signal); }
+.steps { gap: 0 32px; }
+.step { background: none; border-radius: 0; padding: 16px 0 0; border-top: 1px solid var(--rule); }
+.step b { font-size: 1.6rem; color: var(--gold); }
+.setup > li::before { background: none; border-radius: 0; width: auto; height: auto; place-items: start; font: 700 1.35rem/2.2rem var(--font-display); }
+.faq { gap: 0; border-top: 1px solid var(--rule); }
+.faq details { border: 0; border-radius: 0; border-bottom: 1px solid var(--rule); padding: 16px 0; }
+.handy code { background: none; border: 0; padding: 0; color: var(--ink); }
+:not(pre) > code, kbd { border-radius: 2px; }
+.runline { border-radius: 2px; }
+.copy { background: none; color: var(--signal); border: 1px solid var(--band-rule); border-radius: 2px; font: 600 0.82rem var(--font-mono); letter-spacing: 0.04em; padding: 7px 12px; }
+.copy:hover { border-color: var(--signal); }
+.os { gap: 18px; }
+.os button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none !important; padding: 4px 0; }
+.os button[aria-pressed="true"] { border-color: var(--signal); }
+.now { border: 0; border-radius: 0; background: none; padding: 0; font: 600 0.8rem var(--font-mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--band-ink-2); }
+.now:hover { color: var(--band-ink); }
+.model { border-radius: 2px; }
+.tag { border-radius: 2px; }
+.bar, .progress, .bars i, .layers i { border-radius: 0; }
+
+/* Gold is kept for the brand mark, the headline's accent, and data (the layer bars, charts, progress). Everything
+   structural (section numbers, rules, links, controls) is neutral. */
+main section > h2::before, main section > .head > h2::before { color: var(--ink-2); }
+.step b, .setup > li::before { color: var(--ink-2); }
+.pillar { border-top-color: var(--rule); }
+.callout, .callout.deepseek { border-left-color: var(--ink-2); }
+.bubble.a { border-left-color: var(--ink-2); }
+.feat-eyebrow { color: var(--ink-2); }
+.stages li.now { color: var(--ink) !important; }
+.copy { color: var(--band-ink); }
+.copy:hover { border-color: var(--band-ink-2); }
+.os button[aria-pressed="true"] { border-color: var(--band-ink); }
+main a, footer a, .faq a { color: var(--ink); text-decoration-color: var(--ink-2); }
+main a:hover, footer a:hover { text-decoration-color: var(--ink); }
+.install p a { color: var(--band-ink); }
+.faq summary::after { color: var(--ink-2); }
+/* The brand's gradient (the terminal banner's gold, orange, pink, violet), used deliberately: a line along the top,
+   the headline's accent, section numbers, the model's layers and a glow behind it. Text and controls stay calm. */
+:root { --grad: linear-gradient(90deg, #ffcd3c, #ff9646 35%, #ff5f96 68%, #b46eff); }
+.pillar { border-top: 1px solid var(--rule); }
+.band { background: radial-gradient(60% 80% at 82% 55%, rgb(180 110 255 / 0.06), transparent 70%), radial-gradient(40% 60% at 70% 40%, rgb(255 150 70 / 0.045), transparent 70%), var(--band); }
+.bars i::after { background: var(--c, var(--signal)); }
+.model-key span::before { background: linear-gradient(90deg, #ffcd3c, #b46eff); }
+.now .dot { box-shadow: 0 0 0 4px rgb(63 185 80 / 0.18); }
+/* The page's scrollbar, in the brand's colours. */
+html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb { background: #5a544c; border: 2px solid var(--paper); }
+::-webkit-scrollbar-thumb:hover { background: #f1b23c; }
+
 </style>
 </head>
 <body>
@@ -196,9 +308,10 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
         <b>Vibe Hash</b><span class="tag">Testnet</span>
       </a>
       <nav class="topnav" aria-label="Site">
-        <a class="optional" href="#network">Live network</a><a href="#start">Start mining</a><a href="/guide/">Guide</a><a class="optional" href="https://github.com/AlphaChad5000/vibehash">GitHub</a>
+        <a class="optional" href="#network">Live network</a><a href="#start">Start mining</a><a href="/guide/">Guide</a><a class="optional" href="/whitepaper.pdf">Whitepaper</a><a class="optional" href="https://github.com/AlphaChad5000/vibehash">GitHub</a>
       </nav>
     </div>
+    <div class="hero-wrap">
     <div class="hero">
       <a class="now" id="now" href="#network" hidden><span class="dot"></span><span id="now-text"></span></a>
       <h1>Mining that trains <em>real AI models</em></h1>
@@ -212,8 +325,21 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
         <p id="cmd-note">Paste it into PowerShell. It installs everything, asks four quick questions, then offers to start mining. <a href="#start">What it asks</a></p>
       </div>
     </div>
+    <figure class="model" aria-label="DeepSeek V4.1 Flash's 40 layers: 36 prepared once in pieces, 4 trained by miners">
+      <div class="model-head"><b>DeepSeek V4.1 Flash</b><span>510 GB · 40 layers</span></div>
+      <div class="bars" id="bars" aria-hidden="true"></div>
+      <div class="model-key"><span>36 frozen layers, prepared once in pieces</span><span class="k-top">4 layers trained by miners</span></div>
+      <p>Too big for any one PC, so nobody holds it whole: each miner needs about 30 GB.</p>
+    </figure>
+    </div>
   </div>
 </header>
+
+<section class="wrap pillars" aria-label="What makes it different">
+  <div class="pillar"><h3>Useful work, not wasted hashes</h3><p>Every round trains a real model someone asked for. The electricity goes into AI, not into puzzles nobody needs.</p></div>
+  <div class="pillar"><h3>Every piece is checked</h3><p>Other miners redo random bits of your work. Disagreements narrow to one calculation the network redoes, and cheaters lose their stake.</p></div>
+  <div class="pillar"><h3>Open by default</h3><p>The code is MIT-licensed, every block can be re-checked from the start with one command, and the trained models are given away.</p></div>
+</section>
 
 <main>
   <section id="network" class="wrap" aria-labelledby="network-title">
@@ -291,11 +417,26 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
       <p><a href="/guide/">Read the guide</a> for how rounds, checks, payment and penalties work.</p>
     </div>
   </section>
+  <section class="wrap" aria-labelledby="faq-title">
+  <h2 id="faq-title">Questions people ask</h2>
+  <div class="faq">
+    <details><summary>Is VIBE worth money?</summary><p>No. Vibe Hash is a test network and VIBE has no cash value, so don't buy or sell it. It's how the network keeps score of who did the work.</p></details>
+    <details><summary>What do I need to mine?</summary><p>Any computer can earn on the small jobs, with or without a graphics card. The DeepSeek job needs an NVIDIA card with 8 GB or more, 16 GB of memory and about 40 GB free on an SSD.</p></details>
+    <details><summary>What does it do to my computer?</summary><p>While you mine, it uses your graphics card or processor for training. It asks before any big download, keeps model files only where and as long as you allow, and stops with Ctrl+C. The software is open source and hasn't been audited, so run it on a machine you're comfortable testing with.</p></details>
+    <details><summary>How is cheating stopped?</summary><p>Other miners redo random pieces of everyone's work. If someone disagrees, the network narrows the disagreement to a single calculation and redoes just that one. Whoever was wrong loses the stake they put up, so faking work or falsely accusing someone costs more than it gains.</p></details>
+    <details><summary>Who runs the network?</summary><p>Today a single validator runs it, operated by the project's founder. The software already supports many validators voting on every block, and adding more is the next step toward nobody being in charge.</p></details>
+    <details><summary>Is this connected to DeepSeek?</summary><p>No. Vibe Hash isn't affiliated with or endorsed by DeepSeek. Its open model is one of the models the network fine-tunes, under its MIT licence.</p></details>
+    <details><summary>Where can I read how it works?</summary><p>The <a href="/guide/">guide</a> walks through rounds, checks, payment and penalties, the <a href="/whitepaper.pdf">whitepaper</a> has the design in eleven pages, and the <a href="https://github.com/AlphaChad5000/vibehash">source code</a> is on GitHub.</p></details>
+  </div>
+</section>
 </main>
 
 <footer>
   <div class="wrap">
-    <nav aria-label="More"><a href="/guide/">Guide</a><a href="https://github.com/AlphaChad5000/vibehash">Source code</a><a href="https://node.vibehash.org/status">Node status</a></nav>
+    <div class="cols">
+      <span class="mark"><svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>Vibe Hash</span>
+      <nav aria-label="More"><a href="/guide/">Guide</a><a href="/whitepaper.pdf">Whitepaper</a><a href="https://github.com/AlphaChad5000/vibehash">Source code</a><a href="https://node.vibehash.org/status">Node status</a></nav>
+    </div>
     <p>Unaudited test network software. VIBE has no cash value, so don't buy or sell it.</p>
     <p class="fine">Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</p>
   </div>
@@ -311,6 +452,18 @@ footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
     unix: ["curl -fsSL https://vibehash.org/install.sh | sh", "Paste it into Terminal. It installs everything, asks four quick questions, then offers to start mining."]
   };
   var $ = function (id) { return document.getElementById(id); };
+
+  // ---- the hero's picture of the model: 36 frozen layers filling in turn, 4 trained ----
+  (function () {
+    var bars = document.getElementById("bars");
+    for (var i = 0; i < 40; i++) {
+      var b = document.createElement("i");
+      if (i >= 36) b.className = "top";
+      else b.style.setProperty("--c", "hsl(" + (44 - i * 3.75) + " 78% " + (58 - i * 0.1) + "%)");  // gold to violet, layer 1 up
+      b.style.setProperty("--n", String(i));
+      bars.appendChild(b);
+    }
+  })();
 
   // ---- install line ----
   function pick(os) {
