@@ -82,6 +82,14 @@ python -m vibehash worker
 To join a different network instead, give setup its node's address, such as
 `python -m vibehash setup --node 192.168.1.20`.
 
+Or skip the commands: `python -m vibehash` on its own, at a terminal, opens a
+menu of what people do most. Pick with the arrow keys or a number. Each item
+shows the command it runs, and you're back in the menu when it's done.
+
+```bash
+python -m vibehash
+```
+
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
 

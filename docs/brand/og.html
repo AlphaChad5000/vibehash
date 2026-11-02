@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- The link preview for vibehash.org (og.png, 1200×630). Render it with:
+     msedge --headless=new --hide-scrollbars --window-size=1200,630 --virtual-time-budget=8000 --screenshot=og.png docs/brand/og.html
+     then copy it to docs/site/og.png. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=Source+Sans+3:wght@400;600&display=swap">
+<style>
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+  body { background: #151311; color: #eeebe6; font-family: "Source Sans 3", "Segoe UI", sans-serif; position: relative; }
+  .pad { position: absolute; inset: 64px 72px; display: flex; flex-direction: column; }
+  .brand { display: flex; align-items: center; gap: 14px; font: 720 34px "Archivo", sans-serif; font-stretch: 115%; }
+  .brand svg { width: 24px; height: 32px; color: #f1b23c; }
+  .tag { font: 600 15px "Archivo", sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: #a39c93; border: 1px solid #2b2824; border-radius: 6px; padding: 4px 10px; margin-left: 6px; }
+  h1 { margin: 54px 0 0; font: 780 86px/1.0 "Archivo", sans-serif; font-stretch: 110%; letter-spacing: -0.03em; }
+  h1 em { font-style: normal; color: #f1b23c; }
+  .now { margin: 34px 0 0; display: flex; align-items: center; gap: 14px; font-size: 30px; color: #eeebe6; white-space: nowrap; }
+  .now i { width: 14px; height: 14px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 0 6px rgb(63 185 80 / 0.18); }
+  .sub { margin: 10px 0 0 28px; font-size: 26px; color: #a39c93; }
+  .layers { position: absolute; left: 72px; right: 72px; bottom: 56px; height: 56px; display: grid; grid-template-columns: repeat(40, 1fr); gap: 5px; align-items: end; }
+  .layers b { display: block; height: 100%; border-radius: 3px; background: #2b2824; position: relative; overflow: hidden; }
+  .layers b::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: var(--f); background: #f1b23c; }
+  .layers b.top { background: #15301a; box-shadow: inset 0 0 0 2px #80cf88; }
+  .layers b.top::after { display: none; }
+</style>
+</head>
+<body>
+  <div class="pad">
+    <div class="brand">
+      <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
+      Vibe Hash <span class="tag">Testnet</span>
+    </div>
+    <h1>Mining that trains<br><em>real AI models</em></h1>
+    <p class="now"><i></i>Now training: DeepSeek V4.1 Flash learns to think shorter</p>
+    <p class="sub">In pieces, on gaming PCs. Nobody holds the whole 510 GB model.</p>
+  </div>
+  <div class="layers" id="layers"></div>
+  <script>
+    var row = document.getElementById("layers");
+    for (var i = 0; i < 40; i++) {
+      var b = document.createElement("b");
+      if (i >= 36) b.className = "top";
+      else b.style.setProperty("--f", Math.round(100 * Math.max(0.12, Math.min(1, 1.15 - i / 40))) + "%");
+      row.appendChild(b);
+    }
+  </script>
+</body>
+</html>
