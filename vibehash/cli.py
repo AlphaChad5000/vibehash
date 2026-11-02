@@ -1438,7 +1438,19 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def run_command(argv: list[str]) -> None:
+    """One command line, as `vibehash ARGS` runs it, for the menu: a failing command says why and the menu goes on."""
+    try:
+        main(argv)
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(e.code if isinstance(e.code, str) else f"stopped with exit code {e.code}")
+
+
 def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv) == [] and sys.stdin.isatty() and sys.stdout.isatty():
+        from . import menu  # plain `vibehash`, typed at a terminal: the menu
+        return menu.run(run_command, prog())
     a = parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
     try:
