@@ -15,11 +15,12 @@ op's output (merkle.LEAF numbers):
      it should), then referee.judge recomputes the tile. Inside the bounds, the defender wins; outside, it loses.
 A party silent past its move's deadline loses. A challenger may concede instead of picking: a checker that does
 loses (it accused), but a replica challenging the other replica that concedes (or never moves) before its first pick
-goes without blame: it never chose to accuse. Every move is a signed message and goes in the record with the evidence and
-the weights the referee used, so a validator replays the game and re-runs the referee and gets the same verdict.
+goes without blame: it never chose to accuse. Every move is a signed message and goes in the record with the evidence,
+so a validator replays the game and re-runs the referee, on weights it checked itself, and gets the same verdict.
 
-The base model's weights the referee needs come from the pinned commit on the Hub by byte range (HubWeights), or from
-the node's tensor cache: never from either party. The job's manifest pins each tensor's sha256, but only whole: a slice
+The base model's weights the referee needs come from the pinned commit on the Hub, each whole tensor checked against the
+job's manifest before any of it is read (HubWeights), or from the tensor cache that holds only checked tensors: never
+from either party, nor from a record. The job's manifest pins each tensor's sha256, but only whole: a slice
 of a tensor has nothing to be proven against, so a party offering one would have to send the whole tensor (up to
 hundreds of MB), and it would be checked against the same manifest the node can check the Hub's copy with. If the Hub
 can't be reached, the claim ends unchecked and nobody is slashed.
@@ -38,16 +39,11 @@ from .merkle import LEAF, MerkleError
 
 MAX_EVIDENCE = 32 * 2**20  # a tile's inputs: a few MB at most (an attention column over every query position)
 MAX_WEIGHTS = 256 * 2**20  # base-model weights one tile can need (a whole projection, for its backward)
-MAX_RECORDED = 64 * 2**20  # weights a record keeps for one game (the column slices used, not whole tensors)
 MAX_MOVES = 40
 
 
 class WeightsUnavailable(Exception):
     """The base model's weights couldn't be fetched: the claim ends unchecked."""
-
-
-class RecordIncomplete(Exception):
-    """A replayed game's record lacks something its referee used."""
 
 
 # --- the base model's weights -----------------------------------------------------------------------------------------
@@ -77,9 +73,10 @@ _ITEM = {"BF16": 2, "F16": 2, "F32": 4}
 
 
 class HubWeights:
-    """Rows of the job's pinned base model, as the node's referee reads them: from its tensor cache when it has the
-    whole tensor (hash-checked when it was fetched), else by byte range from the pinned commit on the Hub. Ranges
-    fetched are kept in memory, up to `keep` bytes."""
+    """Rows of the job's pinned base model, as a referee reads them: from the tensor cache, after fetching the whole
+    tensor from the pinned commit and checking it against the job's manifest if it isn't there yet. Rows read are
+    kept in memory, up to `keep` bytes. Validators replaying a game read the same way, so none trusts weights the
+    leader (or a record) supplies."""
 
     def __init__(self, manifest, hub=None, cache=None, keep: int = 256 * 2**20):
         from . import hub as hubmod
@@ -104,16 +101,16 @@ class HubWeights:
         e = self.manifest.tensors[name]
         path = self.cache.path(self.manifest.commit, e.sha256)
         try:
-            if path.exists() and path.stat().st_size == e.length:
-                with open(path, "rb") as f:
-                    f.seek(r0 * width)
-                    raw = f.read((r1 - r0) * width)
-            else:
-                size = self.manifest.files[e.file]["size"]
-                f = (self.hub or hubmod.Hub()).open(self.manifest.repo, self.manifest.commit, e.file, size)
-                raw = f.read(e.offset + r0 * width, (r1 - r0) * width)
-        except (hubmod.HubError, OSError) as ex:
-            raise WeightsUnavailable(f"couldn't fetch {name} from the Hub: {ex}") from None
+            if not (path.exists() and path.stat().st_size == e.length):
+                # The whole tensor, checked against the manifest's sha256 (TensorCache.fetch), before any of it is
+                # used: a slice has nothing of its own to be checked against, so every referee, the leader's and each
+                # validator's, reads only bytes it verified itself.
+                self.cache.fetch(self.manifest, [name], hub=self.hub or hubmod.Hub())
+            with open(path, "rb") as f:
+                f.seek(r0 * width)
+                raw = f.read((r1 - r0) * width)
+        except (hubmod.HubError, hubmod.IntegrityError, OSError) as ex:
+            raise WeightsUnavailable(f"couldn't fetch {name} from the Hub and check it: {ex}") from None
         if len(raw) != (r1 - r0) * width:
             raise WeightsUnavailable(f"{name}: the Hub sent {len(raw)} bytes, not {(r1 - r0) * width}")
         while self.kept and sum(map(len, self.kept.values())) + len(raw) > self.keep:
@@ -122,46 +119,12 @@ class HubWeights:
         return raw
 
 
-class Recorded:
-    """The weights a game's referee used, as the record keeps them (pack/unpack)."""
-
-    def __init__(self, blob: bytes | None = None):
-        self.items: dict[str, tuple[str, tuple, bytes]] = {}
-        if blob is not None:
-            header, chunks = merkle.unpack(blob, MAX_RECORDED + 2**20)
-            for key, (dtype, shape) in header.items():
-                if key not in chunks or dtype not in _ITEM or not isinstance(shape, list):
-                    raise RecordIncomplete("the record's weights are malformed")
-                self.items[key] = (dtype, tuple(int(x) for x in shape), chunks[key])
-
-    @staticmethod
-    def key(name, r0, r1) -> str:
-        return f"{name}[{r0}:{r1}]"
-
-    def shape(self, name):
-        for k, (dtype, shape, _) in self.items.items():
-            if k.rsplit("[", 1)[0] == name:
-                return dtype, shape
-        raise RecordIncomplete(f"the record has none of {name}")
-
-    def read(self, name, r0, r1) -> bytes:
-        try:
-            return self.items[self.key(name, r0, r1)][2]
-        except KeyError:
-            raise RecordIncomplete(f"the record lacks rows {r0}-{r1} of {name}") from None
-
-    def pack(self) -> bytes:
-        return merkle.pack({k: [d, list(s)] for k, (d, s, _) in self.items.items()}, {k: raw for k, (_, _, raw) in self.items.items()})
-
-
 class Outside:
     """What the referee reads besides the evidence: base-model weights (`source`: something with .shape(name) and
-    .read(name, r0, r1)), the job's data, its LoRA A matrices and the rotary tables. With `keep`, every weight read is
-    kept (Recorded) for the record."""
+    .read(name, r0, r1)), the job's data, its LoRA A matrices and the rotary tables."""
 
-    def __init__(self, spec, data, source, keep: bool = True, limit: int = MAX_WEIGHTS):
+    def __init__(self, spec, data, source, keep: bool = False, limit: int = MAX_WEIGHTS):
         self.spec, self.data, self.source, self.limit, self.used = spec, data, source, limit, 0
-        self.kept = Recorded() if keep else None
         self._a: dict[int, np.ndarray] = {}
         self._rope: dict = {}
         self._got: dict[str, np.ndarray] = {}
@@ -170,7 +133,7 @@ class Outside:
         return _rows(self.source.shape(name)[1])
 
     def weight(self, name, r0, r1) -> np.ndarray:
-        key = Recorded.key(name, r0, r1)
+        key = f"{name}[{r0}:{r1}]"
         if key in self._got:
             return self._got[key]
         dtype, shape = self.source.shape(name)
@@ -180,8 +143,6 @@ class Outside:
         self.used += len(raw)
         if self.used > self.limit:
             raise WeightsUnavailable("the tile needs more of the base model than the referee fetches for one")
-        if self.kept is not None:
-            self.kept.items[key] = (dtype, shape, raw)
         self._got[key] = decode(dtype, raw, _cols(shape))
         return self._got[key]
 
@@ -435,7 +396,6 @@ class Game:
     detail: str = ""
     deadline: float = 0.0
     evidence: bytes | None = None
-    weights: bytes | None = None
     leaf: object = None  # the op picked, once it is one
     seed: int = 0  # the unit's, which the parties' program.Program needs
 
@@ -472,7 +432,6 @@ class Game:
         return {"id": self.gid, "unit": self.unit, "defender": self.defender, "challenger": self.challenger,
                 "why": self.why, "root": list(self.root), "a": self.origin[0], "b": self.origin[1],
                 "moves": list(self.moves), "evidence": merkle.b64(self.evidence) if self.evidence is not None else None,
-                "weights": merkle.b64(self.weights) if self.weights is not None else None,
                 "outcome": self.outcome, "detail": self.detail}
 
 
@@ -549,8 +508,6 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
             raise MoveRefused("evidence is the id of an uploaded blob")
         outcome, detail = judge_evidence(game.leaf, game.tile, game.a, game.b, evidence, outside)
         game.evidence = evidence
-        if outcome != "unchecked" and outside is not None and outside.kept is not None:
-            game.weights = outside.kept.pack()
         game.end(outcome, detail)
 
 

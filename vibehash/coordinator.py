@@ -340,6 +340,7 @@ class Coordinator:
         # party has for each move.
         self.trace_blobs = None
         self.weight_source = None
+        self.roots = None  # a replay's: where a dispute's checkpoints come from (.array(blob_id, job)), to check its states
         self.datasets = None  # a replay's: where a fine-tune's data comes from (.attach(job) or .attach_dataset(job))
         self.move_s = 60.0
         self._programs: dict = {}
@@ -1317,9 +1318,38 @@ class Coordinator:
                 self._put_trace(manifest)
                 out.append(state)
             return out
-        a, b = self._claim("game", gid, ends)
+        if self.replaying and self.roots is not None:  # a validator: the states are the checkpoints', or it refuses
+            a, b = self._replay_ends(job, key, root)
+            if self.replaying["checks"].get("game", {}).get(gid) != [a, b]:
+                raise ProtocolError(f"dispute {gid}'s starting states in the record aren't the reveal's checkpoints'")
+            r.record["checks"]["game"][gid] = [a, b]
+        else:
+            a, b = self._claim("game", gid, ends)
         g = dg.Game(gid, uid, defender, challenger, why, list(root), a, b, seed=r.units[uid].seed)
         r.games[gid] = g.start(self._program(job, uid))
+
+    def _replay_ends(self, job: TrainingJob, key: tuple[str, str], root: list) -> list[str]:
+        """A game's starting and ending state roots, rebuilt from the checkpoints its claim's reveal names (fetched
+        through self.roots: the leader's blobs, for a validator). Refuses when they can't be had."""
+        uid, worker = key
+        wire = next((d for d in self.replaying.get("reveals", []) if d.get("unit_id") == uid and d.get("worker") == worker),
+                    None)
+        if wire is None:
+            raise ProtocolError(f"the record has no reveal for {uid} by {worker}")
+        openings = blob_openings_in(wire["openings"], job.n_segments)
+        if root[0] == "segment":
+            s = int(root[1])
+            ids = [openings[s][0], openings[s + 1][0]]
+        else:
+            ids = [openings[0][0], wire["final"]]
+        out = []
+        for bid in ids:
+            try:
+                theta = self.roots.array(bid, job)
+            except Exception as e:  # noqa: BLE001 - the checkpoint couldn't be had: nothing to check the record by
+                raise ProtocolError(f"checkpoint {str(bid)[:12]} for a dispute couldn't be fetched: {e}") from None
+            out.append(dg.checkpoint_state(job.spec, theta)[0])
+        return out
 
     # --- states and evidence on the node ---
 
@@ -1360,10 +1390,10 @@ class Coordinator:
 
     @_locked
     def submit_move(self, addr: str, body: dict, envelope: dict | None = None, now: float | None = None,
-                    evidence: bytes | None = None, weights: bytes | None = None) -> dict:
+                    evidence: bytes | None = None) -> dict:
         """One move of a dispute (dispute.play), `body` {"game", "n" (moves so far), "move"}. A replay passes the
-        evidence and the weights the referee used, from the record; a live node reads the evidence from its blobs
-        and the weights from the Hub."""
+        evidence from the record; a live node reads it from its blobs. Either way the referee reads the base model's
+        weights it checked itself against the job's manifest (dispute.HubWeights): none come from the record."""
         r = self._need(Phase.DISPUTE)
         g = r.games.get(body.get("game")) if isinstance(body, dict) else None
         if g is None:
@@ -1375,21 +1405,14 @@ class Coordinator:
         job = self.job(r.job_id)
         move, outside = body.get("move"), None
         if isinstance(move, dict) and "evidence" in move:
-            if self.replaying:
-                source = dg.Recorded(weights) if weights is not None else dg.Unavailable()
-                outside = dg.Outside(job.spec, job.data, source, keep=False)
-            else:
+            if not self.replaying:
                 evidence = self._get_trace(str(move["evidence"]))
-                outside = dg.Outside(job.spec, job.data, self._weight_source(job))
+            outside = dg.Outside(job.spec, job.data, self._weight_source(job))
         try:
             dg.play(g, self._program(job, g.unit), addr, move, evidence=evidence, outside=outside,
                     check_states=None if self.replaying else self._check_states)
         except dg.MoveRefused as e:
             raise ProtocolError(str(e)) from None
-        except dg.RecordIncomplete as e:
-            raise ProtocolError(f"the record can't referee dispute {g.gid}: {e}") from None
-        if self.replaying and g.evidence is not None and g.outcome != "unchecked":
-            g.weights = weights
         g.moves.append(envelope if envelope is not None else {"from": addr, **body})
         if now is not None:
             g.deadline = now + self.move_s

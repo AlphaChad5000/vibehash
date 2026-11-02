@@ -388,7 +388,8 @@ class Node:
                 if block.summary is not None:
                     record = value.get("record")
                     problems = (["no round record"] if not isinstance(record, dict)
-                                else replay_block(self.chain, block, record, datasets=self.store))
+                                else replay_block(self.chain, block, record, datasets=self.store,
+                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey))))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -773,7 +774,8 @@ class Node:
                                  score=body.get("score"))
                 return {"ok": True, "receipt": self._receipt(kind, env)}
             if kind == "move":
-                return c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())
+                view = c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())
+                return {**view, "receipt": self._receipt(kind, env)}
         raise ProtocolError(f"unknown message {kind}")
 
     def _receipt(self, kind: str, entry: dict) -> dict:
@@ -1031,3 +1033,20 @@ class TraceBlobs:
                 return None
             self.roots[blob_id] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
         return self.roots[blob_id]
+
+
+class LeaderBlobs:
+    """A round's checkpoints, for a validator checking its disputes' starting states (replay_block's `roots`): this
+    node's own when it has them, else fetched from the block's proposer and checked by their id."""
+
+    def __init__(self, node: Node, proposer: str):
+        self.node, self.proposer = node, proposer
+
+    def array(self, blob_id: str, job) -> np.ndarray:
+        store = self.node.blobs
+        if not store.has(blob_id):
+            url = self.node.chain.state.validators.get(self.proposer)
+            if not url:
+                raise ProtocolError("the proposer has no address to fetch its checkpoints from")
+            self.node.peers.client(url, timeout=120).download("blob", blob_id, store, size=job.checkpoint_bytes)
+        return np.asarray(store.load(blob_id, job.wire_dtype, job.spec.n_params), dtype=np.float64)

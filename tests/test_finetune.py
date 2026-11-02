@@ -922,6 +922,47 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertEqual(replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record),
                                       datasets=Store()), [])
 
+    def test_validators_dont_take_the_leaders_word_on_disputes(self):
+        """The second review's finding 2. A record carries no weights (every referee, the leader's and each
+        validator's, reads only tensors it checked against the job's manifest); a validator rebuilds each dispute's
+        starting states from the reveal's checkpoints and refuses a record whose states differ; and an outcome the
+        leader edits (say, to unchecked) doesn't replay to the record it's in."""
+        from vibehash.crypto import h256
+        from vibehash.ledger import canonical
+        from vibehash.replay import replay_block
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        rep = self.round()
+        games = rep.record["games"]
+        self.assertTrue(games and all("weights" not in e for e in games))
+        p = self.proto
+
+        class Blobs:
+            def array(self_, bid, job):
+                return p.checkpoints.array(bid, job)
+
+            def attach(self_, j):
+                j.attach_data(load_dataset(self.path), self.sha)
+
+        def replay(record):
+            block = copy.deepcopy(rep.block)
+            block.summary.record_hash = h256(canonical(record)).hex()  # as a leader would seal its own record
+            return replay_block(copy.deepcopy(self.before), block, record, datasets=Blobs(), roots=Blobs())
+        self.assertEqual(replay(copy.deepcopy(rep.record)), [])
+        forged = copy.deepcopy(rep.record)
+        gid = games[0]["id"]
+        forged["checks"]["game"][gid] = forged["checks"]["game"][gid][::-1]  # other starting states
+        self.assertIn("starting states", " ".join(replay(forged)))
+        forged = copy.deepcopy(rep.record)
+        forged["games"][0]["outcome"] = "unchecked"
+        self.assertTrue(replay(forged), "an edited outcome doesn't replay to its record")
+        # Moves get receipts, which the audit finds in the record's games.
+        from vibehash import receipts
+        keys = next(w.keys for w in self.workers if w.keys.public == rep.block.proposer_pubkey)  # the round's leader
+        env = games[0]["moves"][0]
+        r = receipts.make(keys, p.chain.chain_id, rep.block.height, rep.record["attempt"], "move", env)
+        self.assertEqual(receipts.audit(r, rep.block, rep.record)[0], "recorded")
+
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
         challenger. Both are slashed as if they had lost at the referee."""

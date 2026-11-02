@@ -722,14 +722,22 @@ within 1.02).
 - **The residual is steering within the bounds:** a worker that does all the float32 work may still push each sum
   by up to about 7 times the largest honest error measured (3–6e-5 of a value at K = 1024 to 4096), each in a
   direction of its choosing, and pass. That's the room a dishonest worker keeps; it costs it the full work.
-- **The leader** can still drop a move and claim silence, as it can drop a verdict (receipts don't cover moves yet).
-  A plain replay trusts the record for a game's root states and the weights its referee used. A recheck rebuilds the
-  root states from the checkpoints; checking the recorded weights against the pinned commit is a follow-up.
+- **What a validator doesn't take from the leader** (the second review's finding 2):
+  - **the base model's weights:** none are recorded; every referee reads whole tensors it checked itself against
+    the job's manifest;
+  - **a game's starting states:** a validator rebuilds them from the reveal's checkpoints, fetched from the block's
+    proposer (`node.LeaderBlobs`), and refuses a record whose states differ;
+  - **outcomes:** it re-runs every referee, so a game the leader marks unchecked, or any edited outcome, doesn't
+    replay to its record.
+- **What it still takes:** timing. The leader can drop a move and call it silence, or end the phase early, and a
+  replay can't see clocks. Moves now get signed receipts as verdicts do, so a party holding one for a move the record
+  lacks proves it was dropped (`receipts.audit`).
 
-**The weights the referee reads** come from the job's pinned commit on the Hub by byte range (`dispute.HubWeights`), or
-from the node's tensor cache when it has the whole tensor: never from either party. A tile needs at most a block of
-rows (a vocabulary block of the head: 8 MB at 1024 wide) or, for an op's backward, one projection (6 MB on Qwen3-0.6B,
-50 MB on 4B's MLP). Ranges fetched are kept in memory, up to 256 MB. **Why not have the parties supply weight
+**The weights the referee reads** come from the job's pinned commit on the Hub (`dispute.HubWeights`): each tensor it
+needs is fetched whole into the tensor cache and checked against the manifest's sha256 before any of it is read.
+Never from either party, nor from a record. A tile needs at most a block of rows (a vocabulary block of the head:
+8 MB at 1024 wide) or, for an op's backward, one projection (6 MB on Qwen3-0.6B, 50 MB on 4B's MLP). Rows read are kept
+in memory, up to 256 MB. **Why not have the parties supply weight
 slices with a proof:** the job's manifest pins each tensor's sha256 whole, so a slice has nothing to be proven against.
 A party would have to send the whole tensor, up to hundreds of MB, and the node would check it against the same
 manifest it can check the Hub's bytes with. Per-tensor Merkle roots in a future manifest version would make slices
@@ -752,12 +760,12 @@ once a round would be a ledger change.
   It's unreleased, so this redefines it.
   - **What the record adds:** scorers' verdicts carrying `score` beside the checkers' (`verdicts`), the median
     `score`, under `checks/redundancy` whether each replicated unit's replicas agreed, under `checks/game` each
-    dispute's root states, and `games`: each dispute's signed moves, its evidence, the weights its referee used, its
-    outcome and the referee's words.
+    dispute's root states, and `games`: each dispute's signed moves, its evidence, its outcome and the referee's words.
+    No weights: a replay fetches and checks its own.
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
-    the referee on the recorded evidence and weights, so it reaches the same verdicts without PyTorch, the GPU or the
-    Hub. It needs the job's dataset to rebuild the program (which sequences a step trains on); a plain replay of a
-    round without disputes still needs none.
+    the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
+    without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each
+    game's ends, and the job's dataset to rebuild the program; a plain replay of a round without disputes needs none.
   - **Recheck:** besides version 2's, it rebuilds each dispute's root states from the checkpoints.
   - **MLP rounds** stay version 2, unchanged.
 - **What counts as a fine-tune:** a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`), a shape

@@ -18,7 +18,8 @@ field by field. It checks:
     canaries made of cells;
   * for a fine-tune (record version 4): every dispute, move by move (each a signed
     message), with the referee's verdict on its last op re-run from the evidence
-    and base-model weights the record keeps;
+    (base-model weights fetched and checked against the job's manifest, never
+    taken from the record);
   * every verdict, slash, missed deadline and payment share.
 
 Given the round's checkpoints (`checkpoints`: something with .array(blob_id,
@@ -51,7 +52,7 @@ def _sender(env: dict, kind: str, chain: Chain, round_no: int) -> tuple[str, dic
 
 
 def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, stats: dict | None = None,
-                 datasets=None) -> list[str]:
+                 datasets=None, roots=None) -> list[str]:
     """Problems found re-running `block`'s round on `chain`, which must be the chain just before `block`.
     An empty list means every decision in the block follows from its record (and, with `checkpoints`, every
     weight-based result it records checks out). `stats` collects how many results were re-checked or couldn't be.
@@ -66,6 +67,7 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
         rules = record["rules"]
         c = Coordinator(chain, config=CoordinatorConfig(**rules), replay=record, recheck=checkpoints)
         c.datasets = datasets
+        c.roots = roots if roots is not None else checkpoints
         c.open_round()
         if c.r.job_id != s.job_id:
             return [f"the record is for job {c.r.job_id}, the block for {s.job_id}"]
@@ -99,10 +101,9 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
             for gid in sorted(entries):
                 e = entries[gid]
                 evidence = unb64(e["evidence"], 64 * 2**20) if e.get("evidence") else None
-                weights = unb64(e["weights"], 128 * 2**20) if e.get("weights") else None
                 for env in e["moves"]:
                     addr, body = _sender(env, "move", chain, c.r.round_no)
-                    c.submit_move(addr, body, envelope=env, evidence=evidence, weights=weights)
+                    c.submit_move(addr, body, envelope=env, evidence=evidence)
         elif record.get("games"):
             raise ProtocolError("the record has disputes, but the round had none")
         replayed = c.replayed_summary(s.proposer)
