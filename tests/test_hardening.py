@@ -56,6 +56,11 @@ def network(n_workers=3, economics=None, config=None, budget=100 * VIBE):
     return proto, workers, req, job
 
 
+class Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
 class Cli:
     """Runs `vibehash ...` in a scratch home, as test_network's command-line tests do."""
 
@@ -72,8 +77,9 @@ class Cli:
         self.addCleanup(logging.disable, logging.NOTSET)
         self.home = Path(home.name)
 
-    def run_cli(self, *argv) -> str:
-        out = io.StringIO()
+    def run_cli(self, *argv, terminal: bool = False) -> str:
+        """`terminal`: output to a terminal (shown on screen), rather than a pipe or log."""
+        out = Terminal() if terminal else io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             try:
                 cli.main([str(a) for a in argv])
@@ -726,7 +732,7 @@ class IssuanceCommandLineTests(Cli, unittest.TestCase):
 
 class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
     def test_create_shows_words_once_and_restore_rebuilds_the_wallet(self):
-        out = self.run_cli("wallet", "create", "--out", self.home / "a.json")
+        out = self.run_cli("wallet", "create", "--out", self.home / "a.json", terminal=True)
         address = re.search(r"address: (vibe1\w+)", out)[1]
         words = " ".join(re.findall(r"\d+\. ([a-z]+)", out))
         self.assertEqual(len(words.split()), 24)
@@ -746,6 +752,17 @@ class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
             out = self.run_cli("wallet", "restore", "--passphrase", "--out", self.home / "c.json")
         self.assertNotIn(address, out)  # a passphrase is a different wallet
         self.assertEqual(re.search(r"address: (vibe1\w+)", out)[1], mnemonic.keypair(ordered, "extra").address)
+
+    def test_unattended_the_words_go_to_a_private_file_not_the_log(self):
+        """Output to a pipe or log (nohup, Docker, a pod): the words aren't in it, but in a file, and it says where."""
+        out = self.run_cli("wallet", "create", "--out", self.home / "a.json")
+        address = re.search(r"address: (vibe1\w+)", out)[1]
+        self.assertNotRegex(out, r"\d+\. [a-z]+")
+        self.assertIn("NOT printed", out)
+        path = self.home / f"recovery-words-{address[:12]}.txt"
+        self.assertIn(str(path), out.replace("\n", ""))
+        words = " ".join(re.findall(r"^\s*\d+\. ([a-z]+)$", path.read_text(), re.M))
+        self.assertEqual(mnemonic.keypair(words).address, address)
 
     def test_old_wallet_shows_it_has_no_words(self):
         k = KeyPair.generate(b"legacy-plain")

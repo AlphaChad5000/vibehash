@@ -3,7 +3,9 @@ files. No GPU or network needed.
 
 `vibehash setup`, `testnet` and `train` against a live node are in test_network.py.
 """
+import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,10 +109,80 @@ class SettingsTests(unittest.TestCase):
         settings.save(wallet="b")
         self.assertEqual(settings.load(), {"node": "a", "wallet": "b"})
 
+    def test_every_command_takes_an_address_as_setup_does(self):
+        """`worker --node 192.168.1.20` (and $VIBEHASH_NODE without http://, as the installer passes it on) used to
+        fail with "unknown url type"; only setup added the scheme."""
+        import argparse
+
+        from vibehash.cli import node_of
+        self.assertEqual(node_of(argparse.Namespace(node="192.168.1.20")), "http://192.168.1.20:8545")
+        os.environ["VIBEHASH_NODE"] = "node.vibehash.org"
+        self.assertEqual(node_of(argparse.Namespace(node=None)), settings.PUBLIC_NODE)
+
     def test_normalise_url(self):
         self.assertEqual(normalise_url("192.168.1.20"), "http://192.168.1.20:8545")
         self.assertEqual(normalise_url("node.example:9000/"), "http://node.example:9000")
         self.assertEqual(normalise_url("https://node.example"), "https://node.example")
+
+
+class HeadlessSetupTests(unittest.TestCase):
+    """`setup` with nobody at the keyboard (nohup, tmux left alone, a Docker CMD, a pod): stdin is NUL or /dev/null,
+    output goes to a log. Nothing may wait for an answer, and the recovery words mustn't land in the log. (Windows
+    calls NUL a terminal: before, getpass waited on the console for ever.)"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"VIBEHASH_HOME": tmp.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for var in ("VIBEHASH_NODE", "VIBEHASH_WALLET", "VIBEHASH_PASSWORD", "RUNPOD_POD_ID"):
+            os.environ.pop(var, None)
+        self.home = Path(tmp.name)
+
+    def setup(self, *argv) -> tuple[object, str]:
+        import contextlib
+        import io
+
+        from vibehash import cli
+        out = io.StringIO()
+        with open(os.devnull) as nul, mock.patch("sys.stdin", nul), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.main(["setup", "--node", "http://127.0.0.1:1", "--gpu", "skip", *argv])
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_no_password_says_which_variable_gives_it(self):
+        code, out = self.setup()
+        self.assertIn("VIBEHASH_PASSWORD", str(code))
+        self.assertIn("no terminal", str(code))
+        self.assertFalse((self.home / "wallet.json").exists())
+        self.assertIn("Nothing is listening at 127.0.0.1 port 1", out)  # the node: what's wrong, in plain words
+
+    def test_unattended_setup_keeps_the_words_out_of_the_log(self):
+        from vibehash import mnemonic
+        with mock.patch.dict(os.environ, {"VIBEHASH_PASSWORD": "unattended"}):
+            code, out = self.setup("--deepseek", "no")
+        self.assertEqual(code, 0, out)
+        address = json.loads((self.home / "wallet.json").read_text())["address"]
+        self.assertNotRegex(out, r"\d+\. [a-z]+ ")  # no words in the output
+        self.assertIn("NOT printed", out)
+        words = re.findall(r"^\s*\d+\. ([a-z]+)$", (self.home / f"recovery-words-{address[:12]}.txt").read_text(), re.M)
+        self.assertEqual(mnemonic.keypair(" ".join(words)).address, address)
+        self.assertEqual(settings.load()["deepseek"], "no")
+        self.assertIn("Almost there", out)  # and it didn't wait to ask "Start mining now?"
+
+    def test_the_worker_names_the_variable_too(self):
+        from vibehash import cli
+        from vibehash import wallet as wallets
+        from vibehash.crypto import KeyPair
+        wallets.save(KeyPair.generate(b"locked"), self.home / "wallet.json", "secret")
+        with open(os.devnull) as nul, mock.patch("sys.stdin", nul), self.assertRaises(SystemExit) as e:
+            cli.main(["worker", "--node", "http://127.0.0.1:1"])
+        self.assertIn("VIBEHASH_PASSWORD", str(e.exception.code))
 
 
 class TabularTests(unittest.TestCase):
