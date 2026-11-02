@@ -19,7 +19,10 @@ Verifier behaviours, for whole units' segments and sharded units' cells alike:
     absent         never answers (the client and the simulation skip its tasks)
     knowing        approves without replaying, unless a fine-tune's segment breaks Adam's invariants (a lazy checker
                    who knows how canaries used to be made: verification.adam_impossible)
-Lazy and false-accusing scorers of a fine-tune report a made-up score.
+    quitter        checks honestly, but never moves in a dispute it starts (client.py)
+Lazy and false-accusing scorers of a fine-tune report a made-up score. A fine-tune's worker can also be
+    tamper         trains honestly but for one op of one step of each segment, whose output it scales (tamper below),
+                   and defends that training in disputes
 """
 from __future__ import annotations
 
@@ -32,7 +35,16 @@ from . import shards as sh
 from .crypto import KeyPair, merkle_proof, merkle_root
 from .model import params_hash, train_segment
 from .tasks import Commitment, Reveal, TrainingJob, WorkUnit, commit_digest
-from .verification import full_replay, replay_openings, reproduces, required_openings
+from .verification import replay_openings, required_openings
+
+
+def tamper(where: tuple, op) -> float | None:
+    """The "tamper" behaviour's one cheat a segment (tracer.Executor's `tamper`): step 2 of each segment of 4, its
+    second sequence, layer 1's backward, the attention's gradient for the values, scaled by 1.25."""
+    if len(where) >= 3 and where[0].startswith("step ") and int(where[0].split()[1]) % 4 == 2 \
+            and where[1].split(" (")[0].endswith("sequence 1") and where[2] == "layer 1 backward" and op.kind == "attn_dv":
+        return 1.25
+    return None
 
 
 @dataclass(frozen=True)
@@ -106,7 +118,8 @@ class Worker:
             elif self.behavior == "freezer":
                 pass  # passes any check that only asks "within tolerance?" once updates are smaller than it
             else:
-                theta = train_segment(job.spec, job.data, theta, unit.seed, seg * c, c, job.lr, job.batch_size, self.backend)
+                theta = train_segment(job.spec, job.data, theta, unit.seed, seg * c, c, job.lr, job.batch_size, self.backend,
+                                      tamper=tamper if self.behavior == "tamper" else None)
                 if self.fp_noise:
                     theta = theta * (1 + rng.normal(0, self.fp_noise, theta.shape))
             theta = job.spec.round(theta)
@@ -142,19 +155,9 @@ class Worker:
         openings = {i: (work.checkpoints[i], merkle_proof(work.leaves, i)) for i in need}
         return Reveal(unit.unit_id, self.address, work.root, work.salt, work.final, openings)
 
-    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int],
-               whole: bool = False) -> tuple[bool, int | None]:
-        """Replay the challenged segments; or, with `whole` (a fine-tune's jury on replicas that disagree), the whole
-        unit from its first checkpoint, compared with its last."""
-        if not whole:
-            return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
-        if self.verifier_behavior in ("lazy", "false_accuser", "knowing"):
-            return self.verifier_behavior != "false_accuser", None if self.verifier_behavior != "false_accuser" else segments[0]
-        start, last = openings[0][0], openings[job.n_segments][0]
-        from .finetune import WHOLE_TOLERANCE
-        ok = reproduces(last, full_replay(job, unit, start, self.backend), start, max(job.tolerance, WHOLE_TOLERANCE),
-                        job.spec)
-        return bool(ok), None if ok else segments[0]
+    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int]) -> tuple[bool, int | None]:
+        """Replay the challenged segments."""
+        return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
 
     def score(self, job: TrainingJob, start: np.ndarray) -> tuple[float, float]:
         """A fine-tune's score task: (loss, accuracy) of the round's starting model on the job's held-back data."""

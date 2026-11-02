@@ -62,7 +62,7 @@ def audit(receipt: dict, block: Block | None, record: dict | None) -> tuple[str,
         return "abandoned", f"round {n}: the attempt you took part in was abandoned and the block went to another"
     if block.proposer_pubkey.hex() != receipt["node"]:
         return "unrelated", f"round {n}: the receipt is from a different node from the one that sealed the block"
-    entries = record.get(KINDS[kind], []) + (record.get("jury", []) if kind == "verdict" else [])  # jurors' too
+    entries = record.get(KINDS[kind], [])
     if receipt["digest"] in {entry_digest(e) for e in entries}:
         return "recorded", f"round {n}: your {kind} is in the record"
     return "censored", (f"round {n}: the node signed a receipt for your {kind} but sealed the round without it. "

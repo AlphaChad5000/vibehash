@@ -306,14 +306,17 @@ So a fine-tune's rounds now give all of it to workers: **record version 4**
 
 - Each claim has two checkers.
 - Three scorers score the round's starting model, and the node records the median, for people only.
-- Anything rejected, unanswered, or where replicas disagree goes to a jury of three workers in an extra phase of the
-  same round. The majority decides and the losers are slashed.
+- A checker's rejection, or two replicas that disagree, is a **dispute game** in an extra phase of the same round. The
+  worker posts the states between its training's ops and the challenger narrows down where they go wrong, to one op
+  of one step. The node then recomputes a tile of that op (256 numbers) with NumPy on its CPU, with a few MB of the
+  base model fetched by byte range from the pinned commit. Whoever is wrong is slashed. These replaced juries of three
+  workers, which the two runs below used.
 
-The node checks hashes, Merkle proofs and Adam's arithmetic bound, and averages
-B (15M numbers for Qwen3-4B). It needs neither PyTorch nor the weights. A
-rechecking `chain verify` doesn't need them either.
+The node checks hashes, Merkle proofs and Adam's arithmetic bound, referees disputes, and averages B (15M numbers
+for Qwen3-4B). It needs no PyTorch, and of the weights only what a disputed op reads. A rechecking `chain verify`
+needs neither: the record keeps the weights its referee used.
 
-**Proven** on a local network whose node ran in a Python with no PyTorch
+**Proven with juries** (since replaced by disputes) on a local network whose node ran in a Python with no PyTorch
 installed:
 
 - **The setup:** a venv holding only numpy and cryptography, where importing the node's code loads no PyTorch, and
@@ -372,16 +375,16 @@ Moments in bf16 would cut both by a third.
 
 ### What it takes, in order
 
-1. **Done in this branch:** fine-tunes run on a node without PyTorch, checked and scored by workers (record
-   version 4).
+1. **Done in this branch:** fine-tunes run on a node without PyTorch, checked and scored by workers, with disputes
+   refereed by the node one op at a time (record version 4).
 2. **Release (0.5.5) and update the node, as block version 2 rolled out.** The release makes blocks of version 3,
    the first that may hold a fine-tune. A 0.5.x node refuses those blocks, so every validator runs the new release
    before the first one. The public chain has one validator, so its update is the switch. Workers that want fine-tunes need PyTorch (`vibehash install-gpu`); those
    without it skip them and keep mining the rest.
-3. **Staked GPU workers on the public network.** A fine-tune trains only once six staked workers able to run it
-   have registered: a holder, its two checkers and a jury of three who are none of those. Newcomers earn their first
-   stake on the CSV jobs, which the node still checks itself, so the public network wants one running beside the
-   first fine-tunes.
+3. **Staked GPU workers on the public network.** A fine-tune trains only once two staked workers able to run it
+   have registered: one to train a unit, one to check it (with the node refereeing disputes, one honest checker is
+   enough). Newcomers earn their first stake on the CSV jobs, which the node still checks itself, so the public
+   network wants one running beside the first fine-tunes. The node needs to reach huggingface.co when it referees.
 4. **Set `--keep-rounds`** to the disk (above).
 5. **Later:** moments in bf16; manifests published to the network (today each poster streams the weights once to
    build its own; at 8 GB that takes minutes); a worker cache limit and download progress on the dashboard.

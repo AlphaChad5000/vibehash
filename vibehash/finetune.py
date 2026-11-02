@@ -42,7 +42,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .model import batch_indices
 
 TARGETS = ("q", "k", "v", "o", "gate", "up", "down")  # llm.TARGETS, repeated so the node needn't import PyTorch
 FAMILIES = ("llama", "mistral", "qwen2", "qwen3", "smollm3")  # llm.FAMILIES, likewise
@@ -58,7 +57,7 @@ SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
 TOLERANCE = 1e-4
-# The same, for a whole unit replayed from its start (a jury on replicas that disagree, and comparing replicas): errors
+# The same, for a whole unit replayed from its start (comparing replicas of a unit, before they dispute): errors
 # compound over its steps. Measured on Qwen3-0.6B, 16 steps on CUDA replayed on the CPU: 5e-5 of B's size, 7e-5 of the
 # unit's change. So 1e-3 of the size; the 1% rule on the change still binds (DESIGN.md §8).
 WHOLE_TOLERANCE = 1e-3
@@ -494,39 +493,27 @@ def unload() -> None:
 
 
 def train_segment(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, unit_seed: int, start_step: int,
-                  n_steps: int, lr: float, batch_size: int, backend=None) -> np.ndarray:
+                  n_steps: int, lr: float, batch_size: int, backend=None, tamper=None) -> np.ndarray:
     """Adam steps [start_step, start_step + n_steps) of a unit, from the state vector `theta` ([B | m | v]). Step t of
-    a unit (from 0) uses batch_indices(unit_seed, t) and bias correction for t + 1. Every elementwise operation is a
-    separate, correctly rounded float32 operation in a fixed order, so given the same gradients every device takes
-    the same step; only the gradients themselves differ in their last bits."""
+    a unit (from 0) uses batch_indices(unit_seed, t) and bias correction for t + 1. Runs program.py's ops one by one
+    (tracer.Executor), the same ones a dispute re-runs and the node's referee checks; the Adam update is a separate,
+    correctly rounded float32 operation at a time, so given the same gradients every device takes the same step.
+    `tamper` is tracer.Executor's, for tests of a worker that cheats in one op."""
     import torch
+
+    from .program import Program, join_theta, split_theta
+    from .tracer import Executor
 
     rt = runtime(spec, data, device_of(backend))
-    b1, b2, eps = (float(np.float32(x)) for x in OPTIMIZERS[spec.optimizer])
-    state = torch.tensor(np.asarray(theta, dtype=np.float32), device=rt.device)
-    pb, pm, pv = spec.parts
-    b, m, v = state[pb], state[pm], state[pv]
-    slots = rt.lora[spec]
-    with rt.busy:
-        _steps(rt, spec, data, slots, b, m, v, unit_seed, start_step, n_steps, lr, batch_size, b1, b2, eps)
-    return state.cpu().numpy().astype(np.float64)
-
-
-def _steps(rt, spec, data, slots, b, m, v, unit_seed, start_step, n_steps, lr, batch_size, b1, b2, eps) -> None:
-    import torch
-
-    for step in range(start_step, start_step + n_steps):
-        ids, mask = data.batch(batch_indices(unit_seed, step, data.n_train, batch_size))
-        leaves = [b[s].view(shape).clone().requires_grad_() for _, _, s, shape in slots]
-        adapters = {name: (a, leaf) for (name, a, _, _), leaf in zip(slots, leaves)}
-        total, count = rt.model.loss(torch.from_numpy(ids), torch.from_numpy(mask), adapters, spec.scaling)
-        (total / count).backward()
-        g = torch.cat([leaf.grad.reshape(-1) for leaf in leaves])
-        t = step + 1
-        c1, c2 = float(np.float32(1 - b1 ** t)), float(np.float32(1 - b2 ** t))
-        m.mul_(b1).add_(g * float(np.float32(1 - b1)))
-        v.mul_(b2).add_(g * g * float(np.float32(1 - b2)))
-        b.sub_((m / c1) / ((v / c2).sqrt() + eps) * float(np.float32(lr)))
+    prog = Program(spec, data, lr, batch_size, unit_seed)
+    with rt.busy, torch.no_grad():
+        # (copies: a checkpoint may be a read-only memory map)
+        st = {k: torch.tensor(v, device=rt.device) for k, v in split_theta(spec, theta).items()}
+        ex = Executor(rt, spec, prog, tamper)
+        for t in range(start_step, start_step + n_steps):
+            node = prog.step(t)
+            ex.run_atoms(node, 0, len(node.atoms), st, (node.label,))
+        return join_theta(spec, {k: v.cpu().numpy() for k, v in st.items()})
 
 
 def evaluate(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, backend=None) -> tuple[float, float]:

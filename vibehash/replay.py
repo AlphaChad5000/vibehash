@@ -16,6 +16,9 @@ field by field. It checks:
     each member had to open, every edge where neighbours disagreed and the
     signed edge message that said who lied, who checked each cell, and the
     canaries made of cells;
+  * for a fine-tune (record version 4): every dispute, move by move (each a signed
+    message), with the referee's verdict on its last op re-run from the evidence
+    and base-model weights the record keeps;
   * every verdict, slash, missed deadline and payment share.
 
 Given the round's checkpoints (`checkpoints`: something with .array(blob_id,
@@ -33,6 +36,7 @@ from . import shards as sh
 from .coordinator import Coordinator, CoordinatorConfig, ProtocolError
 from .crypto import h256
 from .ledger import Block, Chain, canonical
+from .merkle import MerkleError, unb64
 from .tasks import InvalidJob, Reveal
 from .wire import WireError, commitment_in, open_envelope
 
@@ -84,15 +88,21 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
             bad = body.get("bad_segment")
             c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
                              score=body.get("score"))
-        if c.start_jury():  # version 4: a fine-tune's contested claims, and its jurors' verdicts
-            for env in record["jury"]:
-                addr, body = _sender(env, "verdict", chain, c.r.round_no)
-                bad = body.get("bad_segment")
-                c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env)
-        elif record.get("jury"):
-            raise ProtocolError("the record has jury verdicts, but the round had no jury")
+        if c.start_disputes():  # version 4: a fine-tune's disputes, move by move, refereed again from the record
+            entries = {e["id"]: e for e in record["games"]}
+            if sorted(entries) != sorted(c.r.games):
+                raise ProtocolError("the record's disputes aren't the ones the round had")
+            for gid in sorted(entries):
+                e = entries[gid]
+                evidence = unb64(e["evidence"], 64 * 2**20) if e.get("evidence") else None
+                weights = unb64(e["weights"], 128 * 2**20) if e.get("weights") else None
+                for env in e["moves"]:
+                    addr, body = _sender(env, "move", chain, c.r.round_no)
+                    c.submit_move(addr, body, envelope=env, evidence=evidence, weights=weights)
+        elif record.get("games"):
+            raise ProtocolError("the record has disputes, but the round had none")
         replayed = c.replayed_summary(s.proposer)
-    except (ProtocolError, WireError, InvalidJob, KeyError, TypeError, ValueError) as e:
+    except (ProtocolError, WireError, InvalidJob, MerkleError, KeyError, TypeError, ValueError) as e:
         return [f"the round can't be replayed from its record: {e}"]
     if stats is not None:
         stats["rechecked"] = stats.get("rechecked", 0) + c.rechecked
