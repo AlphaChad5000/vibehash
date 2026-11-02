@@ -533,6 +533,20 @@ class SplitTests(unittest.TestCase):
         self.assertIsNone(h)  # the piece's input: a checked object
         self.assertTrue(torch.equal(first["x"], split.decode(store.get(split.stream_name(0, 2)))[f"{j}.x"]))
 
+    def test_trainers_read_checked_records(self):
+        m, store = self.split("read", split.pieces(4, 2))
+        for c, members in enumerate(self.chunks):
+            got = split.read_block(store, m, c, root=self.whole["root"])
+            self.assertEqual([i for i, _ in got], members)
+            self.assertTrue(all("x" in rec and "tokens" in rec for _, rec in got))
+        with self.assertRaises(split.Tampered):
+            split.read_block(store, m, 0, root="00" * 32)  # not the dataset the job pinned
+        data = bytearray(store.get(split.block_names(0)[0]))
+        data[-1] ^= 1
+        store.put(split.block_names(0)[0], bytes(data))
+        with self.assertRaises(split.Tampered):
+            split.read_block(store, m, 0, root=self.whole["root"])
+
     def test_commitment_chain(self):
         _, store = self.split("chain", split.pieces(4, 1))
         made = json.loads(store.get(split.commit_name(0, 1)))["outputs"]
