@@ -28,6 +28,10 @@ REF_UPLOAD = 2.5e6  # bytes/s
 REF_DOWNLOAD = 12.5e6  # bytes/s
 CHECKED_SEGMENTS = 3  # segments of a unit the beacon challenges (CoordinatorConfig.challenge_segments)
 MAX_COMPUTE_S = 3600.0
+MAX_PHASE_S = 3600.0  # no phase of a round is longer (node.times_for), whatever a spec asks for
+# A dispute's split, in bytes of states the defender uploads in one move: a home connection (REF_UPLOAD, 20 Mbit/s)
+# moves 512 MB in about 3.5 minutes, the time a move has when a game's 15 moves share an hour.
+MAX_SPLIT_BYTES = 512 * 2**20
 
 
 class InvalidJob(ValueError):
@@ -182,6 +186,19 @@ class TrainingJob:
         need(self.data_source.get("kind") == "tokens" and set(self.data_source) == {"kind", "sha256"}
              and re.fullmatch(r"[0-9a-f]{64}", str(self.data_source.get("sha256", ""))),
              'a fine-tune\'s data is {"kind": "tokens", "sha256": ...}')
+        # Its disputes must be playable from a home connection, or a slow honest defender loses to a false accuser
+        # (the third review's finding B). (A DeepSeek job's program will count its own: deepseek_program.)
+        if not getattr(self, "deepseek", False):
+            from .program import dispute_size
+
+            moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
+            need(split <= MAX_SPLIT_BYTES,
+                 f"a dispute over one of its units would upload {split / 2**20:.0f} MB of states in one move, more than "
+                 f"{MAX_SPLIT_BYTES // 2**20} MB: use fewer steps a segment, shorter sequences or fewer LoRA targets")
+            took = moves * self.phase_lengths()["move"]
+            need(took <= MAX_PHASE_S,
+                 f"a dispute over one of its units would take {took / 60:.0f} minutes at home upload speeds, more than "
+                 f"the {MAX_PHASE_S / 60:.0f} a dispute phase has: use fewer steps a segment or shorter sequences")
 
     # --- data ------------------------------------------------------------------
 

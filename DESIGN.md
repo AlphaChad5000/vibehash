@@ -737,11 +737,14 @@ Each step:
     `move_s`, from `program.dispute_size`), so validators wait long enough for a disputed round. It's that long only
     for a party that makes every move just in time: the phase ends when every dispute has. No phase is longer than
     `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
-    - **A limit:** a split can name gigabytes: K − 1 states of the adapters' B, m and v between steps (12.7 GB on
-      Qwen3-4B, all seven targets at rank 16, 64 steps a segment), or a layer's activations. At the reference upload
-      (2.5 MB/s) that's more than an hour, so such a job's moves get less time than they need (`MAX_PHASE_S` over the
-      moves), and a defender that slow loses. Jobs a node takes should keep a split to a few hundred MB: few steps a
-      segment (Qwen3-0.6B at 4 steps: 203 MB, 100 s).
+    - **Jobs whose disputes can't be played from home are refused** (the third review's finding B). A split can name
+      gigabytes: K − 1 states of the adapters' B, m and v between steps, or a layer's activations. At the reference
+      upload (REF_UPLOAD, 20 Mbit/s) a defender that slow would lose to a false accuser. So `post_job` refuses a job
+      whose largest split is over `tasks.MAX_SPLIT_BYTES` (512 MB), or whose moves need more than `MAX_PHASE_S` (an
+      hour) at the reference speeds. With the default unit (16 steps, 4 a segment) that admits Qwen3-0.6B up to about
+      960 tokens (203 MB and 31 minutes at 512), and no Qwen3-4B job: its B, m and v alone are 212 MB a step.
+      Per-move deadlines sized to each level's own split would admit it (only one or two levels have big splits);
+      that's the follow-up.
 
 **The security statement:** with the node as referee, if at least one of a claim's checkers is honest and online, a
 claim whose float32 work deviates from honest float32 by more than the referee's bounds anywhere is found bad; an

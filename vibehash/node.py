@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from . import economics as econ
-from . import netstats, receipts
+from . import netstats, receipts, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
@@ -92,7 +92,7 @@ MAX_TRACE_BLOB, MAX_TRACE_UPLOADS = 2 * 2**30, 16 * 2**30
 MAX_JOB_BYTES = 64 * 2**20
 # No phase is longer than this, whatever a job's size asks for (TrainingJob.phase_lengths): a spec can't stall a node
 # for days. A job that would need more simply gets fewer units done a round.
-MAX_PHASE_S = 3600.0
+MAX_PHASE_S = tasks.MAX_PHASE_S
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
 
 

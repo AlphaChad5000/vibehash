@@ -127,9 +127,29 @@ class SpecTests(unittest.TestCase):
                            steps_per_unit=100_000, checkpoint_every=100_000)
         self.assertTrue(all(x <= MAX_PHASE_S for x in (Node.times_for(node, huge).compute_s,
                                                        Node.times_for(node, huge).verify_s)))
-        long = job_of(batch_size=1024, steps_per_unit=10_000, checkpoint_every=10_000)
-        self.assertEqual(long.phase_lengths()["moves"], 19)
-        self.assertLessEqual(Node.times_for(node, long).dispute_s, MAX_PHASE_S + 1e-6)
+        self.assertLessEqual(t.dispute_s, MAX_PHASE_S)
+
+    def test_a_job_whose_disputes_cant_be_played_from_home_is_refused(self):
+        """The third review's finding B: a move has about MAX_PHASE_S / moves, and a split of gigabytes (a segment of
+        many steps names B, m and v after each) can't be uploaded in that from a home connection, so an honest defender
+        would lose to a false accuser. post_job refuses such a job: a split over MAX_SPLIT_BYTES, or moves that need
+        more than the dispute phase's hour at REF_UPLOAD."""
+        from vibehash.program import dispute_size
+        from vibehash.tasks import MAX_SPLIT_BYTES
+
+        with self.assertRaisesRegex(InvalidJob, "MB of states in one move"):  # 1.6 GB: 63 steps' B, m and v
+            job_of(batch_size=1024, steps_per_unit=10_000, checkpoint_every=10_000)
+        self.assertEqual(dispute_size(spec_of(), 1024, 1, 10_000)[0], 19)
+        with self.assertRaisesRegex(InvalidJob, "MB of states in one move"):  # 533 MB splits at 1024 tokens
+            job_of(spec=spec_of(seq_len=1024))
+        four = ft.LoraSpec(base=spec_of().base, manifest="a" * 64,
+                           dims=dict(spec_of().dims) | {"hidden": 2560, "layers": 36, "heads": 32, "ffn": 9728})
+        with self.assertRaisesRegex(InvalidJob, "minutes at home upload speeds"):  # Qwen3-4B: 440 MB, 15 moves
+            job_of(spec=four, batch_size=4)
+        ok = job_of()  # Qwen3-0.6B, 512 tokens, 4 steps a segment: 203 MB, 31 minutes
+        moves, split = dispute_size(ok.spec, ok.batch_size, ok.n_segments, ok.checkpoint_every)
+        self.assertLessEqual(split, MAX_SPLIT_BYTES)
+        self.assertLessEqual(moves * ok.phase_lengths()["move"], 3600)
 
     def test_the_tree_is_as_deep_as_the_reviewer_measured(self):
         """The second review's finding 6 (t_depth): Qwen3-4B's games take 15 to 21 moves with its settings, Qwen3-0.6B's
