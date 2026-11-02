@@ -252,6 +252,61 @@ class ForwardOpTests(unittest.TestCase):
         self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": drop}, (30 * n) // 256)[0], "challenger")
 
 
+    def test_embedding_engram_and_the_moe_sum(self):
+        from tests.test_deepseek import token_map_for
+        from vibehash.deepseek_config import EngramLayout
+
+        cfg, state, g = self.cfg, self.state, torch.Generator().manual_seed(9)
+        T = 14
+        tokens = torch.randint(0, cfg.vocab_size, (1, T), generator=g)
+        tmap = token_map_for(cfg)
+        src = rd.StateWeights({**state, "engram.token_map": tmap})
+        old, self.src = self.src, src
+        try:
+            for numname, num in (("ref", ds.Numerics()), ("f32", ds.Numerics(torch.float32, quantize=False))):
+                m = ds.Model(cfg, layers=[1], num=num, embed=True, head=False)
+                m.load_state_dict({k: v for k, v in state.items() if k.startswith(("layers.1.", "embed."))}, strict=False)
+                x0, _ = m.start(tokens)
+                emb = x0[0, :, 0]
+                tok = tokens[0, :, None].float()
+                self.judge(mk("ds_embed", "e", ["t"], {"weight": "embed.weight"}, emb.shape, [tok.shape]), {"t": tok}, emb,
+                           f"embed {numname}")
+                eng = m.layers["1"].engram
+                layout = EngramLayout.of(cfg)
+                flat = [p for size in layout.primes[0] for p in size]
+                attrs = {"n": cfg.engram_max_ngram_size, "multipliers": list(layout.multipliers[0]),
+                         "primes": [list(p) for p in layout.primes[0]], "offsets": np.cumsum([0, *flat[:-1]]).tolist(),
+                         "pad": int(tmap[cfg.engram_pad_id]), "token_map": "engram.token_map",
+                         "table": "layers.1.engram.embed"}
+                hashes = ds.engram_hashes(tokens, tmap, cfg)[:, :, 0]
+                rows = eng.rows(hashes)[0].flatten(-2)
+                self.judge(mk("ds_engram_rows", "rw", ["t"], attrs, rows.shape, [tok.shape]), {"t": tok}, rows,
+                           f"engram rows {numname}")
+                stream = x0.to(num.dtype) + 0.1 * torch.randn(x0.shape, generator=g).to(num.dtype)
+                rows4 = eng.rows(hashes)  # [1, T, cols, head_dim], as Engram.forward takes them
+                kvo = eng.wkv(rows4.flatten(-2).to(num.dtype))[0]
+                out = eng(stream, rows=rows4)[0].flatten(1)
+                self.judge(mk("ds_engram_gate", "o", ["s", "kv"], {"q_weight": "layers.1.engram.q_weight",
+                                                               "k_weight": "layers.1.engram.k_weight",
+                                                               "eps": cfg.norm_eps, "num": numname},
+                              out.shape, [stream[0].flatten(1).shape, kvo.shape]),
+                           {"s": stream[0].flatten(1), "kv": kvo}, out, f"engram gate {numname}")
+                moe = m.layers["1"].ffn
+                xx = torch.randn(T, cfg.dim, generator=g).to(num.dtype)
+                chosen, gates = moe.route(xx, ds.Choices())
+                k = cfg.n_activated_experts
+                routed = torch.zeros(T, k, cfg.dim, dtype=num.dtype)
+                for e, tk, slot in moe.assignments(chosen):
+                    routed[tk, slot] = moe.experts[e](xx[tk], gates[tk, slot, None])
+                shared = moe.shared_experts(xx)
+                y = moe(xx, ds.Choices(experts={1: chosen}))
+                self.judge(mk("ds_moe_sum", "y", ["r", "c", "sh"], {"num": numname}, y.shape,
+                              [routed.flatten(1).shape, chosen.shape, shared.shape]),
+                           {"r": routed.flatten(1), "c": chosen.float(), "sh": shared}, y, f"moe sum {numname}")
+        finally:
+            self.src = old
+
+
 def np32(t):
     return t.detach().float().cpu().numpy()
 

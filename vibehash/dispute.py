@@ -65,6 +65,8 @@ def decode(dtype: str, raw: bytes, cols: int) -> np.ndarray:
         if dtype == "F8_E8M0":
             return rd.decode_e8m0(b)
         return np.stack([rd.FP4[b & 15], rd.FP4[b >> 4]], -1).reshape(b.shape[0], 2 * cols)
+    if dtype in ("I32", "I64"):  # integer tables (DeepSeek's engram token map), exact up to 2^53
+        return np.frombuffer(raw, "<i4" if dtype == "I32" else "<i8").astype(np.float64).reshape(-1, cols)
     if dtype == "BF16":
         a = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
     elif dtype == "F16":
@@ -84,7 +86,7 @@ def _rows(shape) -> int:
     return int(shape[0]) if len(shape) > 1 else 1
 
 
-_ITEM = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
+_ITEM = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1, "I32": 4, "I64": 8}
 
 
 class HubWeights:

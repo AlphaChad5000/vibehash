@@ -131,8 +131,9 @@ def qrows(x, base: str, r0: int, r1: int) -> np.ndarray:
         return w
     if sdtype != "F8_E8M0":
         raise rf.Missing(f"{base}.scale is {sdtype}, not ue8m0")
-    wdtype, _ = x.outside.source.shape(base + ".weight")
-    if wdtype == "I8":  # FP4: one scale per 32 inputs of each row
+    wdtype, wshape = x.outside.source.shape(base + ".weight")
+    _, sshape = x.outside.source.shape(base + ".scale")
+    if wdtype == "I8" or sshape[0] == wshape[0]:  # FP4, or an FP8 table (engram's): a scale per 32 of each row
         s = x.weight(base + ".scale", r0, r1)
         return (w.reshape(r1 - r0, -1, BLOCK) * s[:, :, None]).reshape(r1 - r0, -1)
     b0 = r0 // BLOCK
@@ -166,7 +167,7 @@ class StateWeights:
     the referee's inputs from to build its evidence, and what tests use. The node's is dispute.HubWeights."""
 
     NAMES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32", "float8_e4m3fn": "F8_E4M3",
-             "float8_e8m0fnu": "F8_E8M0", "int8": "I8"}
+             "float8_e8m0fnu": "F8_E8M0", "int8": "I8", "int32": "I32", "int64": "I64"}
 
     def __init__(self, state: dict):
         self.state = state
@@ -183,7 +184,7 @@ class StateWeights:
 
         t = self.state[name]
         t = t[r0:r1] if t.dim() > 1 else t
-        width = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()]
+        width = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[t.element_size()]
         return t.detach().contiguous().cpu().view(width).numpy().tobytes()
 
 
@@ -578,6 +579,97 @@ def op_ds_gates(op, x, r, c0, c1):
         g = rf.div(g, rf.add(rf.esum(g[None])[0:1], E(np.array([rf.f32(1e-20)]))))
     return rf.scale(g, rf.f32(a.get("route_scale", 1.0)))[c0:c1]
 
+# --- the embedding and engram -----------------------------------------------------------------------------------------
+
+def _token(x, name, t) -> int:
+    v = x.get(name, t, t + 1, 0, 1)[0, 0]
+    if not (np.isfinite(v) and v == int(v) and v >= 0):
+        raise rf.Missing(f"token {t} isn't a token id")
+    return int(v)
+
+
+def op_ds_embed(op, x, r, c0, c1):
+    """Model.start: the embedding's row for token r (stored bf16, exact in the activations). ins (tokens [T, 1])."""
+    tok = _token(x, op.ins[0], r)
+    return E(x.weight(op.attrs.get("weight", "embed.weight"), tok, tok + 1)[0, c0:c1])
+
+
+def engram_rows(ids: list[int], layer: int, a: dict) -> list[int]:
+    """deepseek.engram_hashes for the last position of `ids` (the normalised tokens up to it, oldest first): its
+    n-grams' table rows, n = 2..N, each head's, as Python integers (exact: no int64 to overflow). attrs: primes
+    [size - 2][head] and multipliers [look-back] of this engram layer (EngramLayout), offsets (each (size, head)'s
+    first row), pad (the normalised pad id), n (N)."""
+    n, mult = a["n"], a["multipliers"]
+    back = [ids[-1 - k] if k < len(ids) else a["pad"] for k in range(n)]
+    rolling, out, at = back[0] * mult[0], [], 0
+    for i in range(1, n):
+        rolling ^= back[i] * mult[i]
+        for p in a["primes"][i - 1]:
+            out.append(rolling % p + a["offsets"][at])
+            at += 1
+    return out
+
+
+def op_ds_engram_rows(op, x, r, c0, c1):
+    """Engram.rows for token r: its n-grams' rows of the layer's FP8 table (ue8m0 scale per 32), dequantised exactly,
+    concatenated [cols · head_dim]. The rows follow from the text alone: ins (tokens [T, 1]); the token map (token id
+    to normalised id) is read as a table (attrs token_map), the rows as attrs table's .weight and .scale."""
+    a = op.attrs
+    ids = [int(_lookup(x, a["token_map"], _token(x, op.ins[0], t))) for t in range(max(0, r - a["n"] + 1), r + 1)]
+    rows = engram_rows(ids, 0, a)
+    hd = op.shape[1] // len(rows)
+    vals = np.concatenate([qrows(x, a["table"], row, row + 1)[0] for row in rows[c0 // hd:(c1 - 1) // hd + 1]])
+    lo = (c0 // hd) * hd
+    return E(vals[c0 - lo:c1 - lo])
+
+
+def _lookup(x, table: str, i: int) -> float:
+    """Entry i of a 1-D integer table (the token map), exactly."""
+    dtype, shape = x.outside.source.shape(table)
+    if len(shape) != 1 or not 0 <= i < shape[0]:
+        raise rf.Missing(f"entry {i} of {table}")
+    return float(x.weight(table, 0, 1)[0, i])
+
+
+def op_ds_engram_gate(op, x, r, c0, c1):
+    """Engram.forward after its wkv: per stream copy k, the gate sigmoid(signed sqrt(max(|dot|, 1e-6))) of
+    dot = Σ_c h·(q_w·k_w)·key · rsqrt(mean(h²) + eps) · rsqrt(mean(key²) + eps) · dim^-1/2, then h + gate · value,
+    in num.hi, cast back. ins (stream [T, hc·dim], wkv's output [T, (hc + 1)·dim]: hc keys, then the value);
+    attrs q_weight, k_weight ([hc, dim]), eps."""
+    a, num = op.attrs, _num(op)
+    dim = op.ishapes[1][1] - op.ishapes[0][1]
+    hc = op.ishapes[0][1] // dim
+    kv = x.row(op.ins[1], r)
+    parts = []
+    for k, j0, j1 in _segments(c0, c1, dim):
+        h = x.get(op.ins[0], r, r + 1, k * dim, (k + 1) * dim)[0]
+        key = kv[k * dim:(k + 1) * dim]
+        qw, kw = x.weight(a["q_weight"], k, k + 1)[0], x.weight(a["k_weight"], k, k + 1)[0]
+        qk = rf.mul(E(qw), E(kw))
+        dot = rf.esum(rf.mul(rf.mul(E(h), qk), E(key))[None])[0:1]
+        rstd = rf.mul(rf._norm(x, h[None], dim, a["eps"]), rf._norm(x, key[None], dim, a["eps"]))
+        dot = rf.scale(rf.mul(dot, rstd), rf.f32(dim ** -0.5))
+        mag = rf.sqrt(E(np.maximum(np.abs(dot.v), 1e-6), dot.e))
+        gate = sigmoid(E(np.copysign(mag.v, dot.v), np.where(np.abs(dot.v) <= dot.e, mag.v + mag.e, mag.e)))
+        val = E(kv[hc * dim + j0:hc * dim + j1])
+        g = E(np.full(j1 - j0, gate.v[0]), np.full(j1 - j0, gate.e[0]))
+        parts.append(cast(rf.add(E(h[j0:j1]), rf.mul(g, val)), num))
+    return rf._cat(*parts)
+
+
+def op_ds_moe_sum(op, x, r, c0, c1):
+    """MoE.forward's sum and combine: token r's routed outputs added in float32 in ascending expert order (the order
+    its experts run), then the shared expert's, cast back. ins (routed [T, k·dim]: slot j the output of the expert in
+    chosen[r, j], chosen [T, k], shared [T, dim])."""
+    dim = op.shape[1]
+    chosen = x.row(op.ins[1], r).astype(np.int64)
+    order = np.argsort(chosen, kind="stable")
+    y = None
+    for j in order:
+        o = E(x.get(op.ins[0], r, r + 1, int(j) * dim + c0, int(j) * dim + c1)[0])
+        y = o if y is None else rf.add(y, o)
+    return cast(rf.add(y, E(x.get(op.ins[2], r, r + 1, c0, c1)[0])), _num(op))
+
 # --- choices: judged by whole rows (referee.CHOICES), exactly, against the committed scores ----------------------------
 # A choice is a function of scores the state already holds, and those were judged in their own op (within their
 # bounds). So a worker may break near-ties either way, as its own scores fall, but may choose nothing its scores don't
@@ -672,12 +764,12 @@ def choice_ds_candidates(op, x, r, row):
     return True, ""
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
-EXACT = {"ds_round_fp8", "ds_round_fp4"}
+EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
 # (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
 # two bf16 numbers can be refused exactly.
 CAST = {"ds_qlinear", "ds_scale", "ds_rmsnorm", "ds_rope", "ds_hc_pre", "ds_hc_post", "ds_compress", "ds_index_scores",
-        "ds_swiglu", "ds_dense", "ds_attn"}
+        "ds_swiglu", "ds_dense", "ds_attn", "ds_engram_gate", "ds_moe_sum"}
 
 
 def bf16_only(op, said: np.ndarray):
