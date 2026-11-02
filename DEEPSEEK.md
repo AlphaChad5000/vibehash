@@ -1052,44 +1052,74 @@ merge). [x] done, [ ] to do.
       worker's dispute states chain to its checkpoints.
     - `referee_deepseek.py` checks each op in NumPy on the node (the fine-tune
       session wrote it). A step's records are read as `record.{seq}.{part}`
-      through the weights' interface, so a game's record keeps the rows it
-      read and replays without the bucket.
+      through the weights' interface, each checked against the pinned root. A
+      validator re-refereeing a game reads them from the bucket
+      (`replay_block`'s `records`).
     - Tested (`tests/test_deepseek_program.py`, tiny config):
       - op by op agrees with autograd to about 1e-7;
       - every honest op passes the referee, and 3% bends fail;
       - a trainer that scaled one op loses its game at that op.
     - The local run (`tests/test_deepseek_network.py`) has a tampering
-      trainer and a false accuser, both slashed.
+      trainer, slashed, and a false accuser, which withdraws (unpaid, not
+      slashed).
   - [x] Per-tensor hashes of Flash's trained layers and head
     (`vibehash/data/deepseek_flash_top.json`, pinned as
     `deepseek_job.TOP_MANIFESTS`; see "Who the referee trusts for weights"
     above). `deepseek_job.FlashWeights` is the node's source.
-  - [x] Prep layers units refereed, losers slashed:
+  - [ ] Prep layers units refereed, losers slashed: written and tested, but
+    off for the pilot (`coordinator.PREP_GAMES`).
+    - **The pilot's rule (the fourth review, 2026-11-02).** A rejected prep
+      unit, rows or layers, ends unchecked and is redone. There's no game,
+      nobody is slashed, and its rejecter isn't paid. It stays until a prep
+      game's moves are timed from its states' real size (one 4K-token chunk's
+      state is 320 MB and more, and a move is timed for a LoRA adapter's, 240
+      s) and `PREP_TOLERANCE` is measured across devices.
     - Their program (`deepseek_program.PrepProgram`) runs in the reference's
       bf16, chunk wide, in 4K-token chunks. Its commitments carry a state root
       before the unit and after each of its layers. A state between layers
       holds only what crosses the cut above it, so roots don't depend on the
       pieces.
-    - When a checker rejects one, the node first checks that the unit's outputs
-      in the bucket are its last committed state (`deepseek_graph.handed_root`,
-      `records_root`, in NumPy). If they aren't, that's fraud. If they are, a
-      game runs over the unit, layer by layer, then op by op.
+    - With prep games on, when a checker rejects one, the node first checks
+      that the unit's outputs in the bucket are its last committed state
+      (`deepseek_graph.handed_root`, `records_root`, in NumPy). If they aren't,
+      that's fraud; if they can't be read, it's unchecked. If they are, a game
+      runs over the unit, layer by layer, then op by op.
     - The node also requires each unit's first root to be the last root of the
       unit below it.
-  - [ ] Rows units (copies of the engram tables) aren't refereed: a rejected
-    one ends unchecked and goes out again. Its consumers read rows only from
-    accepted rows units, and each layer's engram op is refereed against the
-    table itself. Two weaknesses of that rule:
+  - [ ] Rows units (copies of the engram tables) aren't refereed, even with
+    prep games on: a rejected one ends unchecked and goes out again. Its
+    consumers read rows only from accepted rows units, and each layer's engram
+    op is refereed against the table itself. Two weaknesses of that rule, and
+    of the pilot's for every prep unit:
     - One checker that rejects everything costs honest miners their pay for
-      those units, and the prep a round's delay each time, with no penalty.
-      Its stake is never at risk, since there's no game to lose.
+      those units, and the prep a round's delay each time. It isn't paid for
+      a rejection (the fourth review's finding 8), but its stake is never at
+      risk, since there's no game to lose.
     - Prep canaries can be spotted: a canary hands over another unit's
-      commitment, and the commitment names its unit. So they only catch a
+      commitment, and the commitment names its unit. The task no longer names
+      the commitment's object or the donor (it carries the bytes inline: the
+      fourth review's finding 6), but the commitment itself still does. So they only catch a
       checker that approves without reading anything. A checker that reads the
       commitment but doesn't replay goes uncaught; only the any-rejection rule
       and the second checker stand against it. Real canaries need outputs bent
       by the node (it can do that in numpy, decoding a hand-off) under names
       that don't give them away.
+  - [ ] After launch, from the fourth review (2026-11-02). Each is latent while
+    the network has one validator and prep games are off:
+    - Validators without the bucket's key can't re-referee DeepSeek games (one
+      would refuse the block), and a replay takes the leader's accepted
+      digests and records root on its word.
+    - The prep's progress is dropped when the job's data isn't attached.
+    - Signed uploads don't bind a size, a multipart upload has no limit, and
+      any keypair gets download links.
+    - Objects are named by graph unit, not by round and worker. A write's link
+      dies with its compute phase, so only the bucket can change an accepted
+      object now. If one changes, its readers find it Tampered and the prep
+      stalls: nothing calls `Line.redo` on a reader's report yet.
+    - The node's hand-off check (`_handoff`, off with prep games) reads whole
+      states inside its lock, with no size cap. It needs the commitment's
+      treatment (read before the lock, size asked first) before prep games go
+      on.
 - The worker:
   - [x] `modelstore` (below), memory-mapped experts (16 GB of RAM).
   - [x] Setup's step 4 asks where big models go and how much space they may
