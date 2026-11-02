@@ -42,6 +42,15 @@ def _train() -> list[list[str]] | None:
     return [["example"], ["train", "fruit.csv", "--budget", budget]]  # writes fruit.csv here unless it's already here
 
 
+def _finetune() -> list[list[str]] | None:
+    data = input("Chats file, one conversation per line (the guide shows the format): ").strip().strip('"')
+    if not data:
+        return None
+    model = input("Model to fine-tune (Enter for qwen3-0.6b; Models to fine-tune lists them): ").strip() or "qwen3-0.6b"
+    budget = input("Budget in VIBE (Enter for 100): ").strip() or "100"
+    return [["train", data, "--base", model, "--budget", budget]]
+
+
 def _yes(question: str) -> bool:
     return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
 
@@ -116,7 +125,10 @@ SECTIONS = [
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
     ]),
     ("Train", [
-        Item("Train a model on a CSV file", "post it as a job; the network trains it", ask=_train),
+        Item("Train a model on a CSV file", "post it as a job; the network trains it", ask=_train,
+             usage="train FILE.csv --budget VIBE"),
+        Item("Fine-tune a model on my chats", "teach an open model your own text", ask=_finetune,
+             usage="train CHATS.jsonl --base MODEL --budget VIBE"),
         Item("Watch my job", "follow it live, round by round", ("job", "watch")),
         Item("My job's status", "rounds, accuracy, budget left", ("job", "status")),
         Item("Download my trained model", "save it to use with predict", ("job", "download")),

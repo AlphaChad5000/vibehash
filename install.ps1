@@ -61,7 +61,7 @@
 
     $exe, $rest = $python -split ' '
     Write-Host "Installing Vibe Hash with $python..."
-    & $exe @($rest) -m pip install --upgrade --quiet --disable-pip-version-check vibehash
+    & $exe @($rest) -m pip install --upgrade --quiet --disable-pip-version-check 'vibehash[finetune]'
     if ($LASTEXITCODE -ne 0) {
         Write-Host "`nInstalling didn't work; pip's message above says why. Check you're online, then run this again."
         return
