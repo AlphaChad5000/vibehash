@@ -92,7 +92,7 @@ def main():
     plan["goal"] = a.goal
 
     chats, evals = write_files(plan, Path(a.out))
-    cmd = ["vibehash", "train", str(chats), "--base", plan["base"], "--rank", str(plan["rank"]),
+    cmd = [sys.executable, "-m", "vibehash", "train",  # this Python's vibehash, whether or not `vibehash` is on PATH str(chats), "--base", plan["base"], "--rank", str(plan["rank"]),
            "--budget", str(plan["budget"]), "--id", plan["job_id"]]
     cmd += ["--node", a.node] if a.node else []
     cmd += ["--wallet", a.wallet] if a.wallet else []

@@ -16,6 +16,10 @@ import urllib.request
 
 
 def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 0.2) -> str:
+    missing = [k for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL") if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(f"set {', '.join(missing)} first (see the top of agents/llm_call.py); in PowerShell: "
+                         f"$env:LLM_MODEL = \"...\"")
     base = os.environ["LLM_BASE_URL"].rstrip("/")
     body = {"model": os.environ["LLM_MODEL"], "messages": messages, "temperature": temperature}
     if json_mode:  # ask for one JSON object back; providers that don't support this ignore it or error
