@@ -294,6 +294,7 @@ class FileInfo:
     size: int
     oid: str  # its Git blob id (sha1 of "blob <size>\0" + content); for an LFS file, the pointer's
     lfs_sha256: str | None  # for files stored with Git LFS (weights): the sha256 of the content
+    hidden: bool = False  # the Hub hides a gated model's LFS sha256 (as asterisks) until its licence is accepted
 
     @classmethod
     def from_api(cls, entry: dict) -> "FileInfo":
@@ -303,10 +304,12 @@ class FileInfo:
             size, sha = (lfs["size"], lfs["oid"]) if lfs else (entry["size"], None)
         except (KeyError, TypeError, AttributeError):
             raise HubError("the Hub's file listing isn't in the shape expected", retryable=False) from None
+        hidden = bool(lfs) and isinstance(sha, str) and len(sha) == 64 and set(sha) == {"*"}
+        sha = None if hidden else sha
         if type(size) is not int or size < 0 or not isinstance(oid, str) or not _GIT_OID.match(oid) \
                 or not (sha is None or (isinstance(sha, str) and _SHA256.match(sha))):
             raise HubError(f"the Hub's file listing has a bad entry for {path}", retryable=False)
-        return cls(path, size, oid, sha)
+        return cls(path, size, oid, sha, hidden)
 
 
 class _FileCheck:
@@ -314,6 +317,10 @@ class _FileCheck:
     other large files, the Git blob id for small files kept in Git. Returns the content's sha256 either way."""
 
     def __init__(self, info: FileInfo):
+        if info.hidden:  # nothing to check it against, and a file nobody can check is never used
+            raise AccessError(f"the Hub hides the sha256 of {info.path} from accounts that haven't accepted this "
+                              "model's licence, so a copy couldn't be checked: accept the licence on the model's "
+                              "page (with the account HF_TOKEN belongs to), then try again")
         self.info, self.n = info, 0
         self.sha256 = hashlib.sha256()
         git = hashlib.sha1 if len(info.oid) == 40 else hashlib.sha256
@@ -648,10 +655,17 @@ class Hub:
             dtype = f"{dtype or '?'}, {quant['quant_method']}" + (f" ({quant['fmt']})" if quant.get("fmt") else "")
         st = info.get("safetensors") if isinstance(info.get("safetensors"), dict) else {}
         archs = config.get("architectures")
+        # A model that also reads images (DeepSeek-V4.1, Llama 4, Gemma 3) keeps its language model's shape in
+        # text_config, beside a vision_config whose layers aren't the ones a job splits.
+        text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+
+        def count(key: str) -> int | None:
+            return next((c[key] for c in (config, text) if type(c.get(key)) is int), None)
+
         # Mixture-of-experts configs name their expert count differently by family (DeepSeek, Mixtral, Qwen MoE).
-        experts = next((config[k] for k in ("n_routed_experts", "num_local_experts", "num_experts")
-                        if type(config.get(k)) is int), None)
-        active = config.get("num_experts_per_tok") if type(config.get("num_experts_per_tok")) is int else None
+        experts = next((n for k in ("n_routed_experts", "num_local_experts", "num_experts")
+                        if (n := count(k)) is not None), None)
+        active = count("num_experts_per_tok")
         return ModelSummary(
             repo=repo, revision=rev or "the default branch", commit=commit, gated=bool(info.get("gated")),
             licence=str(licence) if licence else None,
@@ -661,8 +675,7 @@ class Hub:
             weight_files=len(weights), weight_bytes=sum(listing[p].size for p in weights),
             has_tokenizer="tokenizer.json" in listing,
             pickle_only=not weights and any(p.endswith(PICKLES) for p in listing),
-            layers=config.get("num_hidden_layers") if type(config.get("num_hidden_layers")) is int else None,
-            experts=experts, experts_per_token=active, config=config)
+            layers=count("num_hidden_layers"), experts=experts, experts_per_token=active, config=config)
 
 
 def _next_link(link: str | None) -> str | None:

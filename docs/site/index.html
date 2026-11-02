@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vibe Hash: mining that trains real AI models</title>
+<meta name="description" content="Vibe Hash is a proof-of-useful-work test network: computers earn VIBE by training small, checkable pieces of AI models instead of hashing. See who's mining and what's training right now.">
+<link rel="canonical" href="https://vibehash.org/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://vibehash.org/">
+<meta property="og:title" content="Vibe Hash: mining that trains real AI models">
+<meta property="og:description" content="Gaming PCs earn VIBE by training checkable pieces of AI models instead of hashing. Right now they're teaching DeepSeek V4.1 Flash to think shorter, in pieces small enough that nobody holds the whole model.">
+<meta property="og:image" content="https://vibehash.org/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Vibe Hash: mining that trains real AI models. Now training DeepSeek V4.1 Flash to think shorter.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3 4'%3E%3Cpath fill='%23f1b23c' d='M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=JetBrains+Mono:wght@400;600&family=Source+Sans+3:wght@400;600;700&display=swap">
+<style>
+/* The front page: a dark band with the pitch and the install line, then the network as it is right now (read from the
+   node every 30 seconds), then three steps and what's next. Everything else lives in the guide. */
+:root {
+  --paper: #ffffff; --stone: #f4f3f0; --ink: #1d1b19; --ink-2: #5b554e; --rule: #e3dfd9;
+  --gold: #995a05; --gold-wash: #f6ead5; --good: #2c7836; --good-wash: #e2f0e3;
+  --band: #151311; --band-ink: #eeebe6; --band-ink-2: #a39c93; --band-rule: #2b2824; --term: #0c0b0a;
+  --signal: #f1b23c; --on-signal: #1d1406;
+  --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Source Sans 3", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
+    --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a;
+    --band: #0b0a09; --band-rule: #25221f; --term: #070606; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
+  --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a;
+  --band: #0b0a09; --band-rule: #25221f; --term: #070606; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.6 var(--font-body); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 16px; }
+@media (min-width: 720px) { .wrap { padding-inline: 32px; } }
+h1, h2, h3 { font-family: var(--font-display); margin: 0; text-wrap: balance; }
+h2 { font-size: 1.7rem; font-weight: 700; font-stretch: 108%; letter-spacing: -0.015em; line-height: 1.15; }
+h3 { font-size: 1.1rem; font-weight: 650; font-stretch: 104%; }
+p { margin: 0; }
+a { color: var(--gold); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 3px; }
+.num { font-variant-numeric: tabular-nums; }
+.quiet { color: var(--ink-2); }
+
+.band { background: var(--band); color: var(--band-ink); }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 16px; border-bottom: 1px solid var(--band-rule); }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--band-ink); text-decoration: none; }
+.brand svg { width: 15px; height: 20px; color: var(--signal); }
+.brand b { font: 720 1.12rem var(--font-display); font-stretch: 115%; }
+.tag { font: 500 0.7rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--band-ink-2); border: 1px solid var(--band-rule); border-radius: 4px; padding: 2px 7px; }
+.topnav { display: flex; gap: 22px; }
+.topnav a { color: var(--band-ink-2); text-decoration: none; }
+.topnav a:hover { color: var(--band-ink); }
+@media (max-width: 560px) { .topnav a.optional { display: none; } .tag { display: none; } }
+
+.hero { padding-block: 56px 64px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; max-width: 46rem; }
+.hero h1 { font-size: clamp(2.3rem, 6vw, 3.9rem); font-weight: 770; font-stretch: 110%; line-height: 1.02; letter-spacing: -0.03em; }
+.hero h1 em { font-style: normal; color: var(--signal); }
+.now { justify-self: start; display: inline-flex; align-items: center; gap: 10px; max-width: 100%; padding: 6px 14px; border: 1px solid var(--band-rule); border-radius: 99px; background: var(--term); color: var(--band-ink); text-decoration: none; font-size: 0.95rem; }
+.now:hover { border-color: var(--signal); }
+.now .dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: #3fb950; }
+.lede { font-size: 1.2rem; color: var(--band-ink-2); max-width: 38rem; }
+.install { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; max-width: 40rem; }
+.os { display: flex; gap: 4px; }
+.os button { font: 600 0.85rem var(--font-body); color: var(--band-ink-2); background: none; border: 1px solid transparent; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.os button[aria-pressed="true"] { color: var(--band-ink); border-color: var(--band-rule); background: var(--term); }
+.runline { display: flex; align-items: center; gap: 12px; background: var(--term); border: 1px solid var(--band-rule); border-radius: 8px; padding: 8px 8px 8px 16px; }
+.runline code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font: 0.92rem var(--font-mono); color: var(--band-ink); scrollbar-width: none; }
+.runline code::before { content: "> "; color: var(--signal); }
+.copy { flex: none; font: 700 0.9rem var(--font-body); background: var(--signal); color: var(--on-signal); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+.install p { font-size: 0.95rem; color: var(--band-ink-2); }
+.install p a { color: var(--band-ink); }
+
+section { padding-block: 64px 8px; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; margin-bottom: 24px; }
+.live { display: inline-flex; align-items: center; gap: 8px; font-size: 0.92rem; color: var(--ink-2); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-2); }
+.live.on .dot { background: #3fb950; box-shadow: 0 0 0 0 rgb(63 185 80 / 0.5); animation: pulse 2s infinite; }
+@keyframes pulse { 70% { box-shadow: 0 0 0 8px rgb(63 185 80 / 0); } 100% { box-shadow: 0 0 0 0 rgb(63 185 80 / 0); } }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; }
+@media (max-width: 860px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+.stat { background: var(--paper); padding: 20px 22px; display: grid; gap: 2px; align-content: start; }
+.stat dt { font-size: 0.9rem; color: var(--ink-2); }
+.stat dd { margin: 0; font: 720 2.2rem/1.15 var(--font-display); font-stretch: 105%; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.stat small { font-size: 0.9rem; color: var(--ink-2); }
+.stat dd span { font-size: 1.1rem; font-weight: 600; margin-left: 6px; color: var(--ink-2); letter-spacing: 0; }
+.callout { margin-top: 16px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; background: var(--gold-wash); border-radius: 10px; padding: 14px 18px; }
+.callout a { font-weight: 700; }
+.callout.deepseek { margin-top: 28px; max-width: 46rem; display: block; }
+.callout.deepseek h3 { margin-bottom: 4px; }
+.callout.deepseek p { color: var(--ink-2); }
+
+.jobs { display: grid; gap: 16px; margin-top: 28px; }
+.job { border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: grid; grid-template-columns: 1fr minmax(0, 300px); gap: 12px 32px; align-items: center; }
+@media (max-width: 760px) { .job { grid-template-columns: 1fr; } }
+.job-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.job h3 { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 600; }
+.pill { font: 600 0.8rem var(--font-body); border-radius: 99px; padding: 2px 10px; background: var(--stone); color: var(--ink-2); }
+.pill.training { background: var(--good-wash); color: var(--good); }
+.pill.waiting { background: var(--gold-wash); color: var(--gold); }
+.metric { font: 720 1.9rem/1.1 var(--font-display); font-variant-numeric: tabular-nums; margin-top: 10px; }
+.metric span { font: 400 1rem var(--font-body); color: var(--ink-2); }
+.facts { margin-top: 6px; font-size: 0.95rem; color: var(--ink-2); }
+.spark { width: 100%; height: 84px; display: block; }
+.spark-cap { font-size: 0.82rem; color: var(--ink-2); display: flex; justify-content: space-between; }
+
+.feat { margin-top: 28px; border: 1px solid var(--rule); border-radius: 16px; padding: 24px; display: grid; gap: 20px; }
+.feat-eyebrow { font: 600 0.78rem var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }
+.feat h3 { font-size: 1.5rem; }
+.feat-head { display: grid; gap: 8px; max-width: 48rem; }
+.stages { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.stages li { font-size: 0.85rem; padding: 3px 12px; border-radius: 99px; background: var(--stone); color: var(--ink-2); }
+.stages li.past { color: var(--good); }
+.stages li.now { background: var(--gold-wash); color: var(--gold); font-weight: 700; }
+.feat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 760px) { .feat-grid { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--stone); border-radius: 12px; padding: 18px 20px; display: grid; gap: 10px; align-content: start; }
+.panel h4, .chat h4 { margin: 0; font: 600 0.9rem var(--font-body); color: var(--ink-2); }
+.big { font: 760 2.6rem/1 var(--font-display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.layers { display: grid; grid-template-columns: repeat(40, minmax(0, 1fr)); gap: 2px; height: 42px; }
+@media (max-width: 560px) { .layers { grid-template-columns: repeat(20, minmax(0, 1fr)); height: 70px; } }
+.layers i { position: relative; background: var(--rule); border-radius: 2px; overflow: hidden; }
+.layers i b { position: absolute; left: 0; right: 0; bottom: 0; background: var(--signal); }
+.layers i.top { background: var(--good-wash); box-shadow: inset 0 0 0 1px var(--good); }
+.layer-cap { display: flex; justify-content: space-between; gap: 12px; font-size: 0.82rem; color: var(--ink-2); }
+.progress { height: 10px; background: var(--rule); border-radius: 5px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--signal); }
+.chat { display: grid; gap: 10px; }
+.bubble { border-radius: 12px; padding: 10px 14px; max-width: 42rem; }
+.bubble.q { justify-self: end; background: var(--stone); }
+.bubble.a { border: 1px solid var(--rule); }
+.think { margin: 0 0 8px; border-left: 3px solid var(--signal); padding: 2px 12px; color: var(--ink-2); font-size: 0.95rem; }
+.think b { display: block; font: 600 0.75rem var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; }
+.source { font-size: 0.8rem; color: var(--ink-2); }
+.miners { margin-top: 28px; }
+.miners ol { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+.miners li { display: grid; grid-template-columns: 1.4rem auto minmax(40px, 1fr) auto; gap: 12px; align-items: center; font-size: 0.95rem; }
+.miners code { font-family: var(--font-mono); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; }
+.bar { height: 8px; border-radius: 4px; background: var(--stone); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--signal); }
+
+.setup { list-style: none; counter-reset: s; margin: 24px 0 0; padding: 0; display: grid; gap: 22px; max-width: 46rem; }
+.setup > li { counter-increment: s; display: grid; grid-template-columns: 2.2rem minmax(0, 1fr); column-gap: 14px; }
+.setup > li::before { content: counter(s); grid-row: span 3; width: 2.2rem; height: 2.2rem; border-radius: 50%; display: grid; place-items: center; background: var(--gold-wash); color: var(--gold); font: 720 0.95rem var(--font-mono); }
+.setup p, .setup dd { color: var(--ink-2); }
+.setup h3 { line-height: 2.2rem; }
+.setup dl { margin: 4px 0 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; }
+.setup dt { font-weight: 700; }
+.setup dd { margin: 0; }
+.setup strong { color: var(--ink); }
+@media (max-width: 560px) { .setup dl { grid-template-columns: minmax(0, 1fr); gap: 0; } .setup dd { margin-bottom: 8px; } }
+code, kbd { font-family: var(--font-mono); font-size: 0.86em; }
+:not(pre) > code, kbd { background: var(--stone); border: 1px solid var(--rule); padding: 0.04em 0.34em; border-radius: 4px; overflow-wrap: anywhere; }
+.runline code { background: none; border: 0; padding: 0; }
+.handy { margin-top: 28px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 24px; max-width: 46rem; }
+.handy p { display: grid; gap: 2px; }
+.handy span { color: var(--ink-2); font-size: 0.92rem; }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 24px; }
+@media (max-width: 860px) { .steps { grid-template-columns: 1fr; } }
+.step { background: var(--stone); border-radius: 12px; padding: 22px; display: grid; gap: 8px; align-content: start; }
+.step b { font: 720 0.85rem var(--font-mono); color: var(--gold); }
+.step p { color: var(--ink-2); }
+.next { display: grid; gap: 12px; margin-top: 20px; max-width: 46rem; }
+.next li { margin-bottom: 6px; }
+.next ul { margin: 0; padding-left: 1.2em; color: var(--ink-2); }
+.next strong { color: var(--ink); }
+
+footer { margin-top: 72px; border-top: 1px solid var(--rule); }
+footer .wrap { padding-block: 24px 40px; display: grid; gap: 10px; font-size: 0.9rem; color: var(--ink-2); }
+footer nav { display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.fine { font-size: 0.8rem; }
+@media (prefers-reduced-motion: reduce) { .live.on .dot { animation: none; } }
+</style>
+</head>
+<body>
+<header class="band">
+  <div class="wrap">
+    <div class="topbar">
+      <a class="brand" href="/" aria-label="Vibe Hash home">
+        <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
+        <b>Vibe Hash</b><span class="tag">Testnet</span>
+      </a>
+      <nav class="topnav" aria-label="Site">
+        <a class="optional" href="#network">Live network</a><a href="#start">Start mining</a><a href="/guide/">Guide</a><a class="optional" href="https://github.com/AlphaChad5000/vibehash">GitHub</a>
+      </nav>
+    </div>
+    <div class="hero">
+      <a class="now" id="now" href="#network" hidden><span class="dot"></span><span id="now-text"></span></a>
+      <h1>Mining that trains <em>real AI models</em></h1>
+      <p class="lede">Instead of burning electricity on hashes nobody uses, your computer trains small, checkable pieces of AI models, and earns VIBE for every piece that checks out.</p>
+      <div class="install">
+        <div class="os" role="group" aria-label="Your system">
+          <button type="button" data-os="win" aria-pressed="true">Windows</button>
+          <button type="button" data-os="unix" aria-pressed="false">macOS and Linux</button>
+        </div>
+        <div class="runline"><code id="cmd">irm https://vibehash.org/install.ps1 | iex</code><button class="copy" type="button" id="copy">Copy</button></div>
+        <p id="cmd-note">Paste it into PowerShell. It installs everything, asks four quick questions, then offers to start mining. <a href="#start">What it asks</a></p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section id="network" class="wrap" aria-labelledby="network-title">
+    <div class="head">
+      <h2 id="network-title">The network right now</h2>
+      <span class="live" id="live"><span class="dot"></span><span id="live-text">Connecting to the network…</span></span>
+    </div>
+    <dl class="stats" aria-live="polite">
+      <div class="stat"><dt>Miners online</dt><dd id="s-online">–</dd><small>working in the last 10 minutes</small></div>
+      <div class="stat"><dt>Miners today</dt><dd id="s-day">–</dd><small>in the last 24 hours</small></div>
+      <div class="stat"><dt>Training done today</dt><dd id="s-work">–</dd><small id="s-units">checked and paid</small></div>
+      <div class="stat"><dt>Latest block</dt><dd id="s-height">–</dd><small id="s-blocktime">&nbsp;</small></div>
+    </dl>
+    <div class="callout" id="empty" hidden>
+      <span>Nobody's mining right now. Start a worker and the next rounds' pay is yours.</span>
+      <a href="#top" id="empty-link">Get the install line</a>
+    </div>
+
+    <div id="featured"></div>
+    <div class="jobs" id="jobs"></div>
+
+    <div class="miners" id="miners" hidden>
+      <h3>Most work today</h3>
+      <ol id="miner-list"></ol>
+    </div>
+  </section>
+
+  <section id="start" class="wrap" aria-labelledby="start-title">
+    <h2 id="start-title">Start mining</h2>
+    <ol class="setup">
+      <li><h3>Paste the install line</h3><p>Into PowerShell on Windows, or Terminal on macOS and Linux. It needs Python 3.10 or newer; on Windows it installs Python for you if it's missing.</p></li>
+      <li><h3>Answer four questions</h3>
+        <dl>
+          <dt>Network</dt><dd>Press Enter to join the public network.</dd>
+          <dt>Wallet</dt><dd>Choose a password. Setup then shows <strong>24 recovery words, once</strong>: write them down. They're the only way back into your wallet if you lose its file or forget the password.</dd>
+          <dt>Graphics card</dt><dd>If it finds one, it offers to install GPU support, a download of up to 3 GB. Without one, training runs on your processor.</dd>
+          <dt>Stake</dt><dd>Nothing to do: your first 5 VIBE of pay becomes your stake.</dd>
+        </dl>
+      </li>
+      <li><h3>Start mining</h3><p>Say yes when setup asks. <kbd>Ctrl</kbd>+<kbd>C</kbd> stops it, and <code class="vh" data-cmd="worker">python -m vibehash worker</code> starts it again any time. If your computer calls Python something else, the installer tells you what to type instead.</p></li>
+    </ol>
+    <div class="callout deepseek">
+      <div>
+        <h3>Mining the DeepSeek job</h3>
+        <p>It takes an NVIDIA graphics card with 8 GB or more (RTX 20-series or newer), 16 GB of memory (32 GB is faster) and about 40 GB free on an SSD. Your PC downloads about 30 GB of the model, after asking. You choose where it goes and how much space it may use, and it's deleted when the job ends, unless you'd rather keep it for next time. No PC ever holds the whole 510 GB model. Other graphics cards and processors keep earning on the network's other jobs.</p>
+      </div>
+    </div>
+    <div class="handy">
+      <p><code class="vh" data-cmd="">python -m vibehash</code> <span>a menu of all of this: pick with the arrow keys</span></p>
+      <p><code class="vh" data-cmd="balance">python -m vibehash balance</code> <span>what you've earned</span></p>
+      <p><code class="vh" data-cmd="devices">python -m vibehash devices</code> <span>what this computer can train on</span></p>
+      <p><code class="vh" data-cmd="setup">python -m vibehash setup</code> <span>change the network, wallet or GPU support</span></p>
+      <p><a href="/guide/#troubleshooting">Troubleshooting</a> <span>if a step fails</span></p>
+    </div>
+  </section>
+
+  <section class="wrap" aria-labelledby="how-title">
+    <h2 id="how-title">How it works</h2>
+    <div class="steps">
+      <div class="step"><b>1</b><h3>Get a piece of work</h3><p>Each round, about every 40 seconds, the network hands your computer a few training steps of a model someone has paid to have trained.</p></div>
+      <div class="step"><b>2</b><h3>Train it</h3><p>On your graphics card if you have one, or your processor if not. An old laptop and a gaming rig earn the same rate per unit of work.</p></div>
+      <div class="step"><b>3</b><h3>Get checked, get paid</h3><p>Other miners redo random bits of your work. If one disagrees, the network narrows it down to a single calculation and redoes just that. Work that checks out is paid by how much you did; cheaters lose their stake.</p></div>
+    </div>
+  </section>
+
+  <section class="wrap" aria-labelledby="next-title">
+    <h2 id="next-title">What's live, and what's next</h2>
+    <div class="next">
+      <ul>
+        <li><strong>Live: fine-tuning open models.</strong> Teach a model like Qwen your own text. The network trains an add-on for it and you download the result. The node that runs the network never runs the model.</li>
+        <li><strong>Live: DeepSeek V4.1 Flash, in pieces.</strong> The first job teaches it to think shorter. Its 510 GB are cut so that no miner holds more than about 30 GB: the bottom layers are prepared once, in pieces anyone can run, and miners train the top four.</li>
+        <li><strong>Next: the full set.</strong> The first job is a 1,500-problem pilot. The full 7,473 come next, reusing the pilot's prepared pieces.</li>
+        <li><strong>Next: nobody in charge.</strong> Today one node runs the network and one storage bucket holds the hand-offs. More validators, and miners hosting the hand-offs, take that away.</li>
+      </ul>
+      <p><a href="/guide/">Read the guide</a> for how rounds, checks, payment and penalties work.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <nav aria-label="More"><a href="/guide/">Guide</a><a href="https://github.com/AlphaChad5000/vibehash">Source code</a><a href="https://node.vibehash.org/status">Node status</a></nav>
+    <p>Unaudited test network software. VIBE has no cash value, so don't buy or sell it.</p>
+    <p class="fine">Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var NODE = new URLSearchParams(location.search).get("node") || "https://node.vibehash.org";
+  var SYN = 1e8;
+  var CMDS = {
+    win: ["irm https://vibehash.org/install.ps1 | iex", "Paste it into PowerShell. It installs everything (Python too, if you need it), asks four quick questions, then offers to start mining."],
+    unix: ["curl -fsSL https://vibehash.org/install.sh | sh", "Paste it into Terminal. It installs everything, asks four quick questions, then offers to start mining."]
+  };
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---- install line ----
+  function pick(os) {
+    document.querySelectorAll(".os button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.os === os)); });
+    $("cmd").textContent = CMDS[os][0];
+    $("cmd-note").firstChild.textContent = CMDS[os][1] + " ";
+    document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = ((os === "win" ? "python" : "python3") + " -m vibehash " + c.dataset.cmd).trim(); });
+  }
+  document.querySelectorAll(".os button").forEach(function (b) { b.addEventListener("click", function () { pick(b.dataset.os); }); });
+  pick(/Win/i.test(navigator.userAgent) ? "win" : "unix");
+  $("copy").addEventListener("click", function () {
+    var text = $("cmd").textContent, btn = $("copy");
+    var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1600); };
+    if (navigator.clipboard) { navigator.clipboard.writeText(text).then(done, function () {}); }
+  });
+  $("empty-link").addEventListener("click", function (e) { e.preventDefault(); window.scrollTo({ top: 0, behavior: "smooth" }); $("copy").focus({ preventScroll: true }); });
+
+  // ---- formatting ----
+  function int(n) { return Math.round(n).toLocaleString("en-US"); }
+  function vibe(syn) { var v = syn / SYN; return (v >= 100 ? int(v) : v.toLocaleString("en-US", { maximumFractionDigits: 3 })) + " VIBE"; }
+  function flopParts(n) {
+    var units = ["FLOP", "kFLOP", "MFLOP", "GFLOP", "TFLOP", "PFLOP", "EFLOP"], i = 0;
+    while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
+    return [n >= 100 ? String(Math.round(n)) : n.toFixed(1), units[i]];
+  }
+  function flops(n) { return n ? flopParts(n).join(" ") : "None yet"; }
+  function ago(s) {
+    if (s < 0) s = 0;
+    if (s < 90) return Math.round(s) + " s ago";
+    if (s < 5400) return Math.round(s / 60) + " min ago";
+    if (s < 129600) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " days ago";
+  }
+  function short(a) { return a.length > 16 ? a.slice(0, 9) + "…" + a.slice(-5) : a; }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+  // ---- a job's score over its rounds ----
+  function spark(points, metric) {
+    var ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 300 84"); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("class", "spark");
+    svg.setAttribute("role", "img");
+    var pts = points.filter(function (p) { return p[1] != null; });
+    if (pts.length < 2) return null;
+    var vals = pts.map(function (p) { return p[1]; });
+    var lo = metric === "accuracy" ? 0 : Math.min.apply(null, vals), hi = metric === "accuracy" ? 1 : Math.max.apply(null, vals);
+    if (hi - lo < 1e-9) { hi = lo + 1; }
+    var xy = pts.map(function (p, i) { return [i / (pts.length - 1) * 298 + 1, 80 - (p[1] - lo) / (hi - lo) * 74]; });
+    var line = xy.map(function (q) { return q[0].toFixed(1) + "," + q[1].toFixed(1); }).join(" ");
+    var area = document.createElementNS(ns, "polygon");
+    area.setAttribute("points", "1,82 " + line + " 299,82"); area.setAttribute("fill", "var(--gold-wash)");
+    var path = document.createElementNS(ns, "polyline");
+    path.setAttribute("points", line); path.setAttribute("fill", "none"); path.setAttribute("stroke", "var(--signal)");
+    path.setAttribute("stroke-width", "2"); path.setAttribute("vector-effect", "non-scaling-stroke"); path.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(area); svg.appendChild(path);
+    svg.setAttribute("aria-label", (metric === "accuracy" ? "Accuracy" : "Loss") + " over " + pts.length + " rounds");
+    return svg;
+  }
+
+  function jobCard(j, net) {
+    var card = el("article", "job"), left = el("div"), top = el("div", "job-top");
+    top.appendChild(el("h3", null, j.id));
+    var online = ((net.miners.online_by_job || {})[j.id] || 0) > 0;
+    var state = j.status === "training" ? (online ? ["training", "Training now"] : ["waiting", "Waiting for miners"])
+              : j.status === "open" ? ["waiting", "Queued"] : ["", "Finished"];
+    top.appendChild(el("span", "pill " + state[0], state[1]));
+    left.appendChild(top);
+    left.appendChild(el("p", "quiet", j.model));
+    if (j.now != null) {
+      var m = el("p", "metric");
+      if (j.metric === "accuracy") {
+        m.textContent = Math.round(j.now * 100) + "% ";
+        m.appendChild(el("span", null, "accuracy on held-back data" + (j.start != null && j.start < j.now ? ", up from " + Math.round(j.start * 100) + "%" : "")));
+      } else {
+        m.textContent = j.now.toFixed(3) + " ";
+        m.appendChild(el("span", null, "held-back loss" + (j.start != null && j.start > j.now ? ", down from " + j.start.toFixed(3) : "")));
+      }
+      left.appendChild(m);
+    }
+    var facts = [];
+    if (j.rounds_trained) facts.push("trained in " + int(j.rounds_trained) + " round" + (j.rounds_trained === 1 ? "" : "s") + ", " + int(j.units) + " units of work");
+    else facts.push("no rounds trained yet");
+    if (j.last_trained && j.last_trained.time) facts.push("last trained " + ago(net.now - j.last_trained.time));
+    if (j.escrow > 0) facts.push(vibe(j.escrow) + " left to pay miners");
+    left.appendChild(el("p", "facts", facts.join(" · ")));
+    card.appendChild(left);
+    var s = spark(j.history || [], j.metric);
+    if (s) {
+      var right = el("div"); right.appendChild(s);
+      var cap = el("p", "spark-cap"); cap.appendChild(el("span", null, "start")); cap.appendChild(el("span", null, "now"));
+      right.appendChild(cap); card.appendChild(right);
+    }
+    return card;
+  }
+
+  // ---- the featured job: what it's for is written here; how it's going comes from the node ----
+  var FEATURED = [{
+    match: "think-shorter",
+    title: "Teaching DeepSeek V4.1 Flash to think shorter",
+    short: "DeepSeek V4.1 Flash learns to think shorter",
+    blurb: "Long thinking is what makes answers slow. Miners' gaming PCs are training an add-on that teaches DeepSeek V4.1 Flash to reach the right answer in a few short steps. Nobody holds the whole 510 GB model: its bottom 36 layers are prepared once, in pieces anyone can run, and miners train the top 4.",
+    // The first job is the pilot: 1,500 GSM8K training problems, scored on 500 held back (docs/datasets/think-shorter.md).
+    examples: 1500, heldBack: 500, unit: "problems",
+    sample: { q: "Twice Angie's age, plus 4, is 20. How old is Angie?",
+              think: "Twice Angie's age is 20-4=16. Angie is 16/2=8.",
+              a: "The answer is 8.", source: "One of the pilot's training problems, from GSM8K (MIT licence)" }
+  }];
+  function infoFor(j) {
+    for (var i = 0; i < FEATURED.length; i++) { if (j.id.indexOf(FEATURED[i].match) >= 0) return FEATURED[i]; }
+    return null;
+  }
+  function pickFeatured(jobs) {
+    var tuned = jobs.filter(function (j) { return /^fine-tune/.test(j.model) && (j.status !== "finished" || infoFor(j)); });
+    return tuned.filter(infoFor)[0] || tuned[0] || null;
+  }
+  function times(r) { return (r < 10 ? r.toFixed(2) : r.toFixed(1)) + "×"; }
+
+  function featuredCard(j, net) {
+    var info = infoFor(j), here = (net.miners.online_by_job || {})[j.id] || 0, prep = j.prep;
+    var prepDone = !prep || prep.done.every(function (x) { return x >= 1; });
+    var stage = j.status === "finished" ? "done" : !prepDone ? "prep" : "train";
+    var card = el("article", "feat"), head = el("div", "feat-head");
+    head.appendChild(el("p", "feat-eyebrow", "Featured job · " + j.model));
+    var top = el("div", "job-top");
+    top.appendChild(el("h3", null, info ? info.title : "Fine-tuning " + j.model.replace(/^fine-tune of /, "")));
+    var pill = stage === "done" ? ["", "Finished"] : stage === "prep" ? ["waiting", "Preparing"] : here ? ["training", "Training now"] : ["waiting", "Waiting for miners"];
+    top.appendChild(el("span", "pill " + pill[0], pill[1]));
+    head.appendChild(top);
+    if (info) head.appendChild(el("p", "quiet", info.blurb));
+    var names = prep ? [["prep", "Prepare the frozen layers"], ["train", "Train the top layers"], ["done", "Done"]] : [["train", "Train"], ["done", "Done"]];
+    var at = names.map(function (n) { return n[0]; }).indexOf(stage), stages = el("ol", "stages");
+    names.forEach(function (n, i) { stages.appendChild(el("li", i < at ? "past" : i === at ? "now" : "", (i < at ? "✓ " : "") + n[1])); });
+    head.appendChild(stages);
+    card.appendChild(head);
+
+    var grid = el("div", "feat-grid");
+    // How it's improving: the held-back score, said plainly.
+    var imp = el("div", "panel");
+    imp.appendChild(el("h4", null, "How it's improving"));
+    if (j.metric === "loss" && j.start != null && j.now != null && j.start > j.now) {
+      var r = Math.exp(j.start - j.now);
+      imp.appendChild(el("p", "big", times(r)));
+      imp.appendChild(el("p", null, (info ? "Short, correct worked solutions" : "Its target answers") + " are now " + times(r) +
+        " as likely, token by token, as before training, on " + (info ? int(info.heldBack) + " " + info.unit : "held-back examples") +
+        " it has never trained on."));
+      imp.appendChild(el("p", "quiet", "Held-back loss " + j.start.toFixed(3) + " → " + j.now.toFixed(3) + " (lower is better)"));
+    } else if (j.metric === "accuracy" && j.now != null) {
+      imp.appendChild(el("p", "big", Math.round(j.now * 100) + "%"));
+      imp.appendChild(el("p", null, "accuracy on held-back data" + (j.start != null && j.start < j.now ? ", up from " + Math.round(j.start * 100) + "%" : "")));
+    } else {
+      imp.appendChild(el("p", "quiet", stage === "prep" ? "Training starts once the frozen layers are prepared. Scores show up here after its first rounds." : "Scores show up here after the first rounds."));
+    }
+    var s = spark(j.history || [], j.metric);
+    if (s) {
+      imp.appendChild(s);
+      var cap = el("p", "spark-cap"); cap.appendChild(el("span", null, "start")); cap.appendChild(el("span", null, "now")); imp.appendChild(cap);
+    }
+    grid.appendChild(imp);
+
+    // Progress: the prep's assembly line, then training.
+    var prog = el("div", "panel");
+    prog.appendChild(el("h4", null, "Progress"));
+    if (prep) {
+      var layers = el("div", "layers");
+      layers.setAttribute("role", "img");
+      layers.setAttribute("aria-label", "Prepared: " + prep.done.filter(function (x) { return x >= 1; }).length + " of " + prep.layers + " frozen layers");
+      prep.done.forEach(function (f) { var c = el("i"), b = el("b"); b.style.height = Math.round(100 * Math.min(1, f)) + "%"; c.appendChild(b); layers.appendChild(c); });
+      for (var k = prep.done.length; k < 40; k++) layers.appendChild(el("i", "top"));
+      prog.appendChild(layers);
+      var lc = el("p", "layer-cap");
+      lc.appendChild(el("span", null, "Layer 1")); lc.appendChild(el("span", null, "the top " + (40 - prep.done.length) + " are trained by miners"));
+      prog.appendChild(lc);
+      prog.appendChild(el("p", null, int(prep.pieces_done) + " of " + int(prep.pieces_total) + " prep pieces done" +
+        (prep.miners ? ", by " + int(prep.miners) + " miner" + (prep.miners === 1 ? "" : "s") : "")));
+    }
+    if (j.examples != null && stage !== "prep") {
+      var total = info && info.examples, passes = total ? j.examples / total : null;
+      if (total) { var bar = el("div", "progress"), fill = el("i"); fill.style.width = Math.round(100 * Math.min(1, passes)) + "%"; bar.appendChild(fill); prog.appendChild(bar); }
+      prog.appendChild(el("p", null, int(j.examples) + " " + (info ? info.unit : "examples") + " studied" +
+        (passes != null ? ", " + passes.toFixed(2) + " passes through all " + int(total) : "")));
+    }
+    var facts = [here ? int(here) + " miner" + (here === 1 ? "" : "s") + " on it now" : "no miners on it right now"];
+    if (j.rounds_trained) facts.push(int(j.rounds_trained) + " rounds trained");
+    if (j.last_trained && j.last_trained.time) facts.push("last trained " + ago(net.now - j.last_trained.time));
+    if (j.escrow > 0) facts.push(vibe(j.escrow) + " left to pay miners");
+    prog.appendChild(el("p", "quiet", facts.join(" · ")));
+    grid.appendChild(prog);
+    card.appendChild(grid);
+
+    // What it's learning from: one real training example.
+    if (info && info.sample) {
+      var chat = el("div", "chat");
+      chat.appendChild(el("h4", null, "What it's learning from"));
+      chat.appendChild(el("div", "bubble q", info.sample.q));
+      var a = el("div", "bubble a"), t = el("p", "think");
+      t.appendChild(el("b", null, "Thinking")); t.appendChild(document.createTextNode(info.sample.think));
+      a.appendChild(t); a.appendChild(el("p", null, info.sample.a));
+      chat.appendChild(a);
+      chat.appendChild(el("p", "source", info.sample.source));
+      card.appendChild(chat);
+    }
+    return card;
+  }
+
+  function render(net) {
+    var m = net.miners;
+    $("s-online").textContent = int(m.online);
+    $("s-day").textContent = int(m.day);
+    var work = $("s-work"), fp = flopParts(m.flops_day);
+    work.textContent = m.flops_day ? fp[0] : "None yet";
+    if (m.flops_day) work.appendChild(el("span", null, fp[1]));
+    $("s-units").textContent = m.units_day ? int(m.units_day) + " units checked and paid" : "in the last 24 hours";
+    $("s-height").textContent = "#" + int(net.height);
+    $("s-blocktime").textContent = (m.block_time ? "one every " + Math.round(m.block_time) + " s · " : "") + "last " + ago(net.now - net.time);
+    $("empty").hidden = m.online > 0;
+    var feat = pickFeatured(net.jobs), slot = $("featured"), jobs = $("jobs");
+    slot.textContent = ""; jobs.textContent = "";
+    if (feat) slot.appendChild(featuredCard(feat, net));
+    var info = feat && infoFor(feat), now = $("now");
+    now.hidden = !feat || feat.status === "finished";
+    if (feat) $("now-text").textContent = (feat.prep && !feat.prep.done.every(function (x) { return x >= 1; }) ? "Preparing: " : "Now training: ") +
+      (info ? info.short : feat.model.replace(/^fine-tune of /, ""));
+    net.jobs.filter(function (j) { return j !== feat && (j.status !== "finished" || j.rounds_trained); }).slice(0, 6)
+      .forEach(function (j) { jobs.appendChild(jobCard(j, net)); });
+    var list = $("miner-list"), top = m.top_miners || [], most = top.length ? top[0].flops : 0;
+    list.textContent = "";
+    top.forEach(function (t, i) {
+      var li = el("li"); li.appendChild(el("span", "quiet num", String(i + 1)));
+      var code = el("code", null, short(t.address)); code.title = t.address; li.appendChild(code);
+      var bar = el("span", "bar"), fill = el("i"); fill.style.width = (most ? 100 * t.flops / most : 0) + "%"; bar.appendChild(fill); li.appendChild(bar);
+      li.appendChild(el("span", "quiet num", flops(t.flops)));
+      list.appendChild(li);
+    });
+    $("miners").hidden = !top.length;
+    $("live").className = "live on";
+    $("live-text").textContent = "Live · " + (m.block_time ? "block every " + Math.round(m.block_time) + " s · " : "") + net.validators + " validator" + (net.validators === 1 ? "" : "s");
+  }
+
+  function load() {
+    fetch(NODE + "/network", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(render)
+      .catch(function () {
+        $("live").className = "live";
+        $("live-text").textContent = "Can't reach the network right now; trying again shortly";
+      });
+  }
+  load();
+  setInterval(function () { if (!document.hidden) load(); }, 30000);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+})();
+</script>
+</body>
+</html>

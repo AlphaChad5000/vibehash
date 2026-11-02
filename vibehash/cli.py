@@ -12,6 +12,7 @@
     python -m vibehash stake --amount 10
     python -m vibehash job template --out job.json
     python -m vibehash post-job --spec job.json --budget 300 [--dataset data.npz]
+    python -m vibehash models                # open-weight models to fine-tune (coming), and what each would take
     python -m vibehash chain verify --genesis genesis.json
 
 --node and --wallet default to what `setup` saved (see settings.py). Wallet passwords are read from
@@ -612,12 +613,86 @@ def _job_node(a, job_id: str) -> NodeClient:
     return NodeClient(node_of(a))
 
 
+def cmd_models(a):
+    """The open-weight models `train --base` will fine-tune, with what Hugging Face says about each (catalog.py)."""
+    from . import catalog
+
+    facts, errors = catalog.lookup([m.repo for m in catalog.CATALOG], refresh=a.refresh)
+    if a.json:
+        print(json.dumps(catalog.to_json(facts, errors), indent=2))
+    else:
+        print(catalog.table(facts, errors, shutil.get_terminal_size((120, 24)).columns, prog()))
+    if not facts:
+        sys.exit(1)
+
+
+def _pick_model() -> str | None:
+    """`train` on a terminal with no data file: a numbered menu, today's model first. Returns the --base to describe,
+    or None for a small model on a CSV file. It shows what the cache knows and asks no one, so it opens at once even
+    where Hugging Face is out of reach; the model picked is looked up in its pre-flight."""
+    from . import catalog
+
+    facts = catalog.cached([m.repo for m in catalog.CATALOG])
+    print("Which model?\n\n   1  a small model sized to your CSV data                        works today")
+    for i, m in enumerate(catalog.CATALOG, 2):
+        f = facts.get(m.repo)
+        about = f"{catalog.params_text(f.parameters)}, {catalog.size_text(f.weight_bytes)}, {f.licence}" if f else ""
+        print(f"  {i:2}  {m.name:<20}  {about:<36}  coming")
+    last = len(catalog.CATALOG) + 1
+    while True:
+        try:
+            pick = input("\nNumber or name [1]: ").strip().lower() or "1"
+        except EOFError:  # nothing to read: Windows counts NUL as a terminal
+            print()
+            sys.exit(f"no answer: `{prog()} train data.csv` trains a small model on a CSV file, and "
+                     f"`{prog()} train --base NAME` shows what fine-tuning one of `{prog()} models` would take")
+        if pick.isdigit() and 1 <= int(pick) <= last:
+            return None if pick == "1" else catalog.CATALOG[int(pick) - 2].name
+        if catalog.find(pick):
+            return pick
+        print(f"Pick a number from 1 to {last}.")
+
+
+def _preflight(a) -> None:
+    """`train --base`: what fine-tuning that model would take. Fine-tuning isn't live yet, so it ends there, before
+    the node or the wallet is touched, and exits with status 1: no job was posted."""
+    from . import catalog
+
+    ref, model = catalog.resolve(a.base)
+    data = Path(a.data) if a.data else None
+    if data is not None:
+        data.stat()  # a missing file says so now, before anyone is asked anything
+    facts, errors = catalog.lookup([ref])
+    if ref not in facts:
+        sys.exit(f"error: {errors[ref]}")
+    if ref in errors:
+        print(f"(Couldn't ask Hugging Face just now: {errors[ref]}. This is what it said on "
+              f"{catalog.checked_text(facts[ref].checked)}.)\n")
+    print(catalog.preflight(ref, model, facts[ref], data, prog()))
+    sys.exit(1)
+
+
 def cmd_train(a):
     """A CSV file in, a training job on the network out, with sensible model settings chosen for it. On a terminal
-    it then follows the job on the live training dashboard."""
-    from . import tabular, trainui
+    it then follows the job on the live training dashboard. `--base` is for fine-tuning an open-weight model, which
+    is coming: for now it shows what that would take, and posts nothing."""
+    from . import catalog, tabular, trainui
     from .blobs import file_sha256
 
+    if a.base is None and a.data is None and sys.stdin.isatty() and sys.stdout.isatty():
+        a.base = _pick_model()
+        if a.base is None:
+            try:
+                a.data = input("CSV file to train on: ").strip().strip('"') or None
+            except EOFError:
+                print()
+            if a.data is None:
+                sys.exit(f"no data: `{prog()} example` writes a sample, fruit.csv, to try")
+    if a.base is not None:
+        return _preflight(a)
+    if a.data is None:
+        sys.exit(f"which data? `{prog()} train data.csv` trains a small model sized to a CSV file, and "
+                 f"`{prog()} example` writes one to try. Fine-tuning open-weight models is coming: `{prog()} models`")
     src = Path(a.data)
     try:
         hidden = tuple(int(v) for v in a.hidden.split(","))
@@ -635,7 +710,12 @@ def cmd_train(a):
             data, classes, mean, std = tabular.to_dataset(table)
             mean, std = mean.tolist(), std.tolist()
     except (tabular.TableError, OSError, KeyError, ValueError) as e:
-        sys.exit(f"error: {e}")
+        hint = ""
+        if catalog.data_kind(src) and not isinstance(e, FileNotFoundError):  # not a table: maybe text to fine-tune on
+            hint = (f"{src.name} may be text rather than a table. Training on text means fine-tuning an open-weight "
+                    f"model, which is coming: `{prog()} models` lists them, and `{prog()} train {_q(a.data)} --base "
+                    "NAME` shows what one would take.")
+        sys.exit(f"error: {e}" + (f"\n{hint}" if hint else ""))
     job_id = a.id or f"{re.sub(r'[^a-z0-9._-]+', '-', src.stem.lower()).strip('-._')[:40] or 'model'}-{secrets.token_hex(2)}"
     home = _job_home(job_id)
     if home.exists():
@@ -1301,7 +1381,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", default=".", help="folder to write it to (default: this one)"); p.set_defaults(fn=cmd_example)
 
     p = sub.add_parser("train", help="train a model on a CSV file: posts it as a job for the network to train")
-    p.add_argument("data", help="CSV with a header row: numeric input columns, plus the column to predict")
+    p.add_argument("data", nargs="?", help="CSV with a header row: numeric input columns, plus the column to predict "
+                   "(on a terminal, leave it out to pick a model from a menu)")
+    p.add_argument("--base", metavar="MODEL", help="fine-tune an open-weight model: a name from `models`, org/name or a "
+                   "huggingface.co address. Coming, not live yet: this shows what it would take and posts nothing")
     p.add_argument("--label", help="the column to predict (default: the last one)")
     p.add_argument("--budget", type=to_syn, default="100", help="VIBE to spend, paid only for work that passes its checks (default 100)")
     p.add_argument("--fee", type=to_syn, default="10", help="VIBE per round of training (default 10)")
@@ -1311,6 +1394,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--plain", action="store_true", help="print the plan and return, instead of following the job on the "
                    "live training dashboard (piped output does this anyway)")
     p.set_defaults(fn=cmd_train)
+
+    p = sub.add_parser("models", help="popular open-weight models to fine-tune (coming), with their size, licence and "
+                       "the GPUs a team would need")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--refresh", action="store_true", help="ask Hugging Face again, rather than use what it said in the "
+                   "last day")
+    p.set_defaults(fn=cmd_models)
 
     p = sub.add_parser("predict", help="use a downloaded model on new rows of a CSV file")
     p.add_argument("model", nargs="?", help="the .npz file `job download` saved (default: the last one)")
@@ -1348,7 +1438,19 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def run_command(argv: list[str]) -> None:
+    """One command line, as `vibehash ARGS` runs it, for the menu: a failing command says why and the menu goes on."""
+    try:
+        main(argv)
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(e.code if isinstance(e.code, str) else f"stopped with exit code {e.code}")
+
+
 def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv) == [] and sys.stdin.isatty() and sys.stdout.isatty():
+        from . import menu  # plain `vibehash`, typed at a terminal: the menu
+        return menu.run(run_command, prog())
     a = parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
     try:

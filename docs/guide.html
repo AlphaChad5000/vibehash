@@ -123,7 +123,7 @@ section > ol { padding-left: 1.4em; }
 
 /* command builder */
 .builder { border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; min-width: 0; }
-.tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--stone); border-bottom: 1px solid var(--rule); }
+.tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); background: var(--stone); border-bottom: 1px solid var(--rule); }
 .tab { font: 600 0.95rem/1.3 var(--font-body); color: var(--ink-2); background: transparent; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: 13px 10px; cursor: pointer; }
 .tab:hover { color: var(--ink); }
 .tab[aria-selected="true"] { color: var(--ink); background: var(--paper); border-bottom-color: var(--gold); }
@@ -143,6 +143,14 @@ section > ol { padding-left: 1.4em; }
 .field { display: grid; gap: 5px; min-width: 0; }
 .field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-2); }
 .field input[type="text"], .field input[type="number"], .field select { font: 0.92rem var(--font-mono); color: var(--ink); background: var(--stone); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; width: 100%; min-width: 0; }
+.field.wide { grid-column: 1 / -1; }
+.fine { font-size: 0.8rem; color: var(--ink-2); }
+.field .fine { margin-top: 2px; }
+footer .fine { flex-basis: 100%; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 18px; margin: 6px 0 0; font-size: 0.93rem; max-width: 66ch; }
+.facts dt { color: var(--ink-2); }
+.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.pill.soon { background: var(--gold-wash); color: var(--gold); margin-left: 8px; vertical-align: 2px; }
 .steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
 .steps > li { counter-increment: step; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 6px 16px; padding: 22px 20px; border-bottom: 1px solid var(--rule); }
 .steps > li:last-child { border-bottom: 0; }
@@ -158,6 +166,9 @@ section > ol { padding-left: 1.4em; }
 .cmd.flow pre { padding-right: 14px; }
 .copy { font: 500 0.74rem var(--font-mono); letter-spacing: 0.03em; color: var(--term-ink); background: transparent; border: 1px solid var(--term-dim); border-radius: 5px; padding: 4px 9px; cursor: pointer; flex: none; }
 .cmd .copy { position: absolute; top: 7px; right: 7px; }
+.cmd.soon { background: transparent; color: var(--ink-2); border: 1px dashed var(--ink-2); }  /* a command that isn't live yet */
+.cmd.soon pre { padding-right: 14px; }
+.cmd.soon .prompt { color: var(--ink-2); }
 .copy:hover { border-color: var(--term-ink); }
 .copy.done { color: var(--signal); border-color: var(--signal); }
 
@@ -232,7 +243,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     <div class="topbar">
       <a class="brand" href="#overview" aria-label="Vibe Hash">
         <svg viewBox="0 0 3 4" aria-hidden="true"><path fill="currentColor" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
-        <b>Vibe Hash</b><span class="tag">Testnet · 0.5</span>
+        <b>Vibe Hash</b><span class="tag">Testnet · 0.5.4</span>
       </a>
       <nav class="topnav" aria-label="Sections">
         <a href="#setup">Get started</a><a href="#round">How it works</a><a href="#jobspec">Reference</a><a href="#troubleshooting">Troubleshooting</a>
@@ -244,9 +255,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <p class="lede">Vibe Hash is a proof-of-useful-work test network. Your computer trains small, checkable pieces of a model someone has paid to have trained, on its graphics card if it has one. Every piece that passes its checks is paid at the same rate per unit of work, on an old laptop or a gaming rig.</p>
       <div class="cta">
         <a class="button" href="#setup">Get started</a>
-        <div class="runline"><pre><span class="prompt">&gt; </span><code id="hero-cmd">python -m vibehash testnet</code></pre><button class="copy" type="button" id="hero-copy" aria-label="Copy command">Copy</button></div>
+        <div class="runline"><pre><span class="prompt">&gt; </span><code id="hero-cmd">irm https://vibehash.org/install.ps1 | iex</code></pre><button class="copy" type="button" id="hero-copy" aria-label="Copy command">Copy</button></div>
       </div>
-      <p class="cta-note">That one command runs a node, two workers and a training job on your own computer.</p>
+      <p class="cta-note">Paste it into PowerShell on Windows, or Terminal on macOS and Linux. It installs Vibe Hash, then setup goes through four steps (network, wallet, graphics card, stake) and offers to start mining.</p>
     </div>
 
     <figure class="term">
@@ -262,10 +273,10 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     <dl class="specs">
       <div><dt>Round</dt><dd>about 38 s</dd></div>
       <div><dt>Stake</dt><dd>5 VIBE, earned by working</dd></div>
-      <div><dt>Block subsidy</dt><dd>50 VIBE, halving every 210 rounds</dd></div>
+      <div><dt>Block subsidy</dt><dd>3.125 VIBE, halving about every 4 years</dd></div>
       <div><dt>A block is final</dt><dd>once validators with over ⅔ of the stake sign it</dd></div>
       <div><dt>Base unit</dt><dd>1 VIBE = 100,000,000 syn</dd></div>
-      <div><dt>Trains on</dt><dd>NVIDIA, Intel Arc, Apple, AMD or CPU</dd></div>
+      <div><dt>Trains on</dt><dd>NVIDIA, Intel Arc, Apple, AMD (Linux) or CPU</dd></div>
     </dl>
   </div>
 </header>
@@ -284,25 +295,35 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <p>There are two ways to take part, and you can do both from the same computer.</p>
       <ul>
         <li><strong>Worker.</strong> Let your computer train and check models. This is the mining. You can start with no VIBE at all: your first 5 VIBE of pay becomes your stake.</li>
-        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows.</li>
+        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows. Fine-tuning popular open-weight models such as Qwen, Llama, Gemma and DeepSeek is coming: the Train a model tab under <a href="#setup">Get started</a> shows what each would take.</li>
       </ul>
       <p>Training a model takes four commands once Vibe Hash is set up. Your data is a CSV file, and the result is a model file that makes predictions; <a href="#setup">Get started</a> walks through each step.</p>
       <div class="cmd flow"><pre><span class="prompt">&gt; </span><code>vibehash train my-data.csv --budget 100</code>   <span class="prompt"># posts the job; the network trains it</span>
 <span class="prompt">&gt; </span><code>vibehash job status</code>                       <span class="prompt"># rounds done, accuracy, budget left</span>
 <span class="prompt">&gt; </span><code>vibehash job download</code>                     <span class="prompt"># saves my-data-model.npz</span>
 <span class="prompt">&gt; </span><code>vibehash predict new-rows.csv</code>             <span class="prompt"># a prediction for every row</span></pre></div>
-      <p>Most people join the public network, run at <code>node.vibehash.org</code>, and <code>vibehash setup</code> connects to it by itself. To join a different network, you need its node address, such as <code>203.0.113.7</code>: get it from whoever runs it, or run your own with <code>vibehash testnet</code>.</p>
+      <p>Most people join the public network, run at <code>node.vibehash.org</code>, and <code>vibehash setup</code> connects to it by itself. To join a different network, you need its node address, such as <code>203.0.113.7</code>: get it from whoever runs it. Developers can run a private network on one computer with <code>vibehash testnet</code>; it uses a fast test schedule of 50 VIBE a block, halving every 210 blocks.</p>
       <p class="note"><strong>Test network.</strong> VIBE has no cash value, so don't buy or sell it. The software hasn't been audited.</p>
     </section>
 
     <section id="setup">
       <h2>Get started</h2>
-      <p>Choose what you want to do, then paste the commands into PowerShell on Windows or Terminal on macOS. Earning and training start with one line that installs everything and asks you the rest; on Windows it installs Python too if you need it. Otherwise you need Python 3.10 or newer, free from <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>. On Windows, tick “Add python.exe to PATH” while installing it.</p>
+      <p>Everything starts with one line, which installs Vibe Hash (or updates it) and then runs its setup. On Windows, paste <code>irm https://vibehash.org/install.ps1 | iex</code> into PowerShell. On macOS or Linux, paste <code>curl -fsSL https://vibehash.org/install.sh | sh</code> into Terminal. Vibe Hash needs Python 3.10 or newer. On Windows the line offers to install it if it's missing; on macOS get it free from <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>, and on Linux from your package manager.</p>
+      <h3>What setup asks</h3>
+      <ol>
+        <li><strong>Node.</strong> Press Enter to join the public network, <code>node.vibehash.org</code>, or type the address of another network's node, such as <code>192.168.1.20</code>.</li>
+        <li><strong>Wallet.</strong> Choose a wallet password and type it again. Setup creates your wallet, prints its address (it starts with <code>vibe1</code>) and shows 24 recovery words, once. Write them down in order and keep them offline: they rebuild the wallet if its file or password is lost (<code>vibehash wallet restore</code>), and anyone who sees them can take your coins.</li>
+        <li><strong>Graphics card.</strong> If it finds a card PyTorch can use, it asks “Install it now?” before a download of up to 3 GB. Say no, or have no card, and training uses the CPU. <code>vibehash install-gpu</code> does this step later.</li>
+        <li><strong>Stake.</strong> On the public network there's nothing to do: your first 5 VIBE of pay becomes your stake. If you already hold VIBE, it offers to stake it. On a network that needs stake first, it says how much to ask its operator for.</li>
+      </ol>
+      <p>Then it asks “Start mining now?”. Press Enter for yes and the worker starts; Ctrl+C stops it. To start mining again later, run <code>python -m vibehash worker</code>. Run the one line again any time to update: setup keeps the wallet and settings it already made.</p>
+      <p>The commands on this page start with <code>python -m vibehash</code> on Windows and <code>python3 -m vibehash</code> on macOS and Linux. If the installer said Vibe Hash has its own environment, type <code>vibehash</code> instead; if it said Python is called py, type <code>py -m vibehash</code>.</p>
+      <p class="note"><strong>Your wallet</strong> is the file <code>wallet.json</code> in the <code>.vibehash</code> folder in your home folder: <code>~/.vibehash/wallet.json</code> on macOS and Linux, <code>C:\Users\YOUR-NAME\.vibehash\wallet.json</code> on Windows. It's encrypted with your password. Keep a copy somewhere safe, and never share it or your recovery words. If a step fails, see <a href="#troubleshooting">Troubleshooting</a>.</p>
+      <p>Pick what you want to do to see its commands. The Windows and macOS / Linux buttons switch them to your system.</p>
       <div class="builder">
         <div class="tabs" role="tablist" aria-label="What you want to do">
           <button class="tab" role="tab" id="tab-worker" data-role="worker" aria-selected="true" aria-controls="builder-panel">Earn as a worker</button>
           <button class="tab" role="tab" id="tab-train" data-role="train" aria-selected="false" aria-controls="builder-panel">Train a model</button>
-          <button class="tab" role="tab" id="tab-local" data-role="local" aria-selected="false" aria-controls="builder-panel">Try it locally</button>
         </div>
         <div role="tabpanel" id="builder-panel" aria-labelledby="tab-worker">
           <div class="panel-head">
@@ -319,7 +340,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <section id="round">
       <h2>A round</h2>
-      <p>The network runs in rounds. With default settings a round takes about 38 seconds and ends with one new block. The bar is drawn to scale, in the colours the worker's dashboard uses for each phase. Jobs with big models get longer rounds, sized so an ordinary computer on a home connection can still download the model, train a unit and upload its snapshots in time. A model with 34 million weights, for example, gets rounds of about 17 minutes.</p>
+      <p>The network runs in rounds. On the public network, and on any node with default settings, a round takes about 38 seconds and ends with one new block. The bar is drawn to scale, in the colours the worker's dashboard uses for each phase. Jobs with big models get longer rounds, sized so an ordinary computer on a home connection can still download the model, train a unit and upload its snapshots in time. A model with 16 million weights, about the largest a node takes by default, gets rounds of about 9 minutes.</p>
       <div class="timeline" aria-hidden="true">
         <div class="bar"><div class="ph-register"></div><div class="ph-compute"></div><div class="ph-reveal"></div><div class="ph-verify"></div></div>
         <div class="axis"><span>0 s</span><span>3 s</span><span>23 s</span><span><span>28 s</span><span>38 s</span></span></div>
@@ -334,7 +355,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <section id="validators">
       <h2>Who runs the network</h2>
-      <p>No single computer is in charge. The network is run by <strong>validators</strong>: nodes with VIBE staked that take turns leading rounds, in an order weighted by stake and fixed in advance.</p>
+      <p>A network is run by <strong>validators</strong>: nodes with VIBE staked that take turns leading rounds, in an order weighted by stake and fixed in advance. With several validators, no single computer is in charge. The public network has one for now, its first node; others can join, as the end of this section shows.</p>
       <ol>
         <li><strong>The leader runs the round.</strong> Workers do the round with whichever validator is leading it. They find it on their own, so nothing changes for you.</li>
         <li><strong>The others check its block.</strong> Each validator replays the round from its record of signed messages, and votes against any block whose payments, penalties or choices don't follow from them.</li>
@@ -351,7 +372,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <li><b>Sealed answer</b><span>Workers send a fingerprint of their result before anyone reveals anything. Copying someone else's answer can't match your own fingerprint.</span></li>
         <li><b>Proven snapshots</b><span>Every snapshot a worker reveals must match the fingerprint, so nobody can swap in different ones after seeing which parts get checked.</span></li>
         <li><b>Sanity check</b><span>Training must start from this round's model and end where the worker says it did, and the change must be a sensible size. That stops boosted updates that would wreck the model.</span></li>
-        <li><b>Spot-check replay</b><span>A randomly chosen worker re-runs 3 random segments and compares. A result must be within the job's tolerance and within 1% of what that segment of training actually changed, which absorbs rounding differences between chips but not skipped work.</span></li>
+        <li><b>Spot-check replay</b><span>A randomly chosen staked worker re-runs 3 random segments and compares. A result must be within the job's tolerance and within 1% of what that segment of training actually changed, which absorbs rounding differences between chips but not skipped work.</span></li>
         <li><b>Duplicate units</b><span>About 1 in 5 units secretly goes to two workers. If their answers differ, the whole unit is re-run to see who was wrong.</span></li>
         <li><b>Planted fakes</b><span>Two known-fake results per round are slipped to checkers. A checker who approves one is caught being lazy; a checker who rejects honest work is caught too, because every rejection is re-run.</span></li>
         <li><b>Checking the node</b><span>Every choice the node makes in a round follows from the round's signed messages, which its block commits to, so anyone can replay the round. It keeps recent rounds' checkpoints, so anyone can also re-run its checks on the actual results. And it signs a receipt for every message it accepts, so a worker whose message goes missing from the round can prove it.</span></li>
@@ -394,7 +415,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
     <section id="payment">
       <h2>Payment</h2>
-      <p>Each round creates a pool of VIBE: new coins from the block subsidy (50 VIBE, halving every 210 rounds, as in Bitcoin) plus the job poster's fee for the units that passed. Job posters pay nothing for work that failed. The pool is split three ways, drawn to scale here.</p>
+      <p>Each round creates a pool of VIBE: new coins from the block subsidy plus the job poster's fee for the units that passed. Job posters pay nothing for work that failed. On the public network the subsidy is 3.125 VIBE a block and halves every 3,320,000 blocks, about every 4 years at 38 seconds a round, so no more than 21 million VIBE can ever exist, as in Bitcoin. Other networks fix their own schedule when they start. The pool is split three ways, drawn to scale here.</p>
       <div class="split">
         <div class="split-bar" aria-hidden="true"><div></div><div></div><div></div></div>
         <ul class="split-key">
@@ -405,20 +426,20 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       </div>
       <p>Anything nobody earned is burned, so nobody gains by rejecting good work. Everyone is paid at the same rate per unit of work, so a laptop earns less in total but gets paid every round it contributes. You don't need a mining pool.</p>
       <h3>Worked example: one round</h3>
-      <p class="note">Subsidy 50 VIBE + job fee 10 VIBE = a 60 VIBE pool. 22 units passed, everyone at full reputation.</p>
+      <p class="note">On the public network: subsidy 3.125 VIBE + job fee 10 VIBE = a 13.125 VIBE pool. 22 units passed, everyone at full reputation.</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Who</th><th>Did</th><th class="r">Share</th><th class="r">Paid</th></tr></thead>
           <tbody>
-            <tr><td>Old laptop</td><td>2 units</td><td class="r">2 / 22 of 48 VIBE</td><td class="r">4.36 VIBE</td></tr>
-            <tr><td>Office desktop</td><td>5 units</td><td class="r">5 / 22 of 48 VIBE</td><td class="r">10.91 VIBE</td></tr>
-            <tr><td>RTX 3060 rig</td><td>15 units</td><td class="r">15 / 22 of 48 VIBE</td><td class="r">32.73 VIBE</td></tr>
-            <tr><td>Checkers</td><td>re-ran segments</td><td class="r">15% of pool</td><td class="r">9.00 VIBE</td></tr>
-            <tr><td>Block producer</td><td>sealed the block</td><td class="r">5% of pool</td><td class="r">3.00 VIBE</td></tr>
+            <tr><td>Old laptop</td><td>2 units</td><td class="r">2 / 22 of 10.5 VIBE</td><td class="r">0.95 VIBE</td></tr>
+            <tr><td>Office desktop</td><td>5 units</td><td class="r">5 / 22 of 10.5 VIBE</td><td class="r">2.39 VIBE</td></tr>
+            <tr><td>RTX 3060 rig</td><td>15 units</td><td class="r">15 / 22 of 10.5 VIBE</td><td class="r">7.16 VIBE</td></tr>
+            <tr><td>Checkers</td><td>re-ran segments</td><td class="r">15% of pool</td><td class="r">1.97 VIBE</td></tr>
+            <tr><td>Block producer</td><td>sealed the block</td><td class="r">5% of pool</td><td class="r">0.66 VIBE</td></tr>
           </tbody>
         </table>
       </div>
-      <p>Every worker gets 2.18 VIBE per unit, the same rate on every machine. <strong>Reputation</strong> scales your share between 0.5× and 1.0×. New wallets start at 0.8×, gain 0.02 each round they deliver verified work, and lose 0.05 for missing a deadline. It moves per round rather than per unit, so a laptop builds reputation as fast as a big rig.</p>
+      <p>Every worker gets about 0.48 VIBE per unit, the same rate on every machine. <strong>Reputation</strong> scales your share between 0.5× and 1.0×. New wallets start at 0.8×, gain 0.02 each round they deliver verified work, and lose 0.05 for missing a deadline. It moves per round rather than per unit, so a laptop builds reputation as fast as a big rig.</p>
     </section>
 
     <section id="penalties">
@@ -438,9 +459,9 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
           </tbody>
         </table>
       </div>
-      <p>Half of any slashed stake goes to whoever caught the problem and the other half is burned. When you unstake, the coins wait 20 rounds before you can spend them, and they can still be slashed in that time. A wallet whose stake falls below the 5 VIBE minimum goes back to earning it in: small batches of work, no checking others, and its pay refills the stake first.</p>
+      <p>Half of any slashed stake goes to whoever caught the problem and the other half is burned. When you unstake, the coins wait 20 blocks before you can spend them, and they can still be slashed in that time. On a network where workers earn their stake in, such as the public one, a wallet whose stake falls below the 5 VIBE minimum goes back to earning it in: small batches of work, no checking others, and its pay refills the stake first.</p>
       <h3>Starting with nothing</h3>
-      <p>Bitcoin needed no stake, because a hash proves itself. Training can only be spot-checked, so the stake is what a cheater stands to lose. To keep that without anyone handing out coins, a new worker <strong>earns its stake in</strong>. Its first 5 VIBE of pay goes into its stake instead of its wallet, so what it could lose by cheating grows with what it has earned. Until then it's held to small batches, gets units only after staked workers have theirs, and never checks other workers' results. Its own results are always checked by a staked worker. The network's first validators vote with <strong>bootstrap stake</strong>, which can never be withdrawn or spent and is burned if they leave. So every spendable coin starts from work.</p>
+      <p>Bitcoin needed no stake, because a hash proves itself. Training can only be spot-checked, so the stake is what a cheater stands to lose. To keep that without anyone handing out coins, a new worker <strong>earns its stake in</strong>. Its first 5 VIBE of pay goes into its stake instead of its wallet, so what it could lose by cheating grows with what it has earned. Until then it's held to small batches, gets units only after staked workers have theirs, and never checks other workers' results. Its own results are always checked by a staked worker. The network's first validators vote with <strong>bootstrap stake</strong>, which can never be withdrawn or spent and is burned if they leave. So apart from any VIBE a network's start hands out to pay for its first training jobs, every spendable coin starts from work.</p>
     </section>
 
     <section id="jobspec">
@@ -456,7 +477,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
             <tr><td><code>model.n_hidden</code></td><td>one width, or a list of 1–8 widths up to 8192</td><td>Hidden layers. <code>[512, 512]</code> is two layers of 512.</td></tr>
             <tr><td><code>precision</code></td><td><code>float32</code> or <code>float64</code></td><td><code>float32</code> runs on GPUs. <code>float64</code> always runs on the CPU, because many GPUs can't do it.</td></tr>
             <tr><td><code>data</code></td><td><code>synthetic</code> + seed, or <code>npz</code> + sha256</td><td><code>post-job --dataset</code> fills in the npz hash for you</td></tr>
-            <tr><td><code>lr</code>, <code>batch_size</code></td><td>0–10, 1–4096</td><td>Training settings</td></tr>
+            <tr><td><code>lr</code>, <code>batch_size</code></td><td>over 0 up to 10, 1–4096</td><td>Training settings</td></tr>
             <tr><td><code>steps_per_unit</code></td><td>up to 100,000</td><td>Training steps in one unit of work</td></tr>
             <tr><td><code>checkpoint_every</code></td><td>must divide steps_per_unit</td><td>Steps per checked segment</td></tr>
             <tr><td><code>units_per_round</code></td><td>1–10,000</td><td>How much work each round hands out</td></tr>
@@ -467,6 +488,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
           </tbody>
         </table>
       </div>
+      <p>A model's weights can be up to 1 GB, but a node only takes jobs up to 64 MB unless its operator raises that with <code>--max-job-mb</code>. 64 MB is about 16 million <code>float32</code> weights, or 8 million <code>float64</code>.</p>
       <p>A dataset is an <code>.npz</code> file with four arrays: <code>x_train</code>, <code>y_train</code>, <code>x_val</code> and <code>y_val</code>. It's loaded without running any code inside it, and every worker checks its hash against the job before using it.</p>
     </section>
 
@@ -474,14 +496,14 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       <h2>Troubleshooting</h2>
       <p>The messages you're most likely to see, and what to do about each.</p>
       <div class="faq">
-        <details><summary>'python' is not recognized / command not found</summary><div class="answer"><p>Python isn't installed, or isn't on your PATH. On Windows, run the python.org installer again and tick “Add python.exe to PATH”. On macOS and Linux, use <code>python3</code>; the “Your computer” setting in Get started does this for you.</p></div></details>
+        <details><summary>'python' is not recognized / command not found</summary><div class="answer"><p>Python isn't installed, or isn't on your PATH. On Windows, run the one-line installer again, which offers to install Python, or run the python.org installer and tick “Add python.exe to PATH”; then open a new PowerShell window. On macOS and Linux, use <code>python3</code>; the macOS / Linux button in Get started does this for you.</p></div></details>
         <details><summary>No matching distribution found for vibehash</summary><div class="answer"><p>Vibe Hash is on PyPI, so this means pip couldn't use it. Usually your Python is older than 3.10: <code>python --version</code> shows which you have, and python.org has the current one. Otherwise update pip with <code>python -m pip install --upgrade pip</code>, check you're online, and run the install command again.</p></div></details>
         <details><summary>I lost my wallet file</summary><div class="answer"><p>Rebuild it from the 24 recovery words setup showed you when it created the wallet: <code>vibehash wallet restore</code> asks for them and saves a new wallet file with the same address and coins. Wallets made before recovery words existed (before version 0.4) have no words, so for those the backed-up file is the only copy.</p></div></details>
         <details><summary>row 12, column 'colour': 'red' isn't a number</summary><div class="answer"><p>Every input column must hold numbers. Leave text columns out of the file, or turn them into numbers, such as small = 1, medium = 2, large = 3. The column you're predicting can hold names; if it isn't the last column, name it with <code>--label</code>.</p></div></details>
         <details><summary>No module named vibehash</summary><div class="answer"><p>Vibe Hash was installed for a different copy of Python. Run the install command again, starting with the same <code>python</code> or <code>python3</code> you use for everything else. If the one-line installer said Vibe Hash has its own environment, type <code>vibehash</code> instead of <code>python3 -m vibehash</code>; if it said Python is called py, type <code>py -m vibehash</code>.</p></div></details>
         <details><summary>The one-line installer can't reach vibehash.org</summary><div class="answer"><p>Some networks block new websites. GitHub serves the same scripts: on Windows, <code>irm https://raw.githubusercontent.com/AlphaChad5000/vibehash/main/install.ps1 | iex</code>; on macOS and Linux, <code>curl -fsSL https://raw.githubusercontent.com/AlphaChad5000/vibehash/main/install.sh | sh</code>.</p></div></details>
-        <details><summary>no node address / no wallet: run `vibehash setup`</summary><div class="answer"><p>Commands use the node address and wallet that setup saved. Run setup once, or add <code>--node</code> or <code>--wallet</code> to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
-        <details><summary>can't reach node at http://…</summary><div class="answer"><p>Check the node address with whoever runs the network. The node may also be offline for a moment; the worker keeps retrying on its own, so you can leave it running.</p></div></details>
+        <details><summary>no wallet: run `python -m vibehash setup`, or add --wallet FILE</summary><div class="answer"><p>Commands use the wallet and node address that setup saved; with no node saved, they use the public network. Run setup once, or add <code>--wallet</code> (and <code>--node</code>) to the command. To switch networks, run <code>vibehash setup --node NEW-ADDRESS</code>.</p></div></details>
+        <details><summary>can't reach node at https://…</summary><div class="answer"><p>Check you're online, and check the node address with whoever runs the network. The node may also be offline for a moment; the worker keeps retrying on its own, so you can leave it running.</p></div></details>
         <details><summary>stake at least 500000000 syn to take work</summary><div class="answer"><p>This network was set up to require stake, rather than letting workers earn it in, and yours is under the 5 VIBE minimum (500,000,000 syn). Ask whoever runs it for some VIBE, then stake it as Get started shows.</p></div></details>
         <details><summary>message timestamp too far from node clock</summary><div class="answer"><p>Your computer's clock is more than 2 minutes off. Turn on automatic time sync in your system settings.</p></div></details>
         <details><summary>node switched networks (genesis changed); refusing to continue</summary><div class="answer"><p>The address you're connected to now runs a different network. Check you have the right node address, then start the worker again.</p></div></details>
@@ -489,8 +511,8 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
         <details><summary>dataset … not available on this node</summary><div class="answer"><p>The job expects a dataset the network doesn't have. Post the job with the dataset file filled in, which uploads it with the job.</p></div></details>
         <details><summary>vibehash devices only lists the CPU</summary><div class="answer"><p>GPU support isn't installed, or was installed without support for your card (a plain <code>pip install torch</code> on Windows does that). Run <code>vibehash install-gpu</code>: it finds your card, installs the PyTorch build that runs on it, and tests it. If it says your driver is too old, update it from your card maker's website and run it again.</p></div></details>
         <details><summary>GPU training needs PyTorch / device … not found</summary><div class="answer"><p>You asked for a GPU with <code>--device</code>, but PyTorch can't see one. Run <code>vibehash devices</code> to see what's available, or leave out <code>--device</code> to fall back to the CPU automatically.</p></div></details>
-        <details><summary>censored: round 12: the node signed a receipt for your commit but sealed the round without it</summary><div class="answer"><p>The node accepted one of your messages, promised in a signed receipt to record it, then sealed the round without it, which can cost you that round's pay and reputation. Your receipts are proof: they're saved in <code>receipts.jsonl</code> in your worker's folder under <code>~/.vibehash/cache</code>. Anyone can check that file with <code>vibehash chain verify --receipts receipts.jsonl</code>, so share it with whoever runs the network, and with other workers deciding whether to trust that node.</p></div></details>
-        <details><summary>The dashboard looks garbled, or I want plain log lines</summary><div class="answer"><p>Add <code>--plain</code> to <code>worker</code> or <code>testnet</code>. Logs redirected to a file get plain lines automatically, and setting <code>NO_COLOR</code> turns the colours off.</p></div></details>
+        <details><summary>censored: round 12: the node signed a receipt for your commit but sealed the round without it</summary><div class="answer"><p>The node accepted one of your messages, promised in a signed receipt to record it, then sealed the round without it, which can cost you that round's pay and reputation. Your receipts are proof: they're saved in <code>~/.vibehash/cache/YOUR-ADDRESS/receipts.jsonl</code>. Anyone can check that file with <code>vibehash chain verify --receipts receipts.jsonl</code>, so share it with whoever runs the network, and with other workers deciding whether to trust that node.</p></div></details>
+        <details><summary>The dashboard looks garbled, or I want plain log lines</summary><div class="answer"><p>Add <code>--plain</code> to <code>worker</code>, <code>train</code> or <code>job watch</code>. Logs redirected to a file get plain lines automatically, and setting <code>NO_COLOR</code> turns the colours off.</p></div></details>
         <details><summary>I'm registered but never get any units</summary><div class="answer"><p>Check three things. Your memory must be at least the job's <code>memory_mb</code>: graphics memory for jobs that run on your GPU, system RAM otherwise (add <code>--memory-mb</code> if it's detected wrong). New workers get at most 4 units until they've delivered once, so the first round is small. And while you're still earning your stake, you only get units staked workers didn't need, so on a busy network the first rounds can pass with none; that changes once your first 5 VIBE is in.</p></div></details>
       </div>
     </section>
@@ -498,7 +520,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 </div>
 
 <footer>
-  <div class="wrap"><span>Vibe Hash 0.5 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.5</span></div>
+  <div class="wrap"><span>Vibe Hash 0.5.4 · unaudited test network software; VIBE has no cash value</span><span>Commands match vibehash 0.5.4</span><span class="fine">Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</span></div>
 </footer>
 
 <script>
@@ -529,7 +551,37 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "";
     return /win/i.test(p) ? "windows" : "unix";
   }
-  var defaults = { os: detectOs(), node: "", data: "my-data.csv" };
+  // The open-weight models `vibehash models` lists (vibehash/catalog.py), with what Hugging Face says about each.
+  // This page can't ask Hugging Face itself, so scripts/bake_models.py writes them in.
+  // models:begin
+  var MODELS = [
+    {"name": "qwen3-0.6b", "title": "Qwen3 0.6B", "repo": "Qwen/Qwen3-0.6B", "params": "752M", "experts": "", "weights": "1.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "1.5 GB", "left_out": []},
+    {"name": "llama-3.2-1b", "title": "Llama 3.2 1B Instruct", "repo": "meta-llama/Llama-3.2-1B-Instruct", "params": "1.2B", "experts": "", "weights": "2.5 GB", "estimated": true, "licence": "llama3.2", "gated": true, "team": [1, 1, 1], "held": "2.5 GB", "left_out": []},
+    {"name": "smollm3-3b", "title": "SmolLM3 3B", "repo": "HuggingFaceTB/SmolLM3-3B", "params": "3.1B", "experts": "", "weights": "6.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "6.2 GB", "left_out": []},
+    {"name": "phi-4-mini", "title": "Phi-4 mini", "repo": "microsoft/Phi-4-mini-instruct", "params": "3.8B", "experts": "", "weights": "7.7 GB", "estimated": false, "licence": "mit", "gated": false, "team": [1, 1, 1], "held": "7.7 GB", "left_out": []},
+    {"name": "qwen3-4b", "title": "Qwen3 4B", "repo": "Qwen/Qwen3-4B", "params": "4.0B", "experts": "", "weights": "8.0 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "8.0 GB", "left_out": []},
+    {"name": "gemma-4-e2b", "title": "Gemma 4 E2B", "repo": "google/gemma-4-E2B-it", "params": "5.1B", "experts": "", "weights": "10.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "10.2 GB", "left_out": []},
+    {"name": "mistral-7b", "title": "Mistral 7B Instruct", "repo": "mistralai/Mistral-7B-Instruct-v0.3", "params": "7.2B", "experts": "", "weights": "14.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "14.5 GB", "left_out": []},
+    {"name": "llama-3.1-8b", "title": "Llama 3.1 8B Instruct", "repo": "meta-llama/Llama-3.1-8B-Instruct", "params": "8.0B", "experts": "", "weights": "16.1 GB", "estimated": true, "licence": "llama3.1", "gated": true, "team": [2, 1, 1], "held": "16.1 GB", "left_out": []},
+    {"name": "qwen3-8b", "title": "Qwen3 8B", "repo": "Qwen/Qwen3-8B", "params": "8.2B", "experts": "", "weights": "16.4 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "16.4 GB", "left_out": []},
+    {"name": "gpt-oss-20b", "title": "gpt-oss 20B", "repo": "openai/gpt-oss-20b", "params": "20.9B", "experts": "4 of 32", "weights": "13.8 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "13.8 GB", "left_out": []},
+    {"name": "qwen3-14b", "title": "Qwen3 14B", "repo": "Qwen/Qwen3-14B", "params": "14.8B", "experts": "", "weights": "29.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [4, 2, 2], "held": "29.5 GB", "left_out": []},
+    {"name": "qwen3.8-27b", "title": "Qwen3.8 27B", "repo": "Qwen/Qwen3.8-27B", "params": "27.8B", "experts": "", "weights": "55.6 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [6, 3, 3], "held": "55.6 GB", "left_out": []},
+    {"name": "gemma-4-31b", "title": "Gemma 4 31B", "repo": "google/gemma-4-31B-it", "params": "31.3B", "experts": "", "weights": "62.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [7, 4, 3], "held": "62.5 GB", "left_out": []},
+    {"name": "gpt-oss-120b", "title": "gpt-oss 120B", "repo": "openai/gpt-oss-120b", "params": "116.8B", "experts": "4 of 128", "weights": "65.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [8, 4, 3], "held": "65.2 GB", "left_out": []},
+    {"name": "glm-5.3-flash", "title": "GLM-5.3-Flash", "repo": "zai-org/GLM-5.3-Flash", "params": "321.3B", "experts": "8 of 288", "weights": "328.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [45, 23, 15], "held": "328.3 GB", "left_out": []},
+    {"name": "glm-5.3", "title": "GLM-5.3", "repo": "zai-org/GLM-5.3", "params": "753.3B", "experts": "8 of 256", "weights": "755.6 GB", "estimated": false, "licence": "glm-5.3", "gated": false, "team": [null, 78, 39], "held": "755.6 GB", "left_out": []},
+    {"name": "deepseek-v4.1-flash", "title": "DeepSeek-V4.1-Flash", "repo": "deepseek-ai/DeepSeek-V4.1-Flash", "params": "763.2B", "experts": "6 of 384", "weights": "510.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [40, 20, 14], "held": "298.3 GB", "left_out": ["the engram tables (203.1 GB): each job gets a slice of the rows its data reads", "the draft layers and vision tower (8.9 GB): a text fine-tune doesn't use them"]}
+  ];
+  var MODELS_GPU_GB = [12, 24, 32], MODELS_CHECKED = "2026-11-01";
+  // models:end
+  var DISCLAIMER = "Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.";
+  function modelOf() {  // the open-weight model picked, or null for the small model trained from a CSV today
+    for (var i = 0; i < MODELS.length; i++) if (MODELS[i].name === state.model) return MODELS[i];
+    return null;
+  }
+
+  var defaults = { os: detectOs(), node: "", data: "my-data.csv", model: "csv" };
   var state = {};
   Object.keys(defaults).forEach(function (k) { var v = store.get("vibehash-guide-" + k); state[k] = v === null ? defaults[k] : v; });
   if (state.node === "NODE-ADDRESS") state.node = "";  // the placeholder older versions of this page filled in
@@ -538,33 +590,29 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
   var fields = {
     node: { label: "Node address (leave empty to join the public network)" },
-    data: { label: "Your data file (a CSV)" }
+    data: { label: "Your data file (a CSV)" },
+    model: { label: "Model" }
   };
-  var roleFields = { worker: ["node"], train: ["node", "data"], local: [] };
+  var roleFields = { worker: ["node"], train: ["model", "node", "data"] };
+  function fieldsFor(role) { return role === "train" && modelOf() ? ["model"] : roleFields[role]; }
   var intros = {
     worker: "Put your computer's spare time to work. It joins the public network unless you give another network's node address, and you start with no VIBE: you earn your stake as you go.",
     train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
-    local: "Run a complete network on this computer: a node, two workers and a training job. Nothing to fill in and nobody else involved."
+    coming: "Fine-tuning open-weight models on the network is coming, not live yet. Here is what this one would take. What works today is a small model trained from a CSV file: pick it from the Model menu to get started."
   };
+  function renderIntro() { document.getElementById("panel-intro").textContent = intros[state.role === "train" && modelOf() ? "coming" : state.role]; }
 
   function q(s) { return /[\s"'$`&|;<>()]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s; }
   function py() { return state.os === "unix" ? "python3" : "python"; }
   function vh(args) { return py() + " -m vibehash " + args; }
 
-  function install() {
-    return { title: "Install Vibe Hash", note: "Downloads Vibe Hash and the two libraries it uses from PyPI, the standard Python package index. " +
-        "Run it again any time to update. The second command checks it worked by listing the available commands.",
-      cmds: [py() + " -m pip install --upgrade vibehash", vh("--help")] };
-  }
-
   // The installer scripts (install.ps1 / install.sh in the repo): Python if needed, Vibe Hash, then setup's questions.
+  var INSTALL = { windows: "irm https://vibehash.org/install.ps1 | iex", unix: "curl -fsSL https://vibehash.org/install.sh | sh" };
   function oneLiner() {
     var node = state.node.trim();
     if (state.os === "unix") return "curl -fsSL https://vibehash.org/install.sh | " + (node ? "VIBEHASH_NODE=" + q(node) + " " : "") + "sh";
-    return (node ? "$env:VIBEHASH_NODE = '" + node.replace(/'/g, "''") + "'; " : "") + "irm https://vibehash.org/install.ps1 | iex";
+    return (node ? "$env:VIBEHASH_NODE = '" + node.replace(/'/g, "''") + "'; " : "") + INSTALL.windows;
   }
-
-  function home(file) { return (state.os === "unix" ? "~/.vibehash/" : "$HOME\\.vibehash\\") + file.replace(/\//g, state.os === "unix" ? "/" : "\\"); }
 
   var SAMPLE = [["weight_g", "length_cm", "width_cm", "sweetness", "colour_hue", "fruit"],
                 ["140", "21.0", "3.5", "18.9", "56", "banana"], ["195", "8.1", "8.0", "10.7", "36", "orange"],
@@ -574,51 +622,47 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     var s = state;
     if (role === "worker") {
       return [
-        { title: "Install and set up", note: "One line does everything, then asks you a few questions. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
-            ", connects to the network (the public one, unless you gave another node's address), creates your wallet (choose a password, and it prints your address, which starts with vibe1), finds your graphics card and offers to install GPU support for it (a 1–3 GB download), and checks your stake. The new wallet comes with 24 recovery words, shown once: write them down and keep them offline. They rebuild the wallet if its file is lost (vibehash wallet restore), and anyone who sees them can take your coins. When everything's ready it offers to start mining straight away: say yes, and the next steps are only for later. Run it again any time to update; it keeps what's already done. The script is short: open its address in a browser to read it first.",
+        { title: "Install and set up", note: "The one line from above, for your system. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
+            " and runs setup's four steps: network, wallet, graphics card, stake. Write down the 24 recovery words it shows. When it asks “Start mining now?”, say yes, and the steps below are only for later. To join a network other than the public one, type its node address in the box above first. Run the line again any time to update; it keeps your wallet and settings. The script is short: open its address in a browser to read it first.",
           cmds: [oneLiner()] },
-        { title: "Stake (usually not needed)", note: "Most networks let you start with nothing: your first 5 VIBE of pay becomes your stake, and setup tells you so. Then skip this step. If setup says this network needs stake first, send your vibe1 address to whoever runs it so they can send you some, then stake it; this stakes 10. Like every transaction it pays a tiny fee, 0.0001 VIBE on most nodes, so ask for slightly more. Stake is only at risk if you cheat; crashes never touch it.",
-          cmds: [vh("stake --amount 10")] },
-        { title: "Start working", note: "Setup starts this for you the first time; this is how to start it again later. The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. GPU-sized jobs train on the graphics card; small float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
+        { title: "Stake (usually not needed)", note: "The public network lets you start with nothing: your first 5 VIBE of pay becomes your stake, and setup tells you so. Then skip this step. If setup says your network needs stake first, send your vibe1 address to whoever runs it so they can send you some VIBE, then stake it; 5 VIBE is the minimum. Like every transaction it pays a small fee, 0.0001 VIBE on the public network and by default, so ask for slightly more. Stake is only at risk if you cheat; crashes never touch it.",
+          cmds: [vh("stake --amount 5")] },
+        { title: "Start working", note: "Setup starts this for you the first time; this is how to start it again later. The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. float32 jobs train on the graphics card; float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
           cmds: [vh("worker")] },
-        { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, and your reputation.", cmds: [vh("balance")] },
-        { title: "Withdraw when you're done", note: "Unstaked coins wait 20 rounds before you can spend them, and they can still be slashed until then. The fee comes from your spendable balance, which your earnings have filled by then.", cmds: [vh("unstake --amount 10")] }
+        { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, your reputation, and the node's transaction fee.", cmds: [vh("balance")] },
+        { title: "Withdraw when you're done", note: "Balance shows how much you have staked; this unstakes 5 VIBE, what earning in puts there. Unstaked coins wait 20 blocks before you can spend them, and they can still be slashed until then. The fee comes from your spendable balance, which your earnings have filled by then.", cmds: [vh("unstake --amount 5")] }
+      ];
+    }
+    if (role === "train" && modelOf()) {
+      var m = modelOf();
+      return [
+        { title: "What it would take", note: "What Hugging Face says about " + m.title + ", as of " + MODELS_CHECKED + ". A team of graphics cards would hold its weights between them, whole layers on each card, with a quarter of each card's memory left for training. With Vibe Hash installed, this command shows the same, fresh from Hugging Face, and stops there: it posts nothing and spends nothing.",
+          facts: modelFacts(m), cmds: [vh("train --base " + m.name)] },
+        { title: "Fine-tune it", soon: true, note: "When fine-tuning goes live, this will be the whole command: your own text or chats, one JSON object per line, and teams of workers' graphics cards train a small LoRA adapter for the model, which you download and use with Hugging Face transformers. Until then it only shows what it would take, as above.",
+          cmds: [vh("train my-chats.jsonl --base " + m.name)] },
+        { title: "Compare the models", note: "Lists every model in the menu above with fresh facts from Hugging Face: size, licence, gated or not, and the graphics cards a team needs.",
+          cmds: [vh("models")] },
+        { title: "Train a model today", note: "The network already trains small models from a spreadsheet of examples. Choose “A small model sized to your data” in the Model menu above for the steps.", cmds: [] }
       ];
     }
     if (role === "train") {
       var file = s.data.trim() || "my-data.csv", stem = file.replace(/^.*[\\/]/, "").replace(/\.[^.]*$/, "") || "my-data";
       return [
-        { title: "Install and set up", note: "One line installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
-            ", connects to the network (the public one, unless you gave another node's address) and creates your wallet: choose a password, and it prints your vibe1 address and 24 recovery words to write down, which rebuild the wallet if you lose its file. The training runs on other people's computers, so when it offers GPU support you can say no.",
+        { title: "Install and set up", note: "The same one line. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
+            " and runs setup's four steps. Write down the 24 recovery words it shows. The training runs on other people's computers, so when setup offers GPU support you can say no, and when it asks “Start mining now?”, say no unless you want to earn VIBE too.",
           cmds: [oneLiner()] },
-        { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some; 100 VIBE is plenty for a first model. This shows when it has arrived.",
+        { title: "Get VIBE", note: "Training is paid for in VIBE. Send your vibe1 address to whoever runs the network and ask for some, or earn it as a worker. The steps below spend 100 VIBE plus a 0.0001 VIBE fee, so you need a little more than 100. This shows when it has arrived.",
           cmds: [vh("balance")] },
-        { title: "Get your data ready", note: "A CSV file, such as a spreadsheet saved as CSV: a header row naming the columns, then one row per example. Every column is an input and must hold numbers, except the last one, which is what the model learns to predict, as names like these or as numbers. No data yet? The command writes this sample, fruit.csv, to try.",
+        { title: "Get your data ready", note: "A CSV file, such as a spreadsheet saved as CSV: a header row naming the columns, then one row per example. Every column is an input and must hold numbers, except the last one, which is what the model learns to predict, as names like these or as numbers. No data yet? The command writes this sample, fruit.csv, to try, and fruit-new.csv, 12 more fruit without names, to predict.",
           sample: SAMPLE, cmds: [vh("example")] },
-        { title: "Train", note: "Uploads your data, sizes a model to fit it, and posts the job. Before spending anything it prints what it will train and what it costs: 100 VIBE pays for up to 10 rounds, charged only for work that passes its checks. A fifth of your rows are held back and never trained on, so the accuracy you see is honest. Then it follows the job live: a forge where your model is a blade that grows with its accuracy, round-by-round accuracy and loss, and the budget left. Ctrl+C stops watching, not training.",
+        { title: "Train", note: "Asks for your wallet password, uploads your data, sizes a model to fit it, and posts the job. Then it prints what it posted: the rows it trains on, the model, and the budget. 100 VIBE pays for up to 10 rounds at 10 VIBE each, charged only for work that passes its checks. A fifth of your rows are held back and never trained on, so the accuracy you see is honest. Then it follows the job live: a forge where your model is a blade that grows with its accuracy, round-by-round accuracy and loss, and the budget left. Ctrl+C stops watching, not training.",
           cmds: [vh("train " + q(file) + " --budget 100")] },
-        { title: "Watch it learn", note: "Brings the live view back after you closed it, until the budget is spent. The second command prints a summary instead: the rounds done, the accuracy on the held-back rows as it climbs, and the budget left. Each round takes under a minute.",
+        { title: "Watch it learn", note: "Brings the live view back after you closed it, until the budget is spent. The second command prints a summary instead: the rounds done, the accuracy on the held-back rows as it climbs, and the budget left. A round takes about 38 seconds, and jobs with budget left take turns, a round each, so while other jobs run yours trains every few rounds.",
           cmds: [vh("job watch"), vh("job status")] },
         { title: "Download the model", note: "Saves the trained model as one file, " + stem + "-model.npz. You can download it part-way through and again later; the file is replaced with the newer model.",
           cmds: [vh("job download")] },
-        { title: "Use it", note: "Predicts each row of a new CSV with the same columns; the column to predict can be left out. Add --out predictions.csv to save every row with its prediction and how sure the model is.",
+        { title: "Use it", note: "Predicts each row of a new CSV with the same columns; the column to predict can be left out. It shows the first 20 rows. Add --out predictions.csv to save every row with its prediction and how sure the model is.",
           cmds: [vh("predict new-rows.csv")] }
-      ];
-    }
-    if (role === "local") {
-      var local = " --node http://127.0.0.1:8545";
-      return [
-        install(),
-        { title: "Add GPU support (optional)", note: "Finds your graphics card and installs the PyTorch build that runs on it, a 1–3 GB download. It tells you if your card or driver can't be used. Skip it and the test network trains on the CPU instead.", cmds: [vh("install-gpu")] },
-        { title: "Start a test network", note: "Runs a node, two workers and a sample training job on this computer, and shows the mining dashboard with a row for each worker. Leave it running and stop it with Ctrl+C. Running it again carries on where it stopped; add --reset to start over. Its wallets are throwaway test keys.",
-          cmds: [vh("testnet")] },
-        { title: "Run it with validators", note: "Stop the test network, then start it again with four validator nodes instead of one. They take turns leading rounds, check each other's blocks by replaying them, and vote: a block is final once validators holding more than two thirds of the stake have signed it. The log names which validator led each round. The number of validators is fixed when a test network is first made, so --reset starts a fresh one.",
-          cmds: [vh("testnet --validators 4 --reset")] },
-        { title: "Look around", note: "In a second terminal while it runs: check a worker's balance, then download every block and replay every round yourself. That shows each payment and penalty follows from the workers' signed messages, and each block carries enough validator signatures to be final.",
-          cmds: [vh("balance" + local + " --wallet " + home("testnet/worker-1.json")), vh("chain verify" + local + " --genesis " + home("testnet/genesis.json"))] },
-        { title: "Train a model on it", note: "Also in a second terminal: write the fruit sample and train on it, paying with your test network's requester wallet, which holds 10,000 test VIBE. The job takes turns with the demo job; follow and download it as the Train a model tab shows.",
-          cmds: [vh("example"), vh("train fruit.csv" + local + " --wallet " + home("testnet/requester.json"))] },
-        { title: "Let other computers join", note: "Starts the test network open to your local network. Newcomers join with the worker steps, and the dashboard shows how to send them VIBE to stake.", cmds: [vh("testnet --host 0.0.0.0")] }
       ];
     }
     return stepsFor("worker");
@@ -629,19 +673,79 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
 
   function renderControls() {
     controls.textContent = "";
-    roleFields[state.role].forEach(function (key) {
-      var wrap = document.createElement("div"), id = "in-" + key, input = document.createElement("input");
-      wrap.className = "field";
+    fieldsFor(state.role).forEach(function (key) {
+      var wrap = document.createElement("div"), id = "in-" + key, input;
+      wrap.className = key === "model" ? "field wide" : "field";
       var lab = document.createElement("label"); lab.htmlFor = id; lab.textContent = fields[key].label;
-      input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.id = id; input.value = state[key];
-      input.addEventListener("input", function () { update(key, input.value); });
+      if (key === "model") {
+        input = modelSelect();
+        var fine = document.createElement("p"); fine.className = "fine"; fine.textContent = DISCLAIMER;
+      } else {
+        input = document.createElement("input");
+        input.type = "text"; input.spellcheck = false; input.autocomplete = "off"; input.value = state[key];
+        input.addEventListener("input", function () { update(key, input.value); });
+      }
+      input.id = id;
       wrap.append(lab, input);
+      if (key === "model") wrap.appendChild(fine);
       controls.appendChild(wrap);
     });
   }
 
+  // Today's model first, then the open-weight models, each with its size and licence and marked as coming.
+  function modelSelect() {
+    var sel = document.createElement("select");
+    sel.appendChild(new Option("A small model sized to your data (works today)", "csv"));
+    var group = document.createElement("optgroup");
+    group.label = "Open-weight models: fine-tuning coming";
+    MODELS.forEach(function (m) {
+      group.appendChild(new Option(m.title + " (coming) · " + (m.estimated ? "about " : "") + m.weights + " · " + m.licence + (m.gated ? ", gated" : ""), m.name));
+    });
+    sel.appendChild(group);
+    sel.value = modelOf() ? state.model : "csv";
+    sel.addEventListener("change", function () {
+      update("model", sel.value); renderIntro(); renderControls();  // today's model has more to fill in
+      document.getElementById("in-model").focus();
+    });
+    return sel;
+  }
+
+  function modelFacts(m) {
+    var gb = MODELS_GPU_GB, team = m.team[0] === 1 ? "one " + gb[0] + " GB card holds it" :
+      m.team.map(function (n, i) { return n === null ? "none with " + gb[i] + " GB (one layer is too big)" : n + " with " + gb[i] + " GB"; }).join(" · ");
+    var rows = [
+      ["Hugging Face", m.repo, "https://huggingface.co/" + m.repo],
+      ["Parameters", m.params + (m.experts ? ", a mixture of experts: " + m.experts + " used per token" : "")],
+      ["Weights", (m.estimated ? "about " : "") + m.weights + " as stored" + (m.estimated ? " (a gated model's files are listed only to accounts that accepted its licence)" : "")],
+      ["Licence", m.licence],
+      ["Gated", m.gated ? "yes: accept its licence on Hugging Face first" : "no"],
+      ["Graphics cards", team]
+    ];
+    if (m.left_out.length) rows.push(["Team holds", m.held + ", leaving out " + m.left_out.join("; ")]);
+    return rows;
+  }
+
+  function factsList(rows) {
+    var dl = document.createElement("dl");
+    dl.className = "facts";
+    rows.forEach(function (r) {
+      var dt = document.createElement("dt"), dd = document.createElement("dd");
+      dt.textContent = r[0];
+      if (r[2]) { var a = document.createElement("a"); a.href = r[2]; a.target = "_blank"; a.rel = "noopener"; a.textContent = r[1]; dd.appendChild(a); }
+      else dd.textContent = r[1];
+      dl.append(dt, dd);
+    });
+    return dl;
+  }
+
   var osButtons = Array.prototype.slice.call(document.querySelectorAll(".os button"));
-  function renderOs() { osButtons.forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.os === state.os ? "true" : "false"); }); }
+  var heroPrompt = document.querySelector(".runline .prompt");
+  function renderHero() {  // the header's first step: the install line for this system
+    var unix = state.os === "unix";
+    heroCmd.textContent = unix ? INSTALL.unix : INSTALL.windows;
+    heroPrompt.textContent = unix ? "$ " : "> ";
+  }
+  function renderOs() { osButtons.forEach(function (b) { b.setAttribute("aria-pressed", b.dataset.os === state.os ? "true" : "false"); }); renderHero(); }
   osButtons.forEach(function (b) { b.addEventListener("click", function () { update("os", b.dataset.os); renderOs(); }); });
 
   function sampleTable(rows) {
@@ -661,20 +765,25 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     stepsFor(state.role).forEach(function (st) {
       var li = document.createElement("li");
       var h = document.createElement("h3"); h.textContent = st.title;
+      if (st.soon) { var pill = document.createElement("span"); pill.className = "pill soon"; pill.textContent = "not available yet"; h.appendChild(pill); }
       var n = document.createElement("p"); n.className = "note"; n.textContent = st.note;
       li.append(h, n);
       if (st.sample) li.appendChild(sampleTable(st.sample));
+      if (st.facts) li.appendChild(factsList(st.facts));
       if (st.cmds.length) {
         var box = document.createElement("div"); box.className = "cmds";
         st.cmds.forEach(function (c) {
-          var wrap = document.createElement("div"); wrap.className = "cmd";
+          var wrap = document.createElement("div"); wrap.className = st.soon ? "cmd soon" : "cmd";
           var pre = document.createElement("pre");
           var p = document.createElement("span"); p.className = "prompt"; p.textContent = state.os === "unix" ? "$ " : "> ";
           var code = document.createElement("code"); code.textContent = c;
           pre.append(p, code);
-          var b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy command");
-          b.addEventListener("click", function () { copyText(b, c, code); });
-          wrap.append(pre, b);
+          wrap.appendChild(pre);
+          if (!st.soon) {  // nothing to copy for a command that isn't live
+            var b = document.createElement("button"); b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy command");
+            b.addEventListener("click", function () { copyText(b, c, code); });
+            wrap.appendChild(b);
+          }
           box.appendChild(wrap);
         });
         li.appendChild(box);
@@ -690,8 +799,7 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
     state.role = role; store.set("vibehash-guide-role", role);
     tabs.forEach(function (t) { var on = t.dataset.role === role; t.setAttribute("aria-selected", on ? "true" : "false"); t.tabIndex = on ? 0 : -1; });
     document.getElementById("builder-panel").setAttribute("aria-labelledby", "tab-" + role);
-    document.getElementById("panel-intro").textContent = intros[role];
-    renderControls(); renderOs(); renderSteps();
+    renderIntro(); renderControls(); renderOs(); renderSteps();
   }
   tabs.forEach(function (t, i) {
     t.addEventListener("click", function () { selectRole(t.dataset.role); });

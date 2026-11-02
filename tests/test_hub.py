@@ -250,6 +250,9 @@ class FakeHub:
                 return self._text(h, json.dumps(info).encode(), {"Content-Type": "application/json"})
             if rest[0] == "tree":
                 entries = self._tree(r["commits"][commit])
+                if r["gated"] and (auth or "").removeprefix("Bearer ") not in r["tokens"]:
+                    # As the real Hub does: a gated repo's LFS sha256 is asterisks to an account without access.
+                    entries = [{**e, "lfs": {**e["lfs"], "oid": "*" * 64}} if e.get("lfs") else e for e in entries]
                 start = int(query.get("cursor", ["0"])[0])
                 page, headers = entries[start:start + self.page_size], {"Content-Type": "application/json"}
                 if start + self.page_size < len(entries):  # utils/_pagination._get_next_page reads Link rel="next"
@@ -553,9 +556,16 @@ class TokenTests(HubTestCase):
         self.assertNotIn("hf_nope", str(cm.exception))
         raw = Hub(self.fake.endpoint, token="hf_ok").fetch_tensor("acme/gated", commit, "model.norm.weight")[2]
         self.assertEqual(raw, shard2()["model.norm.weight"][2])
-        # The API still describes a gated model to anyone, so describe() works before the licence is accepted.
+        # The API still describes a gated model to anyone, so describe() works before the licence is accepted, though
+        # the listing hides the weights' sha256 (which once made describe() refuse every gated model on the real Hub).
         s = self.hub.describe("acme/gated")
         self.assertTrue(s.gated)
+        self.assertGreater(s.weight_bytes, 0)
+        hidden = [f for f in self.hub.list_files("acme/gated", commit).values() if f.hidden]
+        self.assertTrue(hidden)
+        self.assertTrue(all(f.lfs_sha256 is None for f in hidden))
+        with self.assertRaisesRegex(AccessError, "hides the sha256 .*accept the licence"):  # never used unchecked
+            hub._FileCheck(hidden[0])
         self.assertEqual(s.architecture, "TinyForCausalLM")
         self.assertIn("accept its licence", str(s))
 
@@ -762,6 +772,24 @@ class DescribeTests(HubTestCase):
         self.assertFalse(s.pickle_only)
         for words in (commit, "2 safetensors files", "mixture of 8 experts (2 per token), 2 layers", "licence: mit"):
             self.assertIn(words, str(s))
+
+    def test_shape_nested_in_text_config(self):
+        # DeepSeek-V4.1-Flash's config.json, cut down: the language model's shape sits in text_config, beside a vision
+        # tower whose 32 layers must not be taken for the model's 40.
+        config = {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41", "dtype": "bfloat16",
+                  "quantization_config": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0"},
+                  "text_config": {"model_type": "deepseek_v41_text", "num_hidden_layers": 40, "n_routed_experts": 384,
+                                  "num_experts_per_tok": 6},
+                  "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+        self.fake.add_commit("acme/v41", {**sharded_files(), "config.json": json.dumps(config).encode()})
+        s = self.hub.describe("acme/v41")
+        self.assertEqual((s.architecture, s.dtype), ("DeepseekV41ForCausalLM", "bfloat16, fp8"))
+        self.assertEqual((s.layers, s.experts, s.experts_per_token), (40, 384, 6))
+        self.assertIn("mixture of 384 experts (6 per token), 40 layers", str(s))
+        # A top-level value still wins over a nested one.
+        config["num_hidden_layers"] = 41
+        self.fake.add_commit("acme/v41", {**sharded_files(), "config.json": json.dumps(config).encode()})
+        self.assertEqual(self.hub.describe("acme/v41").layers, 41)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@
 A forge in the same mine the workers dig: the model is a blade on an anvil, longer and brighter the more accurate it
 gets. While the network trains it, the furnace roars and a trip hammer strikes it; when a round is sealed the blade
 glows white-hot, grows to its new length, and the change in accuracy flashes above it. While other jobs take their
-turn the fire banks down to embers, and once the budget is spent it goes out and the finished blade gleams.
+turn the fire banks down to embers, and once the budget is spent it goes out and the finished blade gleams. A job
+that fine-tunes an open-weight model forges that model's emblem instead (emblems.py): a dull cast that takes on its
+maker's colours from left to right as the model gets more accurate.
 
 Below it: the network's round and phase and whether this job is the one training, accuracy and loss per round as a
 chart that climbs, the units accepted each round, the budget spent and left in escrow with the rounds it still pays
@@ -22,6 +24,7 @@ import http.client
 import logging
 import math
 import random
+import re
 import shutil
 import threading
 import time
@@ -29,7 +32,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from . import termui
+from . import catalog, emblems, termui
+from .hub import check_repo
 from .client import NodeClient, NodeError
 from .termui import (DIM, GOLD, GREEN, LAMP, PHASES, RED, SPARKS, TEXT, TIMBER, WHITE, YELLOW, _cells, _line, _n,
                      _noise, _vibe, rgb, supported)
@@ -63,8 +67,10 @@ GLYPHS = {**termui.GLYPHS, "hammer": "▐█▌", "loss": "•", "dot": "·", "e
           "rule": "│", "arrow": "→"}
 ASCII = {**termui.ASCII, "hammer": "[#]", "loss": "o", "dot": ".", "eighths": " ..__==##", "axis": "+",
          "rule": "|", "arrow": "->"}
-BAND = 7  # rows in the forge picture: rock above, the chamber in rows 1-4, the floor
+BAND = 7  # rows in the forge picture: rock above, the chamber in rows 1-4, the floor; two more around an emblem
 HANDLE, BLADE, HAMMER_X = 9, 11, 13  # columns: the blade's handle, where its body starts, the hammer over the anvil
+EMBLEM_X = 8  # an emblem's left edge, on the anvil; it stands in the chamber's rows 1-5, and the hammer over its middle
+HOT_RGB = (255, 228, 170)  # what an emblem glows toward when struck or when a round lands
 
 
 # --- reading the node's replies, trusting none of their fields ---------------------------------------------------
@@ -96,6 +102,7 @@ class Job:
     widths: tuple = ()
     escrow: int | None = None  # budget left
     rounds: tuple = ()
+    base: str | None = None  # the open-weight model a fine-tune starts from (`hf:org/name@commit`), when it has one
 
     @property
     def scored(self) -> list[Round]:
@@ -117,6 +124,29 @@ class Job:
         return 1 / self.classes if self.classes >= 2 else 0.0
 
 
+_REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", re.ASCII)  # a branch, tag or commit, as git allows them
+
+
+def safe_base(text) -> str | None:
+    """A base model reference fit to put on the screen, or None. The node hands back a job's spec as its poster wrote
+    it, so `base` could hold anything, escape sequences included: only a Hugging Face reference passes, as
+    `[hf:]org/name[@rev]` in plain ASCII (or a catalog name, as the repository it stands for)."""
+    if not isinstance(text, str) or not 0 < len(text) <= 300:
+        return None
+    model = catalog.find(text) if text.isascii() and text.isprintable() else None
+    if model:
+        return model.repo
+    ref = text[3:] if text[:3].lower() == "hf:" else text
+    repo, at, rev = ref.partition("@")
+    try:
+        check_repo(repo)
+    except ValueError:
+        return None
+    if "/" not in repo or (at and not _REV.fullmatch(rev)):
+        return None
+    return text
+
+
 def parse_job(reply) -> Job:
     d = reply if isinstance(reply, dict) else {}
     spec = d.get("spec") if isinstance(d.get("spec"), dict) else {}
@@ -132,7 +162,8 @@ def parse_job(reply) -> Job:
             rounds[h] = Round(h, max(0, _num(r.get("accepted_units"), int, 0)), _num(r.get("val_loss")),
                               None if acc is None else max(0.0, min(1.0, acc)))
     escrow = _num(d.get("escrow"), int)
-    return Job(fee=max(0, _num(spec.get("fee_per_round"), int, 0)), units=max(0, _num(spec.get("units_per_round"), int, 0)),
+    base = safe_base(spec.get("base"))
+    return Job(base=base, fee=max(0, _num(spec.get("fee_per_round"), int, 0)), units=max(0, _num(spec.get("units_per_round"), int, 0)),
                classes=max(0, _num(m.get("n_out"), int, 0)), widths=widths, escrow=None if escrow is None else max(0, escrow),
                rounds=tuple(rounds[h] for h in sorted(rounds)))
 
@@ -181,8 +212,10 @@ class JobWatch:
     `poll()` makes one round of requests and says how long to wait before the next; `follow()` loops it on a thread
     for the dashboard. Events go to `events`, as (time, level, text), and to each of `listeners`."""
 
-    def __init__(self, job_id: str, node_url: str, budget: int | None = None, posted: bool = False, api=None):
+    def __init__(self, job_id: str, node_url: str, budget: int | None = None, posted: bool = False, api=None,
+                 base: str | None = None):
         self.job_id, self.url, self.posted = job_id, node_url.rstrip("/"), posted
+        self.base_hint = safe_base(base)  # the model it fine-tunes, when the poster knows it before the node says
         self.api = api if api is not None else Reader(node_url)
         self.budget_hint = budget if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0 else None
         self.job: Job | None = None
@@ -212,6 +245,11 @@ class JobWatch:
             return self.budget_hint
         job = self.job
         return None if job is None or job.escrow is None else job.escrow + job.spent
+
+    @property
+    def base(self) -> str | None:
+        """The open-weight model the job fine-tunes, or None for a model trained from scratch on a CSV file."""
+        return self.base_hint or (self.job.base if self.job is not None else None)
 
     def lingering(self, now: float) -> float | None:
         """Seconds before a job that finished while watched leaves the screen; None if it hasn't."""
@@ -418,6 +456,26 @@ def _metal(base: tuple, heat: float) -> str:
     return rgb(*HOT[-1][1], True)
 
 
+def _forged(colour: tuple, t: float, heat: float, shine: bool) -> tuple:
+    """One pixel of an emblem being forged: dull steel until the forging reaches its column (`t` from 0 to 1 across
+    it), then its own colour; glowing toward white-hot with `heat`, and catching the light when `shine`. In a few
+    steps, so a frame doesn't carry a colour per cell."""
+    c = _mix(STEEL_DULL, colour, round(max(0.0, min(1.0, t)) * 4) / 4)
+    if heat > 0:
+        c = _mix(c, HOT_RGB, round(min(0.85, heat) * 8) / 8)
+    return _mix(c, (255, 255, 255), 0.7) if shine else c
+
+
+def _half(g: dict, top: tuple | None, bottom: tuple | None, two_tone: bool) -> tuple[str, str]:
+    """Two pixels, one above the other, as one character cell: (char, style). Without colour, or in ASCII, a cell
+    with both is just full."""
+    if top and bottom:
+        if top == bottom or not two_tone:
+            return g["full"], rgb(*top)
+        return g["bottom"], _on(rgb(*top), bottom)  # the upper half in the top pixel's colour, the rest in the bottom's
+    return (g["bottom"], rgb(*top)) if top else (g["top"], rgb(*bottom))
+
+
 def _pick(width: int, *variants):
     """The first variant, a list of (text, style), that fits in `width`; else the last, to be cut."""
     return next((v for v in variants if sum(len(t) for t, _ in v) <= width), variants[-1])
@@ -446,6 +504,7 @@ class TrainDashboard:
         self.g = termui.glyphs_for(GLYPHS, ASCII)
         self.frame_no, self.phase_seen = 0, {}
         self.blade = 2.0  # the blade's drawn length, which grows toward its accuracy's
+        self.fill = 0.0  # how many of an emblem's columns have taken on their colours, likewise
 
     def state(self, now: float) -> str:
         w = self.watch
@@ -460,7 +519,7 @@ class TrainDashboard:
 
     # --- the forge ---------------------------------------------------------------------------------------------
 
-    def _forge(self, width: int, now: float) -> list[str]:
+    def _forge(self, width: int, now: float, emblem: emblems.Emblem | None = None) -> list[str]:
         g, f, watch = self.g, self.frame_no, self.watch
         job, net, state = watch.job, watch.net, self.state(now)
         landed = watch.landed
@@ -470,20 +529,23 @@ class TrainDashboard:
         fire = 0.0 if state == "finished" else 1.0 if working else 0.75 if state == "training" else 0.35
         fire = max(fire, 0.8 * heat if state != "finished" else 0.0)
         right = width - 3  # where the chamber ends; its walls are a little ragged
-        rows = [[(" ", None)] * width for _ in range(BAND)]
-        for r in range(BAND):
+        low = 6 if emblem else 4  # the chamber's floor, where the furnace stands and the anvil's face is
+        clear_to = EMBLEM_X + emblem.width if emblem else 0  # no prop or lamp behind an emblem
+        rows = [[(" ", None)] * width for _ in range(low + 3)]
+        for r in range(low + 3):
             for x in range(width):
-                if 1 <= r <= 4 and 1 <= x <= right - (r in (1, 4)) - _noise(r, 7) % 2:
-                    if r < 4 and x % 12 == 0 and 24 <= x <= right - 3:
+                if 1 <= r <= low and 1 <= x <= right - (r in (1, low)) - _noise(r, 7) % 2:
+                    if r < low and x % 12 == 0 and max(24, clear_to + 1) <= x <= right - 3:
                         rows[r][x] = (g["post"], TIMBER)  # pit props, as in the mine
-                    elif r == 1 and x >= 22 and termui.lamp_distance(x) == 0:
+                    elif r == 1 and x >= max(22, clear_to + 1) and termui.lamp_distance(x) == 0:
                         rows[r][x] = (g["lamp"], LAMP)
                     continue
-                if r == 0 and 24 <= x <= right - 2 and x % 12 in (11, 0, 1):
+                if r == 0 and max(24, clear_to + 2) <= x <= right - 2 and x % 12 in (11, 0, 1):
                     rows[r][x] = (g["beam"], TIMBER)
                     continue
                 near = termui.lit_by(termui.lamp_distance(x)) if x >= 20 else 1
-                lit = 0 if x <= 9 and fire > 0.6 and r in (0, 5) else near if r in (0, 5) else 1  # glow of the fire
+                edge = r in (0, low + 1)  # the rock just above and below the chamber
+                lit = 0 if x <= 9 and fire > 0.6 and edge else near if edge else 1  # lit by the fire, or by lanterns
                 rows[r][x] = termui.rock(x, r, g, lit, ore=1)
 
         def put(r, c, text, style):
@@ -492,8 +554,8 @@ class TrainDashboard:
         # The furnace, built into the left wall: a stone hood and base, and the fire between.
         stone = termui.ROCK[(3, 0 if fire > 0.6 else 1)]
         put(1, 1, g["top"] + g["full"] * 4 + g["top"], stone)
-        put(4, 1, g["full"] * 6, stone)
-        for r in (2, 3):
+        put(low, 1, g["full"] * 6, stone)
+        for r in range(2, low):
             put(r, 1, g["full"], stone)
             put(r, 6, g["full"], stone)
             for x in range(2, 6):
@@ -501,59 +563,82 @@ class TrainDashboard:
                 level = fire * (0.55 + 0.45 * (n % 100) / 100) * (0.8 if r == 2 else 1.0)
                 put(r, x, g["shades"][(n >> 8) % 3], FIRE[min(5, int(level * 6))] if fire else ASH)
         # The anvil: a face (and horn) under the blade, on a block standing on the floor.
-        put(4, 8, g["bottom"] * 3 + g["full"] * 5 + g["bottom"] * 2, IRON)
-        # The hammer strikes twice a second while workers train the job, every second in its other phases.
+        put(low, 8, g["bottom"] * 3 + g["full"] * 5 + g["bottom"] * 2, IRON)
+        hx = EMBLEM_X + emblem.width // 2 if emblem else HAMMER_X
+        # The hammer strikes twice a second while workers train the job, every second in its other phases. An emblem
+        # stands taller than a blade, so over one the hammer rises into the roof.
         period = 6 if phase == "compute" else 12
         down = working and f % period < 2
-        head = 2 if down else 1
-        for r in range(head):
-            put(r, HAMMER_X, g["post"], TIMBER)
-        put(head, HAMMER_X - 1, g["hammer"], HAMMER)
-        # The blade: as long as the model is accurate, from a blind guess (short) to every row right (full length).
+        head = (1 if down else 0) if emblem else 2 if down else 1
+        # How far the model has come, from a blind guess (0.12) to every row right (1).
         scored = job.scored if job else []
         tip = None
         if job is not None:
             acc = max(0.0, min(1.0, scored[-1].acc)) if scored else None
             span = max(1e-9, 1 - job.chance)
             frac = 0.12 + 0.88 * max(0.0, min(1.0, (acc - job.chance) / span)) if acc is not None else 0.0
-            longest = max(4, min(60, width - BLADE - 12))
-            target = max(2.0, frac * longest)
-            step = target - self.blade
-            self.blade = target if abs(step) < 0.5 else self.blade + step * 0.25  # grows to its new length
-            length = round(self.blade)
-            base = _mix(STEEL_DULL, STEEL_BRIGHT, frac)
-            glint = f % (length + 30) if state == "finished" else -9
-            put(3, HANDLE, g["beam"] * 2, TIMBER)
-            for i in range(length + (acc is not None)):  # an untrained lump has no point yet
-                x = BLADE + i
-                worked = 0.7 * max(0.0, 1 - abs(x - HAMMER_X) / 6) * (1.0 if down else 0.8) if working else 0.0
-                cell = g["tips"][0] if i == length else g["full"]
-                style = rgb(240, 248, 255, True) if i in (glint, glint - 1) else _metal(base, max(heat, worked))
-                put(3, x, cell, style)
-            tip = BLADE + length
+            if emblem is None:  # the blade: as long as the model is accurate
+                longest = max(4, min(60, width - BLADE - 12))
+                target = max(2.0, frac * longest)
+                step = target - self.blade
+                self.blade = target if abs(step) < 0.5 else self.blade + step * 0.25  # grows to its new length
+                length = round(self.blade)
+                base = _mix(STEEL_DULL, STEEL_BRIGHT, frac)
+                glint = f % (length + 30) if state == "finished" else -9
+                put(3, HANDLE, g["beam"] * 2, TIMBER)
+                for i in range(length + (acc is not None)):  # an untrained lump has no point yet
+                    x = BLADE + i
+                    worked = 0.7 * max(0.0, 1 - abs(x - hx) / 6) * (1.0 if down else 0.8) if working else 0.0
+                    cell = g["tips"][0] if i == length else g["full"]
+                    style = rgb(240, 248, 255, True) if i in (glint, glint - 1) else _metal(base, max(heat, worked))
+                    put(3, x, cell, style)
+                tip, label_row = BLADE + length, 3
+            else:  # the emblem: a dull cast that takes on its colours from left to right as the model improves
+                target = frac * emblem.width
+                step = target - self.fill
+                self.fill = target if abs(step) < 0.3 else self.fill + step * 0.25
+                glint = f % (emblem.width + 30) if state == "finished" else -9
+                two_tone = termui.COLOR and g["full"] == GLYPHS["full"]  # a pixel above another, in two colours
+                for r, cells in enumerate(emblems.cells(emblem)):
+                    for i, pair in enumerate(cells):
+                        if pair == (None, None):
+                            continue
+                        x = EMBLEM_X + i
+                        worked = 0.7 * max(0.0, 1 - abs(x - hx) / 6) * (1.0 if down else 0.8) if working else 0.0
+                        top, bottom = (c and _forged(c, self.fill - i, max(heat, worked), i in (glint, glint - 1))
+                                       for c in pair)
+                        put(1 + r, x, *_half(g, top, bottom, two_tone))
+                tip, label_row = EMBLEM_X + emblem.width, 3
             if acc is not None:
-                put(3, tip + 2, f"{acc:.1%}", GOLD if state == "finished" or heat > 0.3 else WHITE)
+                put(label_row, tip + 2, f"{acc:.1%}", GOLD if state == "finished" or heat > 0.3 else WHITE)
             else:
-                put(3, tip + 2, "untrained", DIM)
-        # Sparks off the hammer while it works, and off the blade as a round lands.
+                put(label_row, tip + 2, "untrained", DIM)
+        for r in range(head):
+            put(r, hx, g["post"], TIMBER)
+        put(head, hx - 1, g["hammer"], HAMMER)
+        # Sparks off the hammer while it works, and off the work as a round lands; around an emblem, never on it.
+        clear = (lambda r, c: True) if emblem is None else (lambda r, c: rows[r][c][0] == " ")  # noqa: E731
         if down or (working and f % period == 2):
             for i in range(6):
                 n = _noise(f, i)
-                r, c = 1 + n % 2, HAMMER_X - 4 + (n >> 4) % 9
-                if not (r == head and HAMMER_X - 1 <= c <= HAMMER_X + 1):
+                r, c = 1 + n % 2, hx - 4 + (n >> 4) % 9
+                if not (r == head and hx - 1 <= c <= hx + 1) and clear(r, c):
                     put(r, c, g["sparks"][(n >> 8) % 5], SPARKS[(n >> 12) % 4])
         if heat > 0.5 and tip is not None:
+            start = BLADE if emblem is None else EMBLEM_X
             for i in range(5):
                 n = _noise(f, 40 + i)
-                put(1 + (n >> 5) % 2, BLADE + n % max(1, tip - BLADE + 1), g["sparks"][(n >> 8) % 5], SPARKS[(n >> 12) % 4])
-        # What the round did, above the blade's point.
+                r, c = 1 + (n >> 5) % 2, start + n % max(1, tip - start + 1)
+                if clear(r, c):
+                    put(r, c, g["sparks"][(n >> 8) % 5], SPARKS[(n >> 12) % 4])
+        # What the round did, above the work.
         if landed and now - landed[0] < 3 and tip is not None:
             _, r, delta = landed
             if delta is not None:
                 label, style = f" {delta * 100:+.1f} pts ", GREEN if delta > 0 else RED if delta < 0 else TEXT
             else:
                 label, style = (f" {r.acc:.1%} " if r.acc is not None else " sealed "), GOLD
-            put(0, max(HAMMER_X + 3, min(width - len(label) - 1, tip - len(label) // 2)), label, style)
+            put(0, max(hx + 3, min(width - len(label) - 1, tip - len(label) // 2)), label, style)
         return [_cells(row) for row in rows]
 
     # --- the chart ---------------------------------------------------------------------------------------------
@@ -636,19 +721,23 @@ class TrainDashboard:
         room = w - 1 - len(termui.BANNER[0]) - 3
         shape = f" {g['arrow']} ".join(str(x) for x in job.widths) if job and job.widths else ""
         chain = net.chain_id if net else ""
+        if watch.base:  # a fine-tune: the model it starts from, rather than layer widths
+            shape = watch.base[3:] if watch.base.lower().startswith("hf:") else watch.base
+            shape = shape.split("@")[0]
         tails = [termui._fit(room, f"model forge  ·  {watch.job_id}", watch.job_id),
                  termui._fit(room, f"{shape}  ·  {chain}" if shape and chain else shape or chain, shape, chain)]
         termui.header(add, g, ASCII, tails)
         head = len(lines)
         # Fixed rows: header, forge, two status lines, the headline, units and axis rows, two budget lines, footer.
-        spare = height - 1 - (head + BAND + 2 + 3 + 2 + 1)
+        emblem = emblems.for_base(watch.base)  # a fine-tune forges its model's emblem; a model from a CSV, a blade
+        spare = height - 1 - (head + BAND + 2 * (emblem is not None) + 2 + 3 + 2 + 1)
         gaps = spare >= 8  # blank lines between sections, when there's room
         spare -= 5 * gaps
         rows = max(3, min(10, height // 5, spare - 3))
         gap = (lambda: lines.append("")) if gaps else (lambda: None)  # noqa: E731
 
         gap()
-        lines += [" " + row for row in self._forge(w - 2, now)]
+        lines += [" " + row for row in self._forge(w - 2, now, emblem)]
         gap()
         # The network: its round and phase, and whose turn it is.
         mine = net is not None and net.round and net.job_id == watch.job_id

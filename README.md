@@ -83,6 +83,14 @@ python -m vibehash worker
 To join a different network instead, give setup its node's address, such as
 `python -m vibehash setup --node 192.168.1.20`.
 
+Or skip the commands: `python -m vibehash` on its own, at a terminal, opens a
+menu of what people do most. Pick with the arrow keys or a number. Each item
+shows the command it runs, and you're back in the menu when it's done.
+
+```bash
+python -m vibehash
+```
+
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
 
@@ -113,6 +121,33 @@ your own testnet, pay with its requester wallet by adding
 `--node http://127.0.0.1:8545 --wallet ~/.vibehash/testnet/requester.json` to
 `train`. Jobs take turns a round at a time, so a new one starts at the next
 round.
+
+**Fine-tuning open-weight models is coming, not live yet.** To see what's
+planned, list the models:
+
+```bash
+python -m vibehash models
+```
+
+It lists popular open-weight models (Qwen, Llama, Gemma, Mistral, Phi,
+gpt-oss, GLM and DeepSeek), smallest first, with what Hugging Face says about
+each: parameters, experts, weight size, licence and whether it's gated. It
+also shows how many graphics cards of 12, 24 or 32 GB a team would need to
+hold the model. The answers are cached for a day; `--refresh` asks again, and
+`--json` is for scripts. Where Hugging Face is out of reach it gives up after
+one short timeout and shows what it said last time. `train --base qwen3-0.6b` takes a name from that
+list, an `org/name` or a huggingface.co address, shows what fine-tuning that
+model would take, and stops there: it posts nothing and spends nothing. Run
+in a terminal with no data file, `train` offers the same choice as a
+numbered menu, with today's CSV model first. A data file without `--base` is
+read as a table, as before. [FINETUNING.md](FINETUNING.md)
+describes what's coming. When a fine-tune trains, its dashboard forges the
+model maker's emblem in place of the blade (`scripts/preview_forge.py NAME`
+shows one now).
+
+Disclaimer: All product names, logos, and brands are property of their
+respective owners and are used purely for identification. Vibe Hash isn't
+affiliated with or endorsed by them.
 
 In a terminal, `worker` and `testnet` show a live mining dashboard: a drill
 boring through rock while you train, the round and phase, your speed, units
@@ -155,14 +190,14 @@ trusted publisher for `vibehash` names owner `AlphaChad5000`, repository
 `vibehash`, workflow `publish.yml` and environment `pypi`.
 
 1. Bump `version` in `pyproject.toml` (PyPI never accepts the same version
-   twice; 0.5.3 is out), commit it, and push.
+   twice; 0.5.4 is out), commit it, and push.
 2. Tag the commit with that version and push the tag. This publishes it:
 
 ```bash
-git tag v0.5.4
+git tag v0.5.5
 ```
 ```bash
-git push origin v0.5.4
+git push origin v0.5.5
 ```
 
 Follow the run under the repository's Actions tab. To try a build locally
@@ -347,7 +382,9 @@ from the outside, and restarts the node from disk.
 double-voting validators, lost messages and a split network, on a simulated
 clock. `tests/test_hardening.py` covers fees, issuance schedules, HTTPS
 nodes, rate limits and recovery words, including the official BIP39 and
-SLIP-0010 test vectors.
+SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
+`models` and `train --base` against a fake Hugging Face Hub, and that
+`train --base` never reaches the node or the wallet.
 
 ## Layout
 
@@ -373,8 +410,10 @@ SLIP-0010 test vectors.
 | `vibehash/client.py` | HTTP client and the worker loop, with live `WorkerStats` |
 | `vibehash/minerui.py` | The terminal mining dashboard (plain ANSI, ASCII fallback) |
 | `vibehash/trainui.py` | The terminal training dashboard: a job followed live from the node, politely, with a log-line mode |
+| `vibehash/emblems.py` | Pixel-art emblems of the model makers, which the training dashboard forges instead of a blade for a fine-tune (`scripts/preview_forge.py NAME` plays one) |
 | `vibehash/termui.py` | What the two dashboards share: palette, the mine's rock, banner, phase bar, event feed, the alternate screen |
 | `vibehash/tabular.py` | CSV files to training datasets, and downloaded models to predictions |
+| `vibehash/catalog.py` | The open-weight models `models` lists and `train --base` describes: live facts from Hugging Face, cached, and the GPUs a team would need (the fine-tuning itself is coming). `scripts/bake_models.py` writes them into the guide |
 | `vibehash/data/` | The `fruit.csv` sample `vibehash example` writes, and the BIP39 word list |
 | `vibehash/storage.py` | SQLite chain and weights, content-addressed datasets |
 | `vibehash/blobs.py` | Content-addressed, chunked, resumable binary storage for checkpoints and datasets |
@@ -400,7 +439,8 @@ the remaining work:
   ([SHARDING.md](SHARDING.md) has the design).
 
 [FINETUNING.md](FINETUNING.md) describes where this is heading: fine-tuning open models from Hugging Face
-with one `train --base` command, and workers that fetch and train only their share of a model.
+with one `train --base` command, and workers that fetch and train only their share of a model. Today
+`train --base` stops after its pre-flight, and `models` lists the models it will offer.
 
 §10 covers what's been hardened: fees, the issuance schedule, TLS, rate limits
 and recovery words.
