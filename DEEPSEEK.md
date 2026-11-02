@@ -351,7 +351,10 @@ table); other GPU vendors; the tilelang kernels themselves; decoding. And
 
 **Status (2026-11-01): designed and prototyped on one PC; the speed and quality
 runs wait for the PC to be free.** Code in `vibehash/deepseek_top.py`, tests in
-`tests/test_deepseek_top.py`. Numbers marked *estimate* aren't measured yet.
+`tests/test_deepseek_top.py`. The prep is split into small units that miners
+run (`vibehash/deepseek_split.py`, "The split prep" below), by the owner's
+decision; the one-PC prep stays as the fallback. Numbers marked *estimate*
+aren't measured yet.
 
 **Why this shape.** Miners won't give up 350 GB of SSD, so each should need
 about a game install's worth. And teams passing activations live (§2–§3) are
@@ -361,7 +364,9 @@ The frozen part's output for the job's text never changes. So one machine with
 the whole model, the preparer, computes what crosses the cut once per dataset,
 and publishes it as the job's data with a Merkle root. Miners download a shard
 of it plus the top K layers. Then they train like PR #5's fine-tune units:
-alone, with no traffic between miners but checkpoints.
+alone, with no traffic between miners but checkpoints. The prep itself is
+mining work too: cut into units of a few layers that ordinary miners run, handing
+off through storage ("The split prep" below).
 
 **What crosses the cut** (`Cut.crossing`, from the config). At every cut from
 24 to 36, the first trained layer is an index source that reuses layer 20's
@@ -525,8 +530,9 @@ forward.
   - A checker fetches only the records of the segment it replays (16K tokens is
     0.7 GB).
 
-**The prep: one command, on a rented GPU or a home PC** (`vibehash/deepseek_prep.py`;
-the output isn't trusted, it's checked like any work):
+**The one-PC prep: the fallback and the dev tool** (`vibehash/deepseek_prep.py`;
+the output isn't trusted, it's checked like any work). One command, on a rented
+GPU or a home PC:
 
     pip install torch huggingface_hub tokenizers vibehash
     hf auth login        # the runner's own token: the output goes to their own repo
@@ -583,12 +589,259 @@ A home runner on a link like the owner's dorm network (70 MB/s down) takes ~1.9 
 download. Upload is their bottleneck: 42 GB per million tokens at 20 Mbit/s is
 4.7 hours, so `--fp8` (2.5 h) suits them.
 
+**The split prep: the main path** (decided 2026-11-01; prototype in
+`vibehash/deepseek_split.py`, tests in `tests/test_deepseek_split.py`, numbers from
+`scripts/deepseek_split_plan.py`). Even 70 GB a person is too much. So the prep is cut
+into small units that ordinary miners run, connected by stored hand-offs. The
+one-PC prep above stays as the fallback and the dev tool.
+
+*The shape.* The bottom is frozen, so a unit's output depends only on its inputs.
+Nobody needs anyone else online: each output waits in storage for the unit that
+reads it, an asynchronous assembly line. The work graph (`plan`) has two kinds
+of unit:
+- **rows** (an engram table, a row range): 15 ranges a table, 6.8 GB each, each
+  streamed once from the pinned commit.
+  - For each chunk of the text, the unit stores the rows that chunk's n-grams hash
+    to in its range. That's 3.4 KB a token a table in 64K-token chunks (measured on
+    the everyday chats: 54% of a chunk's 24 rows a token are distinct).
+  - Rows units need no other unit.
+  - A row is checkable exactly: the node reads its 264 bytes from the Hub by range.
+- **layers** (a piece of G layers, a chunk): the piece's layers over the chunk's
+  sequences.
+  - It reads the stream entering its first layer and writes the stream leaving
+    its last.
+  - Side channels (compressed keys, index keys, picks, candidate blocks) are
+    stored once, by the piece that makes them. Every later piece that reuses one
+    reads it directly; nothing is relayed.
+  - The piece holding layer 1 or 14 also reads the chunk's rows.
+  - The last piece writes the job's records.
+
+*Exact* (the small config). Split into pieces of 1 and 2 layers, with the engram
+table in 3 row ranges, the units write exactly the one-PC prep's records, block
+files and Merkle root. Order doesn't matter: the same holds with the last chunk
+run first, and with a unit overturned and redone after the next piece had read
+its output.
+
+*What crosses each cut* (sequences of 4,096 tokens):
+
+| Cut | Side channels crossing (their source layer) | Bytes a token, stored | Compressed losslessly |
+|---|---|---|---|
+| 2, 8, 14, 20 (a kv source starts the next piece) | none | 40,976 | 27,864 |
+| 4, 16 | compressed keys, picks (2; 14) | 42,512 | 28,128 |
+| 21 | compressed keys, index keys, picks (20) | 43,280 | 28,472 |
+| 24, 28, 32, 36 | compressed keys, index keys (20) | 42,256 | 28,220 |
+
+The stream is all but 1–3% of it, so where the cuts fall barely matters. Side
+channels pack as the FP4 values they are, and picks as a bitmap.
+
+*Hand-offs stay exact, compressed losslessly.* Measured on real weights, on the
+CPU (`scripts/deepseek_stream_stats.py`). The chain: the embedding, then layer 2
+standing in as layer 20, then the real layers 36–39, over 4,096 tokens of
+everyday chats.
+- **Lossless.** Byte planes (every value's high byte, then every low byte) through
+  zstd level 3 take the bf16 stream to 0.68–0.71 of its size (level 19:
+  0.60–0.66); zstd on the plain values only to 0.78. So a cut is 27.9 KB a
+  token, not the ~21 KB that FP8 would give.
+- **The 4 copies aren't redundant enough to exploit.**
+  - Their cosine is 0.71–0.98, and they deviate from their mean by 34–56% of
+    the stream.
+  - Low rank is lossy: a rank-3 approximation still errs by 0.1–1.4%, rank 2 by
+    2.2–6.3%.
+  - The best structured code tried, an FP8 mean plus FP4 deviations, errs by
+    3.8–6.5% for 23–36% fewer bytes than FP8 (which errs by 2.7%).
+  - So nothing tried beats FP8 for its size.
+- **FP8 hand-offs** (21.1 KB a token, 17 KB after zstd) round at every cut, and
+  their cost to the model isn't known.
+  - The stand-in chain can't tell. Flipping the last bit of half the values after
+    each layer, a 0.4% nudge, moves its stream 22% from exact after two cuts and
+    58% after five: about as far as FP8 does (24% and 64%). At the head the two
+    end equally far from exact: KL 2.0 and 2.2 nats, with the top token agreeing
+    35% and 38% of the time. One FP8 rounding at the last cut alone costs KL
+    0.003. The chain is out of distribution, and its routing and picks flip under
+    any change.
+  - Measuring it needs consecutive real bottom layers (layers 0–3: 29.6 GB, not
+    downloaded).
+  - Lossy codes are deterministic, so checking would still work; the question is
+    only quality.
+  - FP8 at the training cut alone, one rounding, stays an option.
+
+*Experts: a chunk touches nearly all of each layer's.*
+- **Layer 0, on its real input.** Layer 0's input is the embedding itself, so
+  its routing needs only its 170 MB outside the experts (read from the Hub by
+  range; routing doesn't run the experts). It is balanced: 4,096 tokens of chats
+  touch 362 of its 384 experts, the counts' CV is 1.4, and the busiest 10% take
+  43% of the picks. (The same over all 406K tokens is running.)
+- **Off its input, it isn't.** Layer 2 fed the embedding directly, skipping
+  layers 0–1, touches only 247 of 384 in 64K tokens, adding about 14 a doubling,
+  with the busiest 10% taking 89%. Layers 36–39 on the stand-in chain are as
+  skewed. So routing balance holds on the model's own inputs, which is all a
+  prep ever feeds it.
+- So scoping by expert can't shrink a prep's download. A miner would have to run
+  the layer to learn which experts it needs, and a 64K-token chunk needs nearly
+  all of them.
+- Splitting a layer's experts among people never pays.
+  - Each token would go out to its 6 experts' holders and back: about 120 KB a
+    token a layer (6 × 2 × 10 KB), against 28 KB a cut.
+  - It adds two more hand-offs a layer.
+  - A miner whose GPU can't hold a layer streams its experts from RAM or disk
+    instead (expert-major, as in training).
+
+*Layers per piece, G: the main lever.* Every cut moves 28 GB per million tokens
+up to the bucket and down again. A layer's weights are 7.39 GB, so above about
+265K tokens a cut costs more than a layer (7.39 GB / 27.9 KB). Traffic, in GB,
+with one holder a piece, hand-offs compressed, and miners' upload including the
+records (42.3 GB per million tokens). The weights are 266 GB of layers, the
+1.3 GB embedding, and the 203 GB of tables the rows units stream. The bill counts
+the trainers reading the records once and a month of storing them:
+
+| G | Pieces | Tokens | Weights from HF (once) | Hand-offs: bucket egress | Miners' upload | Spaces bill |
+|---|---|---|---|---|---|---|
+| 1 | 36 | 0.1M | 470 | 99 | 103 | $5.00 |
+| 1 | 36 | 1M | 470 | 994 | 1,027 | $5.00 |
+| 1 | 36 | 10M | 470 | 9,937 | 10,265 | $94.11 |
+| 2 | 18 | 0.1M | 470 | 49 | 52 | $5.00 |
+| 2 | 18 | 1M | 470 | 485 | 525 | $5.00 |
+| 2 | 18 | 10M | 470 | 4,854 | 5,250 | $46.78 |
+| 4 | 9 | 0.1M | 470 | 23 | 27 | $5.00 |
+| 4 | 9 | 1M | 470 | 232 | 273 | $5.00 |
+| 4 | 9 | 10M | 470 | 2,316 | 2,732 | $23.14 |
+| 9 | 4 | 0.1M | 470 | 9 | 13 | $5.00 |
+| 9 | 4 | 1M | 470 | 92 | 134 | $5.00 |
+| 9 | 4 | 10M | 470 | 916 | 1,339 | $10.10 |
+| 36 (one PC) | 1 | 0.1M | 470 | 1 | 5 | $5.00 |
+| 36 (one PC) | 1 | 1M | 470 | 7 | 49 | $5.00 |
+| 36 (one PC) | 1 | 10M | 470 | 69 | 491 | $7.87 |
+
+- **Weights** come from Hugging Face once per holder and stay cached across jobs;
+  hand-offs are per job. On a busy network with layers cached, the hand-offs are
+  all that's left, so fewer cuts matter more than the weights column suggests.
+- **Each unit is network-bound.**
+  - A 64K-token chunk through a piece downloads 1.85 GB and uploads 1.83 GB,
+    whatever G is.
+  - The GPU needs 20 s a layer for it (*estimate*: 0.3 ms a token a layer on a
+    mid-range card; §7 has 0.24 on a 4070 SUPER).
+  - On a 100/20 Mbit/s cable link, the transfer is 2.5 min down and 12 min up.
+    On 300/300 fiber it's under a minute each way.
+  - Per million tokens through a piece: 28.2 GB down and 27.9 GB up, plus
+    G × 7.39 GB of weights once.
+- **End to end**, 1M tokens in 64K chunks, *simulated*. Each miner's downlink, GPU
+  and uplink overlap across chunks. An output is read as soon as it's written,
+  or after a 1-hour window.
+
+| G | Miners | Cable 100/20: read at once | Cable: wait 1 h a unit | Cable, weights cached | Fiber 300/300: read at once | Fiber: wait 1 h |
+|---|---|---|---|---|---|---|
+| 1 | 36 | 13.9 | 49.9 | 13.9 | 1.5 | 37.5 |
+| 1 | 72 | 11.4 | 47.4 | 11.4 | 1.4 | 37.4 |
+| 2 | 18 | 9.7 | 27.7 | 9.5 | 1.1 | 19.1 |
+| 2 | 36 | 7.2 | 25.2 | 7.0 | 0.9 | 18.9 |
+| 4 | 9 | 7.8 | 16.8 | 7.3 | 1.0 | 10.0 |
+| 4 | 18 | 5.3 | 14.3 | 4.8 | 0.8 | 9.8 |
+| 4 | 36 | 4.1 | 13.1 | 3.6 | 0.7 | 9.7 |
+| 9 | 4 | 7.4 | 11.4 | 6.0 | 1.5 | 5.5 |
+| 9 | 8 | 4.9 | 8.9 | 3.6 | 1.1 | 5.1 |
+| 9 | 36 | 3.1 | 7.1 | 1.7 | 0.9 | 4.9 |
+
+**Recommendation: G = 4 by default**: nine pieces of 29.6 GB of weights each.
+- That's the K = 4 trainer's footprint (30.9 GB), so one class of miner does
+  both.
+- Against one-layer pieces it cuts the hand-offs 4×: 232 vs 994 GB of egress per
+  million tokens. It cuts the time 3.4×: 4.1 h vs 13.9 h for 1M tokens with 36
+  miners on cable.
+- Below about 265K tokens a cut moves less than a layer's weights. There, G = 2
+  or 1 lets more miners take part, and the traffic is small anyway (100K tokens
+  at G = 1: 99 GB).
+- G = 9 cuts the egress 2.5× again, but needs 67 GB a person, over the owner's
+  limit.
+- Within a job, the plan fixes G. Miners claim pieces whose layers they hold or
+  have room for, preferring layers already in their cache, so the network
+  downloads each layer once.
+
+*Checking.* Each layers unit commits two things.
+- Per sequence and per layer, deepseek_prep's 32-byte hash: stream, pre_mix, the
+  side channels made, the choices.
+- A digest of every object it read and wrote, taken of the decoded tensors so the
+  codec can change. The chain of digests ties each unit's input to its producer's
+  output (tested).
+
+Anyone holding the piece's layers can replay a unit. A dispute bisects over the
+piece's G layers to one layer, then over that layer's ops, down to one op the
+node referees on its CPU (the table above).
+- A wrong output poisons everything above it for that chunk. Waiting out each
+  unit's window before the next reads it puts every window on the critical path.
+  With 1-hour windows, 1M tokens at G = 4 take 13.1 h instead of 4.1 h (36
+  miners, cable), and 49.9 h at G = 1.
+- So consumption is optimistic (`Line`). A unit's output can be read as soon as
+  it's committed.
+  - If a challenge against it succeeds, it and everything downstream of it for
+    that chunk go back to pending and are redone (`Line.overturn`, tested).
+  - Honest units that read a bad input did right by what they were given. They're
+    paid, out of the cheater's stake.
+  - The job pins the dataset's root once the last unit's window closes: one
+    window at the end, not one per piece.
+
+*Hosting the hand-offs.* The 2 GB node can't hold them.
+- **(a) A DigitalOcean Spaces bucket the operator pays for: recommended.**
+  - The node signs a URL per object and method, so miners need no account
+    (`presign`: S3's Signature Version 4, checked against AWS's worked example;
+    `PresignedStore` uses the URLs).
+  - It costs $5 a month for 250 GiB stored and 1 TiB out, then $0.01 a GiB out
+    and $0.02 a GiB-month stored. Uploads are free.
+  - Each object is deleted once every unit that reads it is accepted
+    (`Line.accept`), so the bucket holds only the frontier and the records.
+  - Bills from the table: $5 for any 1M-token prep; for 10M, $23 at G = 4 and
+    $94 at G = 1.
+- **(b) Each uploader's own HF dataset.**
+  - Every uploader needs an account and a token.
+  - Each object is a git commit, and deleting LFS files frees no space without
+    rewriting history. That fights a frontier that turns over by the hour.
+  - Free accounts get 100 GB private. Public storage is best effort, for content
+    useful to others, which day-old hand-offs aren't.
+  - HF's Storage Buckets fit better: mutable, $12–18 a TB-month, egress up to 8×
+    the storage included. They still need an HF account per uploader, and they
+    document no presigned URLs.
+  - HF is the right home for a reusable dataset's *records*, not for hand-offs.
+- **(c) Peer to peer, later.** The next piece's holder pulls from the producer.
+  That saves the egress bill, but the producer must stay online until its output
+  is read, which loses "nobody online together". Worth it only for big jobs.
+
+*Pay.* Prep units are mining work like any other: a layers unit earns by
+layer-tokens (G × its chunk), and a rows unit by the gigabytes it streamed.
+Uploads are a miner's real cost (12 minutes a unit on cable), so the credit
+should count hand-off bytes too.
+
+*Reuse.*
+- A prep's records at cut 36 serve K = 4 directly. They serve K = 2 or 1 too,
+  after one more frozen piece is run over them (layers 36–37 for K = 2, 36–38
+  for K = 1), like any other unit.
+- They can't serve K = 8, which needs the stream at 32. But in the split prep
+  every cut's stream exists for a while anyway. Keeping cut 32's as well (28 GB
+  per million tokens) serves K = 4 and K = 8 from one prep.
+- Popular open datasets could be prepped once, and their records kept public on
+  HF, pinned by root, for every job that trains on them.
+
+*One machine, one layer at a time* (a fallback, not built). Each layer runs over
+the whole dataset, then is deleted, and the next is fetched.
+- Peak disk is one layer plus the dataset's states: 7.4 GB + 42 GB per million
+  tokens (28 GB compressed).
+- On top of that come the side channels still to be read (1.3 KB a token for
+  layer 20's keys) and the slices.
+- So ~50 GB for 1M tokens, and ~430 GB for 10M (~290 GB compressed). The
+  download stays 470 GB.
+- It's the split prep with one miner holding every piece in turn.
+
+**The training footprint.** Trained layers change every step, so they stay
+inside one miner: no live relay. The per-miner knob is K, counting the 1.3 GB
+head: K = 4 is 30.9 GB, K = 2 16.1 GB, K = 1 8.7 GB. `scripts/topk_quality.py`
+now also runs Qwen3's top 2 layers and top 1, standing in by fraction for
+DeepSeek's top 2.9 and 1.4, so the owner can see what each step down costs.
+
 **Quality: what training only the top costs** (`scripts/topk_quality.py`).
 Qwen3-0.6B (28 layers), LoRA-FA on q, k, v and o, the same steps and data,
-held-back loss on 237 everyday chats; all layers vs the top 6 (~20%) vs the top
-3 (~10%). *Not run yet*: the run was stopped while the PC was needed. It resumes
-from partial results and takes about 20 minutes on a free 4070 SUPER. Qwen3-4B
-in float32 won't fit under 10 GB of GPU memory.
+held-back loss on 237 everyday chats. It compares all layers, the top 6 (~20%),
+the top 3 (~10%), and the top 2 and 1 (DeepSeek's K = 2 and K = 1, by
+fraction). *Not run yet*: the run was stopped while the PC was needed. It
+resumes from partial results and takes about 30 minutes on a free 4070 SUPER.
+Qwen3-4B in float32 won't fit under 10 GB of GPU memory.
 
 **Build order for this route** (replacing §5's 3–7 for the first project):
 1. Done (§7): `deepseek.py`.
@@ -601,18 +854,25 @@ in float32 won't fit under 10 GB of GPU memory.
 4. *Train the top 4 for real.* Their 30.9 GB are downloaded (2026-11-01). Still
    to do: loss on real chats, which needs a prep's records, and DeepSeek's own
    top-4 vs top-8 (60.4 GB, not downloaded).
-5. *The prep, for real.* `deepseek_prep` is prototyped: one command, resumable,
-   tested on the small config, with its table streaming tried on the real Hub.
-   Still to do: a run on real weights (on a rented GPU or a friend's PC: ~470 GB
-   down, ~280 GB of disk), and answering challenges (serving a record's layer
-   inputs on request, by recomputing them).
+5. *The prep, for real.* Prototyped, both ways. The split prep (`deepseek_split`)
+   is the main path: the work graph, exact lossless hand-offs, presigned
+   storage, optimistic consumption with rollback, tested exact to the one-PC
+   prep. The one-PC `deepseek_prep` is one resumable command, with its table
+   streaming tried on the real Hub. Still to do:
+   - wiring the split's units into the node after PR #5 merges: claims,
+     presigned URLs, windows, pay;
+   - multipart uploads, so a 1.8 GB hand-off survives a flaky link;
+   - a run on real weights, piece by piece;
+   - answering challenges by replaying a unit;
+   - FP8 hand-offs measured on consecutive real bottom layers (layers 0–3,
+     29.6 GB), which would cut a cut's 28 KB a token to 17 KB if harmless.
 6. *A DeepSeek unit kind,* once PR #5 merges: a spec with the cut and targets,
    the record dataset in place of token ids, `train_step_streamed` behind
    `train_segment`, and miners' data shards.
 7. *The referee's DeepSeek ops* in numpy (the table above), for the dispute game.
-8. *The job flow:* where the datasets live (42 GB per million tokens: an HF
-   dataset repo or the preparer's server, pinned by root), and the pre-flight's
-   numbers.
+8. *The job flow:* where the datasets live (42 GB per million tokens: the
+   bucket while training, or a public HF dataset for a reusable one, pinned by
+   root), and the pre-flight's numbers.
 
 Skipped for this route: engram slices (§5 step 4: no trained layer reads a
 table, and the preparer holds the tables), pipeline cells and teams (steps

@@ -213,10 +213,28 @@ class HubSource:
         for f in self._files(layer):
             names = {n for n, g in self.wm.items() if g == f and n.startswith(f"layers.{layer}.")}
             out.update(ds.read_safetensors(ds.cache_dir() / f, names))
-        small = work / f"engram-{layer}-small.pt"
-        if small.exists():
-            out.update(torch.load(small))
+        if layer in Config.flash().engram_layer_ids:
+            out.update(self.engram_small(layer, work))
         return out
+
+    def engram_small(self, layer: int, work: Path) -> dict:
+        """An engram layer's tensors other than its table (the projection and gate weights, a few MB), which sit in
+        the table's 101 GB file: read by range, once, and kept in `work`."""
+        path = work / f"engram-{layer}-small.pt"
+        if not path.exists():
+            prefix = f"layers.{layer}.engram."
+            file = self.wm[prefix + "embed.weight"]
+            header, remote = self.hub.header(ds.REPO, ds.COMMIT, file), self.hub.open(ds.REPO, ds.COMMIT, file)
+            small = {}
+            for name, (dtype, shape, begin, end) in header.tensors.items():
+                if name.startswith(prefix) and ".embed." not in name:
+                    raw = torch.frombuffer(bytearray(remote.read(header.data_start + begin, end - begin)),
+                                           dtype=torch.uint8)
+                    small[name] = raw.view(ds.SAFETENSORS_DTYPES[dtype]).reshape(shape)
+            tmp = path.with_suffix(".tmp")
+            torch.save(small, tmp)
+            os.replace(tmp, path)
+        return torch.load(path)
 
     def slice(self, layer: int, wanted: np.ndarray, work: Path, progress=None, stop_after=None) -> Slice:
         """Stream layer `layer`'s engram table from the Hub, keeping rows `wanted`; its small tensors (the
@@ -224,8 +242,7 @@ class HubSource:
         prefix = f"layers.{layer}.engram."
         file = self.wm[prefix + "embed.weight"]
         import threading
-        header = self.hub.header(ds.REPO, ds.COMMIT, file)
-        remote, local = self.hub.open(ds.REPO, ds.COMMIT, file), threading.local()
+        header, local = self.hub.header(ds.REPO, ds.COMMIT, file), threading.local()
 
         def read(offset, size):  # one connection per thread: a RemoteFile keeps its CDN address
             if not hasattr(local, "remote"):
@@ -237,12 +254,7 @@ class HubSource:
             assert dtype in ("F8_E4M3", "F8_E8M0")  # a byte a value: a row is shape[1] bytes
             parts[name] = extract_rows(read, header.data_start + begin, shape[1], wanted,
                                        work / f"engram-{layer}-{name}", progress=progress, stop_after=stop_after)
-        small = {}
-        for name, (dtype, shape, begin, end) in header.tensors.items():
-            if name.startswith(prefix) and ".embed." not in name:
-                raw = torch.frombuffer(bytearray(remote.read(header.data_start + begin, end - begin)), dtype=torch.uint8)
-                small[name] = raw.view(ds.SAFETENSORS_DTYPES[dtype]).reshape(shape)
-        torch.save(small, work / f"engram-{layer}-small.pt")
+        self.engram_small(layer, work)
         return Slice(wanted, parts["embed.weight"], parts["embed.scale"])
 
 

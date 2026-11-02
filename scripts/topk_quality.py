@@ -1,16 +1,20 @@
-"""What training only a model's top layers costs: held-back loss after LoRA on all layers, the top 20% or the top 10%.
+"""What training only a model's top layers costs: held-back loss after LoRA on all layers, the top 20%, the top 10%,
+and the top 2 and 1 layers.
 
     python scripts/topk_quality.py [--model DIR] [--data everyday.jsonl] [--epochs 2] [--lrs 2e-4,1e-3]
 
 DEEPSEEK.md §8's route fine-tunes DeepSeek-V4.1-Flash's top layers only, since then the frozen layers' output can be
-computed once and shipped as the job's data. This measures the price on a model small enough to train whole. It uses
+computed once and shipped as the job's data, and each miner holds the K it trains (K = 4: 31 GB; K = 2: 16 GB; K = 1:
+8.7 GB). Qwen3-0.6B's 28 layers stand in for DeepSeek's 40 by fraction: its top 6, 3, 2 and 1 are DeepSeek's top
+8.6, 4.3, 2.9 and 1.4. This measures the price on a model small enough to train whole. It uses
 Hugging Face transformers and PEFT, as a fine-tune's users would, and Vibe Hash's own recipe (finetune.py): LoRA rank 16,
 alpha 32 on q, k, v and o, A frozen and only B trained, Adam, loss on the assistant's replies only. The same steps and
 data for every run; held-back chats scored on their replies before training and every half epoch. Prints a table and
 writes it as JSON next to the data after each run, and a rerun skips the runs already there (so it can be stopped and
 resumed between runs). Kept under --max-gb of GPU memory (an out-of-memory error rather than spilling into system RAM,
-which slows the whole PC): logits are made only for the reply tokens. Six runs of Qwen3-0.6B on the everyday chats,
-2 epochs at batch 8: about 20 minutes on an idle RTX 4070 SUPER (an estimate: 536 steps of ~1,600 tokens a run).
+which slows the whole PC): logits are made only for the reply tokens. Ten runs of Qwen3-0.6B on the everyday chats,
+2 epochs at batch 8: about 30 minutes on an idle RTX 4070 SUPER (an estimate: 536 steps of ~1,600 tokens a run, the
+smaller runs quicker).
 """
 import argparse
 import json
@@ -147,7 +151,7 @@ def main():
 
     from transformers import AutoConfig
     layers = AutoConfig.from_pretrained(args.model).num_hidden_layers
-    tops = [None, max(1, round(layers * 0.2)), max(1, round(layers * 0.1))]
+    tops = list(dict.fromkeys([None, max(1, round(layers * 0.2)), max(1, round(layers * 0.1)), 2, 1]))
     print(f"{Path(args.model).name}: {layers} layers; {len(train)} chats to train on, {len(val)} held back; "
           f"{args.epochs} epochs of batch {args.batch}; GPU {torch.cuda.get_device_name()}", flush=True)
     out = Path(args.data).with_name(f"topk_quality_{Path(args.model).name}.json")

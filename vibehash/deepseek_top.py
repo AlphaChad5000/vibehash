@@ -64,12 +64,13 @@ class Cut:
     def trained(self) -> range:
         return range(self.first, self.cfg.n_layers)
 
-    def crossing(self) -> dict[str, int | list[int]]:
+    def crossing(self, stop: int | None = None) -> dict[str, int | list[int]]:
         """What the trained layers reuse from below the cut, besides the stream and pre_mix: {"compress_kv": its
         source layer, "index_k": ..., "picks": ..., "candidates": ..., "engram": [trained engram layers, which need
-        table rows]}, each present only when it crosses."""
+        table rows]}, each present only when it crosses. With `stop`, what layers [first, stop) alone reuse (a piece
+        of the split prep, deepseek_split)."""
         cfg, out = self.cfg, {}
-        for layer in self.trained:
+        for layer in range(self.first, self.cfg.n_layers if stop is None else stop):
             if cfg.ratio(layer):
                 kv, ix = cfg.source(layer, "kv"), cfg.source(layer, "index")
                 if kv < self.first:
