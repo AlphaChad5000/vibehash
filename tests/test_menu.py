@@ -40,7 +40,7 @@ class MenuTests(unittest.TestCase):
         labels = [i.label for i in menu.items()]
         self.assertEqual(labels[self.pick(["down", "down", "enter"])], "What can this computer train on?")
         self.assertIsNone(self.pick(["up", "enter"]))  # up from the top wraps to Quit
-        self.assertEqual(labels[self.pick(["up", "up", "enter"])], "Open the guide")
+        self.assertEqual(labels[self.pick(["up", "up", "enter"])], "More commands")
         self.assertEqual(self.pick(["4", "enter"]), 3)
         self.assertIsNone(self.pick(["end", "enter"]))  # Quit
         self.assertIsNone(self.pick(["down", "quit"]))
@@ -57,6 +57,27 @@ class MenuTests(unittest.TestCase):
         self.assertIn("No wallet yet", text)
         quit_at = len(menu.items()) - 1
         self.assertIn("same as:  —", plain(menu.frame(quit_at, status, "vibehash", 120, termui.ASCII)))
+
+    def test_more_commands_is_a_page_of_its_own(self):
+        ran, main, more = [], [i.label for i in menu.items()], [i.label for i in menu.items(menu.MORE, menu.BACK)]
+        picks = iter([main.index("More commands"), more.index("Send VIBE"), None, None])  # in, send, Back, Quit
+        answers = iter(["vibe1friend", "2.5", "y", ""])  # to, amount, confirm, then "back to the menu"
+        with no_wallet(), mock.patch.object(menu, "pick", lambda *a: next(picks)),                 mock.patch.object(menu.termui, "supported", return_value=True),                 mock.patch("builtins.input", lambda *a: next(answers)), contextlib.redirect_stdout(io.StringIO()):
+            menu.run(ran.append, "vibehash")
+        self.assertEqual(ran, [["send", "--to", "vibe1friend", "--amount", "2.5"]])
+        for label in ("Stake more", "Unstake", "Restore a wallet", "Predict with my model", "Validators",
+                      "Verify the whole chain", "Install GPU support", "Every command"):
+            self.assertIn(label, more)
+        with no_wallet():
+            page = menu.frame(more.index("Send VIBE"), menu.Status(), "vibehash", 120, termui.ASCII, menu.MORE, menu.BACK)
+        page = re.sub(r"\x1b\[[0-9;]*[mKJH]", "", page)
+        self.assertIn("same as:  vibehash send --to ADDRESS --amount VIBE", page)
+        self.assertIn("q back", page)
+
+    def test_nothing_is_sent_without_a_yes(self):
+        answers = iter(["vibe1friend", "2.5", ""])
+        with mock.patch("builtins.input", lambda *a: next(answers)):
+            self.assertIsNone(menu._send())
 
     def test_keys_by_name(self):
         self.assertEqual([menu.Keys.name(c) for c in "\r\nqk j7x"], ["enter", "enter", "quit", "up", None, "down", "7", None])
