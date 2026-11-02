@@ -714,6 +714,11 @@ Each step:
      (`verification.adam_impossible`; the test checker `knowing` uses it).
    - **Drawn from the round secret** (`test_canaries_pass_adams_invariants_and_rescaled_ones_dont`,
      `test_canaries_catch_a_checker_that_spots_rescaled_updates`). A checker rejecting a canary starts no dispute.
+   - **Residual: colluders can tell one apart** (the second review). A canary's openings are named by their blobs'
+     ids, which are their content's sha256: the donor claim's. A checker in league with the donor's worker, or with
+     its checkers, sees ids it knows under another unit's id. So canaries catch a lazy checker only on tasks whose
+     units' workers and checkers aren't its allies. Hiding the ids would mean serving each checkpoint under a
+     per-checker name that still proves its content, which isn't cheap; it's left as a known limit.
 8. **Bootstrapping.** A fine-tune's round assigns nothing until `FINETUNE_QUORUM` = 2 staked workers able to run it
    have registered: one to train a unit and one to check it. With the node refereeing, one honest checker makes a
    claim's verdict right (below), so that's enough to start, and with two workers each checks the other.
