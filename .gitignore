@@ -25,3 +25,8 @@ wallet.json
 .claude/settings.local.json
 Thumbs.db
 .DS_Store
+
+
+# API Keys
+.env.local
+.env
