@@ -643,8 +643,8 @@ footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify
       var r = modelOf(), chats = "my-chats.jsonl";
       return [
         { title: "Install and set up", note: "The same one line as for mining. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
-            " and runs setup's four steps; write down the 24 recovery words it shows. The training runs on other people's graphics cards, so you don't need one: when setup offers GPU support you can say no. The second line adds what reads your chats the way " + r.title + " does: its own tokenizer and chat template.",
-          cmds: [oneLiner(), py() + ' -m pip install "vibehash[finetune]"'] },
+            " and runs setup's four steps; write down the 24 recovery words it shows. The training runs on other people's graphics cards, so you don't need one: when setup offers GPU support you can say no. The installer also adds what reads your chats the way " + r.title + " does: its own tokenizer and chat template. If you installed Vibe Hash with pip yourself instead, add that with " + py() + ' -m pip install "vibehash[finetune]".',
+          cmds: [oneLiner()] },
         { title: "Get VIBE", note: "A fine-tune is paid for in VIBE: 10 a round by default, and only for work that passes its checks. The steps below spend up to 100 VIBE plus a 0.0001 VIBE fee. Send your vibe1 address to whoever runs the network and ask for some, or earn it as a worker. This shows when it has arrived.",
           cmds: [vh("balance")] },
         { title: "Get your chats ready", note: "One JSON object per line. A chat is a list of messages, each with a role (system, user or assistant) and its text; the model learns to write the assistant's replies, in your chats' style, and nothing else. Lines of plain text, as {\"text\": \"...\"}, work too. A tenth of the examples, at most 128, is held back and never trained on, to measure progress honestly. Longer chats are cut at 1,024 tokens (--max-len changes that).",
