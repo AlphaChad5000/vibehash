@@ -655,7 +655,7 @@ Each step:
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
    - a correctly rounded operation (+ − × ÷ √), u = 2⁻²⁴ of its result;
    - exp, log or rsqrt, 4 ulps (CUDA's are 1 to 2, the CPU's at most 1);
-   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), with M the largest partial sum any honest order
+   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), or γ_K·Σ|terms| where tighter (a few terms), with M the largest partial sum any honest order
      forms (`referee.spread`: the largest |sum| of a run of terms contiguous at a stride of 1 to 32, covering
      sequential, blocked, split-K, pairwise and 32-lane strided accumulation).
    Errors of earlier steps of the op are carried through by each step's derivative. A number passes within MARGIN

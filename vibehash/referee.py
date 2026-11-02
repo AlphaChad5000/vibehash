@@ -244,10 +244,17 @@ def spread(t: np.ndarray) -> np.ndarray:
     return math.sqrt(k) * m + np.sqrt(np.einsum("...i,...i->...", t, t))
 
 
+def rounding(t: np.ndarray) -> np.ndarray:
+    """How far summing the K terms along the last axis can land from their exact sum, in any honest order: the
+    statistical model, SPREAD_C·u·spread, or the worst case γ_K·Σ|t| where that's tighter. Both hold for any order, and
+    for a few terms the worst case is the smaller (4u·Σ|t| against up to 18u·Σ|t| at K = 4)."""
+    return np.minimum(gamma(t.shape[-1]) * fsum_rows(np.abs(t)), SPREAD_C * U * spread(t))
+
+
 def esum(a: E) -> E:
     """The sum along the last axis of K terms, in any honest order."""
     ae = fsum_rows(a.e) if np.any(a.e) else np.zeros(a.v.shape[:-1])
-    return E(fsum_rows(a.v), ae * (1 + 2 * U) + SPREAD_C * U * spread(a.v))
+    return E(fsum_rows(a.v), ae * (1 + 2 * U) + rounding(a.v))
 
 
 def contract(a: E, b: np.ndarray) -> E:
@@ -256,7 +263,7 @@ def contract(a: E, b: np.ndarray) -> E:
     n, m = a_v.shape[0], b.shape[0]
     p = a_v[:, None, :] * b[None, :, :]
     ae = fsum_rows(a_e[:, None, :] * np.abs(b)[None, :, :]) if np.any(a_e) else np.zeros((n, m))
-    return E(fsum_rows(p), ae * (1 + 2 * U) + SPREAD_C * U * spread(p))
+    return E(fsum_rows(p), ae * (1 + 2 * U) + rounding(p))
 
 
 def bcast(a: E) -> E:
