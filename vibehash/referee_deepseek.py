@@ -1086,6 +1086,83 @@ def op_ds_hc_split_bwd(op, x, r, c0, c1):
     dcomb = rf.scale(dz, rf.f32(sc[2]))
     return rf._cat(dpre, dpost, dcomb)[c0:c1]
 
+# --- the head and the loss, and rows by the loss mask -----------------------------------------------------------------
+
+def op_ds_rows(op, x, r, c0, c1):
+    """Model.loss's h[mask]: the r-th row whose mask is 1, exact. ins (src [T, d], mask [T, 1])."""
+    mask = x.get(op.ins[1], 0, op.ishapes[1][0], 0, 1)[:, 0]
+    rows = np.flatnonzero(mask == 1)
+    return E(x.get(op.ins[0], int(rows[r]), int(rows[r]) + 1, c0, c1)[0])
+
+
+def op_ds_unrows(op, x, r, c0, c1):
+    """The backward of ds_rows: row r is the gradient of its place among the masked rows, or zero. ins (src [P, d],
+    mask [T, 1])."""
+    mask = x.get(op.ins[1], 0, op.shape[0], 0, 1)[:, 0]
+    if mask[r] != 1:
+        return E(np.zeros(c1 - c0))
+    at = int((mask[:r] == 1).sum())
+    return E(x.get(op.ins[0], at, at + 1, c0, c1)[0])
+
+
+def _ds_logits(op, x, r):
+    w = x.weight(op.attrs["weight"], op.attrs["b0"], op.attrs["b1"])
+    return rf.contract(E(x.row(op.ins[0], r)[None]), w)[0], w
+
+
+def op_ds_head_stats(op, x, r, c0, c1):
+    """The loss's running (max, Σ exp(logit - max)) over the head's rows [b0, b1) for masked position r, carried
+    from the previous block's (ins[1]) when given: referee.op_head_stats with the row given. ins (h [P, dim][,
+    stats [P, 2]]); attrs weight, b0, b1."""
+    lo, _ = _ds_logits(op, x, r)
+    mb = E(lo.v.max(), lo.e.max())
+    if len(op.ins) > 1:
+        pm, ps = x.row(op.ins[1], r)
+        m = E(max(pm, float(mb.v)), mb.e)
+        s = rf.add(rf.mul(E(ps), rf.exp(rf.sub(E(pm), m))), rf.esum(rf.exp(rf.sub(lo, m))))
+    else:
+        m, s = mb, rf.esum(rf.exp(rf.sub(lo, mb)))
+    return rf._cat(E(np.atleast_1d(m.v), np.atleast_1d(m.e)), E(np.atleast_1d(s.v), np.atleast_1d(s.e)))[c0:c1]
+
+
+def op_ds_head_grad(op, x, r, c0, c1):
+    """The loss's gradient to masked position r's h from the head's rows [b0, b1): (softmax - onehot(target)) · ic ·
+    W over that block, then + acc (the blocks before). ins (h [P, dim], lse [P, 1], targets [P, 1][, acc]); attrs
+    weight, b0, b1, ic (1 / the step's count)."""
+    lo, w = _ds_logits(op, x, r)
+    lse = x.row(op.ins[1], r)[0]
+    tgt = int(x.get(op.ins[2], r, r + 1, 0, 1)[0, 0])
+    ex = rf.exp(rf.sub(lo, E(lse)))
+    b0 = op.attrs["b0"]
+    if b0 <= tgt < op.attrs["b1"]:
+        one = rf.sub(ex[tgt - b0:tgt - b0 + 1], E([1.0]))
+        ex = E(ex.v.copy(), ex.e.copy())
+        ex.v[tgt - b0], ex.e[tgt - b0] = one.v[0], one.e[0]
+    q = rf.scale(ex, rf.f32(op.attrs["ic"]))
+    g = rf.contract(E(q.v[None], q.e[None]), w[:, c0:c1].T)[0]
+    return _acc(op, x, r, c0, c1, g, 3)
+
+
+class LoraLayout:
+    """What the referee needs of a DeepSeek job's adapters (dispute.Outside's spec): the adapted modules in
+    deepseek_top.Adapters' order, (name, out, in), the rank and the seed. Its A matrices are drawn as Adapters.fresh
+    draws them: PCG64([seed, 0x10A])'s raw stream, rank·in values a module, (2u - 1) / √in, as float32."""
+
+    def __init__(self, modules: list[tuple[str, int, int]], rank: int, seed: int):
+        self.mods, self.rank, self.seed = list(modules), rank, seed
+
+    def modules(self):
+        return self.mods
+
+    def lora_a_of(self, k: int) -> np.ndarray:
+        import math
+
+        rng = np.random.Generator(np.random.PCG64([self.seed, 0x10A]))
+        rng.bit_generator.advance(sum(self.rank * inp for _, _, inp in self.mods[:k]))
+        inp = self.mods[k][2]
+        u = (rng.bit_generator.random_raw(self.rank * inp) >> np.uint64(11)).astype(np.float64) * 2.0 ** -53
+        return ((2 * u - 1) / math.sqrt(inp)).astype(np.float32).reshape(self.rank, inp)
+
 # --- choices: judged by whole rows (referee.CHOICES), exactly, against the committed scores ----------------------------
 # A choice is a function of scores the state already holds, and those were judged in their own op (within their
 # bounds). So a worker may break near-ties either way, as its own scores fall, but may choose nothing its scores don't
@@ -1180,7 +1257,7 @@ def choice_ds_candidates(op, x, r, row):
     return True, ""
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
-EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows"}
+EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows", "ds_rows", "ds_unrows"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
 # (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
 # two bf16 numbers can be refused exactly.

@@ -199,8 +199,9 @@ class Outside:
         return self._got[key]
 
     def lora_a(self, k) -> np.ndarray:
-        if k not in self._a:
-            self._a[k] = lora_a_one(self.spec, k).astype(np.float64)
+        if k not in self._a:  # a spec may draw its own (referee_deepseek.LoraLayout: DeepSeek's adapters)
+            fn = getattr(self.spec, "lora_a_of", None)
+            self._a[k] = (fn(k) if fn is not None else lora_a_one(self.spec, k)).astype(np.float64)
         return self._a[k]
 
     def tokens(self, seq):

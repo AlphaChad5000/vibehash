@@ -470,6 +470,89 @@ class BackwardOpTests(_OpCase):
         self.check("ds_hc_split_bwd", ["d", "m", "tr"], attrs, {"d": d, "m": m.detach(), "tr": trace}, got, gm,
                    "hc_split_bwd")
 
+    def test_head_rows_and_adapters(self):
+        """The loss's rows by mask (exact), its head stats and gradient (against autograd's cross-entropy), the
+        adapters' A drawn as deepseek_top.Adapters.fresh draws them, and PR #5's LoRA and RMSNorm backward ops on
+        DeepSeek's modules."""
+        from vibehash import deepseek_top as top
+        from vibehash.deepseek_config import Cut
+
+        cfg, st = self.cfg, self.state
+        # A, exactly as Adapters.fresh draws it
+        model = ds.Model(cfg, layers=[4], num=top.TRAIN, embed=False, head=False, engram_table=False)
+        model.load_state_dict({k: v for k, v in st.items() if k.startswith("layers.4.")}, strict=False)
+        ad = top.Adapters.fresh(model, Cut(cfg, 4), rank=4, seed=3)
+        layout = rd.LoraLayout([(n, *top._shape(model.get_submodule(n))) for n in ad.names], ad.rank, 3)
+        for k, a in enumerate(ad.a):
+            np.testing.assert_array_equal(layout.lora_a_of(k), a.numpy())
+        old = self.src
+        T = 7
+        x = self.rnd(T, cfg.dim)
+        # lora_down on layers.4.attn.wq_a (module 0), through an Outside that knows the layout
+        xa = x.float() @ ad.a[0].T
+        op = mk("lora_down", "y", ["x"], {"module": 0}, xa.shape, [x.shape])
+        xs = {"x": x.float().numpy()}
+        inp = dispute.Inputs({"x": x.shape}, dispute.Outside(layout, None, old, keep=False), full=xs)
+        for leaf in range(merkle.n_leaves(*xa.shape)):
+            ok, why = rf.judge(op, inp, leaf, xa.numpy().reshape(-1)[leaf * 256:(leaf + 1) * 256].astype(np.float64))
+            self.assertTrue(ok, why)
+        # RMSNorm's backward (PR #5's op) on q_norm's weight
+        w = st["layers.4.attn.q_norm.weight"].double()
+        h = self.rnd(T, w.shape[0]).requires_grad_()
+        y = w * (h * torch.rsqrt(h.square().mean(-1, keepdim=True) + cfg.norm_eps))
+        dy = self.rnd(T, w.shape[0])
+        gh, = torch.autograd.grad(y, h, dy)
+        hf, dyf, wf = h.detach().float(), dy.float(), w.float()
+        r = torch.rsqrt(hf.square().mean(-1, keepdim=True) + cfg.norm_eps)
+        dyw = dyf * wf
+        got = r * (dyw - hf * ((r * r) * (dyw * hf).mean(-1, keepdim=True)))
+        self.check("rmsnorm_bwd", ["h", "dy"], {"weight": "layers.4.attn.q_norm.weight", "group": w.shape[0],
+                                                "eps": cfg.norm_eps}, {"h": h.detach(), "dy": dy}, got, gh, "rmsnorm_bwd")
+        # rows by mask, and back
+        mask = torch.tensor([[1.0], [0], [1], [1], [0], [0], [1]])
+        src = self.rnd(T, cfg.dim)
+        rows = src[mask[:, 0] == 1]
+        self.judge(mk("ds_rows", "y", ["s", "m"], {}, rows.shape, [src.shape, mask.shape]), {"s": src, "m": mask}, rows, "rows")
+        back = torch.zeros(T, cfg.dim, dtype=torch.float64)
+        back[mask[:, 0] == 1] = rows
+        self.judge(mk("ds_unrows", "y", ["s", "m"], {}, back.shape, [rows.shape, mask.shape]), {"s": rows, "m": mask}, back,
+                   "unrows")
+        # the head: two blocks of the vocabulary, stats carried, then the gradient
+        P, V = 5, cfg.vocab_size
+        hw = st["head.weight"].double()
+        hh = self.rnd(P, cfg.dim).requires_grad_()
+        tg = torch.randint(0, V, (P,), generator=self.g)
+        loss = F.cross_entropy(hh @ hw.T, tg, reduction="sum") / 13.0
+        ghh, = torch.autograd.grad(loss, hh)
+        hf, wf = hh.detach().float(), hw.float()
+        lo1, lo2 = hf @ wf[:V // 2].T, hf @ wf[V // 2:].T
+        m1 = lo1.max(-1).values
+        s1 = torch.exp(lo1 - m1[:, None]).sum(-1)
+        st1 = torch.stack([m1, s1], -1)
+        m2 = torch.maximum(m1, lo2.max(-1).values)
+        s2 = s1 * torch.exp(m1 - m2) + torch.exp(lo2 - m2[:, None]).sum(-1)
+        st2 = torch.stack([m2, s2], -1)
+        base = {"h": hh.detach(), "st1": st1}
+        self.judge(mk("ds_head_stats", "y", ["h"], {"weight": "head.weight", "b0": 0, "b1": V // 2, "num": "f32"}, st1.shape,
+                      [hh.shape]), {"h": hh.detach()}, st1, "head stats 1")
+        self.judge(mk("ds_head_stats", "y", ["h", "st1"], {"weight": "head.weight", "b0": V // 2, "b1": V, "num": "f32"},
+                      st2.shape, [hh.shape, st1.shape]), base, st2, "head stats 2")
+        lse = (st2[:, :1] + torch.log(st2[:, 1:2]))
+        ic = float(np.float32(1 / 13.0))
+        g1 = torch.exp(lo1 - lse)
+        low = tg < V // 2
+        g1[torch.arange(P)[low], tg[low]] -= 1
+        g1 = (g1 * ic) @ wf[:V // 2]
+        g2 = torch.exp(lo2 - lse)
+        hit = tg >= V // 2
+        g2[torch.arange(P)[hit], tg[hit] - V // 2] -= 1
+        g2 = g1 + (g2 * ic) @ wf[V // 2:]
+        self.close(g2, ghh, "head grad vs autograd")
+        before = {"h": hh.detach(), "lse": lse, "t": tg[:, None].double(), "acc": g1}
+        self.judge(mk("ds_head_grad", "y", ["h", "lse", "t", "acc"], {"weight": "head.weight", "b0": V // 2, "b1": V,
+                                                                       "ic": 1 / 13.0, "num": "f32"},
+                      g2.shape, [hh.shape, lse.shape, (P, 1), g1.shape]), before, g2, "head grad")
+
     def test_attention(self):
         cfg, st = self.cfg, self.state
         T, H, hd, n, k, W = 90, cfg.n_heads, cfg.head_dim, 30, 3, 40
