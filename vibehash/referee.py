@@ -550,6 +550,8 @@ def op_adam_b(op, x, r, c0, c1):
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
 EXACT = {"embed", "scatter"}  # copies: no rounding at all
+# kind -> fn(op, said) giving why a tile's numbers can't be an honest output's (a dtype they can't be in), or None
+FORMATS: dict = {}
 
 
 class Missing(LookupError):
@@ -578,7 +580,12 @@ def judge(op, x, leaf: int, said: np.ndarray) -> tuple[bool, str]:
     said = np.asarray(said, dtype=np.float64)
     if said.shape != v.shape:
         return False, "the tile has the wrong size"
-    masked = np.isinf(v)
+    fmt = FORMATS.get(op.kind)
+    if fmt is not None:
+        bad = fmt(op, said)
+        if bad is not None:
+            return False, f"{op.kind} → {op.out}: {bad}"
+    masked = np.isinf(v) | (op.kind in EXACT)  # exact ops, and the mask's -inf, must match to the bit
     allowed = MARGIN * e + REL * np.abs(v) + FLOOR
     with np.errstate(invalid="ignore"):
         off = np.where(masked, np.where(said == v, 0.0, np.inf), np.abs(said - v) / allowed)

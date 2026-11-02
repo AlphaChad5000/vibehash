@@ -1,0 +1,506 @@
+"""The referee's DeepSeek-V4.1 ops (DEEPSEEK.md §8): one op of a prep unit or of a top-layer training unit, a tile of
+its output recomputed with NumPy, as referee.py does for Qwen-style models. Registered into referee.OPS under
+"ds_" names.
+
+Two arithmetics, as attrs["num"]:
+- "ref", deepseek.Numerics(): the reference's, which prep units run. Activations are bf16; the code upcasts to
+  float32 where the reference does; FP8 and FP4 activation rounding are ops of their own.
+- "f32", deepseek_top.TRAIN: float32 throughout, no activation rounding, which training units run.
+Each op is the torch expression in deepseek.py its docstring names, and its bound follows that expression step by step
+(referee.py's E). A result cast to bf16 adds bf16's unit roundoff, 2⁻⁸ of it. Matmuls and sums are assumed to
+accumulate in at least float32: cuBLAS with reduced-precision reductions off (deepseek.configure_torch), and oneDNN
+on CPUs, do.
+
+Exact ops (decoding weights, the FP8/FP4 rounding, engram hashes and rows) are judged by equality: they're
+recomputed exactly here, in float32 where the reference computes in float32 (NumPy's float32 operations are IEEE
+correctly rounded, as torch's are). The one float op whose rounding IEEE doesn't pin, powf in the rotary table, is
+bounded, not trusted.
+
+Weights are read by checkpoint name: a quantised matrix as NAME.weight plus NAME.scale (FP8 E4M3 with a ue8m0 scale
+per 32x32 block, or FP4 E2M1 packed two to a byte with one per 32 inputs), the rest as bf16 or float32, all decoded
+exactly in float64 (dispute.decode).
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from . import referee as rf
+from .referee import E, add, div, exp
+
+U_BF16 = 2.0 ** -8  # bf16's unit roundoff (8 significand bits)
+FP8_MAX, FP4_MAX, BLOCK = 448.0, 6.0, 32
+F32 = np.float32
+
+
+# --- exact formats ----------------------------------------------------------------------------------------------------
+
+def _e4m3_table() -> np.ndarray:
+    """Every E4M3 (fn) byte's value: 4 exponent bits (bias 7), 3 mantissa bits, no infinities, 0x7f and 0xff NaN."""
+    out = np.empty(256)
+    for b in range(256):
+        sign, e, m = -1.0 if b & 0x80 else 1.0, (b >> 3) & 0xF, b & 7
+        if e == 0xF and m == 7:
+            out[b] = np.nan
+        elif e == 0:
+            out[b] = sign * m * 2.0 ** -9
+        else:
+            out[b] = sign * (1 + m / 8) * 2.0 ** (e - 7)
+    return out
+
+
+E4M3 = _e4m3_table()
+FP4 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+
+
+def decode_e8m0(raw: np.ndarray) -> np.ndarray:
+    """ue8m0 scales: 2^(byte - 127); 255 is NaN."""
+    b = np.asarray(raw, dtype=np.uint8).astype(np.int64)
+    return np.where(b == 255, np.nan, np.ldexp(1.0, b - 127))
+
+
+def _exponent(a: np.ndarray) -> np.ndarray:
+    """floor(log2(a)) of positive float64s, exactly (frexp, not log2's rounding)."""
+    _, e = np.frexp(a)
+    return e.astype(np.int64) - 1
+
+
+def round_e4m3(v: np.ndarray) -> np.ndarray:
+    """Values in [-448, 448] rounded to the nearest E4M3 number, ties to even, as torch's cast to float8_e4m3fn does:
+    steps of 2^(e-3) at exponent e, and 2^-9 below the smallest normal, 2^-6."""
+    v = np.asarray(v, dtype=np.float64)
+    a = np.abs(v)
+    e = np.maximum(_exponent(np.where(a > 0, a, 1.0)), -6)
+    step = np.ldexp(1.0, e - 3)
+    return np.copysign(np.rint(a / step) * step, v)
+
+
+def fp4_grid(v: np.ndarray) -> np.ndarray:
+    """deepseek._fp4_grid: the nearest E2M1 value to each of v in [-6, 6], ties to even."""
+    v = np.asarray(v, dtype=np.float64)
+    a = np.abs(v)
+    r = np.where(a < 2, np.rint(a * 2) / 2, np.where(a < 4, np.rint(a), np.rint(a / 2) * 2))
+    return np.copysign(r, v)
+
+
+def pow2_ceil(x) -> np.ndarray:
+    """deepseek._pow2_ceil: 2^ceil(log2(x)) of positive normal float32s, from their bits."""
+    bits = np.asarray(x, dtype=F32).view(np.int32).astype(np.int64)
+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0)
+    return np.ldexp(1.0, e)
+
+
+def round_bf16(v) -> np.ndarray:
+    """Float32 values rounded to bf16, ties to even: what `.to(torch.bfloat16)` does to them."""
+    bits = np.asarray(v, dtype=F32).view(np.uint32).astype(np.uint64)
+    bits = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) << 16
+    return bits.astype(np.uint32).view(F32).astype(np.float64)
+
+
+def round_fp8(row, block: int = BLOCK) -> np.ndarray:
+    """deepseek.round_fp8 of one row: per `block` values, the scale 2^ceil(log2(max(amax, 1e-4) · f32(1/448))), that
+    product rounded to float32, then each value the nearest E4M3 number times it."""
+    b = np.asarray(row, dtype=np.float64).reshape(-1, block)
+    amax = np.maximum(np.abs(b).max(-1, keepdims=True), float(F32(1e-4)))
+    s = pow2_ceil(F32(amax) * F32(1 / FP8_MAX))
+    return (round_e4m3(np.clip(b / s, -FP8_MAX, FP8_MAX)) * s).reshape(-1)
+
+
+def round_fp4(row, block: int = BLOCK, e4m3_scale: bool = False) -> np.ndarray:
+    """deepseek.round_fp4 of one row: E2M1 values times one scale per `block`, either 2^ceil(log2(amax · f32(1/6)))
+    or (e4m3_scale) the E4M3 number nearest f32(max(amax, 6·2^-9) / 6), capped at 448."""
+    b = np.asarray(row, dtype=np.float64).reshape(-1, block)
+    amax = np.abs(b).max(-1, keepdims=True)
+    if e4m3_scale:
+        s = round_e4m3(np.minimum((F32(np.maximum(amax, FP4_MAX * 2.0 ** -9)) / F32(FP4_MAX)).astype(np.float64),
+                                  FP8_MAX))
+    else:
+        s = pow2_ceil(F32(np.maximum(amax, FP4_MAX * 2.0 ** -126)) * F32(1 / FP4_MAX))
+    q = np.clip((F32(b) / F32(s)).astype(np.float64), -FP4_MAX, FP4_MAX)
+    return (fp4_grid(q) * s).reshape(-1)
+
+
+# --- reading DeepSeek's weights ----------------------------------------------------------------------------------------
+
+def qrows(x, base: str, r0: int, r1: int) -> np.ndarray:
+    """Rows [r0, r1) of a projection, dequantised exactly: base.weight times base.scale (FP8 32x32 blocks or FP4 32
+    inputs); or base.weight itself, when it's bf16 or float32 and has no scale."""
+    w = x.weight(base + ".weight", r0, r1)
+    try:
+        sdtype, _ = x.outside.source.shape(base + ".scale")
+    except Exception:  # noqa: BLE001 - no scale: a plain matrix
+        return w
+    if sdtype != "F8_E8M0":
+        raise rf.Missing(f"{base}.scale is {sdtype}, not ue8m0")
+    wdtype, _ = x.outside.source.shape(base + ".weight")
+    if wdtype == "I8":  # FP4: one scale per 32 inputs of each row
+        s = x.weight(base + ".scale", r0, r1)
+        return (w.reshape(r1 - r0, -1, BLOCK) * s[:, :, None]).reshape(r1 - r0, -1)
+    b0 = r0 // BLOCK
+    s = x.weight(base + ".scale", b0, (r1 - 1) // BLOCK + 1)  # FP8: one per 32x32 block
+    rows = np.repeat(s, BLOCK, axis=0)[r0 - b0 * BLOCK:r1 - b0 * BLOCK]
+    return w * np.repeat(rows, BLOCK, axis=1)[:, :w.shape[1]]
+
+
+def vec(x, name: str) -> np.ndarray:
+    """A 1-D parameter (a norm's weight, a bias, the sinks), exactly."""
+    return x.weight(name, 0, 1)[0]
+
+
+# --- bounds -----------------------------------------------------------------------------------------------------------
+
+def cast(a: E, num: str) -> E:
+    """A result rounded to the activation dtype: bf16 under "ref"; nothing more under "f32"."""
+    if num == "f32":
+        return a
+    with np.errstate(invalid="ignore", over="ignore"):
+        return E(a.v, a.e + U_BF16 * (np.abs(a.v) + a.e))
+
+
+def sigmoid(a: E) -> E:
+    """torch.sigmoid: 1 / (1 + exp(-a)), each step rounded."""
+    return div(E(1.0), add(E(1.0), exp(-a)))
+
+
+class StateWeights:
+    """A weight source (dispute.Outside's) over a dict of torch tensors as DeepSeek stores them: what a worker reads
+    the referee's inputs from to build its evidence, and what tests use. The node's is dispute.HubWeights."""
+
+    NAMES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32", "float8_e4m3fn": "F8_E4M3",
+             "float8_e8m0fnu": "F8_E8M0", "int8": "I8"}
+
+    def __init__(self, state: dict):
+        self.state = state
+
+    def shape(self, name):
+        t = self.state.get(name)
+        if t is None:
+            from .dispute import WeightsUnavailable
+            raise WeightsUnavailable(f"no {name}")
+        return self.NAMES[str(t.dtype).replace("torch.", "")], tuple(t.shape)
+
+    def read(self, name, r0, r1) -> bytes:
+        import torch
+
+        t = self.state[name]
+        t = t[r0:r1] if t.dim() > 1 else t
+        width = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()]
+        return t.detach().contiguous().cpu().view(width).numpy().tobytes()
+
+
+# --- the ops ----------------------------------------------------------------------------------------------------------
+# Each takes (op, x, r, c0, c1) and gives E for row r, columns [c0, c1) of op.shape, as referee.OPS do. `x` reads the
+# state before the op (x.row, x.get) and the base model's weights (x.weight).
+
+def _num(op) -> str:
+    return op.attrs.get("num", "ref")
+
+
+def op_ds_round_fp8(op, x, r, c0, c1):
+    """num.fp8(x): deepseek.round_fp8, exact."""
+    return E(round_fp8(x.row(op.ins[0], r), op.attrs.get("block", BLOCK))[c0:c1])
+
+
+def op_ds_round_fp4(op, x, r, c0, c1):
+    """num.fp4(x, block, e4m3_scale): deepseek.round_fp4, exact."""
+    a = op.attrs
+    return E(round_fp4(x.row(op.ins[0], r), a.get("block", BLOCK), a.get("e4m3", False))[c0:c1])
+
+
+def _segments(c0, c1, width):
+    """Columns [c0, c1) split where a group of `width` ends: (group, first, end) within it."""
+    out, c = [], c0
+    while c < c1:
+        g, j = divmod(c, width)
+        end = min(c1, (g + 1) * width)
+        out.append((g, j, j + end - c))
+        c = end
+    return out
+
+
+def op_ds_qlinear(op, x, r, c0, c1):
+    """QLinear.matmul (deepseek._matmul): x · Wᵀ with W dequantised, x already rounded to FP8 under "ref". With
+    groups > 1 (wo_a), group g of x's row meets only W's g-th block of rows (deepseek._matmul's einsum)."""
+    a, xs = op.attrs, x.row(op.ins[0], r)
+    groups = a.get("groups", 1)
+    out_g, in_g = op.shape[1] // groups, op.ishapes[0][1] // groups
+    parts = []
+    for g, j0, j1 in _segments(c0, c1, out_g):
+        w = qrows(x, a["weight"], g * out_g + j0, g * out_g + j1)
+        parts.append(rf.contract(E(xs[g * in_g:(g + 1) * in_g][None]), w)[0])
+    return cast(rf._cat(*parts), _num(op))
+
+
+def op_ds_dense(op, x, r, c0, c1):
+    """F.linear(x, W) for a matrix stored as is (bf16 or float32): the router's, the compressor's r = 1 projection,
+    the indexer's wk and weights_proj, the head. attrs hi: computed in num.hi and left there (MoE.scores, the
+    head); else in the activation dtype."""
+    y = rf.contract(E(x.row(op.ins[0], r)[None]), x.weight(op.attrs["weight"], c0, c1))[0]
+    return y if op.attrs.get("hi") else cast(y, _num(op))
+
+
+def op_ds_scale(op, x, r, c0, c1):
+    """x · c for a float32 constant c (the indexer's head weights times D^-1/2 H^-1/2), in the activation dtype."""
+    return cast(rf.scale(E(x.get(op.ins[0], r, r + 1, c0, c1)[0]), rf.f32(op.attrs["c"])), _num(op))
+
+
+def op_ds_rmsnorm(op, x, r, c0, c1):
+    """RMSNorm.forward: weight · (h · rsqrt(mean(h²) + eps)) in num.hi, cast back. attrs group: normalised per that
+    many columns (default: the whole row)."""
+    g = op.attrs.get("group", op.shape[1])
+    xs = x.row(op.ins[0], r).reshape(-1, g)
+    w = x.weight(op.attrs["weight"], 0, 1)[0]
+    y = rf.mul(E(w[None, :]), rf.mul(E(xs), rf.bcast(rf._norm(x, xs, g, op.attrs["eps"]))))
+    return cast(E(y.v.reshape(-1)[c0:c1], y.e.reshape(-1)[c0:c1]), _num(op))
+
+
+# --- rotary positions -------------------------------------------------------------------------------------------------
+
+POWF_ULPS = 1.5  # powf's error in the rotary table's frequencies: faithful (under 1 ulp) in glibc, Sleef and CUDA
+
+
+def rope_table(args, positions) -> tuple[E, E]:
+    """cos and sin [len(positions), dim/2] of deepseek._rope_table(seqlen, *args) at those positions, with bounds
+    covering how float32 computes them there: base ** t (powf, POWF_ULPS of error), then 1 / it, YaRN's blend and
+    positions times frequencies each correctly rounded, then cos and sin (an ulp of 1)."""
+    import math
+
+    dim, original_seq_len, base, factor, beta_fast, beta_slow = args
+    t = (np.arange(0, dim, 2, dtype=F32) / F32(dim)).astype(np.float64)
+    p = rf.dexp(t * rf.dlog(np.float64(base)))  # base ** t, near enough: the bound covers powf's own error
+    p32 = F32(p).astype(np.float64)
+    freqs = rf.div(E(1.0), E(p32, POWF_ULPS * np.spacing(F32(p)).astype(np.float64) + np.abs(p - p32)))
+    if original_seq_len > 0:
+        def corrected_dim(rotations):
+            return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
+        low = max(math.floor(corrected_dim(beta_fast)), 0)
+        high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
+        ramp = rf._r((np.arange(dim // 2, dtype=np.float64) - low) / float(F32(max(high - low, 1e-3))), 0.0)
+        smooth = rf.sub(E(1.0), E(np.clip(ramp.v, 0, 1), ramp.e))
+        fq = float(F32(factor))
+        slow = rf._r(freqs.v / fq, freqs.e / fq)
+        freqs = rf.add(rf.mul(slow, rf.sub(E(1.0), smooth)), rf.mul(freqs, smooth))
+    pos = np.asarray(positions, dtype=np.float64)[:, None]
+    ang = rf._r(pos * freqs.v[None, :], pos * freqs.e[None, :])
+    s, c = rf.dsincos(ang.v)
+    err = ang.e + 2.0 ** -23  # |d cos| ≤ |d angle|, plus the sincos implementation's ulp
+    return E(c, err), E(s, err)
+
+
+def op_ds_rope(op, x, r, c0, c1):
+    """deepseek._rope: the last rd dims of each head of `hd` taken in adjacent pairs (x0, x1) and rotated by the
+    position's angle, (x0 cos - x1 sin, x0 sin + x1 cos) in num.hi (sin negated with inverse), cast back; the other
+    dims copied. attrs: rope (Config.rope_args' tuple), hd, stride (positions per row: a compressed token sits at its
+    group's first), inverse."""
+    a = op.attrs
+    hd, rope = a["hd"], a["rope"]
+    rd = rope[0]
+    row = x.row(op.ins[0], r).reshape(-1, hd)
+    cos, sin = rope_table(rope, [r * a.get("stride", 1)])
+    if a.get("inverse"):
+        sin = -sin
+    x0, x1 = E(row[:, hd - rd::2]), E(row[:, hd - rd + 1::2])
+    t0 = rf.sub(rf.mul(x0, cos), rf.mul(x1, sin))
+    t1 = rf.add(rf.mul(x0, sin), rf.mul(x1, cos))
+    n = row.shape[0]
+    tail = cast(E(np.stack([t0.v, t1.v], -1).reshape(n, rd), np.stack([t0.e, t1.e], -1).reshape(n, rd)), _num(op))
+    v = np.concatenate([row[:, :hd - rd], tail.v], 1).reshape(-1)
+    e = np.concatenate([np.zeros((n, hd - rd)), tail.e], 1).reshape(-1)
+    return E(v[c0:c1], e[c0:c1])
+
+
+# --- hyper-connections ------------------------------------------------------------------------------------------------
+
+def _sum(a: E, axis: int) -> E:
+    """A sum along one axis of a small array, in any order, kept broadcastable."""
+    k = a.v.shape[axis]
+    v = np.apply_along_axis(math_fsum, axis, a.v)
+    s_abs = np.apply_along_axis(math_fsum, axis, np.abs(a.v))
+    ae = np.apply_along_axis(math_fsum, axis, a.e)
+    v, ae, s_abs = (np.expand_dims(t, axis) for t in (v, ae, s_abs))
+    return E(v, ae + rf.gamma(k) * (s_abs + ae))
+
+
+def math_fsum(t) -> float:
+    import math
+    return math.fsum(t.tolist())
+
+
+def op_ds_hc_mixes(op, x, r, c0, c1):
+    """Block.hc_mixes' first half: F.linear(h, fn) · rsqrt(mean(h²) + eps), h the flattened stream in num.hi. The
+    result stays in num.hi."""
+    h = x.row(op.ins[0], r)
+    y = rf.contract(E(h[None]), x.weight(op.attrs["fn"], c0, c1))[0]
+    return rf.mul(y, rf.bcast(rf._norm(x, h[None], h.size, op.attrs["eps"]))[0])
+
+
+def hc_split(m: np.ndarray, sc: np.ndarray, base: np.ndarray, hc: int, iters: int, eps: float) -> E:
+    """deepseek._sinkhorn_split of one token's mixes, as [pre (hc) | post (hc) | comb (hc·hc, row-major)]."""
+    m, e32 = E(m), rf.f32(eps)
+
+    def lin(lo, hi, k):
+        return rf.add(rf.scale(m[lo:hi], rf.f32(sc[k])), E(base[lo:hi]))
+    pre = rf.add(sigmoid(lin(0, hc, 0)), E(e32))
+    post = rf.scale(sigmoid(lin(hc, 2 * hc, 1)), 2.0)
+    z = lin(2 * hc, (2 + hc) * hc, 2)
+    z = E(z.v.reshape(hc, hc), z.e.reshape(hc, hc))
+    top = E(z.v.max(-1, keepdims=True), z.e.max(-1, keepdims=True))
+    ex = rf.exp(rf.sub(z, top))
+    comb = sinkhorn(rf.add(rf.div(ex, _sum(ex, 1)), E(e32)), iters, e32)
+    return rf._cat(pre, post, E(comb.v.reshape(-1), comb.e.reshape(-1)))
+
+
+def sinkhorn(k: E, iters: int, eps: float) -> E:
+    """The kernel's normalisations of a positive matrix k, columns first, then rows and columns iters - 1 times, each
+    a / (sum + eps), with a bound that doesn't double at every step as elementwise bounds would.
+
+    Every step only rescales rows or columns, so the float iterate is the exact one with each element times
+    exp(ρ_i + κ_j + π_ij): a row factor ρ, a column factor κ and an elementwise part π, which only the divisions'
+    own rounding adds to (an ulp a step). A row step divides by the row's float sum: that is, by e^ρ_i times a
+    weighted mean of e^(κ_k + π_ik) and a rounding of the sum, so ρ_i is replaced by (nearly) minus that mean: ρ's
+    old value cancels, and the bound grows by a few roundings a step rather than doubling. (With eps the
+    cancellation is (1 - λ) short of whole, λ = s/(s + eps) near 1: carried exactly as (1 - λ)ρ - λ(σ + τ).)
+    The intervals of ρ, κ and the bound on |π| are propagated step by step against the exact iterate, computed in
+    float64 alongside."""
+    a = k.v.astype(np.float64).copy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lo = np.where(k.e < a, np.log1p(-k.e / a), -np.inf)
+        p = float(np.max(np.maximum(np.log1p(k.e / a), -lo)))
+    n = a.shape[0]
+    u_div = -np.log1p(-rf.U)  # a correctly rounded division or addition, in log terms
+    tau = -np.log1p(-rf.gamma(n))  # a float sum of n positive terms
+    rho = np.zeros((n, 2))  # [lo, hi] per row
+    kap = np.zeros((n, 2))  # per column
+    for step in ["col"] + ["row", "col"] * (iters - 1):
+        mat, own, other = (a, rho, kap) if step == "row" else (a.T, kap, rho)
+        s = np.array([math_fsum(r) for r in mat])
+        w = mat / s[:, None]
+        sig_lo = np.log(w @ np.exp(other[:, 0] - p))
+        sig_hi = np.log(w @ np.exp(other[:, 1] + p))
+        d_lo = np.minimum(0.0, own[:, 0] + sig_lo - tau)
+        d_hi = np.maximum(0.0, own[:, 1] + sig_hi + tau)
+        lam = np.stack([s * np.exp(d_lo) / (s * np.exp(d_lo) + eps), s * np.exp(d_hi) / (s * np.exp(d_hi) + eps)], 1)
+        q = np.stack([sig_lo - tau, sig_hi + tau], 1)
+        corners = np.stack([(1 - lam[:, i]) * own[:, j] - lam[:, i] * q[:, l]
+                            for i in (0, 1) for j in (0, 1) for l in (0, 1)], 1)
+        new = np.stack([corners.min(1) - u_div, corners.max(1) + u_div], 1)  # and the rounding of sum + eps
+        if step == "row":
+            rho, a = new, a / (s + eps)[:, None]
+        else:
+            kap, a = new, a / (s + eps)[None, :]
+        p += u_div  # the division's own rounding, elementwise
+    hi = rho[:, 1][:, None] + kap[:, 1][None, :] + p
+    lo = rho[:, 0][:, None] + kap[:, 0][None, :] - p
+    e = a * np.maximum(np.expm1(hi), -np.expm1(lo)) + 1e-12 * a  # (and float64's own rounding of the exact iterate)
+    return E(a, e)
+
+
+def op_ds_hc_split(op, x, r, c0, c1):
+    """deepseek._sinkhorn_split: pre, post and comb of one token, from its mixes, in num.hi."""
+    a = op.attrs
+    return hc_split(x.row(op.ins[0], r), vec(x, a["scale"]), vec(x, a["base"]), a["hc"], a["iters"], a["eps"])[c0:c1]
+
+
+def op_ds_hc_pre(op, x, r, c0, c1):
+    """deepseek.hc_pre: Σ_k pre_k · x_k over the stream's hc copies, in num.hi, cast back. ins (stream, mixes);
+    attrs col: where pre starts in the mixes' row."""
+    a, dim = op.attrs, op.shape[1]
+    hc, col = op.ishapes[0][1] // dim, op.attrs.get("col", 0)
+    pre = x.get(op.ins[1], r, r + 1, col, col + hc)[0]
+    xs = np.stack([x.get(op.ins[0], r, r + 1, k * dim + c0, k * dim + c1)[0] for k in range(hc)], -1)  # [cols, hc]
+    return cast(rf.esum(rf.mul(E(pre[None, :]), E(xs))), _num(op))
+
+
+def op_ds_hc_post(op, x, r, c0, c1):
+    """deepseek.hc_post: out_k = post_k · y + Σ_j comb_jk · residual_j, the sum over j from 0 in order, in num.hi,
+    cast back. ins (y, residual stream, split row); attrs post, comb: where they start in the split row."""
+    a = op.attrs
+    dim = op.ishapes[0][1]
+    hc = op.shape[1] // dim
+    post = x.get(op.ins[2], r, r + 1, a["post"], a["post"] + hc)[0]
+    comb = x.get(op.ins[2], r, r + 1, a["comb"], a["comb"] + hc * hc)[0].reshape(hc, hc)
+    parts = []
+    for k, j0, j1 in _segments(c0, c1, dim):
+        y = E(x.get(op.ins[0], r, r + 1, j0, j1)[0])
+        res = [E(x.get(op.ins[1], r, r + 1, j * dim + j0, j * dim + j1)[0]) for j in range(hc)]
+        mixed = rf.mul(E(comb[0, k]), res[0])
+        for j in range(1, hc):
+            mixed = rf.add(mixed, rf.mul(E(comb[j, k]), res[j]))
+        parts.append(cast(rf.add(rf.mul(E(post[k]), y), mixed), _num(op)))
+    return rf._cat(*parts)
+
+
+# --- the compressor and the indexer -----------------------------------------------------------------------------------
+
+def op_ds_compress(op, x, r, c0, c1):
+    """Compressor.forward's pooling (ratio > 1), before its norm: for compressed token r, the softmax over its ratio
+    tokens of h·wgate weighting h·wkv, per column, in num.hi, the sum cast back. attrs wkv, wgate, ratio."""
+    a = op.attrs
+    k = a["ratio"]
+    h = x.get(op.ins[0], r * k, (r + 1) * k)  # [ratio, dim]
+    kv = rf.contract(E(h), x.weight(a["wkv"], c0, c1))  # [ratio, cols]
+    sc = rf.contract(E(h), x.weight(a["wgate"], c0, c1))
+    top = E(sc.v.max(0, keepdims=True), sc.e.max(0, keepdims=True))
+    ex = rf.exp(rf.sub(sc, top))
+    p = rf.div(ex, _sum(ex, 0))
+    tot = _sum(rf.mul(kv, p), 0)
+    return cast(E(tot.v[0], tot.e[0]), _num(op))
+
+
+def op_ds_index_scores(op, x, r, c0, c1):
+    """Indexer.scores for query r: Σ_h relu(q_h · k_t) · w_h for each compressed token t, -inf for those it can't
+    see yet ((r + 1) // ratio of them). The einsum, the product and the sum each round to the activation dtype.
+    ins (q [T, H·D], index keys [n, D], w [T, H]); attrs heads, ratio."""
+    a, num = op.attrs, _num(op)
+    H = a["heads"]
+    D = op.ishapes[0][1] // H
+    visible = (r + 1) // a["ratio"]
+    q = x.row(op.ins[0], r).reshape(H, D)
+    w = x.row(op.ins[2], r)
+    v, e = np.full(c1 - c0, -np.inf), np.zeros(c1 - c0)
+    hi = min(c1, visible)
+    if hi > c0:
+        k = x.get(op.ins[1], c0, hi)  # [cols, D]
+        sc = cast(rf.contract(E(q), k), num)  # [H, cols]
+        sc = E(np.maximum(sc.v, 0), np.where(sc.v + sc.e > 0, sc.e, 0.0))  # relu: within e of 0 stays within e
+        prod = cast(rf.mul(sc, E(w[:, None])), num)
+        tot = cast(_sum(prod, 0), num)
+        v[:hi - c0], e[:hi - c0] = tot.v[0], tot.e[0]
+    return E(v, e)
+
+
+# --- the MoE's experts ------------------------------------------------------------------------------------------------
+
+def op_ds_swiglu(op, x, r, c0, c1):
+    """Expert.forward's middle: g and u in num.hi, u clamped to ±limit and g below +limit (limit > 0), silu(g) · u,
+    times the token's gate if given, cast back. ins (g, u[, gate [n, 1]])."""
+    lim = op.attrs.get("limit", 0)
+    g, u = (x.get(n, r, r + 1, c0, c1)[0] for n in op.ins[:2])
+    if lim > 0:
+        g, u = np.minimum(g, lim), np.clip(u, -lim, lim)
+    h = rf.mul(rf._silu(g), E(u))
+    if len(op.ins) > 2:
+        h = rf.mul(E(x.get(op.ins[2], r, r + 1, 0, 1)[0]), h)
+    return cast(h, _num(op))
+
+
+OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
+EXACT = {"ds_round_fp8", "ds_round_fp4"}
+# Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
+# (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
+# two bf16 numbers can be refused exactly.
+CAST = {"ds_qlinear", "ds_scale", "ds_rmsnorm", "ds_rope", "ds_hc_pre", "ds_hc_post", "ds_compress", "ds_index_scores",
+        "ds_swiglu", "ds_dense"}
+
+
+def bf16_only(op, said: np.ndarray):
+    if _num(op) != "ref" or (op.kind == "ds_dense" and op.attrs.get("hi")):
+        return None
+    fin = np.isfinite(said)
+    if not np.array_equal(round_bf16(said[fin]), said[fin]) or np.isnan(said).any() or (np.isinf(said) & (said > 0)).any():
+        return "a number that isn't a bf16 number, as every output of this op is"
+    return None
+
+
+rf.OPS.update(OPS)
+rf.EXACT.update(EXACT)
+rf.FORMATS.update({k: bf16_only for k in CAST})

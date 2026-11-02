@@ -53,7 +53,18 @@ class RecordIncomplete(Exception):
 # --- the base model's weights -----------------------------------------------------------------------------------------
 
 def decode(dtype: str, raw: bytes, cols: int) -> np.ndarray:
-    """Stored weights as float64, exactly: bf16 and f16 widen without rounding."""
+    """Stored weights as float64, exactly: bf16 and f16 widen without rounding, and DeepSeek's FP8 (E4M3), ue8m0
+    scales and FP4 (E2M1 codes packed two to an I8 byte, low nibble first: `cols` packed bytes give 2·cols values)
+    decode from their bits (referee_deepseek)."""
+    if dtype in ("F8_E4M3", "F8_E8M0", "I8"):
+        from . import referee_deepseek as rd
+
+        b = np.frombuffer(raw, np.uint8).reshape(-1, cols)
+        if dtype == "F8_E4M3":
+            return rd.E4M3[b]
+        if dtype == "F8_E8M0":
+            return rd.decode_e8m0(b)
+        return np.stack([rd.FP4[b & 15], rd.FP4[b >> 4]], -1).reshape(b.shape[0], 2 * cols)
     if dtype == "BF16":
         a = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
     elif dtype == "F16":
@@ -73,7 +84,7 @@ def _rows(shape) -> int:
     return int(shape[0]) if len(shape) > 1 else 1
 
 
-_ITEM = {"BF16": 2, "F16": 2, "F32": 4}
+_ITEM = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
 
 
 class HubWeights:
