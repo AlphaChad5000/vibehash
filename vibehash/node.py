@@ -15,14 +15,15 @@ Public (read-only) endpoints let anyone audit the chain:
     GET  /job/<id>/model?offset=N   one chunk of the job's latest trained weights (what its poster downloads)
     GET  /round/params           the current round's starting weights (as a blob id)
     GET  /round/<height>/record  the signed messages and check results a block's round was decided from (replay.py)
+    GET  /round/games            a fine-tune round's disputes: whose move, and what's been posted (dispute.py)
 Signed-envelope endpoints (workers):
-    POST /register  /assignment  /commit  /reveal  /tasks  /verdict
+    POST /register  /assignment  /commit  /reveal  /tasks  /verdict  /move
     (register, commit, reveal and verdict answer with a signed receipt: proof the message will be in the
     round's record, so a node that drops it can be caught; see receipts.py)
 Binary transfer (chunked, resumable, content-addressed; no size cap from HTTP):
     GET  /blob/<sha256>/status   bytes received so far
     GET  /blob/<sha256>?offset=N one chunk of a checkpoint
-    PUT  /blob/<sha256>          upload one chunk (signed headers; registered workers only)
+    PUT  /blob/<sha256>          upload one chunk (signed headers; this round's workers, or a dispute's defender)
     ... and the same three under /dataset/<sha256> for training data
 Other:
     POST /tx                     a signed user transaction (passed on to peers)
@@ -77,8 +78,14 @@ MAX_BLOCKS_REPLY = 4 * 2**20
 # anything more would be junk that every validator stores and every proposal carries.
 ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
 BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"round"}, "commit": {"round", "commitment"},
-          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"}}
+          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"},
+          "move": {"round", "game", "n", "move"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
+MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
+# What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
+# a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
+MAX_TRACE_BLOB, MAX_TRACE_UPLOADS = 2 * 2**30, 16 * 2**30
+DISPUTE_MOVES = 14  # the most moves a dispute takes: unit, segment, step, sequence, layer and ops, two levels each
 # The biggest model this node relays a post_job for (--max-job-mb), as one checkpoint at the job's precision. Measured:
 # a float32 model's starting weights take ~7 times its checkpoint size to build (float64 copies), ~460 MB at 64 MB, and
 # a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
@@ -101,12 +108,13 @@ class PhaseTimes:
     reveal_s: float = 5.0
     verify_s: float = 10.0
     idle_s: float = 2.0
-    jury_s: float = 0.0  # a fine-tune's jury phase, which its round has when a claim is contested (times_for)
+    dispute_s: float = 0.0  # a fine-tune's dispute phase, which its round has when a claim is disputed (times_for)
+    move_s: float = 0.0  # how long a dispute's party has for each move
 
     @property
     def round_s(self) -> float:
         """The longest a round can take: validators wait for a proposal accordingly (_propose_wait)."""
-        return self.register_s + self.compute_s + self.reveal_s + self.verify_s + self.jury_s
+        return self.register_s + self.compute_s + self.reveal_s + self.verify_s + self.dispute_s
 
 
 class Node:
@@ -130,6 +138,8 @@ class Node:
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
         self.coord.timing = lambda job: self.times_for(job).compute_s * 0.8  # capacity leaves slack, as above
         self.blobs: BlobStore = self.store.blobs
+        self.coord.trace_blobs = TraceBlobs(self.blobs)
+        self.trace_uploads: dict[str, int] = {}  # per-defender bytes uploaded for disputes this round
         self.start_blob: str | None = None
         self.uploads: dict[str, set[str]] = {}  # per-worker blob ids this round (quota)
         self._blob_of: dict[int, str] = {}  # id(array) -> blob id, for arrays this round loaded from blobs
@@ -218,7 +228,7 @@ class Node:
 
     def _end_round(self) -> None:
         with self.coord.lock:
-            self.start_blob, self.uploads, self._blob_of = None, {}, {}
+            self.start_blob, self.uploads, self._blob_of, self.trace_uploads = None, {}, {}, {}
         self.blobs.prune(self._evidence())
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
 
@@ -260,10 +270,13 @@ class Node:
         for a longer compute phase). See TrainingJob.phase_lengths."""
         t, need = self.times, job.phase_lengths()
         verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
-        # A fine-tune's jury replays at most a unit, which takes no longer than checking two claims: as long as verify.
+        # A dispute's dearest move re-runs a segment (a challenger checking each step of one), which takes no longer
+        # than checking a claim's segments: as long as verify. Most moves take a second or two, and the phase ends as
+        # soon as every dispute has; it's this long only for a party that makes every move just in time.
+        move = min(verify, MAX_PHASE_S / DISPUTE_MOVES) if job.finetune else 0.0
         return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
                           min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s,
-                          verify if job.finetune else 0.0)
+                          DISPUTE_MOVES * move, move)
 
     def _propose_wait(self) -> float:
         """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
@@ -292,10 +305,17 @@ class Node:
                 return False
             if step:
                 step()
-        if c.start_jury():  # a fine-tune's contested claims: a jury of workers replays them
-            log.info("  %d claims to a jury of workers", len(c.r.contested))
-            if not self._wait(t.jury_s, still):
-                return False
+        c.move_s = t.move_s
+        if c.start_disputes(time.time()):  # a fine-tune's disputed claims, refereed by this node
+            log.info("  %d disputes", len(c.r.games))
+            ends = self.phase_ends = time.time() + t.dispute_s
+            while not c.disputes_done() and time.time() < ends:
+                if self.stopping.wait(0.2) or (still is not None and not still()):
+                    return False
+                c.expire_moves(time.time())
+            for g in sorted(c.r.games.values(), key=lambda g: g.gid):
+                log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, g.challenger[:10], g.defender[:10],
+                         g.outcome or "unfinished")
         return True
 
     # --- running a chain with validators ------------------------------------------------------
@@ -367,7 +387,8 @@ class Node:
                 apply_block(self.chain.state, block, self.chain.chain_id, tip)
                 if block.summary is not None:
                     record = value.get("record")
-                    problems = ["no round record"] if not isinstance(record, dict) else replay_block(self.chain, block, record)
+                    problems = (["no round record"] if not isinstance(record, dict)
+                                else replay_block(self.chain, block, record, datasets=self.store))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -463,7 +484,7 @@ class Node:
                 problem = check_certificate(d.get("certificate"), block.height, block.hash.hex(),
                                             self.chain.state.validator_set(), self.chain.chain_id)
             if problem is None and record is not None:
-                problem = "; ".join(replay_block(self.chain, block, record)) or None
+                problem = "; ".join(replay_block(self.chain, block, record, datasets=self.store)) or None
         if problem:
             log.error("refusing block %d from %s: %s", block.height, peer.url, problem)
             return False
@@ -694,7 +715,7 @@ class Node:
             raise WireError("malformed envelope")
         if not set(env["body"]) <= BODIES.get(kind, set()):
             raise WireError(f"a {kind} message has only {', '.join(sorted(BODIES.get(kind, ())))}")
-        if len(canonical(env)) > (MAX_REVEAL if kind == "reveal" else MAX_MESSAGE):
+        if len(canonical(env)) > {"reveal": MAX_REVEAL, "move": MAX_MOVE}.get(kind, MAX_MESSAGE):
             raise WireError(f"{kind} message too large")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
         with c.lock:
@@ -743,7 +764,7 @@ class Node:
                     d = {"task_id": t.task_id, "unit": t.unit.to_dict(), "segments": t.segments, "dtype": job.wire_dtype,
                          "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
                     if t.kind != "check":  # fine-tunes': only new workers get these, so old ones see what they always did
-                        d |= {"kind": t.kind, "whole": t.whole}
+                        d |= {"kind": t.kind}
                     tasks.append(d)
                 return {"tasks": tasks}
             if kind == "verdict":
@@ -751,6 +772,8 @@ class Node:
                 c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
                                  score=body.get("score"))
                 return {"ok": True, "receipt": self._receipt(kind, env)}
+            if kind == "move":
+                return c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())
         raise ProtocolError(f"unknown message {kind}")
 
     def _receipt(self, kind: str, entry: dict) -> dict:
@@ -779,6 +802,15 @@ class Node:
         c = self.coord
         with c.lock:
             r = c.r
+            if r is not None and c.phase == Phase.DISPUTE:  # a defender's states and evidence
+                if not any(g.defender == addr and g.turn != "done" for g in r.games.values()):
+                    raise ProtocolError("only a dispute's defender uploads, while its dispute lasts")
+                done = self.trace_uploads.get(addr, 0)
+                if not 0 < total <= MAX_TRACE_BLOB or done + total > MAX_TRACE_UPLOADS:
+                    raise ProtocolError("upload quota for this round's disputes used up")
+                if not self.blobs.has(blob_id) and self.blobs.received(blob_id, addr) == 0:
+                    self.trace_uploads[addr] = done + total
+                return addr
             if r is None or c.phase not in (Phase.COMPUTE, Phase.REVEAL) or not r.assignments.get(addr):
                 raise ProtocolError("checkpoints can only be uploaded by this round's workers, before the reveal deadline")
             job = c.job(r.job_id)
@@ -923,6 +955,8 @@ def _handler(node: Node):
                     return node.job_info(parts[1])
                 if parts == ["round", "params"]:
                     return node.round_params()
+                if parts == ["round", "games"]:
+                    return node.coord.game_views()
                 if len(parts) == 3 and parts[0] == "round" and parts[2] == "record":
                     record = node.store.load_record(_number(parts[1], "height"))
                     if record is None:
@@ -975,3 +1009,25 @@ def _handler(node: Node):
             self._guard(route)
 
     return Handler
+
+
+class TraceBlobs:
+    """A dispute's states and evidence, in the node's blob store: what Coordinator.trace_blobs needs."""
+
+    def __init__(self, store: BlobStore):
+        self.store, self.roots = store, {}
+
+    def put_bytes(self, raw: bytes) -> str:
+        return self.store.put_array(np.frombuffer(raw, dtype=np.uint8), "uint8")
+
+    def get_bytes(self, blob_id: str) -> bytes | None:
+        return self.store.path(blob_id).read_bytes() if self.store.has(blob_id) else None
+
+    def tensor_root(self, blob_id: str, rows: int, cols: int) -> str | None:
+        from .merkle import root_of
+
+        if blob_id not in self.roots:
+            if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
+                return None
+            self.roots[blob_id] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
+        return self.roots[blob_id]

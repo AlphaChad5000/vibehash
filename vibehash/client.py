@@ -290,6 +290,8 @@ class WorkerClient:
         self.start_blob: dict[int, str] = {}
         self.uploaded: dict[int, set[str]] = {}  # checkpoints the node confirmed it has, by round
         self.attempt_of: dict[int, str | None] = {}  # the attempt at each round those confirmations were for
+        self.moved: set[tuple] = set()  # (round, dispute, move number) we've made our move for
+        self.party: dict = {}  # this round's tracer.Party, for its disputes
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
@@ -535,17 +537,16 @@ class WorkerClient:
                 for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
                     if res and not res["ok"]:
                         log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])
-        elif phase in ("verify", "jury"):
-            # A fine-tune's round can end with a jury phase, whose tasks are contested claims to replay.
+        elif phase == "dispute":  # a fine-tune's disputes: a move in each that waits on us, every poll until it ends
+            self._disputes(rnd, job)
+            return
+        elif phase == "verify":
             absent = self.worker.verifier_behavior == "absent"  # tests only: a checker that never answers
             tasks = [] if absent else self.node.signed(k, "tasks", {"round": rnd})["tasks"]
-            self._answer(rnd, job, tasks, "on a jury: replaying a contested claim" if phase == "jury" else None)
+            self._answer(rnd, job, tasks)
             st.activity = "round done; waiting for the block"
             if tasks:
-                log.info("round %d: %s %d tasks", rnd, "judged" if phase == "jury" else "verified", len(tasks))
-            if phase == "jury":
-                self.done[key] = True
-                return
+                log.info("round %d: verified %d tasks", rnd, len(tasks))
             for u in self.units.pop(rnd, []):
                 self.worker.forget(u.unit_id)
             self.start_blob.pop(rnd, None)
@@ -555,29 +556,69 @@ class WorkerClient:
             return
         self.done[key] = True
 
-    def _answer(self, rnd: int, job: TrainingJob, tasks: list[dict], doing: str | None = None) -> None:
-        """Do this phase's tasks and send a verdict for each: replay segments (or, for a jury on replicas, a whole
-        unit), or score a fine-tune's starting model on its held-back data."""
+    def _answer(self, rnd: int, job: TrainingJob, tasks: list[dict]) -> None:
+        """Do this phase's tasks and send a verdict for each: replay segments, or score a fine-tune's starting model
+        on its held-back data."""
         st = self.stats
         st.busy = bool(tasks)
         try:
             for i, t in enumerate(tasks, 1):
+                if st.phase_ends and time.time() > st.phase_ends:
+                    # The node refuses verdicts now, and a fine-tune's disputes may be waiting on this worker's move.
+                    log.warning("round %d: the verify phase ended with %d tasks left unchecked", rnd, len(tasks) - i + 1)
+                    break
                 kind = t.get("kind", "check")
                 body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
                 if kind == "score":
                     st.activity = "scoring the round's starting model on the held-back data"
                     body["score"] = list(self.worker.score(job, self._round_start(rnd, job)))
                 else:
-                    st.activity = doing or f"checking other workers' results ({i} of {len(tasks)})"
+                    st.activity = f"checking other workers' results ({i} of {len(tasks)})"
                     openings = {}
                     for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
                         self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
                         openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
-                    ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"], bool(t.get("whole")))
+                    ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"])
                     body |= {"ok": bool(ok), "bad_segment": bad}
                 self._try(self._signed, "verdict", body)
                 st.checked += 1
                 st.checks += 1
+        finally:
+            st.busy = False
+
+    def _disputes(self, rnd: int, job: TrainingJob) -> None:
+        """Make our move in each of this round's disputes that waits on us (dispute.py): as the defender, post the
+        states between our training's ops, or the evidence for one op; as the challenger, name where they go wrong."""
+        st, me = self.stats, self.keys.address
+        games = [g for g in self.node.get("/round/games") if g["turn"] != "done"
+                 and (g["defender"] if g["turn"] in ("split", "evidence") else g["challenger"]) == me
+                 and (rnd, g["id"], g["n"]) not in self.moved]
+        if not games:
+            st.activity = "waiting on this round's disputes"
+            return
+        from .program import Program
+        from .tracer import Party
+
+        party = self.party.get(rnd)
+        if party is None:
+            from . import finetune
+            from .worker import tamper
+
+            rt = finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
+            party = self.party[rnd] = Party(rt, job.spec, job.data, _Remote(self),
+                                            tamper if self.worker.behavior == "tamper" else None)
+            self.party = {rnd: party}
+        st.busy = True
+        try:
+            for g in games:
+                if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
+                    continue  # tests only: a challenger that goes quiet
+                st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
+                prog = Program.of(job, int(g["seed"]))
+                move = (party.pick(prog, g) if g["turn"] == "pick" else {"split": party.split(prog, g)}
+                        if g["turn"] == "split" else {"evidence": party.remote.put(party.evidence(prog, g))})
+                self.moved.add((rnd, g["id"], g["n"]))
+                self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move})
         finally:
             st.busy = False
 
@@ -610,3 +651,22 @@ class WorkerClient:
                 log.exception("unexpected error; skipping to the next phase")
                 time.sleep(2)
             time.sleep(self.poll_s)
+
+
+class _Remote:
+    """A dispute's states and evidence, through the node's blob endpoints (tracer.Party's `remote`)."""
+
+    def __init__(self, client: WorkerClient):
+        self.client = client
+
+    def put(self, raw: bytes) -> str:
+        c = self.client
+        bid = c.blobs.put_array(np.frombuffer(raw, dtype=np.uint8), "uint8")
+        c.node.upload(c.keys, "blob", c.blobs.path(bid), bid)
+        return bid
+
+    def get(self, bid: str) -> bytes:
+        c = self.client
+        if not c.blobs.has(bid):
+            c.node.download("blob", bid, c.blobs)
+        return c.blobs.path(bid).read_bytes()

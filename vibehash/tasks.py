@@ -386,7 +386,7 @@ class Verdict(str, Enum):
     FAILED_SANITY = "failed_sanity"  # NaN, wrong start/final, oversized update
     FAILED_REPLAY = "failed_replay"  # spot-check replay mismatch
     FAILED_REDUNDANCY = "failed_redundancy"  # lost a full-replay arbitration
-    UNCHECKED = "unchecked"  # a fine-tune's claim that no checker answered and no jury decided: unpaid, not slashed
+    UNCHECKED = "unchecked"  # a fine-tune's claim nobody answered for, or the referee couldn't decide: unpaid, unslashed
 
     @property
     def is_fraud(self) -> bool:

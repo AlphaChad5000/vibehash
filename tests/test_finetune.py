@@ -111,17 +111,17 @@ class SpecTests(unittest.TestCase):
                 _score(bad)
         self.assertEqual(_score([1.5, 0.25]), (1.5, 0.25))
 
-    def test_a_fine_tune_round_has_room_for_its_jury(self):
-        """Validators wait for a proposal as long as the round can take: a fine-tune's has a jury phase. And no phase
-        is longer than an hour, whatever a spec asks for."""
+    def test_a_fine_tune_round_has_room_for_its_disputes(self):
+        """Validators wait for a proposal as long as the round can take: a fine-tune's has a dispute phase, long enough
+        for every move of a dispute made just in time. And no phase is longer than an hour, whatever a spec asks for."""
         from types import SimpleNamespace
 
-        from vibehash.node import MAX_PHASE_S, Node, PhaseTimes
+        from vibehash.node import DISPUTE_MOVES, MAX_PHASE_S, Node, PhaseTimes
         node = SimpleNamespace(times=PhaseTimes())
         t = Node.times_for(node, job_of())
-        self.assertEqual(t.jury_s, t.verify_s)
-        self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + 2 * t.verify_s)
-        self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).jury_s, 0)
+        self.assertEqual((t.move_s, t.dispute_s), (t.verify_s, DISPUTE_MOVES * t.verify_s))
+        self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + t.verify_s + t.dispute_s)
+        self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).dispute_s, 0)
         huge = TrainingJob("big", "", 1, 1, spec=ModelSpec(4096, (8192,) * 3, 1000, "float32"), batch_size=4096,
                            steps_per_unit=100_000, checkpoint_every=100_000)
         self.assertTrue(all(x <= MAX_PHASE_S for x in (Node.times_for(node, huge).compute_s,
@@ -715,7 +715,7 @@ class _Seeded:
 @needs_torch
 class NodeFreeRoundTests(unittest.TestCase):
     """Record version 4: a fine-tune's round where the node never runs the model. Rounds are driven by hand here, so
-    each checker, scorer and juror answers as a test needs, and then replayed from their records."""
+    each checker, scorer and party to a dispute does as a test needs, and then replayed from their records."""
 
     def network(self, behaviors, **cfg):
         from unittest import mock
@@ -744,10 +744,11 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.proto.post_job(req, self.job)
         self.before = copy.deepcopy(self.proto.chain)
 
-    def round(self, answer=None, jury=None):
+    def round(self, answer=None, moves=None):
         """One round: everyone trains and reveals honestly as their behaviour says; verify-phase tasks are answered by
-        `answer(task, worker) -> (ok, bad) | None` (None: silent; default: as the worker would), jurors likewise by
-        `jury`. Returns the report."""
+        `answer(task, worker) -> (ok, bad) | None` (None: silent; default: as the worker would); disputes are played
+        by their parties (tracer.Party) unless `moves(game, who) -> move | None | "default"` says otherwise (None: it
+        never moves). Returns the report."""
         p, c = self.proto, self.proto.coord
         c.open_round()
         r = c.r
@@ -768,11 +769,10 @@ class NodeFreeRoundTests(unittest.TestCase):
         c.start_verify()
         self.tasks = dict(r.tasks)
         self._answer(answer)
-        self.jury_phase = c.start_jury()
-        if self.jury_phase:
-            self._answer(jury)
-        self.contested = dict(r.contested)
-        self.jury = dict(r.jury)
+        self.disputed = c.start_disputes()
+        if self.disputed:
+            self._play(moves)
+        self.games = dict(r.games)
         return c.finalize(proposer_keys=p._proposer(beacon), timestamp=p.chain.tip.height + 1)
 
     def _answer(self, policy):
@@ -785,7 +785,7 @@ class NodeFreeRoundTests(unittest.TestCase):
                 else:
                     got = policy(t, w) if policy else "default"
                     if got == "default":
-                        got = w.verify(job, t.unit, t.openings, t.segments, t.whole)
+                        got = w.verify(job, t.unit, t.openings, t.segments)
                     score = None
                 if got is None:
                     continue
@@ -794,6 +794,36 @@ class NodeFreeRoundTests(unittest.TestCase):
                 if score is not None:
                     body["score"] = score
                 c.submit_verdict(addr, t.task_id, ok, bad, envelope=p._signed(w, "verdict", body), score=score)
+
+    def _play(self, policy):
+        from vibehash.program import Program
+        from vibehash.protocol import _Blobs
+        from vibehash.tracer import Party
+        from vibehash.worker import tamper
+
+        p, c = self.proto, self.proto.coord
+        job = c.job(c.r.job_id)
+        remote, rt = _Blobs(c), ft.runtime(job.spec, job.data, "cpu")
+        parties = {a: Party(rt, job.spec, job.data, remote, tamper if w.behavior == "tamper" else None)
+                   for a, w in p.workers.items()}
+        quiet, moved = set(), True
+        while moved:
+            moved = False
+            for g in c.game_views():
+                if g["turn"] == "done" or g["id"] in quiet:
+                    continue
+                who = g["challenger"] if g["turn"] == "pick" else g["defender"]
+                move = policy(g, who) if policy else "default"
+                if move is None:
+                    quiet.add(g["id"])
+                    continue
+                if move == "default":
+                    party, prog = parties[who], Program.of(job, int(g["seed"]))
+                    move = (party.pick(prog, g) if g["turn"] == "pick" else {"split": party.split(prog, g)}
+                            if g["turn"] == "split" else {"evidence": remote.put(party.evidence(prog, g))})
+                body = {"round": c.r.round_no, "game": g["id"], "n": g["n"], "move": move}
+                c.submit_move(who, body, envelope=p._signed(p.workers[who], "move", body))
+                moved = True
 
     def replays(self, reports):
         from vibehash.replay import replay_block
@@ -846,154 +876,136 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertEqual(sum(t.kind == "score" for t in self.tasks.values()), 3)
         self.replays([rep])
 
-    def test_juries_settle_accusations_cheats_and_silence(self):
-        """One round, every case: an honest claim falsely accused (upheld; the accuser and an outvoted juror slashed),
-        a cheat approved by a lazy checker and rejected by an honest one (found bad; the cheat and the approver
-        slashed), a claim no checker answered (its jury upholds it), and one whose jury is silent too (unchecked:
-        unpaid, nobody slashed). Then the round replays from its record."""
-        self.network([("honest", "honest")] * 6 + [("shortcut", "honest")], replication_rate=0.0)
-        cheat = self.workers[-1].address
-        plan = {}
-
-        def checkers(key):
-            return sorted(x.verifier for x in self.proto.coord.r.tasks.values()
-                          if (x.unit.unit_id, x.submitter) == key and x.kind == "check" and not x.canary)
-
-        def answer(t, w):
-            key = (t.unit.unit_id, t.submitter)
-            if not plan:  # choose the claims once the tasks exist; the silent one's worker gets no other part to play
-                honest = sorted({(x.unit.unit_id, x.submitter) for x in self.proto.coord.r.tasks.values()
-                                 if x.kind == "check" and not x.canary and x.submitter != cheat})
-                silent = honest[-1]
-                rest = [k for k in honest if k[1] != silent[1]]
-                accused = next(k for k in rest if set(checkers(k)) - {silent[1], cheat})
-                plan.update(accused=accused, quiet=next(k for k in rest if k != accused), silent=silent)
-            if key == plan["accused"]:
-                first = next(v for v in checkers(key) if v not in (plan["silent"][1], cheat))
-                return (False, t.segments[0]) if t.verifier == first else None
-            if key in (plan["quiet"], plan["silent"]):
-                return None
-            if t.submitter == cheat:
-                lazy = next((v for v in checkers(key) if v != plan["silent"][1]), None)
-                return (True, None) if t.verifier == lazy else "default"
-            return "default"
-        outvoted = []
-
-        def jury(t, w):
-            key = (t.unit.unit_id, t.submitter)
-            if key == plan["silent"]:
-                return None
-            if key == plan["accused"] and not outvoted and t.verifier != plan["silent"][1]:
-                outvoted.append(t.verifier)
-                return False, t.segments[0]
-            return "default"
-        rep = self.round(answer, jury)
-        res, slashed = self.results(rep), {(s[0], s[2]) for s in rep.slashes}
-        self.assertTrue(self.jury_phase)
-        self.assertEqual({k: v[0] for k, v in self.contested.items() if k[1] != cheat},
-                         {plan["accused"]: "dispute", plan["quiet"]: "unchecked", plan["silent"]: "unchecked"})
-        self.assertTrue(all(len(v[2]) == 3 for v in self.contested.values()), "juries of three")
-        self.assertEqual(res[plan["accused"]].verdict.value, "accepted")
-        accuser = next(t.verifier for t in self.tasks.values() if (t.unit.unit_id, t.submitter) == plan["accused"]
-                       and t.verdict is not None and not t.verdict[0])
-        self.assertIn((accuser, "false accusation"), slashed)
-        self.assertIn((outvoted[0], "outvoted on a jury"), slashed)
-        self.assertEqual(res[plan["quiet"]].verdict.value, "accepted")
-        self.assertEqual(res[plan["silent"]].verdict.value, "unchecked")
-        self.assertNotIn(plan["silent"][1], {s[0] for s in rep.slashes})
+    def test_disputes_catch_a_tampered_op_and_false_accusations(self):
+        """A worker that scaled one op's output deep in one step of each segment, checked by honest checkers, and a
+        checker that rejects everything. Every rejection becomes a dispute the node referees: the tampering worker
+        loses on that very op (and is slashed, its accuser the catcher), the false accuser loses each of its own (and
+        is slashed, with no catcher), and every honest claim is accepted and paid. Then the round replays."""
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest"), ("honest", "false_accuser")],
+                     replication_rate=0.0, canaries_per_round=0)
+        cheat, liar = self.workers[-2].address, self.workers[-1].address
+        rep = self.round()
+        self.assertTrue(self.disputed)
+        res, slashes = self.results(rep), rep.slashes
         cheats = [v for k, v in res.items() if k[1] == cheat]
-        self.assertTrue(cheats and all(v.verdict.is_fraud for v in cheats))
-        self.assertIn((cheat, "failed_replay"), slashed)
-        lazies = {t.verifier for t in self.tasks.values() if t.submitter == cheat and t.verdict == (True, None)}
-        self.assertTrue(lazies)
-        for v in lazies:
-            self.assertIn((v, "approved bad work"), slashed)
+        self.assertTrue(cheats and all(v.verdict.value == "failed_replay" for v in cheats), [v.detail for v in cheats])
+        self.assertTrue(all("attn_dv → b.dv" in v.detail for v in cheats), [v.detail for v in cheats])
+        for k, v in res.items():
+            if k[1] != cheat:
+                self.assertEqual(v.verdict.value, "accepted", v.detail)
+        self.assertTrue(any(s[0] == cheat and s[1] not in (None, cheat) for s in slashes))
+        false = [s for s in slashes if s[0] == liar]
+        self.assertTrue(false and all(s[1:] == [None, "false accusation"] for s in false), false)
+        self.assertEqual({s[0] for s in slashes}, {cheat, liar})
+        won = [g for g in self.games.values() if g.challenger == liar]
+        self.assertTrue(won and all(g.outcome in ("defender", "challenger") for g in won))
+        self.assertTrue(all(g.outcome == "challenger" for g in self.games.values() if g.defender == cheat))
         paid = rep.block.summary.worker_flops
-        self.assertIn(plan["accused"][1], paid)
         self.assertNotIn(cheat, paid)
+        self.assertTrue(set(paid) >= {w.address for w in self.workers[:5]} & {k[1] for k in res})
+        games = rep.record["games"]
+        self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
+        self.assertTrue(all(e["evidence"] for e in games if e["outcome"] != "unchecked"))
+        self.replays([rep])
+        # What a validator votes by: a plain replay. Its referee needs the job's data (which sequences a step trains
+        # on), which a node passes as its store.
+        from vibehash.replay import replay_block
+        bare = replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record))
+        self.assertTrue(bare and "needs its dataset" in bare[0], bare)
+
+        class Store:
+            def attach_dataset(_, j):
+                j.attach_data(load_dataset(self.path), self.sha)
+        self.assertEqual(replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record),
+                                      datasets=Store()), [])
+
+    def test_silent_parties_lose(self):
+        """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
+        challenger. Both are slashed as if they had lost at the referee."""
+        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        liar = self.workers[-1].address
+        order = []
+
+        def moves(g, who):
+            if g["id"] not in order:
+                order.append(g["id"])
+            if g["id"] == order[0] and who == g["defender"]:
+                return None  # never splits
+            if len(order) > 1 and g["id"] == order[1] and who == g["challenger"] and g["n"] >= 3:
+                return None  # picks once, then goes quiet
+            return "default"
+        rep = self.round(moves=moves)
+        silent_defence, quitting = self.games[order[0]], self.games[order[1]]
+        self.assertEqual((silent_defence.outcome, silent_defence.detail),
+                         ("challenger", "the defender didn't split in time"))
+        self.assertEqual((quitting.outcome, quitting.detail), ("defender", "the challenger didn't pick in time"))
+        slashed = {(s[0], s[2]) for s in rep.slashes}
+        self.assertIn((silent_defence.defender, "failed_replay"), slashed)
+        self.assertIn((liar, "false accusation"), slashed)
         self.replays([rep])
 
-    def test_replicas_that_disagree_go_to_a_jury(self):
-        """Every unit replicated, one segment challenged: a shortcut worker's spot checks can pass, but its unit's
-        replicas disagree, and a jury replays the whole unit for each: the cheat is slashed, its honest twin paid. A
-        checker who falsely rejected the twin is judged with it and slashed (it used to be dropped)."""
-        self.network([("honest", "honest")] * 8 + [("shortcut", "honest")], replication_rate=1.0, challenge_segments=1)
-        cheat, accused, who = self.workers[-1].address, [], []
-
-        def answer(t, w):  # the first checker of an honest twin falsely rejects it
-            twins = self.proto.coord.r.holders[t.unit.unit_id]
-            if t.kind == "check" and cheat in twins and t.submitter in twins and t.submitter != cheat                     and not accused and w.address != cheat:
-                accused.append((t.unit.unit_id, t.submitter))
-                who.append(w.address)
-                return False, t.segments[0]
-            return "default"
-        reports = []
+    def test_replicas_that_disagree_dispute_each_other(self):
+        """Every unit replicated, one segment challenged: a tampering worker's unit and its honest twin's disagree, so
+        each challenges the other. The honest twin finds the tampered op and wins; the tampering one finds nothing
+        wrong with its twin's unit and concedes, which costs a replica nothing. The honest twin is paid."""
+        self.network([("honest", "honest")] * 8 + [("tamper", "honest")], replication_rate=1.0, challenge_segments=1,
+                     canaries_per_round=0)
+        cheat = self.workers[-1].address
         for _ in range(3):
-            reports.append(self.round(answer))
-            if accused:
+            rep = self.round()
+            twins = [g for g in self.games.values() if g.why == "replicas"]
+            if twins:
                 break
-        verdicts = [res.verdict.value for rep in reports for res in rep.results if res.worker == cheat]
-        self.assertTrue(verdicts and all(v == "failed_redundancy" for v in verdicts), verdicts)
-        for rep in reports:
-            for (uid, addr), res in self.results(rep).items():
-                if addr != cheat:
-                    self.assertEqual(res.verdict.value, "accepted", res.detail)
-        self.assertTrue(accused, "a checker of a twin accused it")
-        self.assertIn((who[0], "false accusation"), {(s[0], s[2]) for s in reports[-1].slashes})
-        self.assertEqual(self.contested[accused[0]][0], "replicas")
-        self.replays(reports)
+        self.assertTrue(twins, "a tampering worker's unit was replicated")
+        by_defender = {g.defender: g for g in twins}
+        self.assertEqual(by_defender[cheat].outcome, "challenger", by_defender[cheat].detail)
+        self.assertIn("attn_dv", by_defender[cheat].detail)
+        honest = [g for g in twins if g.defender != cheat]
+        self.assertTrue(honest and all(g.outcome == "conceded" for g in honest))
+        res = self.results(rep)
+        self.assertTrue(all(v.verdict.is_fraud for k, v in res.items() if k[1] == cheat))
+        self.assertTrue(all(v.verdict.value == "accepted" for k, v in res.items() if k[1] != cheat))
+        self.assertFalse([s for s in rep.slashes if s[0] != cheat])
 
     def test_canaries_catch_a_checker_that_spots_rescaled_updates(self):
         """A lazy checker that knows Adam: it approves without replaying unless a segment breaks what Adam's moments
         must satisfy, which spotted most of the old, rescaled canaries. Today's are real training under another unit's
         seed, so it approves one and is slashed; and once it has, its approvals count for nothing (a claim only it
-        approved goes to a jury)."""
+        approved ends unchecked)."""
         self.network([("honest", "honest")] * 7 + [("honest", "knowing")])
         knowing = self.workers[-1].address
 
         def answer(t, w):  # everyone as their behaviour says; the knowing checker's rejections are noted
-            got = w.verify(self.job, t.unit, t.openings, t.segments, t.whole)
+            got = w.verify(self.job, t.unit, t.openings, t.segments)
             if w.address == knowing:
                 flagged.append(not got[0])
             return got
-        flagged = []
-        caught = None
+        flagged, reports = [], []
         for _ in range(5):
-            rep = self.round(answer, answer)
-            if any(s[0] == knowing and s[2] == "approved a canary" for s in rep.slashes):
-                caught = rep
+            reports.append(self.round(answer))
+            if any(s[0] == knowing and s[2] == "approved a canary" for s in reports[-1].slashes):
                 break
-        self.assertIsNotNone(caught, "the knowing checker was given a canary and approved it")
+        caught = reports[-1]
+        self.assertTrue(any(s[0] == knowing and s[2] == "approved a canary" for s in caught.slashes),
+                        "the knowing checker was given a canary and approved it")
         self.assertFalse(any(flagged), "honest work and canaries both pass Adam's invariants")
         alone = [k for k in {(t.unit.unit_id, t.submitter) for t in self.tasks.values() if t.kind == "check" and not t.canary}
                  if {t.verifier for t in self.tasks.values() if (t.unit.unit_id, t.submitter) == k and t.verdict
                      is not None and not t.canary} == {knowing}]
         for key in alone:
-            self.assertIn(key, self.contested, "a claim only the canary's approver approved goes to a jury")
-        self.replays([caught])
+            self.assertEqual(self.results(caught)[key].verdict.value, "unchecked")
+        self.replays(reports)
 
-    def test_a_jury_needs_three(self):
-        """With too few workers left to draw a jury of three (here one worker is out for faking its unit), an accused
-        claim ends unchecked: unpaid, and nobody is slashed for it, neither the worker, nor its approving checker, nor
-        the accuser. A jury of one used to decide alone."""
-        self.network([("honest", "honest")] * 5 + [("lazy", "honest")], replication_rate=0.0, canaries_per_round=0)
-        plan = {}
-
-        def answer(t, w):
-            key = (t.unit.unit_id, t.submitter)
-            if t.kind == "check" and not plan and t.submitter != self.workers[-1].address:
-                plan.update(key=key, accuser=t.verifier)
-            if key == plan.get("key") and t.verifier == plan["accuser"]:
-                return False, t.segments[0]
-            return "default"
-        rep = self.round(answer, answer)
-        why, segs, ids = self.contested[plan["key"]]
-        self.assertEqual((why, ids), ("dispute", []))
-        self.assertEqual(self.results(rep)[plan["key"]].verdict.value, "unchecked")
-        slashed = {s[0] for s in rep.slashes}
-        self.assertNotIn(plan["key"][1], slashed)
-        self.assertNotIn(plan["accuser"], slashed)
-        self.assertEqual(slashed, {self.workers[-1].address})  # only the faker
+    def test_two_workers_are_enough_to_start(self):
+        """With the node refereeing, one honest checker a claim makes its verdict right: two staked workers train,
+        checking each other."""
+        from vibehash.coordinator import FINETUNE_QUORUM
+        self.assertEqual(FINETUNE_QUORUM, 2)
+        self.network([("honest", "honest")] * 2, replication_rate=0.0, canaries_per_round=0)
+        rep = self.round()
+        self.assertGreater(rep.block.summary.accepted_units, 0)
+        self.assertTrue(all(res.verdict.value == "accepted" for res in rep.results))
         self.replays([rep])
 
     def test_scorers_are_paid_only_when_they_agree(self):
@@ -1005,7 +1017,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         def answer(t, w):
             return None if w.address == liar else "default"
         for _ in range(6):
-            rep = self.round(answer, answer)
+            rep = self.round(answer)
             if any(t.kind == "score" and t.verifier == liar for t in self.tasks.values()):
                 break
         scores = {t.verifier: t.score for t in self.tasks.values() if t.kind == "score"}
@@ -1017,8 +1029,8 @@ class NodeFreeRoundTests(unittest.TestCase):
 
     def test_without_a_quorum_of_staked_workers_it_waits(self):
         """On a chain where newcomers earn their stake in, a fine-tune trains only once enough staked workers can check
-        and judge each other's work; until then nothing is assigned, nobody scores (or is paid for scoring) nothing,
-        and the round says why."""
+        each other's work; until then nothing is assigned, nobody scores (or is paid for scoring) nothing, and the
+        round says why."""
         from vibehash.coordinator import FINETUNE_QUORUM
         self.network([("honest", "honest")] * FINETUNE_QUORUM, earn_in=True,
                      stakes={KeyPair.generate(f"w{i}".encode()).address: 10 * VIBE for i in range(FINETUNE_QUORUM - 1)})
@@ -1047,14 +1059,18 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertIn("broken", c.waiting)
 
     def test_a_round_replays_with_pytorch_blocked(self):
-        """What a node does with a fine-tune's round, done in a process where importing PyTorch fails: the node's
-        modules load, and the round replays and rechecks from its record and checkpoints."""
+        """What a node does with a fine-tune's round, done in processes where importing PyTorch fails: the node's
+        modules load, and a round with disputes replays and rechecks from its record and checkpoints, its referee
+        recomputing each dispute's last op with NumPy. Two such processes, as two validators would, reach
+        byte-identical verdicts."""
         import pickle
         import subprocess
         import sys
 
-        self.network([("honest", "honest")] * 6)
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest"), ("honest", "false_accuser")],
+                     replication_rate=0.0, canaries_per_round=0)
         rep = self.round()
+        self.assertTrue(rep.record["games"])
         d = tmpdir(self)
         arrays = {}
         for x in rep.record["reveals"]:
@@ -1064,10 +1080,12 @@ class NodeFreeRoundTests(unittest.TestCase):
             pickle.dump({"before": self.before, "block": rep.block, "record": rep.record, "arrays": arrays,
                          "path": str(self.path), "sha": self.sha}, f)
         script = BLOCK_TORCH + """
-import copy, pickle
-from vibehash import node, coordinator, replay, storage, finetune  # noqa: F401
+import copy, hashlib, pickle
+from vibehash import node, coordinator, replay, storage, finetune, dispute, referee  # noqa: F401
 from vibehash.replay import replay_block
 from vibehash.tasks import load_dataset
+from vibehash.coordinator import Coordinator, CoordinatorConfig
+from vibehash.ledger import canonical
 d = pickle.load(open(sys.argv[1], "rb"))
 class Recheck:
     def array(self, bid, job): return d["arrays"][bid]
@@ -1075,14 +1093,21 @@ class Recheck:
 stats = {}
 problems = replay_block(copy.deepcopy(d["before"]), d["block"], copy.deepcopy(d["record"]), Recheck(), stats)
 assert "torch" not in sys.modules
+verdicts = []
+for e in d["record"]["games"]:
+    verdicts.append([e["id"], e["outcome"], e["detail"]])
 print("PROBLEMS", problems, "RECHECKED", stats["rechecked"], "UNCHECKED", stats["unchecked"])
+print("VERDICTS", hashlib.sha256(canonical(verdicts)).hexdigest(), len(verdicts))
 """
         root = str(Path(__file__).resolve().parents[1])
-        out = subprocess.run([sys.executable, "-c", script, str(d / "round.pkl")], capture_output=True, text=True,
-                             cwd=root, env={**os.environ, "PYTHONPATH": root}, timeout=300)
-        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
-        self.assertIn("PROBLEMS [] RECHECKED", out.stdout)
-        self.assertIn("UNCHECKED 0", out.stdout)
+        outs = [subprocess.run([sys.executable, "-c", script, str(d / "round.pkl")], capture_output=True, text=True,
+                               cwd=root, env={**os.environ, "PYTHONPATH": root}, timeout=600) for _ in range(2)]
+        for out in outs:
+            self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+            self.assertIn("PROBLEMS [] RECHECKED", out.stdout)
+            self.assertIn("UNCHECKED 0", out.stdout)
+        self.assertEqual(outs[0].stdout, outs[1].stdout)
+        self.assertTrue(any(e["outcome"] == "challenger" and "attn_dv" in e["detail"] for e in rep.record["games"]))
 
     def test_a_fine_tune_record_must_be_version_4(self):
         from vibehash.coordinator import Coordinator, ProtocolError
@@ -1154,9 +1179,10 @@ class LiveNetworkTests(unittest.TestCase):
 
         from vibehash.node import PhaseTimes
         # Seven workers in one process take turns on a GPU (finetune._Runtime.busy): longer phases than the MLP tests'.
+        # A dispute's move gets as long as the verify phase, and a defender may still be checking when its dispute opens.
         node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(
-            self, 7, times=PhaseTimes(register_s=1.0, compute_s=10.0, reveal_s=3.0, verify_s=6.0, idle_s=0.3))
-        clients[-1].worker.verifier_behavior = "false_accuser"  # its rejections go to a jury of the others
+            self, 7, times=PhaseTimes(register_s=1.0, compute_s=10.0, reveal_s=3.0, verify_s=15.0, idle_s=0.3))
+        clients[-1].worker.verifier_behavior = "false_accuser"  # its rejections become disputes it loses
         wallets.save(req, d / "requester.json", None)
 
         def run(*argv) -> str:
@@ -1174,7 +1200,7 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertIn("60 examples (60 chats", said)
         self.assertIn("Posted job chats-1", said)
 
-        run_until(node, clients, stop, 5, seconds=300)  # the job's block and four rounds (the first while workers join)
+        run_until(node, clients, stop, 5, seconds=600)  # the job's block and four rounds (the first while workers join)
         info = api.get("/job/chats-1")
         spec = TrainingJob.from_spec_json(json.dumps(info["spec"]), "", 0).spec
         self.assertEqual(spec.repo, "tiny/qwen3")
@@ -1183,8 +1209,10 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertLess(node.chain.state.escrow["chats-1"], 100 * VIBE)
         self.assertTrue(any(node.chain.state.balance(w.address) for w in workers), "workers were paid")
         slashes = [s for b in node.chain.blocks if b.summary for s in b.summary.slashes]
-        self.assertTrue(any(s[0] == workers[-1].address and s[2] == "false accusation" for s in slashes), slashes)
-        self.assertFalse([s for s in slashes if s[0] != workers[-1].address], "only the false accuser was slashed")
+        games = [(e["outcome"], e["detail"], len(e["moves"])) for b in node.chain.blocks if b.summary
+                 for e in api.get(f"/round/{b.height}/record").get("games", [])]
+        self.assertTrue(any(s[0] == workers[-1].address and s[2] == "false accusation" for s in slashes), (slashes, games))
+        self.assertFalse([s for s in slashes if s[0] != workers[-1].address], ("only the false accuser was slashed", games))
         self.assertTrue(all(r["version"] == 4 for r in (api.get(f"/round/{b.height}/record") for b in node.chain.blocks
                                                         if b.summary)))
 
@@ -1270,7 +1298,7 @@ class RealModelTests(unittest.TestCase):
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs CUDA")
     def test_a_whole_unit_on_cuda_replays_on_the_cpu(self):
-        """What a jury on disagreeing replicas does: a whole 16-step unit trained on CUDA, replayed on the CPU, passes
+        """What comparing replicas assumes: a whole 16-step unit trained on CUDA, replayed on the CPU, passes
         the whole-unit rule (finetune.WHOLE_TOLERANCE, and 1% of the unit's own change). Measured 2026-11-01: 5.0e-5
         of B's size and 7.1e-5 of its change, so a segment's 1e-4 of the size would leave a margin of only two."""
         from vibehash import compute

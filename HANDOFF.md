@@ -169,14 +169,8 @@ Done and tested (as of the last full runs):
      segment within 2.6e-6 of the segment's change, same GPU bit-identical; tolerance 1e-4. A 16-step unit of 8
      chats is 9.5 s on the 4070 SUPER. Learning rate from a sweep (DESIGN §8).
    - **Nodes don't run the model (record version 4, DESIGN §8 "Fine-tune rounds without the model on the node").**
-     A fine-tune's round gives each claim two checkers, has three scorers score its starting model (the record keeps
-     the median, for people only), and sends anything rejected, unanswered, or where replicas disagree to a jury of
-     three workers in an extra `jury` phase of the same round (`Coordinator.start_jury`, `_settle_finetune`).
-     Majority of jurors drawn decides; losers are slashed; no majority leaves the claim `UNCHECKED` (unpaid, unslashed,
-     not carried over). A fine-tune trains only once six staked workers able to run it have registered
-     (`FINETUNE_QUORUM`; `waiting` in `/status` says why); newcomers earn stake on other jobs first. The node needs
-     neither PyTorch nor the weights, and rechecks don't either. Proven with the node in a venv with no PyTorch
-     (FINETUNING.md milestone B).
+     A fine-tune's round gives each claim two checkers and has three scorers score its starting model (the record
+     keeps the median, for people only). Juries are gone (below): a rejection is a dispute game.
    - **After the review of PR #5 (2026-11-01):**
      - **What counts as a fine-tune:** only a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`),
        so an MLP spec with a stray `base` stays an MLP spec.
@@ -184,14 +178,27 @@ Done and tested (as of the last full runs):
      - **Bad data:** config.json is checked strictly when a dataset arrives (`finetune.arch_dims`), and a job that
        won't load is skipped, not fatal.
      - **Canaries** are another unit's real training (the old rescaled ones broke Adam's invariants, which a lazy
-       checker could test with numpy, `verification.adam_impossible`). A canary-approver's verdicts don't count, and
-       the jury phase gets a canary too.
-     - **Juries** need three, or the claim ends unchecked.
+       checker could test with numpy, `verification.adam_impossible`). A canary-approver's verdicts don't count.
      - **Scorers** are paid only when three agree.
      - **Draws** are seeded per claim.
-     - **Replicas:** disagreeing replicas judge their accusers.
-     - **Timing:** round lengths count the jury phase, and no phase is over an hour (`node.MAX_PHASE_S`).
-     - **Tolerance:** whole-unit replays use `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA).
+     - **Timing:** no phase is over an hour (`node.MAX_PHASE_S`).
+     - **Tolerance:** comparing replicas uses `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA).
+   - **Disputes in place of juries (DESIGN §8, `dispute.py`):** a checker's rejection, or two replicas that disagree,
+     is a bisection game in a `dispute` phase of the same round. The worker posts the states between its training's
+     ops (unit → segment → step → sequence → layer → op, up to 64 children a split), the challenger picks where they
+     go wrong, and the node recomputes one tile of one op with NumPy (`referee.py`: float64 with a bound on float32
+     rounding; no libm, so every machine agrees). Losers are slashed; a false accusation's slash is burned. The weights
+     it needs come by byte range from the pinned commit (`dispute.HubWeights`); Hub unreachable means unchecked.
+     - **Training changed with it:** it runs `program.py`'s ops one by one (`tracer.py`), so the states a worker posts
+       are its training's own. Gradients match autograd to ~1e-6. It's 2.2× slower a step on Qwen3-0.6B (1.62 s
+       against 0.72 s at batch 8); batching a step's sequences in each op is the follow-up.
+     - **Start gate:** `FINETUNE_QUORUM` = 2 (one to train, one to check): one honest checker makes a claim's verdict
+       right now.
+     - **New HTTP:** `GET /round/games`, `POST /move`; a dispute's defender may upload its states (quota per round).
+     - **Records:** `games` (signed moves, evidence, the weights used), `checks/game`. Replaying a round with disputes
+       needs the job's dataset (the program), not PyTorch or the Hub.
+     - **Not done:** receipts for moves; a recheck checking the recorded weights against the Hub; measuring how far a
+       worker can steer a segment with every op at its bound (DESIGN §8's residual).
      `vibehash node --device` still exists for MLP checks. `testnet --job none` posts no demo job, for `train --base`.
    - **hub.py:** `TensorCache` now fetches 64 MiB runs over six connections (1.5 GB in ~15 s here); manifests pin
      `chat_template.jinja` too.
@@ -200,7 +207,8 @@ Done and tested (as of the last full runs):
    - **Rolling it out:** this release makes block version 3, which a 0.5.x node refuses, so every validator runs it
      before the first new block (as with version 2); on `vibehash-public-1` the node is the only validator, so
      updating it is the switch. Size `--keep-rounds` to the disk (about 3 GB a round of 8 Qwen3-4B units). The public
-     network then needs six staked GPU workers before a fine-tune trains. The live chain was scanned on 2026-11-01
+     network then needs two staked GPU workers before a fine-tune trains, and the node needs to reach
+     huggingface.co for disputes (byte ranges of the base model; a few MB each). The live chain was scanned on 2026-11-01
      (height 6187): its one post_job (height 2) has no `base` field, so nothing on it changes meaning.
    - **Not done:** `vibehash hub login` (gated Llamas need `HF_TOKEN` set by hand); manifests shared on the network
      (each poster builds and caches its own); moments in bf16; cache limits on the worker; Intel/AMD/Apple
