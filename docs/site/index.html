@@ -285,7 +285,7 @@ main a:hover, footer a:hover { text-decoration-color: var(--ink); }
 /* The brand's gradient (the terminal banner's gold, orange, pink, violet), used deliberately: a line along the top,
    the headline's accent, section numbers, the model's layers and a glow behind it. Text and controls stay calm. */
 :root { --grad: linear-gradient(90deg, #ffcd3c, #ff9646 35%, #ff5f96 68%, #b46eff); }
-.pillar { border-top: 1px solid transparent; border-image: var(--grad) 1; }
+.pillar { border-top: 1px solid var(--rule); }
 .band { background: radial-gradient(60% 80% at 82% 55%, rgb(180 110 255 / 0.06), transparent 70%), radial-gradient(40% 60% at 70% 40%, rgb(255 150 70 / 0.045), transparent 70%), var(--band); }
 .bars i::after { background: var(--c, var(--signal)); }
 .model-key span::before { background: linear-gradient(90deg, #ffcd3c, #b46eff); }
