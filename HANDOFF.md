@@ -115,6 +115,26 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 
 ## Current state
 
+**Release 0.5.5 (2026-11-02): fine-tuning, the dispute judge, and DeepSeek-V4.1-Flash's first job.** It brings together:
+- PR #5: LoRA fine-tuning of open models where the node never runs the model, plus the bisection dispute judge, after
+  two reviews and a re-check;
+- PRs #6, #9 and #14: the DeepSeek top-layers route, its split prep, the think-shorter pilot data and the DeepSeek
+  referee ops;
+- PR #7 and the PRs after it: the node's /network, the new front page, the terminal menu, the installers with the
+  finetune extra;
+- PR #4: the whitepaper.
+
+The DeepSeek wiring (#14) had one review, and its eight launch-blocking findings were fixed. Three more are noted in
+DEEPSEEK.md §8 for after launch. #14 merged on the owner's call before CI finished on its last commit; the publish
+workflow's tests are the check on what shipped.
+
+Launch steps that come after this release, in order:
+1. the node upgrade, which restarts it and picks up the VIBEHASH_BUCKET_* lines already in /etc/vibehash/env;
+2. a short live fine-tune check;
+3. post the think-shorter pilot;
+4. publish the site with scripts/build_site.py;
+5. post on r/deepseek.
+
 Done and tested (as of the last full runs):
 - Ledger, economics, verification, every cheat type, live multi-process network, chain audit, restart from disk.
 - Chunked blob transfer: a live network trained a **2.2M-weight float32 model (8.8 MB checkpoints)** with all units accepted, and a **20 MB dataset** moved in chunks. The checkpoint cap is now **1 GiB** (`tasks.MAX_CHECKPOINT_BYTES`).

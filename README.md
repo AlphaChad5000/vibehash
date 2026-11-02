@@ -208,14 +208,14 @@ trusted publisher for `vibehash` names owner `AlphaChad5000`, repository
 `vibehash`, workflow `publish.yml` and environment `pypi`.
 
 1. Bump `version` in `pyproject.toml` (PyPI never accepts the same version
-   twice; 0.5.4 is out), commit it, and push.
+   twice; 0.5.5 is out), commit it, and push.
 2. Tag the commit with that version and push the tag. This publishes it:
 
 ```bash
-git tag v0.5.5
+git tag v0.5.6
 ```
 ```bash
-git push origin v0.5.5
+git push origin v0.5.6
 ```
 
 Follow the run under the repository's Actions tab. To try a build locally
