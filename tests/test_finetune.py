@@ -944,8 +944,10 @@ class NodeFreeRoundTests(unittest.TestCase):
         loses on that very op (and is slashed, its accuser the catcher); the false accuser, finding nothing the referee
         would refuse in the honest work it disputes, withdraws each of its own (unpaid for checking and marked missed,
         but not slashed: an honest checker mistaken the same way mustn't be); and every honest claim is accepted and
-        paid. Then the round replays."""
-        self.network([("honest", "honest")] * 5 + [("tamper", "honest"), ("honest", "false_accuser")],
+        paid. Then the round replays. Three workers, so a claim's checkers are the other two: the false accuser checks
+        every claim it doesn't hold, and the cheat's claims always meet an honest checker (with seven, which claims the
+        accuser drew depended on the training's float bits, and on 3.10 it drew none)."""
+        self.network([("honest", "honest"), ("tamper", "honest"), ("honest", "false_accuser")],
                      replication_rate=0.0, canaries_per_round=0)
         cheat, liar = self.workers[-2].address, self.workers[-1].address
         rep = self.round()
@@ -967,7 +969,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertTrue(all(g.outcome == "challenger" for g in self.games.values() if g.defender == cheat))
         paid = rep.block.summary.worker_flops
         self.assertNotIn(cheat, paid)
-        self.assertTrue(set(paid) >= {w.address for w in self.workers[:5]} & {k[1] for k in res})
+        self.assertTrue(set(paid) >= {w.address for w in self.workers if w.address != cheat} & {k[1] for k in res})
         games = rep.record["games"]
         self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
         refereed = [e for e in games if e["outcome"] in ("challenger", "defender")]
@@ -1367,16 +1369,14 @@ class NodeFreeRoundTests(unittest.TestCase):
 
     def test_scorers_are_paid_only_when_they_agree(self):
         """The median of three scorers goes on record; a scorer is paid only when three answered and it agrees with
-        them. One that makes its score up (and here checks nothing either) gets nothing for it."""
-        self.network([("honest", "honest")] * 6 + [("honest", "lazy")], replication_rate=0.0, canaries_per_round=0)
+        them. One that makes its score up (and here checks nothing either) gets nothing for it. Three workers, so all
+        three score (with seven, whether the made-up scorer was drawn within a few rounds was luck)."""
+        self.network([("honest", "honest")] * 2 + [("honest", "lazy")], replication_rate=0.0, canaries_per_round=0)
         liar = self.workers[-1].address
 
         def answer(t, w):
             return None if w.address == liar else "default"
-        for _ in range(6):
-            rep = self.round(answer)
-            if any(t.kind == "score" and t.verifier == liar for t in self.tasks.values()):
-                break
+        rep = self.round(answer)
         scores = {t.verifier: t.score for t in self.tasks.values() if t.kind == "score"}
         self.assertEqual(scores[liar], (0.01, 0.99))
         self.assertEqual(rep.record["score"][0], sorted(v[0] for v in scores.values())[1])
