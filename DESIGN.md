@@ -630,21 +630,36 @@ Each step:
      output and dropped what it should, then `referee.judge` recomputes the tile.
    - **Its length:** a game takes about 5 or 6 splits, as many picks and the evidence; `node.DISPUTE_MOVES` = 14 is the
      most. Each move has `move_s` to be made, as long as the verify phase.
-   - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede. A checker that does
-     loses (it accused), but a replica that concedes, or never moves, before its first pick goes without blame: it
-     never chose to accuse.
+   - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede instead of picking.
+     - **A checker that concedes withdraws its rejection.** It isn't slashed, but it forfeits its pay for checking that
+       round and counts as having missed (reputation). Before naming a tile at an op, a checker runs the referee itself
+       on the defender's states (it has them all by then) and withdraws if no tile would fail. So an honest checker
+       never plays on to lose its stake.
+     - **A replica that concedes,** or never moves, before its first pick goes without blame: it never chose to
+       accuse.
 5. **The referee** works out, in float64, each output number's exact value given the defender's own inputs, and a bound
    on how far an honest float32 computation of it can land (`referee.E`, running error analysis). Each op is the
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
    - a correctly rounded operation (+ − × ÷ √), u = 2⁻²⁴ of its result;
    - exp, log or rsqrt, 4 ulps (CUDA's are 1 to 2, the CPU's at most 1);
-   - a dot product or sum of K terms, in any order, with or without fused multiply-adds, γ_K·Σ|terms| (Higham §3.1).
-   Errors of earlier steps of the op are carried through by each step's derivative. A number passes within twice its
-   bound (for kernels that order a step's operations differently), plus 2⁻³⁰ of its value, plus 2⁻¹²⁶ (for GPUs that
-   flush subnormals); the attention mask's −∞ must be exact. In tests, every honest tile of every op of a step passes
-   on all four families from both CPU and CUDA traces, and so does one tile of every op kind of Qwen3-0.6B. A single
-   number changed by 0.1% fails in 99.5% of tiles; the rest are numbers whose bound is wide because they come from
-   cancellation.
+   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), with M the largest partial sum any honest order
+     forms (`referee.spread`: the largest |sum| of a run of terms contiguous at a stride of 1 to 32, covering
+     sequential, blocked, split-K, pairwise and 32-lane strided accumulation).
+   Errors of earlier steps of the op are carried through by each step's derivative. A number passes within MARGIN
+   (1.25) times its bound, plus 2⁻³⁰ of its value, plus 2⁻¹²⁶ (for GPUs that flush subnormals); the attention mask's −∞
+   must be exact.
+   - **Why the sum bound is statistical.** The worst case, γ_K·Σ|terms| (Higham §3.1), allows K roundings all one way:
+     the second review measured 1.5% of an output at K = 2560 against 2.7e-7 of honest error. That is room for a worker
+     to compute every projection in TF32 or with bf16 activations, or to steer every op, and still pass, and for the
+     honest checker to lose. A real order's rounding errors are K draws of at most u times a partial sum, about as
+     likely up as down, so their total is about √K of them (Hoeffding: beyond SPREAD_C = 6 times the scale with
+     probability 2·exp(−54)).
+   - **Calibration** (`BoundTests`): float32 dot products by numpy, torch on the CPU, CUDA and a naive sequential loop,
+     on random, same-sign, alternating and heavy-tailed terms at K = 256 to 3072, land within 1.02 of the scale; the
+     referee allows 7.5. Honest CPU and CUDA traces of every op of a step pass on all four families.
+   - **What it catches:** TF32 and bf16-activation projections fail every tile at K = 1024, 2560 and 4096, where the
+     allowance is 3–6e-5 of a value. At width 2560, a TF32 worker 1.7% off loses its game at the projection it
+     changed (`test_a_tf32_worker_loses_at_full_width`).
    - **Determinism.** Products of two float32s are exact in float64, and `math.fsum` rounds a sum exactly, so a dot
      product's reference value is its exact value correctly rounded. Everything else uses only + − × ÷ √, which IEEE
      754 rounds correctly on every platform, element by element: no NumPy pairwise sums, whose order NumPy may change,
@@ -660,6 +675,8 @@ Each step:
      with the winning challenger as catcher.
    - **The challenger lost:** it's slashed for a false accusation, **with no catcher**: the slash is burned. Otherwise
      a worker could bait an honest checker into a dispute it can't win (the residual below) and collect.
+   - **The challenger withdrew:** no slash; it's unpaid for checking and marked as missing that round. The claim
+     stands on its other verdicts (accepted if another counted checker approved it, else unchecked).
    - **The referee couldn't reach the weights:** the Hub was unreachable, so the claim ends unchecked and nobody is
      slashed.
    - **A checker that approved a claim found bad isn't slashed.** The referee finds an op a few ulps out of bounds,
@@ -689,21 +706,22 @@ Each step:
     move just in time: the phase ends when every dispute has. No phase is longer than `node.MAX_PHASE_S` (an hour),
     whatever a spec asks for.
 
-**The security statement:** a claim's verdict is right if at least one of its checkers is honest and online, with the
-node as referee.
-- **An honest worker can't lose a dispute:** every number it computed is within its bounds, which hold for any honest
-  float32 kernel (on whatever GPU or CPU, `test_a_cuda_defender_beats_a_cpu_checker`), and its states chain because
-  they're its training's own.
-- **An honest checker that rejected bad work wins,** as long as the work has an op outside its bounds. Work that
-  saves compute does: a faked or extrapolated segment can't be made of ops that each pass. So does any op changed by
-  more than float32 noise (`test_a_tampered_op_is_found`: one op of one step, deep in a layer's backward).
-- **The residual is steering within the bounds.** The bounds are rigorous, so they have room: γ_K·Σ|terms| allows K
-  roundings all one way, where an honest sum is off by about √K of them (`test_float32_bounds`: an actual order's
-  error is a tenth of the bound or less). A worker that does all the work and pushes every op to its limit might move
-  a segment past a checker's 1% rule without any op out of bounds; the honest checker who rejects it then loses its
-  dispute. Such a worker gains nothing (the slash is burned) and pays for the full work. How far steering can move a
-  segment hasn't been measured yet; if it's near the 1% rule, the checker's rule loosens (a cheat that saves work is
-  off by far more), or bounds tighten where kernels allow.
+**The security statement:** with the node as referee, if at least one of a claim's checkers is honest and online, a
+claim whose float32 work deviates from honest float32 by more than the referee's bounds anywhere is found bad; an
+honest worker is never found bad; and an honest checker is never slashed. This rests on the calibrated sum model
+(an honest float32 sum, in any order a real kernel uses, lands within SPREAD_C · MARGIN = 7.5 of its scale; measured
+within 1.02).
+- **An honest worker can't lose a dispute:** every number it computes is within its bounds on any GPU or CPU tested
+  (CPU and CUDA traces of every op, and `test_a_cuda_defender_beats_a_cpu_checker`, where the CPU checker finds
+  nothing to win on and withdraws), and its states chain because they're its training's own. If the model failed for
+  some honest number (a probability the calibration puts far below any round's count of numbers), a dishonest
+  challenger hunting for it could win: that is the one assumption.
+- **An honest checker that rejected bad work wins** when the work has an op outside its bounds: work that saves
+  compute (TF32, bf16 activations, extrapolation) does, and so does any op changed by more than a few times float32
+  noise (`test_a_tampered_op_is_found`). When it finds no such op, it withdraws: unpaid for the round, never slashed.
+- **The residual is steering within the bounds:** a worker that does all the float32 work may still push each sum
+  by up to about 7 times the largest honest error measured (3–6e-5 of a value at K = 1024 to 4096), each in a
+  direction of its choosing, and pass. That's the room a dishonest worker keeps; it costs it the full work.
 - **The leader** can still drop a move and claim silence, as it can drop a verdict (receipts don't cover moves yet).
   A plain replay trusts the record for a game's root states and the weights its referee used. A recheck rebuilds the
   root states from the checkpoints; checking the recorded weights against the pinned commit is a follow-up.

@@ -879,8 +879,10 @@ class NodeFreeRoundTests(unittest.TestCase):
     def test_disputes_catch_a_tampered_op_and_false_accusations(self):
         """A worker that scaled one op's output deep in one step of each segment, checked by honest checkers, and a
         checker that rejects everything. Every rejection becomes a dispute the node referees: the tampering worker
-        loses on that very op (and is slashed, its accuser the catcher), the false accuser loses each of its own (and
-        is slashed, with no catcher), and every honest claim is accepted and paid. Then the round replays."""
+        loses on that very op (and is slashed, its accuser the catcher); the false accuser, finding nothing the referee
+        would refuse in the honest work it disputes, withdraws each of its own (unpaid for checking and marked missed,
+        but not slashed: an honest checker mistaken the same way mustn't be); and every honest claim is accepted and
+        paid. Then the round replays."""
         self.network([("honest", "honest")] * 5 + [("tamper", "honest"), ("honest", "false_accuser")],
                      replication_rate=0.0, canaries_per_round=0)
         cheat, liar = self.workers[-2].address, self.workers[-1].address
@@ -894,18 +896,19 @@ class NodeFreeRoundTests(unittest.TestCase):
             if k[1] != cheat:
                 self.assertEqual(v.verdict.value, "accepted", v.detail)
         self.assertTrue(any(s[0] == cheat and s[1] not in (None, cheat) for s in slashes))
-        false = [s for s in slashes if s[0] == liar]
-        self.assertTrue(false and all(s[1:] == [None, "false accusation"] for s in false), false)
-        self.assertEqual({s[0] for s in slashes}, {cheat, liar})
-        won = [g for g in self.games.values() if g.challenger == liar]
-        self.assertTrue(won and all(g.outcome in ("defender", "challenger") for g in won))
+        self.assertEqual({s[0] for s in slashes}, {cheat})
+        mine = [g for g in self.games.values() if g.challenger == liar]
+        self.assertTrue(mine and all(g.outcome in ("withdrawn", "challenger") for g in mine), [g.outcome for g in mine])
+        self.assertTrue(any(g.outcome == "withdrawn" for g in mine))
+        self.assertNotIn(liar, rep.block.summary.verifier_flops)  # unpaid for checking
+        self.assertIn(liar, rep.block.summary.missed)
         self.assertTrue(all(g.outcome == "challenger" for g in self.games.values() if g.defender == cheat))
         paid = rep.block.summary.worker_flops
         self.assertNotIn(cheat, paid)
         self.assertTrue(set(paid) >= {w.address for w in self.workers[:5]} & {k[1] for k in res})
         games = rep.record["games"]
         self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
-        self.assertTrue(all(e["evidence"] for e in games if e["outcome"] != "unchecked"))
+        self.assertTrue(all(e["evidence"] for e in games if e["outcome"] in ("challenger", "defender")))
         self.replays([rep])
         # What a validator votes by: a plain replay. Its referee needs the job's data (which sequences a step trains
         # on), which a node passes as its store.
@@ -1230,8 +1233,8 @@ class LiveNetworkTests(unittest.TestCase):
         slashes = [s for b in node.chain.blocks if b.summary for s in b.summary.slashes]
         games = [(e["outcome"], e["detail"], len(e["moves"])) for b in node.chain.blocks if b.summary
                  for e in api.get(f"/round/{b.height}/record").get("games", [])]
-        self.assertTrue(any(s[0] == workers[-1].address and s[2] == "false accusation" for s in slashes), (slashes, games))
-        self.assertFalse([s for s in slashes if s[0] != workers[-1].address], ("only the false accuser was slashed", games))
+        self.assertTrue(any(o == "withdrawn" for o, _, _ in games), games)  # the false accuser withdraws its rejections
+        self.assertFalse(slashes, ("nobody is slashed: the accuser withdrew", games))
         self.assertTrue(all(r["version"] == 4 for r in (api.get(f"/round/{b.height}/record") for b in node.chain.blocks
                                                         if b.summary)))
 

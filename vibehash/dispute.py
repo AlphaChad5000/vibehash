@@ -501,8 +501,12 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
     if kind == "concede":
         if move["concede"] is not True:
             raise MoveRefused("conceding is {\"concede\": true}")
+        # A replica that never picked concedes without blame; a checker withdraws its rejection: it isn't slashed, but
+        # it forfeits its pay for the round (coordinator._settle_finetune). Its challenge found no number the referee
+        # would refuse, so it couldn't have won: an honest checker never has to play on to lose.
         blameless = game.why == "replicas" and not game.played
-        game.end("conceded" if blameless else "defender", "the challenger conceded")
+        game.end("conceded" if blameless else "withdrawn", "the challenger conceded" if blameless else
+                 "the challenger withdrew: it found no number the referee would refuse")
     elif kind == "split":
         roots = move["split"]
         n = len(groups(game.lo, game.hi))

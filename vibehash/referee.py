@@ -7,11 +7,22 @@ committed inputs, and a bound on how far any honest float32 computation of it ca
 Every op is the sequence of float32 operations tracer.py runs, and each step of it adds what one rounding can:
     - a correctly rounded operation (+ − × ÷ √): u·|result|, with u = 2⁻²⁴;
     - exp, log, rsqrt: 4 ulps (CUDA's are 1 to 2, the CPU's at most 1);
-    - a dot product or sum of K terms, in any order, with or without fused multiply-adds: γ_K · Σ|terms|, where
-      γ_K = Ku / (1 − Ku) (Higham, Accuracy and Stability of Numerical Algorithms, §3.1).
+    - a dot product or sum of K terms: C · u · (√K · M + ‖terms‖₂), where M is the largest partial sum any honest order
+      makes (spread()). Not the worst case γ_K · Σ|terms| (Higham §3.1), which allows K roundings all one way: that's
+      about K times more than any real order makes (1.5% of an output at K = 2560 against 3e-7 of honest error), room
+      for a worker to compute in TF32 or steer every op and still pass.
 Errors in a step's inputs are carried through by the operation's derivative. A worker's number passes when it's within
-twice the bound (for the order a kernel happens to use inside a step, like multiplying by 1/x for ÷x), plus 2⁻³⁰ of
-the value, plus 2⁻¹²⁶ (for GPUs that flush subnormals). −∞ where the causal mask puts it must be exact.
+MARGIN times the bound (for the order a kernel happens to use inside a step, like multiplying by 1/x for ÷x), plus
+2⁻³⁰ of the value, plus 2⁻¹²⁶ (for GPUs that flush subnormals). −∞ where the causal mask puts it must be exact.
+
+The sum bound is statistical, not a worst case. A float sum of K terms, in any order, rounds K times, each time by at
+most u of a partial sum. The orders real kernels use (sequential, blocked, split-K, pairwise trees and strided
+accumulators of up to 32 lanes, as GPU reductions are) only ever form partial sums of runs of terms that are
+contiguous at some stride up to 32, whose sizes spread() takes the largest of, M. Rounding errors behave as
+independent zero-mean draws of size at most u·M, so their total lies within C·u·√K·M except with a probability
+Hoeffding bounds by 2·exp(-C²·3/2); and each product's own rounding adds u·‖terms‖₂ the same way. C is calibrated
+(SPREAD_C): honest CPU and CUDA traces of real models stay within a small part of it (tests/test_dispute.py,
+CalibrationTests).
 
 Deterministic on every machine. Products of two float32s are exact in float64, and math.fsum rounds a sum exactly, so a
 dot product's value is its exact value correctly rounded. Everything else uses only + − × ÷ √, which IEEE 754 rounds
@@ -34,7 +45,9 @@ from .merkle import LEAF
 
 U = 2.0 ** -24  # float32's unit roundoff
 TRANS = 8.0  # exp, log and rsqrt: up to 4 ulps, which is 8u
-MARGIN, REL, FLOOR = 2.0, 2.0 ** -30, 2.0 ** -126
+MARGIN, REL, FLOOR = 1.25, 2.0 ** -30, 2.0 ** -126
+SPREAD_C = 6.0  # the sum bound's multiple of its statistical scale: about 7 standard deviations (see the docstring)
+STRIDES = (1, 2, 4, 8, 16, 32)  # the strides at which honest orders accumulate runs of terms
 
 
 def f32(x: float) -> float:
@@ -211,20 +224,39 @@ def fsum_rows(x: np.ndarray) -> np.ndarray:
     return np.array([math.fsum(row) for row in x.reshape(-1, x.shape[-1]).tolist()]).reshape(x.shape[:-1])
 
 
+def spread(t: np.ndarray) -> np.ndarray:
+    """√K · M + ‖t‖₂ along the last axis: the scale of the rounding error any honest order makes summing K terms (see
+    the module's docstring). M is the largest |sum| of a run of terms contiguous at a stride in STRIDES, from running
+    sums (NumPy's cumsum is sequential, so every machine gets the same M)."""
+    t = np.asarray(t, dtype=np.float64)
+    k = t.shape[-1]
+    m = np.zeros(t.shape[:-1])
+    for s in STRIDES:
+        if s > k:
+            break
+        pad = (-k) % s
+        tt = np.concatenate([t, np.zeros(t.shape[:-1] + (pad,))], -1) if pad else t
+        tt = tt.reshape(t.shape[:-1] + (-1, s))
+        c = np.cumsum(tt, axis=-2)
+        hi = np.maximum(c.max(-2), 0.0)
+        lo = np.minimum(c.min(-2), 0.0)
+        m = np.maximum(m, (hi - lo).max(-1))
+    return math.sqrt(k) * m + np.sqrt(np.einsum("...i,...i->...", t, t))
+
+
 def esum(a: E) -> E:
-    """The sum along the last axis of K terms, in any order."""
-    k = a.v.shape[-1]
+    """The sum along the last axis of K terms, in any honest order."""
     ae = fsum_rows(a.e) if np.any(a.e) else np.zeros(a.v.shape[:-1])
-    return E(fsum_rows(a.v), ae + gamma(k) * (fsum_rows(np.abs(a.v)) + ae))
+    return E(fsum_rows(a.v), ae * (1 + 2 * U) + SPREAD_C * U * spread(a.v))
 
 
 def contract(a: E, b: np.ndarray) -> E:
     """a [n, K] · bᵀ, b [m, K] exact: [n, m], a dot product of K terms each."""
     a_v, a_e, b = np.atleast_2d(a.v), np.atleast_2d(a.e), np.atleast_2d(np.asarray(b, dtype=np.float64))
-    (n, k), m = a_v.shape, b.shape[0]
+    n, m = a_v.shape[0], b.shape[0]
     p = a_v[:, None, :] * b[None, :, :]
     ae = fsum_rows(a_e[:, None, :] * np.abs(b)[None, :, :]) if np.any(a_e) else np.zeros((n, m))
-    return E(fsum_rows(p), ae + gamma(k) * (fsum_rows(np.abs(p)) + ae))
+    return E(fsum_rows(p), ae * (1 + 2 * U) + SPREAD_C * U * spread(p))
 
 
 def bcast(a: E) -> E:

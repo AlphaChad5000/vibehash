@@ -1661,6 +1661,9 @@ class Coordinator:
             games[(g.unit, g.defender)].append(g)
             if g.outcome == "defender":
                 r.slashes.append([g.challenger, None, "false accusation"])
+        # A checker that withdrew its rejection (it found no number the referee would refuse) isn't slashed, but isn't
+        # paid for checking this round either: a rejection costs something even when it's taken back.
+        withdrawn = {g.challenger for g in r.games.values() if g.outcome == "withdrawn"}
         for key in sorted(r.reveals):
             lost = [g for g in games[key] if g.outcome == "challenger"]
             if lost:
@@ -1708,10 +1711,10 @@ class Coordinator:
             job_id=r.job_id,
             accepted_units=len(updates),
             worker_flops=dict(sorted(worker_flops.items())),
-            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders},
+            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders | withdrawn},
             slashes=r.slashes,
             accepted=sorted(worker_flops),
-            missed=sorted(missed | r.forfeit | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
+            missed=sorted(missed | r.forfeit | withdrawn | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
             params_hash=model_hash,
             proposer=proposer,
             record_hash=h256(canonical(r.record)).hex(),

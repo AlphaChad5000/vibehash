@@ -8,7 +8,7 @@ import unittest
 
 import numpy as np
 
-from vibehash import dispute, merkle, referee
+from vibehash import dispute, merkle, referee, verification
 
 try:
     import torch
@@ -210,7 +210,7 @@ class GameTests(_Tiny):
         return ft.train_segment(self.spec, self.data, np.zeros(self.spec.n_params), self.seed, 0, self.per, self.lr,
                                 self.batch, None if device == "cpu" else TorchBackend(device), tamper=tamper_fn)
 
-    def play(self, after, defender, challenger, cheat=None, policy=None):
+    def play(self, after, defender, challenger, cheat=None, policy=None, party=None):
         """One game over segment 0, from fresh adapters to `after`. `policy(game, who) -> move | None | "default"`."""
         from vibehash import hub
         prog = Program(self.spec, self.data, self.lr, self.batch, self.seed, 1, self.per)
@@ -223,7 +223,8 @@ class GameTests(_Tiny):
             remote.put(m)
             roots.append(root)
         g = dispute.Game("g", "u", "D", "C", "dispute", ["segment", 0], *roots, seed=self.seed).start(prog)
-        d, c = Party(defender, self.spec, self.data, remote, cheat), Party(challenger, self.spec, self.data, remote)
+        d = (party or Party)(defender, self.spec, self.data, remote, cheat)
+        c = Party(challenger, self.spec, self.data, remote)
         weights = dispute.HubWeights(hub.Manifest.from_bytes(self.model.manifest_bytes))
         while g.turn != "done":
             v = g.view()
@@ -301,20 +302,160 @@ class GameTests(_Tiny):
             with self.subTest(move=move), self.assertRaises(dispute.MoveRefused):
                 dispute.play(g, prog, "C", move)
         dispute.play(g, prog, "C", {"concede": True})
-        self.assertEqual(g.outcome, "defender")  # a checker that concedes loses: it accused
+        self.assertEqual(g.outcome, "withdrawn")  # a checker that concedes withdraws: unpaid, not slashed
+
+    def test_a_tf32_worker_loses_at_full_width(self):
+        """The second review's end-to-end case: every projection computed with TF32-rounded activations (cheaper tensor
+        cores), at width 2560, ends 1.7% off; the honest checker rejects it, plays the game, and now wins on the
+        projection the cheat changed (it used to lose there, within the old worst-case bound, and be slashed)."""
+        import torch
+
+        from vibehash import tracer
+        model = TinyModel(tmpdir(self), "qwen3", hidden_size=2560, intermediate_size=2560, num_hidden_layers=1,
+                          num_attention_heads=8, num_key_value_heads=4, head_dim=64).use(self)
+        self.model, self.spec, self.data = model, model.spec(targets=ALL, rank=4), model.dataset()
+        self.rt = ft.runtime(self.spec, self.data, "cpu")
+        self.per = 2
+
+        def tf32(t):
+            b = t.contiguous().view(torch.int32).to(torch.int64)
+            return (((b + 0xFFF + ((b >> 13) & 1)) >> 13) << 13).to(torch.int32).view(torch.float32)
+
+        class Lazy(Executor):
+            def run(self, op, st):
+                if op.kind in ("linear", "linear_bwd"):
+                    view = dict(st)
+                    view[op.ins[0]] = tf32(st[op.ins[0]])
+                    st[op.out] = tracer.RUN[op.kind](self, op, view).contiguous()
+                    for d in op.drops:
+                        del st[d]
+                else:
+                    super().run(op, st)
+
+        class LazyParty(Party):
+            def executor(self, prog, honest):
+                return Executor(self.rt, self.spec, prog) if honest else Lazy(self.rt, self.spec, prog)
+
+        old = tracer.Executor
+        tracer.Executor = Lazy
+        try:
+            lazy = self.unit()
+        finally:
+            tracer.Executor = old
+        self.assertFalse(verification.reproduces(lazy, self.unit(), np.zeros(self.spec.n_params), ft.TOLERANCE,
+                                                 self.spec), "the checker rejects it")
+        g = self.play(lazy, self.rt, self.rt, party=LazyParty)
+        self.assertEqual(g.outcome, "challenger", g.detail)
+        self.assertIn(g.leaf.kind, ("linear", "linear_bwd"))
+
+    def test_an_honest_challenger_withdraws_rather_than_lose(self):
+        """A checker that rejected an honest unit (here, told to) finds nothing the referee would refuse when it gets
+        to an op, and withdraws: unpaid, not slashed (dispute.play's concede)."""
+        self.tiny()
+        g = self.play(self.unit(), self.rt, self.rt)
+        self.assertEqual((g.outcome, g.loser), ("withdrawn", None))
 
     @unittest.skipUnless(CUDA, "needs a CUDA GPU")
     def test_a_cuda_defender_beats_a_cpu_checker(self):
         """An honest unit trained on CUDA, challenged by a checker that recomputes on the CPU (whose numbers differ
-        in their last bits throughout): the CPU-side referee sides with the CUDA worker."""
+        in their last bits throughout): every number the CUDA worker posts is within the referee's bounds, so the
+        checker, running the referee itself before naming a tile, finds nothing to win on and withdraws. Neither is
+        slashed; the CUDA worker's evidence for any tile would pass (checked directly)."""
         self.tiny()
         cuda = ft.runtime(self.spec, self.data, "cuda")
         from vibehash import compute
         compute.TorchBackend("cuda")
         after = self.unit(device="cuda")
         g = self.play(after, cuda, self.rt)
-        self.assertEqual(g.outcome, "defender", g.detail)
-        self.assertNotEqual(g.leaf.kind, "embed", "the CPU challenger found a difference to chase")
+        self.assertEqual(g.outcome, "withdrawn", g.detail)
+        self.assertGreater(len(g.moves), 4, "the CPU challenger found differences to chase down to an op")
+
+
+
+class _Src:
+    """Float32 weights by name, as dispute.Outside reads them."""
+
+    def __init__(self, ws):
+        self.ws = ws
+
+    def shape(self, name):
+        return "F32", tuple(self.ws[name].shape)
+
+    def read(self, name, r0, r1):
+        return np.ascontiguousarray(self.ws[name][r0:r1], dtype="<f4").tobytes()
+
+
+def _round_bits(a, drop):
+    """float32s rounded to `drop` fewer mantissa bits, ties to even (16: bf16; 13: TF32)."""
+    b = np.asarray(a, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    half = (1 << (drop - 1)) - 1
+    b = ((b + half + ((b >> drop) & 1)) >> drop) << drop
+    return b.astype(np.uint32).view(np.float32)
+
+
+class BoundTests(unittest.TestCase):
+    """The second review's finding 1: sums are bounded by how far honest orders actually land (referee.spread), not
+    by the worst case γ_K·Σ|terms|, which let TF32 and bf16-activation workers pass at K ≥ 2560."""
+
+    def test_reduced_precision_fails_every_tile_and_honest_passes(self):
+        from vibehash.program import Op
+
+        rng = np.random.default_rng(0)
+        for K, O in ((1024, 1024), (2560, 2560), (4096, 512)):
+            T = 4
+            x = rng.normal(0, 1, (T, K)).astype(np.float32)
+            w = _round_bits(rng.normal(0, 1 / np.sqrt(K), (O, K)), 16)  # bf16 weights, as pretrained ones are
+            op = Op("linear", "y", ("x",), {"weight": "W", "bias": None}, (), (T, O), ((T, K),))
+            out = dispute.Outside(None, None, _Src({"W": w}), keep=False)
+            cases = {"honest": x @ w.T, "bf16 activations": _round_bits(x, 16) @ w.T,
+                     "tf32": _round_bits(x, 13) @ _round_bits(w, 13).T}
+            if torch is not None:
+                cases["honest (torch)"] = (torch.from_numpy(x) @ torch.from_numpy(w).T).numpy()
+            for name, y in cases.items():
+                flat = y.reshape(-1)
+                passed = [referee.judge(op, dispute.Inputs({"x": (T, K)}, out, full={"x": x}), leaf,
+                                        flat[leaf * merkle.LEAF:(leaf + 1) * merkle.LEAF])[0]
+                          for leaf in range(merkle.n_leaves(T, O))]
+                if name.startswith("honest"):
+                    self.assertTrue(all(passed), (K, name))
+                else:
+                    self.assertFalse(any(passed), (K, name))
+            want = referee.op_linear(op, dispute.Inputs({"x": (T, K)}, out, full={"x": x}), 0, 0, merkle.LEAF)
+            allowed = referee.MARGIN * want.e + referee.REL * np.abs(want.v) + referee.FLOOR
+            self.assertLess(np.median(allowed / np.abs(want.v)), 1e-4, K)  # (it was ~1.5% at K = 2560)
+
+    def test_honest_sums_land_well_inside_the_model(self):
+        """The calibration behind SPREAD_C: float32 dot products, by numpy, by torch on the CPU and CUDA, and by a
+        naive sequential loop, on random, same-sign, alternating and heavy-tailed terms, land within 2 of the
+        statistical scale u·spread(); the referee allows SPREAD_C · MARGIN = 7.5 of it."""
+        rng = np.random.default_rng(1)
+        worst = 0.0
+        for K in (256, 1024, 3072):
+            x = rng.normal(0, 1, (8, K)).astype(np.float32)
+            w = rng.normal(0, 1 / np.sqrt(K), (64, K)).astype(np.float32)
+            alt = np.abs(x) * np.where(np.arange(K) % 2, 1, -1).astype(np.float32)
+            heavy = x.copy()
+            heavy[:, ::7] *= 50
+            for a, b in ((x, w), (np.abs(x), np.abs(w)), (alt, np.abs(w)), (heavy, w)):
+                p = a[:, None, :].astype(np.float64) * b[None, :, :].astype(np.float64)
+                exact, scale = referee.fsum_rows(p), referee.U * referee.spread(p)
+                outs = [a @ b.T]
+                if torch is not None:
+                    outs.append((torch.from_numpy(a) @ torch.from_numpy(b).T).numpy())
+                    if CUDA:
+                        outs.append((torch.from_numpy(a).cuda() @ torch.from_numpy(b).cuda().T).cpu().numpy())
+                seq = np.zeros((2, 8), dtype=np.float32)
+                for i in range(2):
+                    for j in range(8):
+                        acc = np.float32(0)
+                        for k in range(K):
+                            acc = np.float32(acc + np.float32(a[i, k] * b[j, k]))
+                        seq[i, j] = acc
+                worst = max(worst, float(np.max(np.abs(seq - exact[:2, :8]) / scale[:2, :8])))
+                for y in outs:
+                    worst = max(worst, float(np.max(np.abs(y.astype(np.float64) - exact) / scale)))
+        self.assertLess(worst, 2.0)
+        self.assertGreaterEqual(referee.SPREAD_C * referee.MARGIN, 3 * 2.0)
 
 
 if __name__ == "__main__":
