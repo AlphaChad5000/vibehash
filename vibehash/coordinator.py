@@ -1868,7 +1868,7 @@ class _MemoryBlobs:
 
     def __init__(self):
         self.data: dict[str, bytes] = {}
-        self.roots: dict[str, str] = {}
+        self.roots: dict[tuple, str] = {}
 
     def put_bytes(self, raw: bytes) -> str:
         import hashlib
@@ -1886,6 +1886,6 @@ class _MemoryBlobs:
         raw = self.data.get(bid)
         if raw is None or len(raw) != rows * cols * 4:
             return None
-        if bid not in self.roots:
-            self.roots[bid] = merkle.root_of(np.frombuffer(raw, "<f4").reshape(rows, cols))
-        return self.roots[bid]
+        if (bid, rows, cols) not in self.roots:  # by shape: the same bytes make another root in another shape
+            self.roots[bid, rows, cols] = merkle.root_of(np.frombuffer(raw, "<f4").reshape(rows, cols))
+        return self.roots[bid, rows, cols]

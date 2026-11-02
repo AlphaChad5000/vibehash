@@ -230,6 +230,7 @@ class Node:
         with self.coord.lock:
             self.start_blob, self.uploads, self._blob_of, self.trace_uploads = None, {}, {}, {}
         self.blobs.prune(self._evidence())
+        self.coord.trace_blobs.forget()
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
 
     def _rounds(self) -> None:
@@ -1026,13 +1027,21 @@ class TraceBlobs:
         return self.store.path(blob_id).read_bytes() if self.store.has(blob_id) else None
 
     def tensor_root(self, blob_id: str, rows: int, cols: int) -> str | None:
+        """The root of a blob read as a [rows, cols] tensor, or None when it isn't on the node at that size. Checked on
+        every call, though the root is cached: a blob pruned since isn't on the node for a challenger to fetch. And
+        cached by shape, since the same bytes (zeros, say) make another root in another shape."""
         from .merkle import root_of
 
-        if blob_id not in self.roots:
-            if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
-                return None
-            self.roots[blob_id] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
-        return self.roots[blob_id]
+        if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
+            return None
+        key = (blob_id, rows, cols)
+        if key not in self.roots:
+            self.roots[key] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
+        return self.roots[key]
+
+    def forget(self) -> None:
+        """At a round's end: its roots go with its blobs."""
+        self.roots = {}
 
 
 class LeaderBlobs:

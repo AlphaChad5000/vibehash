@@ -513,3 +513,34 @@ class EvidenceTests(unittest.TestCase):
             self.assertLess(cap, 256 * 2**20)
         self.assertTrue(any("seq_len" in p for p in
                             finetune.LoraSpec("x/y", "r", {}, seq_len=T + finetune.SEQ_STEP).problems()))
+
+
+class StateCheckTests(unittest.TestCase):
+    """The second review's finding 5: the node's cache of tensor roots outlived the blobs, so a split naming a state
+    whose tensors were pruned still passed Coordinator._check_states (t_stale_roots)."""
+
+    def test_a_pruned_tensor_is_missing_and_shapes_have_their_own_roots(self):
+        import tempfile
+        import types
+
+        from vibehash.blobs import BlobStore
+        from vibehash.coordinator import Coordinator, _MemoryBlobs
+        from vibehash.node import TraceBlobs
+
+        x = np.random.default_rng(0).normal(size=(64, 64)).astype(np.float32)
+        z = np.zeros((8, 64), dtype=np.float32)
+        manifest, blobs = dispute.state_manifest({"x": x, "z": z, "zt": z.reshape(64, 8)})
+        for tb in (TraceBlobs(BlobStore(tempfile.mkdtemp())), _MemoryBlobs()):
+            fake = types.SimpleNamespace(trace_blobs=tb, _get_trace=tb.get_bytes)
+            for raw in blobs.values():
+                tb.put_bytes(raw)
+            root = tb.put_bytes(manifest)
+            Coordinator._check_states(fake, [root])  # zeros in two shapes: one blob, two roots, both right
+            Coordinator._check_states(fake, [root])
+            if isinstance(tb, TraceBlobs):
+                tb.store.prune(set())  # the round's end
+                tb.put_bytes(manifest)  # and later, only the manifest is uploaded again
+                with self.assertRaises(dispute.MoveRefused):
+                    Coordinator._check_states(fake, [root])
+                tb.forget()
+                self.assertEqual(tb.roots, {})
