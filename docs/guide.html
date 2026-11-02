@@ -236,6 +236,13 @@ footer { border-top: 1px solid var(--rule); }
 footer .wrap { padding-block: 22px 40px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; color: var(--ink-2); font-size: 0.9rem; }
 
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+/* The page's scrollbar, in the brand's colours. */
+html { scrollbar-width: thin; scrollbar-color: #8a6a2c var(--paper); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb { background: #8a6a2c; border: 2px solid var(--paper); }
+::-webkit-scrollbar-thumb:hover { background: #f1b23c; }
+
 </style>
 
 <header class="band">
