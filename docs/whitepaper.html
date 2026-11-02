@@ -442,9 +442,9 @@ claim's checkers are such with probability at most <i>f</i><sup>2</sup>: 0.01 at
 halt the network or refuse messages.</li>
 <li><b>The hand-off storage.</b> The first large job's hand-offs pass through one storage bucket the operator pays
 for. It can withhold or delete data, which costs recomputation, but cannot alter it undetected.</li>
-<li><b>Steering below honest variation.</b> Tolerances must admit honest rounding, so a worker that does all the work
-could still nudge results by less than honest devices differ. It cannot skip work or fake results this way, and it
-gains nothing by doing so, but such nudges are not caught.</li>
+<li><b>Steering within the tolerance.</b> Tolerances must admit honest rounding with a margin, about seven times its
+typical size per sum, so a worker that does all the work could still nudge each result by a few parts in 100,000. It
+cannot skip work or fake results this way, and it gains nothing by doing so, but such nudges are not caught.</li>
 <li><b>The frozen layers' arithmetic.</b> The preparation runs the frozen layers in the model's reduced precision,
 which differs between devices by about 1% a layer, so a unit's holder could bend each layer's output within the
 tolerance; a bitwise replay on the same class of hardware would close the gap.</li>
