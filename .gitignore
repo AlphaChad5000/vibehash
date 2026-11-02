@@ -25,3 +25,11 @@ wallet.json
 .claude/settings.local.json
 Thumbs.db
 .DS_Store
+
+
+# API Keys
+.env.local
+.env
+
+# What agents/architect.py writes by default (chats, eval prompts, answers, grades)
+agent-jobs/
