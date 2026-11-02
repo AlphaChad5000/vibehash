@@ -16,6 +16,12 @@ record of those messages, plus the results of the checks that need the model's
 weights, so anyone can re-run the round with this same code (replay.py) and
 must reach the same summary.
 
+A fine-tune (finetune.py) runs them so that the node never runs the model: its rounds are recorded as version 4.
+Each claim goes to two checkers; scorers measure the round's starting model; and each rejection, and each pair of
+replicas that disagree, becomes a dispute in an extra phase: the claim's worker and its accuser narrow their
+disagreement down to one op of one step, and the node referees that one op with NumPy (dispute.py, referee.py;
+start_disputes, _settle_finetune). Otherwise the node only checks hashes, Merkle proofs and bounds, and averages.
+
 A sharded job (SHARDING.md, shards.py) runs the same phases with teams in
 place of workers: each unit goes to a team, one worker per shard; each member
 commits to its own trace; the beacon challenges cells (one shard by one
@@ -36,12 +42,14 @@ from enum import Enum
 
 import numpy as np
 
+from . import dispute as dg
 from . import economics as econ
 from . import fees
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
+from .finetune import MAX_VAL, WHOLE_TOLERANCE
 from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
-from .model import evaluate, params_hash
+from .model import params_hash
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
 from .verification import (
     challenge_segments,
@@ -65,8 +73,31 @@ from .worker import HardwareProfile, Worker
 # also hash in a secret the leader commits to when it opens the round, and canaries are copies of real work. 3: a
 # sharded job's round (teams, cells, edges and edge evidence), with version 2's secret; only sharded jobs' rounds are
 # recorded as 3, so whole units' rounds stay version 2 and keep replaying, and being voted for, as they are.
+# 4: a fine-tune's round, where the node never runs the model: two checkers a claim, scorers, and a dispute phase
+# (start_disputes) where the node referees one op of each disputed claim. Only fine-tunes' rounds are recorded as 4.
 RECORD_VERSION = 2
 SHARDED_RECORD_VERSION = 3
+FINETUNE_RECORD_VERSION = 4
+CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
+SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
+MAX_GAMES = 4  # disputes one checker can open in a round (games_allowed); its further rejections are ignored
+
+
+def games_allowed(rep: float) -> int:
+    """Disputes a checker with reputation `rep` may open in a round: MAX_GAMES from the reputation a newcomer starts
+    with, one fewer for each round's worth of reputation it has lost since (economics.REP_LOSS_MISSED: a round in which
+    it withdrew a rejection, or missed a deadline), and never fewer than one. So accusing again and again costs more:
+    each round of it takes a dispute away, as well as that round's pay for checking and some of its pay rate."""
+    lost = max(0, round((econ.REP_START - rep) / econ.REP_LOSS_MISSED))
+    return max(1, MAX_GAMES - lost)
+# Staked workers able to run a fine-tune that must register before its round assigns work: a holder and one checker.
+# With the node refereeing disputes, a claim's verdict is right whenever one of its checkers is honest and online, so
+# one checker is enough to start; from three workers on, each claim gets two, so one going quiet leaves the other.
+# (Canaries, which catch checkers who approve without replaying, need a worker who neither holds nor checks either of
+# two units, so they start from about five.)
+FINETUNE_QUORUM = 2
+# How close a scorer's (loss, accuracy) must be to the median to be paid: honest scorers agree to about 1e-6.
+SCORE_AGREEMENT = 1e-3
 RAMP = 2  # a worker's capacity can grow this much each round it delivers in full, up to what it says it can do
 LOOKBACK = 50  # blocks searched for a worker's most recent round
 
@@ -86,6 +117,7 @@ class Phase(str, Enum):
     COMPUTE = "compute"
     REVEAL = "reveal"
     VERIFY = "verify"
+    DISPUTE = "dispute"  # a fine-tune's disputes over claims, refereed by the node (start_disputes)
 
 
 @dataclass
@@ -124,6 +156,10 @@ class VerifyTask:
     openings: dict[int, tuple[np.ndarray, list]]
     canary: bool = False
     verdict: tuple[bool, int | None] | None = None
+    # Fine-tunes: "check" (replay the segments) or "score" (score the round's starting model on the held-back data; no
+    # openings).
+    kind: str = "check"
+    score: tuple[float, float] | None = None  # what a scorer reported: (loss, accuracy)
 
 
 @dataclass
@@ -215,6 +251,14 @@ class _Round:
     opened: dict[tuple[str, str], sh.ShardReveal] = field(default_factory=dict)
     evidence: dict[tuple, tuple[bytes, bytes]] = field(default_factory=dict)  # (unit, receiver, step, kind) -> (hash, sig)
     waiting: str = ""
+    # Fine-tunes only: the disputes (dispute.Game by id), and the checkers who approved a canary, whose verdicts this
+    # round don't count.
+    games: dict[str, dg.Game] = field(default_factory=dict)
+    void: set[str] = field(default_factory=set)
+
+    @property
+    def v4(self) -> bool:
+        return self.record.get("version") == FINETUNE_RECORD_VERSION
 
 
 def _mean(arrays: list, job: TrainingJob) -> np.ndarray:
@@ -224,7 +268,8 @@ def _mean(arrays: list, job: TrainingJob) -> np.ndarray:
     total = np.zeros(job.spec.n_params, dtype=np.float64)
     for a in arrays:
         total += np.asarray(a, dtype=np.float64)
-    return job.spec.round(total / len(arrays))
+    theta = job.spec.round(total / len(arrays))
+    return job.spec.fresh(theta) if job.finetune else theta  # a fine-tune's units each start Adam afresh
 
 
 def _mean_by_shard(finals: list[list], shards: list[sh.Shard], job: TrainingJob) -> np.ndarray:
@@ -238,6 +283,36 @@ def _mean_by_shard(finals: list[list], shards: list[sh.Shard], job: TrainingJob)
             total += np.asarray(parts[k], dtype=np.float64)
         theta[s.span(job.spec)] = job.spec.round(total / len(finals))
     return theta
+
+
+def _pick(draw: Draw, candidates: list[str], k: int) -> list[str]:
+    """Up to k of `candidates`, drawn without replacement."""
+    candidates, out = list(candidates), []
+    while candidates and len(out) < k:
+        out.append(candidates.pop(draw.below(len(candidates))))
+    return out
+
+
+def _score(score) -> tuple[float, float]:
+    """A scorer's report, [loss, accuracy]: a non-negative finite loss and an accuracy in [0, 1]."""
+    try:
+        loss, acc = (float(x) for x in score)
+    except (TypeError, ValueError, OverflowError):
+        raise ProtocolError("a score is [loss, accuracy]") from None
+    if not (np.isfinite(loss) and loss >= 0 and 0 <= acc <= 1):
+        raise ProtocolError("a score's loss is finite and not negative, and its accuracy in [0, 1]")
+    return loss, acc
+
+
+def _median(values: list[float]) -> float:
+    v = sorted(values)
+    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+
+
+def score_cost(job: TrainingJob) -> int:
+    """FLOPs to score a fine-tune's model on held-back data, from its spec alone (a replay may not have the data): a
+    forward pass over MAX_VAL sequences, a third of what LoraSpec.flops_per_step counts for training them."""
+    return job.spec.flops_per_step(MAX_VAL) // 3 if job.finetune else 0
 
 
 def _size(mb: int) -> str:
@@ -270,6 +345,15 @@ class Coordinator:
         self.replaying = replay
         self.recheck = recheck if replay else None
         self.timing = None  # job -> seconds of compute a live round of it gets (node.py); None: config.compute_s
+        # Disputes: where states and evidence are kept (a BlobStore: the node's; None, a dict in memory), how the
+        # referee reaches the base model's weights (job -> source; default dispute.HubWeights), and the seconds a
+        # party has for each move.
+        self.trace_blobs = None
+        self.weight_source = None
+        self.roots = None  # a replay's: where a dispute's checkpoints come from (.array(blob_id, job)), to check its states
+        self.datasets = None  # a replay's: where a fine-tune's data comes from (.attach(job) or .attach_dataset(job))
+        self.move_s = 60.0
+        self._programs: dict = {}
         self.disputes: list[str] = []  # recorded results a recheck contradicted
         self.rechecked = self.unchecked = 0
         self.jobs: dict[str, TrainingJob] = {}
@@ -297,12 +381,12 @@ class Coordinator:
     def job(self, job_id: str) -> TrainingJob:
         if job_id not in self.jobs:
             job = self.chain.state.job(job_id)
-            if job.data_source["kind"] == "npz" and self.recheck is not None:
+            if job.data_source["kind"] in ("npz", "tokens") and self.recheck is not None:
                 try:
                     self.recheck.attach(job)  # rechecking replays trains on the data
                 except Exception:  # noqa: BLE001 - unavailable data only means those checks can't be redone
                     pass
-            elif job.data_source["kind"] == "npz" and not self.replaying:  # plain replays never touch the data
+            elif job.data_source["kind"] in ("npz", "tokens") and not self.replaying:  # plain replays never touch the data
                 if self.store is None:
                     raise InvalidJob("no dataset store")
                 self.store.attach_dataset(job)
@@ -331,6 +415,9 @@ class Coordinator:
                     job = self.job(job_id)
                 except (InvalidJob, ValueError, OSError):
                     continue  # dataset not available here yet
+                except Exception as e:  # noqa: BLE001 - one job's bad data must never stop every job's rounds
+                    self.waiting[job_id] = f"job {job_id} can't run: its data or spec doesn't load ({type(e).__name__}: {e})"
+                    continue
                 if job.sharded and not self.runs_teams:
                     self.waiting[job_id] = (f"job {job_id} waits: it's split into {job.shards} shards, trained by teams "
                                             "whose workers send each other activations, and this node can't run teams yet")
@@ -389,9 +476,9 @@ class Coordinator:
         """May take work: staked, or on a chain where workers earn their stake in."""
         return self.chain.state.staked(addr) or self.chain.state.earn_in
 
-    def _need(self, phase: Phase) -> _Round:
-        if self.phase != phase or self.r is None:
-            raise ProtocolError(f"not in {phase.value} phase (now {self.phase.value})")
+    def _need(self, *phases: Phase) -> _Round:
+        if self.phase not in phases or self.r is None:
+            raise ProtocolError(f"not in {phases[0].value} phase (now {self.phase.value})")
         return self.r
 
     def _claim(self, kind: str, key: str, compute):
@@ -505,7 +592,7 @@ class Coordinator:
                 raise ProtocolError(f"job {job_id} had no budget left")
             if self.replaying["round"] != round_no:
                 raise ProtocolError(f"the record is for round {self.replaying['round']}, not {round_no}")
-            if self.replaying.get("version", RECORD_VERSION) not in (1, 2, SHARDED_RECORD_VERSION):
+            if self.replaying.get("version", RECORD_VERSION) not in (1, 2, SHARDED_RECORD_VERSION, FINETUNE_RECORD_VERSION):
                 raise ProtocolError(f"the record is version {self.replaying.get('version')!r}, which this code doesn't know")
         else:
             job_id = self.active_job_id()
@@ -515,6 +602,9 @@ class Coordinator:
         if self.replaying and (self.replaying.get("version", RECORD_VERSION) == SHARDED_RECORD_VERSION) != job.sharded:
             raise ProtocolError(f"the record is version {self.replaying.get('version', RECORD_VERSION)}, but sharded jobs' "
                                 f"rounds, and only theirs, are recorded as version {SHARDED_RECORD_VERSION}")
+        if self.replaying and (self.replaying.get("version", RECORD_VERSION) == FINETUNE_RECORD_VERSION) != job.finetune:
+            raise ProtocolError(f"the record is version {self.replaying.get('version', RECORD_VERSION)}, but fine-tunes' "
+                                f"rounds, and only theirs, are recorded as version {FINETUNE_RECORD_VERSION}")
         if self.replaying:
             start, start_hash = None, bytes.fromhex(self.replaying["start_hash"])
             if start_hash != self.expected_start_hash(job):
@@ -531,6 +621,9 @@ class Coordinator:
                          "checks": {"reveal": {}, "replay": {}, "arbitration": {}, "redundancy": {}, "model": {}}}
         if job.sharded:  # its teams (start_compute) and the signed edge messages that settled disputes (submit_edge_evidence)
             self.r.record |= {"version": SHARDED_RECORD_VERSION, "teams": [], "evidence": []}
+        if job.finetune:  # its disputes (start_disputes): signed moves, evidence and the weights the referee used
+            self.r.record |= {"version": FINETUNE_RECORD_VERSION, "games": []}
+            self.r.record["checks"]["game"] = {}  # each dispute's root states, from the checkpoints
         # Names this attempt at the round, for receipts (receipts.py): a round abandoned and run again under the
         # same number gets a new label, so receipts from the abandoned attempt don't look like censorship.
         if self.replaying:
@@ -599,6 +692,18 @@ class Coordinator:
             self._form_teams(job, order, capacity)
             self.phase = Phase.COMPUTE
             return
+        if r.v4:
+            able = [a for a, reg in r.regs.items() if staked(a) and reg.memory_mb >= job.memory_mb]
+            if len(able) < FINETUNE_QUORUM:  # its work couldn't be checked: train nothing, waste nothing
+                r.waiting = (f"job {r.job_id} waits: a fine-tune's work is checked by workers, so it needs "
+                             f"{FINETUNE_QUORUM} staked workers with {_size(job.memory_mb)} of GPU memory each (one to "
+                             f"train a unit, one to check it), and {len(able)} registered. Workers earn their stake on "
+                             "other jobs first")
+                self.waiting[r.job_id] = r.waiting
+                r.unassigned = len(r.units)
+                self.phase = Phase.COMPUTE
+                return
+            self.waiting.pop(r.job_id, None)
 
         def pick(unit: WorkUnit, exclude: set[str]) -> str | None:
             # Staked workers first: those earning their stake in only get what's left, so they can't crowd them out.
@@ -932,6 +1037,10 @@ class Coordinator:
         def task_id(uid, submitter, verifier) -> str:
             return h256(*seed, uid.encode(), submitter.encode(), verifier.encode()).hex()[:20]
 
+        if r.v4:
+            r.tasks = self._finetune_tasks(job, draw, pool, task_id)
+            self.phase = Phase.VERIFY
+            return
         tasks, checkers = [], defaultdict(set)
         for (uid, addr), rv in r.reveals.items():
             segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
@@ -960,6 +1069,65 @@ class Coordinator:
 
         r.tasks = {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
         self.phase = Phase.VERIFY
+
+    def _finetune_tasks(self, job: TrainingJob, draw: Draw, pool, task_id) -> dict[str, VerifyTask]:
+        """Version 4's verify tasks: each claim's challenged segments to CHECKERS checkers (never its unit's holders),
+        canaries, and SCORERS scorers for the round's starting model when there's work to score. A claim nobody can
+        check gets no task, and ends unchecked. Every draw is seeded by the round secret and what it's
+        for (each claim's checkers by the claim), and claims are taken in sorted order, so the order a leader recorded
+        the reveals in steers nothing."""
+        r, q = self.r, self.config.challenge_segments
+        tasks, checkers = [], defaultdict(set)
+        for uid, addr in sorted(r.reveals):
+            rv = r.reveals[(uid, addr)]
+            segs = challenge_segments(r.beacon, uid, addr, job.n_segments, q)
+            openings = {i: rv.openings[i] for s in segs for i in (s, s + 1)}
+            mine = Draw(b"check", r.beacon, r.secret, uid.encode(), addr.encode())
+            for verifier in _pick(mine, pool(set(r.holders[uid])), CHECKERS):
+                checkers[uid].add(verifier)
+                tasks.append(VerifyTask(task_id(uid, addr, verifier), verifier, r.units[uid], addr, segs, openings))
+        tasks += self._finetune_canaries(job, Draw(b"canaries", r.beacon, r.secret), pool, checkers,
+                                         self.config.canaries_per_round, "check")
+        if r.reveals:  # (a round that trained nothing has nothing to score, and nobody to pay for scoring it)
+            first = next(iter(r.units.values()))  # a score task names a unit only because every task has one
+            for verifier in _pick(Draw(b"score", r.beacon, r.secret), pool(set()), SCORERS):
+                tasks.append(VerifyTask(task_id("score", "", verifier), verifier, first, "", [], {}, kind="score"))
+        tasks.sort(key=lambda t: t.task_id)
+        return {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
+
+    def _finetune_canaries(self, job: TrainingJob, draw: Draw, pool, checkers: dict[str, set[str]], n: int,
+                           kind: str) -> list[VerifyTask]:
+        """A fine-tune's canaries: another unit's honest training, presented as this unit's. A donor claim's challenged
+        openings (real Adam steps, so every invariant of Adam's moments holds, which a rescaled update breaks) go out
+        under a target unit's id, and so its seed: an honest replay draws other batches and rejects them, and without
+        a replay nothing gives it away. The checker neither holds nor checks either unit, so it can't have seen those
+        checkpoints. Needs two units revealed."""
+        r, q = self.r, self.config.challenge_segments
+        units = sorted({uid for uid, _ in r.reveals})
+        planted, used = [], set()
+        if len(units) < 2:
+            return planted
+        for donor_uid, donor in draw.shuffle(sorted(r.reveals)):
+            if len(planted) == n:
+                break
+            others = [u for u in units if u != donor_uid and u not in used]
+            if not others or donor_uid in used:
+                continue
+            target = others[draw.below(len(others))]
+            near = set(r.holders[target]) | set(r.holders[donor_uid]) | checkers[target] | checkers[donor_uid]
+            candidates = pool(near)
+            if not candidates:
+                continue
+            used.update((target, donor_uid))
+            tag = (kind + str(len(planted))).encode()
+            fake = KeyPair.generate(h256(b"canary", r.secret, tag)).address
+            segs = challenge_segments(r.beacon, donor_uid, donor, job.n_segments, q)
+            rv = r.reveals[(donor_uid, donor)]
+            openings = {} if self.replaying else {i: rv.openings[i] for s in segs for i in (s, s + 1)}
+            verifier = candidates[draw.below(len(candidates))]
+            tid = h256(b"canary", r.beacon, r.secret, tag, verifier.encode()).hex()[:20]
+            planted.append(VerifyTask(tid, verifier, r.units[target], fake, segs, openings, canary=True, kind=kind))
+        return planted
 
     def _canaries(self, job: TrainingJob, draw: Draw, pool, task_id, checkers: dict[str, set[str]]) -> list[VerifyTask]:
         """Version 2's planted fakes, each a copy of a real reveal's task with one segment's update rescaled
@@ -1059,23 +1227,291 @@ class Coordinator:
 
     @_locked
     def tasks_for(self, addr: str) -> list[VerifyTask]:
-        r = self._need(Phase.VERIFY)
+        r = self.r
+        if r is None or self.phase != Phase.VERIFY:
+            raise ProtocolError(f"not in verify phase (now {self.phase.value})")
         return [t for t in r.tasks.values() if t.verifier == addr and t.verdict is None]
 
     @_locked
-    def submit_verdict(self, addr: str, task_id: str, ok: bool, bad_segment: int | None, envelope: dict | None = None) -> None:
-        """`envelope` is the verifier's signed message, kept in the record as proof of what it said."""
-        r = self._need(Phase.VERIFY)
+    def submit_verdict(self, addr: str, task_id: str, ok: bool, bad_segment: int | None, envelope: dict | None = None,
+                       score=None) -> None:
+        """`envelope` is the verifier's signed message, kept in the record as proof of what it said. A fine-tune's
+        scorer answers with `score`, [loss, accuracy] of the round's starting model on the held-back data."""
+        r = self.r
+        if r is None or self.phase != Phase.VERIFY:
+            raise ProtocolError(f"not in verify phase (now {self.phase.value})")
         t = r.tasks.get(task_id)
         if t is None or t.verifier != addr:
             raise ProtocolError("no such task for this verifier")
         if t.verdict is not None:
             raise ProtocolError("verdict already submitted")
+        if t.kind == "score":
+            t.score = _score(score)
+            ok, bad_segment = True, None
+        elif score is not None:
+            raise ProtocolError("only a score task answers with a score")
         if not ok and bad_segment not in t.segments:
             raise ProtocolError("a rejection must name one of the challenged segments")
         t.verdict = (bool(ok), None if ok else int(bad_segment))
-        r.record["verdicts"].append(envelope if envelope is not None else
-                                    {"verifier": addr, "task_id": task_id, "ok": bool(ok), "bad_segment": t.verdict[1]})
+        entry = {"verifier": addr, "task_id": task_id, "ok": bool(ok), "bad_segment": t.verdict[1]}
+        if t.score is not None:
+            entry["score"] = list(t.score)
+        r.record["verdicts"].append(envelope if envelope is not None else entry)
+
+    @_locked
+    def start_disputes(self, now: float | None = None) -> bool:
+        """A fine-tune's round, after the verify phase: open a dispute (dispute.Game) for every rejection of a claim by
+        a checker whose verdicts count, rooted at the segment it named, and, when replicas of a unit disagree, one each
+        way between them, rooted at the whole unit. A checker that approved a canary is lazy: none of its verdicts
+        count. Say whether there's a dispute phase; other rounds have none. With `now`, moves have deadlines."""
+        r = self._need(Phase.VERIFY)
+        if not r.v4:
+            return False
+        job = self.job(r.job_id)
+        r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
+        opened = defaultdict(int)
+        for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
+            if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
+                # One challenger can't load a round with disputes, fewer the more it has accused in vain: the rest of
+                # its rejections are ignored (their claims stand on other verdicts).
+                if opened[t.verifier] >= games_allowed(self.chain.state.rep(t.verifier)):
+                    continue
+                opened[t.verifier] += 1
+                self._open_game(job, (t.unit.unit_id, t.submitter), t.verifier, "dispute", ["segment", t.verdict[1]])
+        for uid, holders in sorted(r.holders.items()):
+            keys = [(uid, a) for a in holders if (uid, a) in r.reveals]
+            if len(keys) > 1 and not self._claim("redundancy", uid, lambda keys=keys: self._replicas_agree(job, keys)):
+                for d, c in itertools.permutations(keys, 2):
+                    self._open_game(job, d, c[1], "replicas", ["unit"])
+        if not r.games:
+            return False
+        for g in r.games.values():
+            g.deadline = 0.0 if now is None else now + self.move_s
+        self.phase = Phase.DISPUTE
+        return True
+
+    def _program(self, job: TrainingJob, uid: str):
+        from .program import Program
+
+        key = (job.job_id, uid)
+        if key not in self._programs:
+            if getattr(job, "_data", None) is None:
+                self._attach(job)
+            self._programs[key] = Program.of(job, self.r.units[uid].seed)
+        return self._programs[key]
+
+    def _attach(self, job: TrainingJob) -> None:
+        """A replay needs a fine-tune's data to referee its disputes (which sequences a step trains on, and how long
+        they are); a plain replay never needed it otherwise."""
+        for src in (self.recheck, self.datasets, self.store):
+            if src is None:
+                continue
+            try:
+                (src.attach if hasattr(src, "attach") else src.attach_dataset)(job)
+                return
+            except Exception:  # noqa: BLE001 - try the next place
+                continue
+        raise ProtocolError(f"refereeing job {job.job_id}'s disputes needs its dataset, which isn't here")
+
+    def _open_game(self, job: TrainingJob, key: tuple[str, str], challenger: str, why: str, root: list) -> None:
+        r = self.r
+        uid, defender = key
+        gid = h256(b"game", r.beacon, r.secret, canonical([uid, defender, challenger, root])).hex()[:20]
+
+        def ends():
+            rv = r.reveals[key]
+            if root[0] == "segment":
+                s = int(root[1])
+                before, after = rv.openings[s][0], rv.openings[s + 1][0]
+            else:
+                before, after = r.start, rv.final_params
+            self._weights(before, after)
+            out = []
+            for theta in (before, after):
+                state, manifest, blobs = dg.checkpoint_state(job.spec, theta)
+                for raw in blobs.values():
+                    self._put_trace(raw)
+                self._put_trace(manifest)
+                out.append(state)
+            return out
+        if self.replaying and self.roots is not None:  # a validator: the states are the checkpoints', or it refuses
+            a, b = self._replay_ends(job, key, root)
+            if self.replaying["checks"].get("game", {}).get(gid) != [a, b]:
+                raise ProtocolError(f"dispute {gid}'s starting states in the record aren't the reveal's checkpoints'")
+            r.record["checks"]["game"][gid] = [a, b]
+        else:
+            a, b = self._claim("game", gid, ends)
+        g = dg.Game(gid, uid, defender, challenger, why, list(root), a, b, seed=r.units[uid].seed)
+        r.games[gid] = g.start(self._program(job, uid))
+
+    def _replay_bytes(self, blob_id: str) -> bytes | None:
+        """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
+        None when it can't be had: a validator then refuses the block (submit_move), a plain replay counts it
+        unchecked."""
+        get = getattr(self.roots, "bytes", None)
+        if get is None:
+            return None
+        try:
+            return get(blob_id)
+        except Exception:  # noqa: BLE001 - pruned or unreachable: as a checkpoint that's gone
+            return None
+
+    def _replay_ends(self, job: TrainingJob, key: tuple[str, str], root: list) -> list[str]:
+        """A game's starting and ending state roots, rebuilt from the checkpoints its claim's reveal names (fetched
+        through self.roots: the leader's blobs, for a validator). Refuses when they can't be had."""
+        uid, worker = key
+        wire = next((d for d in self.replaying.get("reveals", []) if d.get("unit_id") == uid and d.get("worker") == worker),
+                    None)
+        if wire is None:
+            raise ProtocolError(f"the record has no reveal for {uid} by {worker}")
+        openings = blob_openings_in(wire["openings"], job.n_segments)
+        if root[0] == "segment":
+            s = int(root[1])
+            ids = [openings[s][0], openings[s + 1][0]]
+        else:
+            ids = [openings[0][0], wire["final"]]
+        out = []
+        for bid in ids:
+            try:
+                theta = self.roots.array(bid, job)
+            except Exception as e:  # noqa: BLE001 - the checkpoint couldn't be had: nothing to check the record by
+                raise ProtocolError(f"checkpoint {str(bid)[:12]} for a dispute couldn't be fetched: {e}") from None
+            out.append(dg.checkpoint_state(job.spec, theta)[0])
+        return out
+
+    # --- states and evidence on the node ---
+
+    def _put_trace(self, raw: bytes) -> str:
+        if self.trace_blobs is None:
+            self.trace_blobs = _MemoryBlobs()
+        return self.trace_blobs.put_bytes(raw)
+
+    def _get_trace(self, blob_id: str) -> bytes | None:
+        return None if self.trace_blobs is None else self.trace_blobs.get_bytes(blob_id)
+
+    def _trace_size(self, blob_id: str) -> int | None:
+        return None if self.trace_blobs is None else self.trace_blobs.size(blob_id)
+
+    def _check_evidence_size(self, g, blob_id: str, outside) -> None:
+        """Evidence no bigger than its tile can need (dispute.evidence_cap), checked before it's read."""
+        size = self._trace_size(blob_id) if dg._hex64(blob_id) else None
+        if size is None:
+            raise ProtocolError("evidence is the id of an uploaded blob")
+        if size > dg.MAX_EVIDENCE:
+            try:
+                cap = dg.evidence_cap(g.leaf, g.tile, outside)
+            except dg.WeightsUnavailable:  # the referee will say so (unchecked), on evidence it then doesn't read
+                return
+            if size > cap:
+                raise ProtocolError(f"evidence of {size} bytes is more than this tile can need ({cap})")
+
+    def _check_states(self, roots: list[str]) -> None:
+        """Every state a split names is on the node, with every tensor it names, each hashing as its manifest says:
+        the challenger can fetch them all. Sizes are checked before anything is read or hashed."""
+        from . import merkle
+
+        for root in roots:
+            size = self._trace_size(root)
+            if size is None:
+                raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
+            if size > merkle.MAX_MANIFEST:
+                raise dg.MoveRefused(f"state {root[:12]}… is too big to be a manifest")
+            m = self._get_trace(root)
+            if m is None:
+                raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
+            try:
+                entries = merkle.parse_manifest(m)
+            except merkle.MerkleError as e:
+                raise dg.MoveRefused(f"state {root[:12]}…: {e}") from None
+            for name, (troot, blob, rows, cols) in entries.items():
+                if self.trace_blobs.tensor_root(blob, rows, cols) != troot:
+                    raise dg.MoveRefused(f"state {root[:12]}…: {name} isn't uploaded, or doesn't hash as its manifest says")
+
+    def _weight_source(self, job: TrainingJob):
+        if self.weight_source is not None:
+            return self.weight_source(job)
+        return dg.HubWeights(job.data.parsed_manifest())
+
+    @_locked
+    def game_views(self) -> list[dict]:
+        r = self.r
+        return [] if r is None else [g.view() for _, g in sorted(r.games.items())]
+
+    @_locked
+    def submit_move(self, addr: str, body: dict, envelope: dict | None = None, now: float | None = None,
+                    evidence: bytes | None = None) -> dict:
+        """One move of a dispute (dispute.play), `body` {"game", "n" (moves so far), "move"}. A replay passes the
+        evidence from the record; a live node reads it from its blobs. Either way the referee reads the base model's
+        weights it checked itself against the job's manifest (dispute.HubWeights): none come from the record."""
+        r = self._need(Phase.DISPUTE)
+        g = r.games.get(body.get("game")) if isinstance(body, dict) else None
+        if g is None:
+            raise ProtocolError("no such dispute in this round")
+        if body.get("n") != len(g.moves):
+            raise ProtocolError(f"this dispute has had {len(g.moves)} moves; that one was for another turn")
+        if now is not None and g.deadline and now > g.deadline:
+            raise ProtocolError("too late: that move's deadline has passed")
+        job = self.job(r.job_id)
+        move, outside = body.get("move"), None
+        try:
+            kind = dg.whose(g, addr, move)  # before reading anything the move names
+        except dg.MoveRefused as e:
+            raise ProtocolError(str(e)) from None
+        if kind == "evidence":
+            outside = dg.Outside(job.spec, job.data, self._weight_source(job))
+            blob = str(move["evidence"])
+            if not self.replaying:
+                self._check_evidence_size(g, blob, outside)
+            evidence = self._replay_bytes(blob) if self.replaying else self._get_trace(blob)
+            if self.replaying and evidence is None:
+                if getattr(self.roots, "bytes", None) is not None:  # a validator never takes an outcome on trust
+                    raise ProtocolError(f"dispute {g.gid}'s evidence {blob[:12]}… can't be fetched to referee it again")
+                # A plain replay with no blobs to fetch from (an old round, past its window): the record's outcome,
+                # counted unchecked.
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
+                self.unchecked += 1
+                g.moves.append(envelope if envelope is not None else {"from": addr, **body})
+                return g.view()
+        try:
+            dg.play(g, self._program(job, g.unit), addr, move, evidence=evidence, outside=outside,
+                    check_states=None if self.replaying else self._check_states)
+        except dg.MoveRefused as e:
+            raise ProtocolError(str(e)) from None
+        g.moves.append(envelope if envelope is not None else {"from": addr, **body})
+        if now is not None:
+            g.deadline = now + self.move_s
+        return g.view()
+
+    @_locked
+    def expire_moves(self, now: float) -> None:
+        """A party whose move is past its deadline loses (dispute.silence)."""
+        r = self.r
+        if r is not None and self.phase == Phase.DISPUTE:
+            for g in r.games.values():
+                if g.turn != "done" and g.deadline and now > g.deadline:
+                    dg.silence(g)
+
+    @_locked
+    def end_disputes(self, now: float) -> None:
+        """The dispute phase is over: each unfinished game is judged by its own move's deadline (dispute.cut_short)."""
+        r = self.r
+        if r is not None and self.phase == Phase.DISPUTE:
+            most = self.job(r.job_id).phase_lengths().get("moves", 0)
+            for g in r.games.values():
+                dg.cut_short(g, now, most)
+
+    def disputes_done(self) -> bool:
+        r = self.r
+        return r is None or all(g.turn == "done" for g in r.games.values())
+
+    def _replicas_agree(self, job: TrainingJob, keys: list) -> bool:
+        """Whether replicas of a unit ended at the same weights (by the agreement rule, loosened to what a whole unit on
+        other hardware measured, finetune.WHOLE_TOLERANCE; no training)."""
+        r, tol = self.r, max(self.config.agreement_tolerance, WHOLE_TOLERANCE)
+        finals = [r.reveals[k].final_params for k in keys]
+        self._weights(r.start, *finals)
+        return all(reproduces(f, finals[0], r.start, tol, job.spec) for f in finals[1:])
 
     # --- 5. finalize ------------------------------------------------------------------------
 
@@ -1206,6 +1642,8 @@ class Coordinator:
         job = self.job(r.job_id)
         if job.sharded:
             return self._settle_teams(proposer)
+        if r.v4:
+            return self._settle_finetune(proposer)
         verifier_flops: dict[str, int] = defaultdict(int)
         missed: set[str] = set()
 
@@ -1284,10 +1722,115 @@ class Coordinator:
         )
         return summary, new_params, worker_flops
 
+    def _settle_finetune(self, proposer: str):
+        """Version 4's settlement, from verdicts and disputes: the node replays nothing. A claim is accepted when a
+        checker whose verdicts count approved it, or when it won every dispute over it; found bad, when it lost one
+        (its worker slashed, the winner its catcher). A dispute the referee couldn't decide (the Hub unreachable)
+        leaves it unchecked: unpaid, out of the model, nobody slashed. So does a claim no counted checker answered.
+        A challenger that lost is slashed for a false accusation, with no catcher: baiting one into a dispute earns
+        nothing. A checker that approved a canary is slashed, and none of its verdicts count. Approving a claim found
+        bad isn't slashed: the referee finds an op a few ulps out that a checker's replay rightly passes. Scorers'
+        median goes into the record, for people: nothing is paid by it."""
+        r = self.r
+        job = self.job(r.job_id)
+        most = job.phase_lengths().get("moves", 0)
+        for g in r.games.values():
+            # The leader's clock: its phase ended before the move was due, which it can be only near the game's end.
+            if g.turn != "done" and self.replaying and len(g.moves) >= most - 1:
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                if (entry.get("outcome"), entry.get("detail")) == ("unchecked", dg.PHASE_ENDED):
+                    g.end("unchecked", dg.PHASE_ENDED)
+            dg.silence(g)  # whoever's move it still is didn't make it
+        verifier_flops: dict[str, int] = defaultdict(int)
+        missed: set[str] = set()
+        answered, scores = defaultdict(list), []
+        for t in r.tasks.values():
+            if t.verdict is None:
+                if t.verifier:
+                    missed.add(t.verifier)
+                continue
+            if t.kind == "score":
+                scores.append((t.verifier, t.score))
+                continue
+            verifier_flops[t.verifier] += replay_cost(job, len(t.segments))
+            if t.canary:
+                if t.verdict[0]:
+                    r.slashes.append([t.verifier, None, "approved a canary"])
+                continue
+            if t.verifier not in r.void:
+                answered[(t.unit.unit_id, t.submitter)].append(t)
+        games = defaultdict(list)
+        for _, g in sorted(r.games.items()):
+            games[(g.unit, g.defender)].append(g)
+            if g.outcome == "defender":
+                r.slashes.append([g.challenger, None, "false accusation"])
+        # A checker that withdrew its rejection (it found no number the referee would refuse) isn't slashed, but isn't
+        # paid for checking this round either: a rejection costs something even when it's taken back.
+        withdrawn = {g.challenger for g in r.games.values() if g.outcome == "withdrawn"}
+        for key in sorted(r.reveals):
+            lost = [g for g in games[key] if g.outcome == "challenger"]
+            if lost:
+                g = lost[0]
+                self._fraud(key, Verdict.FAILED_REDUNDANCY if g.why == "replicas" else Verdict.FAILED_REPLAY,
+                            f"lost a dispute ({g.why}): {g.detail}", catcher=g.challenger, verifier=g.challenger)
+            elif any(g.outcome == "unchecked" for g in games[key]):
+                why = next(g.detail for g in games[key] if g.outcome == "unchecked")
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None, f"not refereed: {why}")
+            elif any(t.verdict[0] for t in answered[key]) or any(g.outcome == "defender" for g in games[key]):
+                first = next((t.verifier for t in answered[key] if t.verdict[0]), None)
+                won = sum(g.outcome == "defender" for g in games[key])
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.ACCEPTED, first,
+                                            f"won {won} dispute{'s' * (won != 1)}" if won else "")
+            else:
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
+                                            "no checker whose verdicts count answered for it")
+        r.record["games"] = [g.entry() for _, g in sorted(r.games.items())]
+        # An offender pays one slash a round, its first (ledger._slash_txs): one with a catcher goes before a burn, or
+        # a cheater that also accused falsely (or approved a canary) would keep its catcher from the bounty.
+        r.slashes.sort(key=lambda s: s[1] is None)
+
+        accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
+        offenders = {s[0] for s in r.slashes} | r.forfeit
+        worker_flops: dict[str, int] = defaultdict(int)
+        updates: dict[str, np.ndarray] = {}
+        for (uid, addr), rv in accepted.items():
+            if addr not in offenders:
+                worker_flops[addr] += r.units[uid].flops
+                updates.setdefault(uid, rv.final_params)
+        new_params = None
+
+        def average() -> str:
+            nonlocal new_params
+            self._weights(*(updates.values() if updates else [r.start]))
+            new_params = _mean(list(updates.values()), job) if updates else r.start
+            return params_hash(new_params).hex()
+        model_hash = self._claim("model", "params_hash", average)
+        if scores:
+            r.record["score"] = [_median([s[0] for _, s in scores]), _median([s[1] for _, s in scores])]
+            # Paid only when SCORERS answered and this one agrees with their median: nothing checks a lone score.
+            loss, acc = r.record["score"]
+            for v, (l, a) in scores if len(scores) >= SCORERS else []:
+                if abs(l - loss) <= SCORE_AGREEMENT * max(1.0, loss) and abs(a - acc) <= SCORE_AGREEMENT:
+                    verifier_flops[v] += score_cost(job)
+        r.record["secret"] = r.secret.hex()
+        summary = RoundSummary(
+            job_id=r.job_id,
+            accepted_units=len(updates),
+            worker_flops=dict(sorted(worker_flops.items())),
+            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders | withdrawn},
+            slashes=r.slashes,
+            accepted=sorted(worker_flops),
+            missed=sorted(missed | r.forfeit | withdrawn | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
+            params_hash=model_hash,
+            proposer=proposer,
+            record_hash=h256(canonical(r.record)).hex(),
+        )
+        return summary, new_params, worker_flops
+
     @_locked
     def replayed_summary(self, proposer: str) -> RoundSummary:
         """The summary a replayed round arrives at; nothing is sealed or stored."""
-        self._need(Phase.VERIFY)
+        self._need(Phase.VERIFY, Phase.DISPUTE)
         summary, _, _ = self._settle(proposer)
         self.phase, self.r = Phase.IDLE, None
         return summary
@@ -1297,7 +1840,7 @@ class Coordinator:
         """Settle the round into a signed block. With `seal`, the block goes straight onto the chain (a chain one node
         runs); without, it's only built, for the validators to vote on (consensus.py), and adopt() adds it if they
         agree."""
-        r = self._need(Phase.VERIFY)
+        r = self._need(Phase.VERIFY, Phase.DISPUTE)
         if self.replaying:
             raise ProtocolError("a replayed round isn't sealed; use replayed_summary")
         job = self.job(r.job_id)
@@ -1306,7 +1849,8 @@ class Coordinator:
             raise ProtocolError("no proposer key")
         summary, new_params, worker_flops = self._settle(keys.address)
         block = self._block(summary, keys, timestamp)
-        val_loss, val_acc = evaluate(job.spec, new_params, job.data.x_val, job.data.y_val)
+        # A fine-tune's score is its scorers' (of the model this round started from): the node never runs the model.
+        val_loss, val_acc = (r.record.get("score") or (None, None)) if r.v4 else job.evaluate(new_params)
         report = RoundReport(r.round_no, r.job_id, list(r.results.values()), dict(worker_flops), summary.verifier_flops,
                              r.slashes, r.unassigned, val_loss, val_acc, keys.address, block, record=r.record, params=new_params,
                              teams=[list(t.members) for t in r.teams], waiting=r.waiting)
@@ -1316,8 +1860,8 @@ class Coordinator:
         report.burned = report.pool - sum(t.amount for t in rewards)
         report.worker_pay = {t.recipient: t.amount for t in rewards if t.memo == "work"}
         report.verifier_pay = {t.recipient: t.amount for t in rewards if t.memo == "verify"}
-        if seal:
-            self.adopt(block, r.record, new_params, (val_loss, val_acc))
+        if seal:  # (a fine-tune's scores are saved from its record)
+            self.adopt(block, r.record, new_params, None if r.v4 else (val_loss, val_acc))
             self.history.append(report)
         self.phase, self.r = Phase.IDLE, None
         return report
@@ -1366,11 +1910,47 @@ class Coordinator:
         s = block.summary
         if s is None:
             return
+        if self.store and isinstance(record, dict) and record.get("version") == FINETUNE_RECORD_VERSION and record.get("score"):
+            # Scores come with a fine-tune's record, whoever led its round: the scorers' median. A round no scorer
+            # answered in has none, and isn't in the job's history of scores (the chain still has its units).
+            self.store.save_round(s.job_id, block.height, s.accepted_units, *record["score"])
         if params is None:
             self.params.pop(s.job_id, None)
             return
         self.params[s.job_id] = params
         if self.store:
             self.store.save_params(s.job_id, block.height, params)
-            if scores is not None:
+            fine_tune = isinstance(record, dict) and record.get("version") == FINETUNE_RECORD_VERSION
+            if scores is not None and not fine_tune:  # (a fine-tune's were saved from its record, above)
                 self.store.save_round(s.job_id, block.height, s.accepted_units, *scores)
+
+
+class _MemoryBlobs:
+    """Disputes' states and evidence when no BlobStore is given (in-process networks and replays)."""
+
+    def __init__(self):
+        self.data: dict[str, bytes] = {}
+        self.roots: dict[tuple, str] = {}
+
+    def put_bytes(self, raw: bytes) -> str:
+        import hashlib
+
+        bid = hashlib.sha256(raw).hexdigest()
+        self.data[bid] = bytes(raw)
+        return bid
+
+    def get_bytes(self, bid: str) -> bytes | None:
+        return self.data.get(bid)
+
+    def size(self, bid: str) -> int | None:
+        return len(self.data[bid]) if bid in self.data else None
+
+    def tensor_root(self, bid: str, rows: int, cols: int) -> str | None:
+        from . import merkle
+
+        raw = self.data.get(bid)
+        if raw is None or len(raw) != rows * cols * 4:
+            return None
+        if (bid, rows, cols) not in self.roots:  # by shape: the same bytes make another root in another shape
+            self.roots[bid, rows, cols] = merkle.root_of(np.frombuffer(raw, "<f4").reshape(rows, cols))
+        return self.roots[bid, rows, cols]

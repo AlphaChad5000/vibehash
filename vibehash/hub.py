@@ -41,7 +41,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import threading
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
@@ -58,12 +60,18 @@ MAX_HEADER = 25_000_000  # constants.SAFETENSORS_MAX_HEADER_LENGTH: a longer hea
 MAX_JSON = 64 * 2**20  # an index, config or API reply bigger than this is refused (DeepSeek V3's index is ~9 MB)
 MAX_PAGES = 1000  # of a file listing (1000 entries each)
 CHUNK = 8 * 2**20
+# A run of back-to-back tensors comes down in one ranged request, but no more than this per request unless one tensor is
+# bigger, and DOWNLOADS requests at once: the Hub's CDN slows a single long stream to about 1.5 MiB/s after a couple of
+# minutes, while fresh requests get 30 MiB/s or more each (DEEPSEEK.md §5 step 3).
+MAX_RUN = 64 * 2**20
+DOWNLOADS = 6
 RETRIES = 5
 MAX_REDIRECTS = 10
 MANIFEST_FORMAT = "vibehash-hf-manifest/1"
 # Small files a manifest pins besides the weights, when the repo has them: the architecture and the tokenizer have
 # to be the same bytes on every worker too.
-EXTRA_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json")
+EXTRA_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+               "chat_template.jinja")
 PICKLES = (".bin", ".pt", ".pth", ".ckpt", ".pkl")  # PyTorch pickles: loading one can run code, so we never do
 USER_AGENT = "vibehash-hub/1 (python-urllib)"
 
@@ -1321,10 +1329,12 @@ class TensorCache:
         if need > free:
             raise DiskFullError(f"these weights need {_gb(need)} and {_gb(free)} is free in {folder}: free some space, "
                                 "or set VIBEHASH_HOME to a folder on a bigger disk")
-        done = 0
+        done, lock = 0, threading.Lock()
         if progress:
             progress(0, need, label)
-        for run in _runs(missing, have):
+
+        def fetch(run: list[TensorEntry]) -> None:
+            nonlocal done
             e0 = run[0]
             info = manifest.files[e0.file]
             f = hub.open(manifest.repo, manifest.commit, e0.file, info["size"], info["sha256"])
@@ -1333,9 +1343,10 @@ class TensorCache:
             try:
                 for piece in f.iter_range(start, end - start):
                     writer.write(piece)
-                    done += len(piece)
-                    if progress:
-                        progress(done, need, label)
+                    with lock:
+                        done += len(piece)
+                        if progress:
+                            progress(done, need, label)
             except OSError as err:
                 if getattr(err, "errno", None) == 28:  # ENOSPC: something else filled the disk meanwhile
                     raise DiskFullError(f"the disk holding {folder} filled up while fetching weights") from None
@@ -1343,17 +1354,25 @@ class TensorCache:
             finally:
                 writer.close()
 
+        runs = _runs(missing, have)
+        with ThreadPoolExecutor(max(1, min(DOWNLOADS, len(runs)))) as pool:
+            for _ in pool.map(fetch, runs):  # the first failure is raised here; the others' parts stay to resume
+                pass
+
 
 def _runs(missing: list[TensorEntry], have: dict[str, int]) -> list[list[TensorEntry]]:
-    """Group tensors into runs that are back to back in one file, each fetched with one ranged request. A partial
-    download can only continue at the start of a run."""
+    """Group tensors into runs that are back to back in one file, each fetched with one ranged request of at most
+    MAX_RUN bytes (unless one tensor is bigger). A partial download can only continue at the start of a run."""
     runs: list[list[TensorEntry]] = []
+    size = 0
     for e in sorted(missing, key=lambda e: (e.file, e.offset, e.length)):
         last = runs[-1][-1] if runs else None
-        if last is not None and last.file == e.file and last.offset + last.length == e.offset and not have[e.sha256]:
+        if last is not None and last.file == e.file and last.offset + last.length == e.offset and not have[e.sha256]                 and size + e.length <= MAX_RUN:
             runs[-1].append(e)
+            size += e.length
         else:
             runs.append([e])
+            size = e.length - have[e.sha256]
     return runs
 
 

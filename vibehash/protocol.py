@@ -132,20 +132,63 @@ class Protocol:
                     published[uid].append(rv)
 
         c.start_verify()
-        for addr, w in self.workers.items():
-            for t in c.tasks_for(addr):
-                if isinstance(t, CellTask):
-                    ok, bad = w.check_cell(job, t)
-                else:
-                    ok, bad = w.verify(job, t.unit, t.openings, t.segments)
-                body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
-                c.submit_verdict(addr, t.task_id, ok, bad, envelope=self._signed(w, "verdict", body))
+        self._answer_tasks(job)
+        if c.start_disputes():  # a fine-tune's disputes, played out move by move
+            self._play_disputes(job)
 
         report = c.finalize(proposer_keys=self._proposer(beacon), timestamp=report_ts(self.chain))
         for w in self.workers.values():
             for uid in [*w._work, *w._shards]:
                 w.forget(uid)
         return report
+
+    def _answer_tasks(self, job: TrainingJob) -> None:
+        """Every worker does the tasks it was given this phase: checks, cells, a fine-tune's scores."""
+        c, r = self.coord, self.coord.r
+        for addr, w in self.workers.items():
+            if w.verifier_behavior == "absent":
+                continue
+            for t in c.tasks_for(addr):
+                score = None
+                if isinstance(t, CellTask):
+                    ok, bad = w.check_cell(job, t)
+                elif t.kind == "score":
+                    (ok, bad), score = (True, None), list(w.score(job, r.start))
+                else:
+                    ok, bad = w.verify(job, t.unit, t.openings, t.segments)
+                body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}
+                if score is not None:
+                    body["score"] = score
+                c.submit_verdict(addr, t.task_id, ok, bad, envelope=self._signed(w, "verdict", body), score=score)
+
+    def _play_disputes(self, job: TrainingJob) -> None:
+        """Each dispute's parties make their moves (tracer.Party) until every dispute is over or waits on a party
+        that won't move (a "quitter" challenger); those it settles (Coordinator._settle_finetune)."""
+        from . import finetune
+        from .program import Program
+        from .tracer import Party
+        from .worker import tamper
+
+        c = self.coord
+        remote = _Blobs(c)
+        rt = finetune.runtime(job.spec, job.data, finetune.device_of(None))
+        parties = {a: Party(rt, job.spec, job.data, remote, tamper if w.behavior == "tamper" else None)
+                   for a, w in self.workers.items()}
+        moved = True
+        while moved:
+            moved = False
+            for g in c.game_views():
+                if g["turn"] == "done":
+                    continue
+                who = g["challenger"] if g["turn"] == "pick" else g["defender"]
+                if g["turn"] == "pick" and self.workers[who].verifier_behavior == "quitter":
+                    continue
+                p, prog = parties[who], Program.of(job, int(g["seed"]))
+                move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g)}
+                        if g["turn"] == "split" else {"evidence": remote.put(p.evidence(prog, g))})
+                body = {"round": c.r.round_no, "game": g["id"], "n": g["n"], "move": move}
+                c.submit_move(who, body, envelope=self._signed(self.workers[who], "move", body))
+                moved = True
 
     def _train_teams(self, job: TrainingJob) -> None:
         """Each team trains its units as a pipeline (shards.train_sharded), every tensor a member sends signed by it
@@ -188,3 +231,16 @@ class Protocol:
 
 def report_ts(chain: Chain) -> int:
     return chain.tip.height + 1
+
+
+class _Blobs:
+    """A dispute's states and evidence, kept by the coordinator in memory (tracer.Party's `remote`)."""
+
+    def __init__(self, coord: Coordinator):
+        self.coord = coord
+
+    def put(self, raw: bytes) -> str:
+        return self.coord._put_trace(raw)
+
+    def get(self, blob_id: str) -> bytes:
+        return self.coord._get_trace(blob_id)

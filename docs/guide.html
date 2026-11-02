@@ -302,7 +302,7 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
       <p>There are two ways to take part, and you can do both from the same computer.</p>
       <ul>
         <li><strong>Worker.</strong> Let your computer train and check models. This is the mining. You can start with no VIBE at all: your first 5 VIBE of pay becomes your stake.</li>
-        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows. Fine-tuning popular open-weight models such as Qwen, Llama, Gemma and DeepSeek is coming: the Train a model tab under <a href="#setup">Get started</a> shows what each would take.</li>
+        <li><strong>Train a model.</strong> Give the network a spreadsheet of examples and some VIBE, and get back a trained model that makes predictions on new rows. Or fine-tune an open-weight model on your own chats: Qwen3 0.6B and 4B, Llama 3.2 1B and SmolLM3 3B today, trained into a small LoRA adapter that you use with Hugging Face transformers. Bigger models, Gemma and DeepSeek are coming: the Train a model tab under <a href="#setup">Get started</a> shows what each would take.</li>
       </ul>
       <p>Training a model takes four commands once Vibe Hash is set up. Your data is a CSV file, and the result is a model file that makes predictions; <a href="#setup">Get started</a> walks through each step.</p>
       <div class="cmd flow"><pre><span class="prompt">&gt; </span><code>vibehash train my-data.csv --budget 100</code>   <span class="prompt"># posts the job; the network trains it</span>
@@ -562,23 +562,23 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
   // This page can't ask Hugging Face itself, so scripts/bake_models.py writes them in.
   // models:begin
   var MODELS = [
-    {"name": "qwen3-0.6b", "title": "Qwen3 0.6B", "repo": "Qwen/Qwen3-0.6B", "params": "752M", "experts": "", "weights": "1.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "1.5 GB", "left_out": []},
-    {"name": "llama-3.2-1b", "title": "Llama 3.2 1B Instruct", "repo": "meta-llama/Llama-3.2-1B-Instruct", "params": "1.2B", "experts": "", "weights": "2.5 GB", "estimated": true, "licence": "llama3.2", "gated": true, "team": [1, 1, 1], "held": "2.5 GB", "left_out": []},
-    {"name": "smollm3-3b", "title": "SmolLM3 3B", "repo": "HuggingFaceTB/SmolLM3-3B", "params": "3.1B", "experts": "", "weights": "6.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "6.2 GB", "left_out": []},
-    {"name": "phi-4-mini", "title": "Phi-4 mini", "repo": "microsoft/Phi-4-mini-instruct", "params": "3.8B", "experts": "", "weights": "7.7 GB", "estimated": false, "licence": "mit", "gated": false, "team": [1, 1, 1], "held": "7.7 GB", "left_out": []},
-    {"name": "qwen3-4b", "title": "Qwen3 4B", "repo": "Qwen/Qwen3-4B", "params": "4.0B", "experts": "", "weights": "8.0 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "8.0 GB", "left_out": []},
-    {"name": "gemma-4-e2b", "title": "Gemma 4 E2B", "repo": "google/gemma-4-E2B-it", "params": "5.1B", "experts": "", "weights": "10.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "10.2 GB", "left_out": []},
-    {"name": "mistral-7b", "title": "Mistral 7B Instruct", "repo": "mistralai/Mistral-7B-Instruct-v0.3", "params": "7.2B", "experts": "", "weights": "14.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "14.5 GB", "left_out": []},
-    {"name": "llama-3.1-8b", "title": "Llama 3.1 8B Instruct", "repo": "meta-llama/Llama-3.1-8B-Instruct", "params": "8.0B", "experts": "", "weights": "16.1 GB", "estimated": true, "licence": "llama3.1", "gated": true, "team": [2, 1, 1], "held": "16.1 GB", "left_out": []},
-    {"name": "qwen3-8b", "title": "Qwen3 8B", "repo": "Qwen/Qwen3-8B", "params": "8.2B", "experts": "", "weights": "16.4 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "16.4 GB", "left_out": []},
-    {"name": "gpt-oss-20b", "title": "gpt-oss 20B", "repo": "openai/gpt-oss-20b", "params": "20.9B", "experts": "4 of 32", "weights": "13.8 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "13.8 GB", "left_out": []},
-    {"name": "qwen3-14b", "title": "Qwen3 14B", "repo": "Qwen/Qwen3-14B", "params": "14.8B", "experts": "", "weights": "29.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [4, 2, 2], "held": "29.5 GB", "left_out": []},
-    {"name": "qwen3.8-27b", "title": "Qwen3.8 27B", "repo": "Qwen/Qwen3.8-27B", "params": "27.8B", "experts": "", "weights": "55.6 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [6, 3, 3], "held": "55.6 GB", "left_out": []},
-    {"name": "gemma-4-31b", "title": "Gemma 4 31B", "repo": "google/gemma-4-31B-it", "params": "31.3B", "experts": "", "weights": "62.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [7, 4, 3], "held": "62.5 GB", "left_out": []},
-    {"name": "gpt-oss-120b", "title": "gpt-oss 120B", "repo": "openai/gpt-oss-120b", "params": "116.8B", "experts": "4 of 128", "weights": "65.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [8, 4, 3], "held": "65.2 GB", "left_out": []},
-    {"name": "glm-5.3-flash", "title": "GLM-5.3-Flash", "repo": "zai-org/GLM-5.3-Flash", "params": "321.3B", "experts": "8 of 288", "weights": "328.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [45, 23, 15], "held": "328.3 GB", "left_out": []},
-    {"name": "glm-5.3", "title": "GLM-5.3", "repo": "zai-org/GLM-5.3", "params": "753.3B", "experts": "8 of 256", "weights": "755.6 GB", "estimated": false, "licence": "glm-5.3", "gated": false, "team": [null, 78, 39], "held": "755.6 GB", "left_out": []},
-    {"name": "deepseek-v4.1-flash", "title": "DeepSeek-V4.1-Flash", "repo": "deepseek-ai/DeepSeek-V4.1-Flash", "params": "763.2B", "experts": "6 of 384", "weights": "510.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [40, 20, 14], "held": "298.3 GB", "left_out": ["the engram tables (203.1 GB): each job gets a slice of the rows its data reads", "the draft layers and vision tower (8.9 GB): a text fine-tune doesn't use them"]}
+    {"name": "qwen3-0.6b", "title": "Qwen3 0.6B", "repo": "Qwen/Qwen3-0.6B", "params": "752M", "experts": "", "weights": "1.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "1.5 GB", "left_out": [], "ready": true},
+    {"name": "llama-3.2-1b", "title": "Llama 3.2 1B Instruct", "repo": "meta-llama/Llama-3.2-1B-Instruct", "params": "1.2B", "experts": "", "weights": "2.5 GB", "estimated": true, "licence": "llama3.2", "gated": true, "team": [1, 1, 1], "held": "2.5 GB", "left_out": [], "ready": true},
+    {"name": "smollm3-3b", "title": "SmolLM3 3B", "repo": "HuggingFaceTB/SmolLM3-3B", "params": "3.1B", "experts": "", "weights": "6.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "6.2 GB", "left_out": [], "ready": true},
+    {"name": "phi-4-mini", "title": "Phi-4 mini", "repo": "microsoft/Phi-4-mini-instruct", "params": "3.8B", "experts": "", "weights": "7.7 GB", "estimated": false, "licence": "mit", "gated": false, "team": [1, 1, 1], "held": "7.7 GB", "left_out": [], "ready": false},
+    {"name": "qwen3-4b", "title": "Qwen3 4B", "repo": "Qwen/Qwen3-4B", "params": "4.0B", "experts": "", "weights": "8.0 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [1, 1, 1], "held": "8.0 GB", "left_out": [], "ready": true},
+    {"name": "gemma-4-e2b", "title": "Gemma 4 E2B", "repo": "google/gemma-4-E2B-it", "params": "5.1B", "experts": "", "weights": "10.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "10.2 GB", "left_out": [], "ready": false},
+    {"name": "mistral-7b", "title": "Mistral 7B Instruct", "repo": "mistralai/Mistral-7B-Instruct-v0.3", "params": "7.2B", "experts": "", "weights": "14.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "14.5 GB", "left_out": [], "ready": false},
+    {"name": "llama-3.1-8b", "title": "Llama 3.1 8B Instruct", "repo": "meta-llama/Llama-3.1-8B-Instruct", "params": "8.0B", "experts": "", "weights": "16.1 GB", "estimated": true, "licence": "llama3.1", "gated": true, "team": [2, 1, 1], "held": "16.1 GB", "left_out": [], "ready": false},
+    {"name": "qwen3-8b", "title": "Qwen3 8B", "repo": "Qwen/Qwen3-8B", "params": "8.2B", "experts": "", "weights": "16.4 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "16.4 GB", "left_out": [], "ready": false},
+    {"name": "gpt-oss-20b", "title": "gpt-oss 20B", "repo": "openai/gpt-oss-20b", "params": "20.9B", "experts": "4 of 32", "weights": "13.8 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [2, 1, 1], "held": "13.8 GB", "left_out": [], "ready": false},
+    {"name": "qwen3-14b", "title": "Qwen3 14B", "repo": "Qwen/Qwen3-14B", "params": "14.8B", "experts": "", "weights": "29.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [4, 2, 2], "held": "29.5 GB", "left_out": [], "ready": false},
+    {"name": "qwen3.8-27b", "title": "Qwen3.8 27B", "repo": "Qwen/Qwen3.8-27B", "params": "27.8B", "experts": "", "weights": "55.6 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [6, 3, 3], "held": "55.6 GB", "left_out": [], "ready": false},
+    {"name": "gemma-4-31b", "title": "Gemma 4 31B", "repo": "google/gemma-4-31B-it", "params": "31.3B", "experts": "", "weights": "62.5 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [7, 4, 3], "held": "62.5 GB", "left_out": [], "ready": false},
+    {"name": "gpt-oss-120b", "title": "gpt-oss 120B", "repo": "openai/gpt-oss-120b", "params": "116.8B", "experts": "4 of 128", "weights": "65.2 GB", "estimated": false, "licence": "apache-2.0", "gated": false, "team": [8, 4, 3], "held": "65.2 GB", "left_out": [], "ready": false},
+    {"name": "glm-5.3-flash", "title": "GLM-5.3-Flash", "repo": "zai-org/GLM-5.3-Flash", "params": "321.3B", "experts": "8 of 288", "weights": "328.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [45, 23, 15], "held": "328.3 GB", "left_out": [], "ready": false},
+    {"name": "glm-5.3", "title": "GLM-5.3", "repo": "zai-org/GLM-5.3", "params": "753.3B", "experts": "8 of 256", "weights": "755.6 GB", "estimated": false, "licence": "glm-5.3", "gated": false, "team": [null, 78, 39], "held": "755.6 GB", "left_out": [], "ready": false},
+    {"name": "deepseek-v4.1-flash", "title": "DeepSeek-V4.1-Flash", "repo": "deepseek-ai/DeepSeek-V4.1-Flash", "params": "763.2B", "experts": "6 of 384", "weights": "510.3 GB", "estimated": false, "licence": "mit", "gated": false, "team": [40, 20, 14], "held": "298.3 GB", "left_out": ["the engram tables (203.1 GB): each job gets a slice of the rows its data reads", "the draft layers and vision tower (8.9 GB): a text fine-tune doesn't use them"], "ready": false}
   ];
   var MODELS_GPU_GB = [12, 24, 32], MODELS_CHECKED = "2026-11-01";
   // models:end
@@ -605,9 +605,13 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
   var intros = {
     worker: "Put your computer's spare time to work. It joins the public network unless you give another network's node address, and you start with no VIBE: you earn your stake as you go.",
     train: "Turn a spreadsheet of examples into a model that predicts new rows. The network does the training; you pay only for rounds that pass their checks.",
-    coming: "Fine-tuning open-weight models on the network is coming, not live yet. Here is what this one would take. What works today is a small model trained from a CSV file: pick it from the Model menu to get started."
+    finetune: "Teach an open-weight model your own style from a file of chats. Workers' graphics cards train a small LoRA adapter for it, other workers check every unit, and you pay only for rounds that pass. You download the adapter and use it with Hugging Face transformers.",
+    coming: "Fine-tuning this model on the network is coming, not live yet: it needs a team of graphics cards, or an architecture Vibe Hash doesn't train yet. Here is what it would take. The models under “Fine-tune today” in the Model menu work now, and so does a small model trained from a CSV file."
   };
-  function renderIntro() { document.getElementById("panel-intro").textContent = intros[state.role === "train" && modelOf() ? "coming" : state.role]; }
+  function renderIntro() {
+    var m = state.role === "train" && modelOf();
+    document.getElementById("panel-intro").textContent = intros[m ? (m.ready ? "finetune" : "coming") : state.role];
+  }
 
   function q(s) { return /[\s"'$`&|;<>()]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s; }
   function py() { return state.os === "unix" ? "python3" : "python"; }
@@ -636,8 +640,39 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
           cmds: [vh("stake --amount 5")] },
         { title: "Start working", note: "Setup starts this for you the first time; this is how to start it again later. The worker picks your GPU if you have one, measures its speed and memory, then joins each round on its own. float32 jobs train on the graphics card; float64 jobs run on the CPU. It shows the live dashboard pictured at the top of this page (add --plain for plain log lines). Leave it running, and stop it with Ctrl+C. To choose a device yourself, add --device cpu, cuda, xpu or mps.",
           cmds: [vh("worker")] },
+        { title: "Fine-tune jobs (optional)", note: "Fine-tuning an open-weight model needs an NVIDIA graphics card with PyTorch; this installs it, if setup didn't. The worker is only given units of jobs that fit its card, and skips the rest. It downloads each model's weights once from Hugging Face, checks them tensor by tensor and keeps them in its cache: 1.5 GB for Qwen3 0.6B, 8 GB for Qwen3 4B. Measured on a 12 GB RTX 4070 SUPER, Qwen3 0.6B took 3.5 GB of graphics memory and Qwen3 4B 11.1 GB; the plan a job's poster sees says what each needs. Each unit uploads four checkpoints, about 110 MB for Qwen3 0.6B and up to 240 MB for Qwen3 4B. When another worker disputes your work, or you dispute theirs, your worker plays its part in the dispute by itself.",
+          cmds: [vh("install-gpu")] },
         { title: "Check your earnings", note: "Shows your balance, stake, any coins waiting to unlock, your reputation, and the node's transaction fee.", cmds: [vh("balance")] },
         { title: "Withdraw when you're done", note: "Balance shows how much you have staked; this unstakes 5 VIBE, what earning in puts there. Unstaked coins wait 20 blocks before you can spend them, and they can still be slashed until then. The fee comes from your spendable balance, which your earnings have filled by then.", cmds: [vh("unstake --amount 5")] }
+      ];
+    }
+    if (role === "train" && modelOf() && modelOf().ready) {
+      var r = modelOf(), chats = "my-chats.jsonl";
+      return [
+        { title: "Install and set up", note: "The same one line as for mining. It installs Vibe Hash" + (s.os === "unix" ? "" : " (and Python, if you don't have it yet, after asking)") +
+            " and runs setup's four steps; write down the 24 recovery words it shows. The training runs on other people's graphics cards, so you don't need one: when setup offers GPU support you can say no. The installer also adds what reads your chats the way " + r.title + " does: its own tokenizer and chat template. If you installed Vibe Hash with pip yourself instead, add that with " + py() + ' -m pip install "vibehash[finetune]".',
+          cmds: [oneLiner()] },
+        { title: "Get VIBE", note: "A fine-tune is paid for in VIBE: 10 a round by default, and only for work that passes its checks. The steps below spend up to 100 VIBE plus a 0.0001 VIBE fee. Send your vibe1 address to whoever runs the network and ask for some, or earn it as a worker. This shows when it has arrived.",
+          cmds: [vh("balance")] },
+        { title: "Get your chats ready", note: "One JSON object per line. A chat is a list of messages, each with a role (system, user or assistant) and its text; the model learns to write the assistant's replies, in your chats' style, and nothing else. Lines of plain text, as {\"text\": \"...\"}, work too. A tenth of the examples, at most 128, is held back and never trained on, to measure progress honestly. Longer chats are cut at 512 tokens (--max-len changes that, up to the size a dispute over the job can still be played from a home connection).",
+          code: ['{"messages": [{"role": "user", "content": "Any tips for a first run?"}, {"role": "assistant", "content": "Start with ten easy minutes, then add a little each week."}]}',
+                 '{"messages": [{"role": "user", "content": "What should I eat before?"}, {"role": "assistant", "content": "Something light an hour or two before, like toast or a banana."}]}'],
+          cmds: [] },
+        { title: "Fine-tune it", note: "Reads your chats with " + r.title + "'s tokenizer and chat template. The first time anyone on this computer uses the model, it streams its weights once from Hugging Face (" + r.weights + "), hashing each tensor so every worker trains on exactly the same model, and keeps nothing. Then it shows the plan: your data, the adapter (LoRA rank 16 on the attention), the learning rate, how many rounds one pass over the data takes, what a worker's graphics card needs, and the cost. It asks “Post it?” before it uploads or spends anything." +
+            (r.gated ? " " + r.title + " is gated: accept its licence on Hugging Face first, and set HF_TOKEN to a token of yours before running this." : "") +
+            " Once posted, it follows the job live, as the CSV training does. Ctrl+C stops watching, not training.",
+          cmds: [vh("train " + chats + " --base " + r.name + " --budget 100")] },
+        { title: "Watch it learn", note: "Brings the live view back, or prints a summary: the rounds done, and the loss on the held-back chats as it falls (lower is better). Workers score each round's starting model, so the score you see is one round behind the training. Jobs with budget left take turns, a round each.",
+          cmds: [vh("job watch"), vh("job status")] },
+        { title: "Download the adapter", note: "Saves the adapter as a folder, my-chats-lora, in PEFT's format: adapter_model.safetensors and adapter_config.json, which names " + r.repo + " and the exact commit it was trained on. It's small: about 18 MB for Qwen3 0.6B. You can download part-way through and again later. It prints the two lines of Python below with that commit filled in.",
+          cmds: [vh("job download")] },
+        { title: "Use it", note: "With Python's transformers and peft packages installed, load the model at the commit the download printed, then the adapter on top. vLLM serves it too: the download prints that command as well.",
+          code: ["from transformers import AutoModelForCausalLM", "from peft import PeftModel", "",
+                 'base = AutoModelForCausalLM.from_pretrained("' + r.repo + '", revision="COMMIT")  # the commit job download printed',
+                 'model = PeftModel.from_pretrained(base, "my-chats-lora")'],
+          cmds: [] },
+        { title: "Compare the models", note: "Lists every model in the menu above with fresh facts from Hugging Face: size, licence, gated or not, the graphics cards it takes, and whether it fine-tunes today.",
+          cmds: [vh("models")] }
       ];
     }
     if (role === "train" && modelOf()) {
@@ -645,11 +680,11 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
       return [
         { title: "What it would take", note: "What Hugging Face says about " + m.title + ", as of " + MODELS_CHECKED + ". A team of graphics cards would hold its weights between them, whole layers on each card, with a quarter of each card's memory left for training. With Vibe Hash installed, this command shows the same, fresh from Hugging Face, and stops there: it posts nothing and spends nothing.",
           facts: modelFacts(m), cmds: [vh("train --base " + m.name)] },
-        { title: "Fine-tune it", soon: true, note: "When fine-tuning goes live, this will be the whole command: your own text or chats, one JSON object per line, and teams of workers' graphics cards train a small LoRA adapter for the model, which you download and use with Hugging Face transformers. Until then it only shows what it would take, as above.",
+        { title: "Fine-tune it", soon: true, note: "When fine-tuning " + m.title + " goes live, this will be the whole command, as it already is for the models under “Fine-tune today” in the Model menu: your chats, one JSON object per line, and workers' graphics cards train a small LoRA adapter, which you download and use with Hugging Face transformers. Until then it only shows what it would take, as above.",
           cmds: [vh("train my-chats.jsonl --base " + m.name)] },
         { title: "Compare the models", note: "Lists every model in the menu above with fresh facts from Hugging Face: size, licence, gated or not, and the graphics cards a team needs.",
           cmds: [vh("models")] },
-        { title: "Train a model today", note: "The network already trains small models from a spreadsheet of examples. Choose “A small model sized to your data” in the Model menu above for the steps.", cmds: [] }
+        { title: "Train a model today", note: "Four models fine-tune today: pick one under “Fine-tune today” in the Model menu above. The network also trains small models from a spreadsheet of examples: choose “A small model sized to your data” for those steps.", cmds: [] }
       ];
     }
     if (role === "train") {
@@ -699,16 +734,20 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     });
   }
 
-  // Today's model first, then the open-weight models, each with its size and licence and marked as coming.
+  // The small model trained from a CSV first, then the open-weight models that fine-tune today, then those coming,
+  // each with its size and licence.
   function modelSelect() {
     var sel = document.createElement("select");
     sel.appendChild(new Option("A small model sized to your data (works today)", "csv"));
-    var group = document.createElement("optgroup");
-    group.label = "Open-weight models: fine-tuning coming";
-    MODELS.forEach(function (m) {
-      group.appendChild(new Option(m.title + " (coming) · " + (m.estimated ? "about " : "") + m.weights + " · " + m.licence + (m.gated ? ", gated" : ""), m.name));
+    [["Fine-tune today", true, ""], ["Open-weight models: fine-tuning coming", false, " (coming)"]].forEach(function (g) {
+      var group = document.createElement("optgroup");
+      group.label = g[0];
+      MODELS.forEach(function (m) {
+        if (!!m.ready !== g[1]) return;
+        group.appendChild(new Option(m.title + g[2] + " · " + (m.estimated ? "about " : "") + m.weights + " · " + m.licence + (m.gated ? ", gated" : ""), m.name));
+      });
+      sel.appendChild(group);
     });
-    sel.appendChild(group);
     sel.value = modelOf() ? state.model : "csv";
     sel.addEventListener("change", function () {
       update("model", sel.value); renderIntro(); renderControls();  // today's model has more to fill in
@@ -767,6 +806,17 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     return wrap;
   }
 
+  function codeBlock(text) {  // a file's lines or a snippet: copyable, with no prompt, since it isn't a command
+    var box = document.createElement("div"), wrap = document.createElement("div"), pre = document.createElement("pre");
+    var code = document.createElement("code"), b = document.createElement("button");
+    box.className = "cmds"; wrap.className = "cmd";
+    code.textContent = text; pre.appendChild(code); wrap.appendChild(pre);
+    b.className = "copy"; b.type = "button"; b.textContent = "Copy"; b.setAttribute("aria-label", "Copy");
+    b.addEventListener("click", function () { copyText(b, text, code); });
+    wrap.appendChild(b); box.appendChild(wrap);
+    return box;
+  }
+
   function renderSteps() {
     stepsEl.textContent = "";
     stepsFor(state.role).forEach(function (st) {
@@ -776,6 +826,7 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
       var n = document.createElement("p"); n.className = "note"; n.textContent = st.note;
       li.append(h, n);
       if (st.sample) li.appendChild(sampleTable(st.sample));
+      if (st.code) li.appendChild(codeBlock(st.code.join("\n")));
       if (st.facts) li.appendChild(factsList(st.facts));
       if (st.cmds.length) {
         var box = document.createElement("div"); box.className = "cmds";

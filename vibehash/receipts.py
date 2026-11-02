@@ -17,7 +17,8 @@ from __future__ import annotations
 from .crypto import KeyPair, h256, verify
 from .ledger import Block, canonical
 
-KINDS = {"register": "registrations", "commit": "commitments", "reveal": "reveals", "verdict": "verdicts"}
+KINDS = {"register": "registrations", "commit": "commitments", "reveal": "reveals", "verdict": "verdicts",
+         "move": "games"}  # a dispute's moves are in its game's entry
 
 
 def entry_digest(entry: dict) -> str:
@@ -62,7 +63,10 @@ def audit(receipt: dict, block: Block | None, record: dict | None) -> tuple[str,
         return "abandoned", f"round {n}: the attempt you took part in was abandoned and the block went to another"
     if block.proposer_pubkey.hex() != receipt["node"]:
         return "unrelated", f"round {n}: the receipt is from a different node from the one that sealed the block"
-    if receipt["digest"] in {entry_digest(e) for e in record.get(KINDS[kind], [])}:
+    entries = record.get(KINDS[kind], [])
+    if kind == "move":
+        entries = [m for g in entries for m in g.get("moves", [])]
+    if receipt["digest"] in {entry_digest(e) for e in entries}:
         return "recorded", f"round {n}: your {kind} is in the record"
     return "censored", (f"round {n}: the node signed a receipt for your {kind} but sealed the round without it. "
                         "Keep the receipt: it's proof the node dropped your message")

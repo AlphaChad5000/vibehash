@@ -55,12 +55,14 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. |
 | `gpusetup.py` | GPU detection without PyTorch (nvidia-smi, OS device list, ROCm). Picks PyTorch builds by driver CUDA version and compute capability, **probes PyTorch's index** (`pip index versions`) for what's published, installs, and self-tests in a fresh subprocess (Windows locks loaded DLLs). The build table needs updating when CUDA versions change. |
 | `protocol.py` | In-process driver for `simulate.py` and the tests. |
-| `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Not wired into jobs yet (FINETUNING.md). |
+| `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Jobs use `llm.py`; this is its float64 reference in `test_finetune` and the basis for sharded transformers. |
+| `llm.py` | Pretrained decoders in plain PyTorch: Llama (with Llama 3's rotary scaling), Mistral, Qwen2 (q/k/v biases), Qwen3 (q/k norms), SmolLM3 (no rotary on every fourth layer). float32 with frozen weights kept as stored (`_Frozen` casts per matmul), attention written out, layers recomputed in the backward, rotary tables in float64 on the CPU, head and loss fused over reply tokens only (`_HeadLoss`). `Arch.from_hf_config` refuses what it doesn't compute (Gemma, YaRN, sliding windows shorter than the sequence). Matches transformers to 2e-6 on Qwen3-0.6B. |
+| `finetune.py` | Fine-tune jobs (FINETUNING.md, DESIGN §8 "Fine-tuning pretrained models"). `LoraSpec`: ModelSpec's interface for LoRA with **A frozen** (drawn from the job's seed like PEFT) and **B trained with Adam**, the vector `[B | m | v]`, `parts` for part-by-part checks, `max_step` (Adam's rigorous bound) for the sanity check, `fresh` zeroing moments after averaging. `TokenDataset`: ids, lengths and a learn-mask per sequence, plus the model's manifest and config.json as bytes. `ChatTokenizer`/`prepare`: chats through the model's own Jinja chat template and tokenizer, learning only the replies and their end-of-turn token (found by text in the rendering, so any template works). `runtime`: the base model fetched once per process and device. `train_segment`, `evaluate`, `export_peft` (adapter_model.safetensors + adapter_config.json + README). `plan`: what `train DATA --base` shows before posting. |
 | `moe.py` | Mixture-of-experts feed-forward block (DeepSeek style: top-k router, routed and shared SwiGLU experts, optional LoRA), NumPy reference. Workers commit their routing; checkers replay with it and accept it only if no left-out expert beat a chosen one by more than a tie margin (1e-4 in logits), so rounding can't fail an honest worker. Experts are checkable one at a time. SHARDING.md §7. Not wired in yet. |
-| `hub.py` | Hugging Face Hub client, standard library only: `org/name[@rev]` to a pinned commit, `describe` for a pre-flight, one ranged request per tensor (never the whole checkpoint), a per-tensor sha256 manifest checked against the Hub's own file hashes, a resumable cache with LRU pruning, and `HF_TOKEN` sent only to the Hub, never to its CDN. Mirrors `huggingface_hub` 2.4; tested against a fake Hub (huggingface.co was blocked where it was built), and since 2026-11-01 used against the real one for DeepSeek's headers and weights. `describe` reads shapes nested in `text_config` (multimodal configs). Not wired in yet. |
+| `hub.py` | Hugging Face Hub client, standard library only: `org/name[@rev]` to a pinned commit, `describe` for a pre-flight, one ranged request per tensor (never the whole checkpoint), a per-tensor sha256 manifest checked against the Hub's own file hashes, a resumable cache with LRU pruning, and `HF_TOKEN` sent only to the Hub, never to its CDN. Mirrors `huggingface_hub` 2.4; tested against a fake Hub (huggingface.co was blocked where it was built), and since 2026-11-01 used against the real one for DeepSeek's headers and weights. `describe` reads shapes nested in `text_config` (multimodal configs). Fine-tunes use it: workers fetch the base through `TensorCache`, 64 MiB runs over six connections. |
 | `deepseek.py` | DeepSeek-V4.1-Flash in plain PyTorch (DEEPSEEK.md §7): trainable, deterministic, weights kept in DeepSeek's FP8/FP4 formats and names and dequantised exactly inside each matmul (`_FrozenMatmul`, which also lets experts stay in pinned RAM). `Numerics()` is the reference's bf16-with-FP8-rounding arithmetic, `Numerics(float64, quantize=False)` the smooth one. Discrete choices (routing, indexer picks, candidate blocks) are inputs (`Choices`), side channels between layers explicit (`Side`). `Model` holds any run of layers. `fetch_file` / `load_layer` download whole weight files into `~/.vibehash/cache/deepseek` (parallel pieces, sha256-checked). Needs PyTorch 2.8+. Prefill and text only. Not wired into jobs. |
 | `emblems.py` | Pixel-art emblems (at most 18×10, two pixels a cell in half blocks) of DeepSeek, Meta, Qwen, Gemma, OpenAI, Microsoft, Mistral and Hugging Face, by model family (`FAMILIES`: an organisation and the start of the model's name, so Google's T5 or Meta's Prompt-Guard don't get Gemma's star or Llama's loop); a generic gem for anything else (Z.ai's GLM too). `scripts/preview_forge.py NAME` plays a made-up job so you can see one. |
-| `catalog.py` | The model picker: 17 popular open-weight models (`CATALOG`, short name → Hugging Face repo, smallest first), their facts from `Hub.describe` cached a day in `~/.vibehash/cache/models.json`, and "what it takes" (`team`: GPUs of 12/24/32 GB holding the weights as stored, whole layers each, a quarter of each card kept free; DEEPSEEK.md §2's 40/20/14). `vibehash models` and `train --base` print it. Fine-tuning itself isn't built, so `train --base` stops after the pre-flight. |
+| `catalog.py` | The model picker: 17 popular open-weight models (`CATALOG`, short name → Hugging Face repo, smallest first), their facts from `Hub.describe` cached a day in `~/.vibehash/cache/models.json`, and "what it takes" (`team`: GPUs of 12/24/32 GB holding the weights as stored, whole layers each, a quarter of each card kept free; DEEPSEEK.md §2's 40/20/14). `ready`: an architecture `llm.py` trains and one 12 GB card holds it (qwen3-0.6b, llama-3.2-1b, smollm3-3b, qwen3-4b today). `vibehash models` and `train --base` print it; `train DATA --base` fine-tunes a ready one (`cli._finetune`) and shows the pre-flight for the rest. |
 | `shards.py` | Sharded units: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard, and signed edge messages. The coordinator runs sharded jobs in-process (teams, cell tasks, edge evidence, per-shard pay and averaging, record version 3; `simulate.py --shards N`). Nodes don't yet (`Coordinator.runs_teams` is off, `waiting` says why), and there's no worker-to-worker transport. See `SHARDING.md`. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
@@ -150,6 +152,69 @@ Done and tested (as of the last full runs):
    - The site went up with the model menu once 0.5.4 shipped `models` and `--base` (0.5.3 hadn't): the Train tab tells people to run them.
    - **`Hub.describe` failed on every gated model** (Llama, gated Gemmas) for an account that hadn't accepted the licence: the real tree API hides those repos' LFS sha256 as `****…`. The DeepSeek-layer session's PR #2 makes `hub.py` read that as hidden. `catalog.describe` keeps its fallback for now: it uses `model_info` alone and estimates the size from the parameter count per dtype (shown with `*`). `catalog.py` also reads layers and experts from `text_config` until `describe` does (DEEPSEEK.md §5 step 3).
 
+15. **Fine-tuning pretrained models (2026-11-01, branch `claude/finetune-0d3007`, PR #5).** A poster runs
+   `vibehash train chats.jsonl --base qwen3-0.6b`; workers' GPUs train LoRA adapters in verified units; `job download`
+   writes a PEFT adapter. Proven on a local testnet with Qwen3-0.6B (FINETUNING.md "Try it" has the run).
+   - **Combining:** A frozen, B trained, so averaging units' B is exactly averaging their change to the model (DESIGN
+     §8 has the alternatives). Adam per unit, moments in each checkpoint (`[B|m|v]`, 3× B's size), zeroed after
+     averaging. Checks compare B, m and v each on its own; the sanity check is Adam's own bound on how far a weight
+     can move (B starts at zero, so "relative to the start" meant nothing).
+   - **Spec:** its own shape (`tasks.FINETUNE_KEYS`): `base` (hf:org/name@commit), `manifest` (sha256 of hub's
+     manifest), `model` (the dims), `lora`, `seq_len`, `optimizer`, data `{"kind": "tokens"}`. MLP specs are
+     unchanged byte for byte; old nodes refuse a fine-tune's post_job as malformed, so they can't accept a fine-tune
+     round either. The dataset .npz carries the manifest and config.json, so workers need nothing else.
+   - **Measured:** matches transformers (2.1e-6 on Qwen3-0.6B; every family on tiny models), CPU replay of a CUDA
+     segment within 2.6e-6 of the segment's change, same GPU bit-identical; tolerance 1e-4. A 16-step unit of 8
+     chats is 9.5 s on the 4070 SUPER. Learning rate from a sweep (DESIGN §8).
+   - **Nodes don't run the model (record version 4, DESIGN §8 "Fine-tune rounds without the model on the node").**
+     A fine-tune's round gives each claim two checkers and has three scorers score its starting model (the record
+     keeps the median, for people only). Juries are gone (below): a rejection is a dispute game.
+   - **After the review of PR #5 (2026-11-01):**
+     - **What counts as a fine-tune:** only a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`),
+       so an MLP spec with a stray `base` stays an MLP spec.
+     - **Block version 3** is the first that may hold a fine-tune's post_job (`ledger.FINETUNE_VERSION`).
+     - **Bad data:** config.json is checked strictly when a dataset arrives (`finetune.arch_dims`), and a job that
+       won't load is skipped, not fatal.
+     - **Canaries** are another unit's real training (the old rescaled ones broke Adam's invariants, which a lazy
+       checker could test with numpy, `verification.adam_impossible`). A canary-approver's verdicts don't count.
+     - **Scorers** are paid only when three agree.
+     - **Draws** are seeded per claim.
+     - **Timing:** no phase is over an hour (`node.MAX_PHASE_S`).
+     - **Tolerance:** comparing replicas uses `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA).
+   - **Disputes in place of juries (DESIGN §8, `dispute.py`):** a checker's rejection, or two replicas that disagree,
+     is a bisection game in a `dispute` phase of the same round. The worker posts the states between its training's
+     ops (unit → segment → step → sequence → layer → op, up to 64 children a split), the challenger picks where they
+     go wrong, and the node recomputes one tile of one op with NumPy (`referee.py`: float64 with a bound on float32
+     rounding; no libm, so every machine agrees). Losers are slashed; a false accusation's slash is burned; a checker
+     that finds no number the referee would refuse withdraws (unpaid, not slashed). The weights it needs are fetched
+     whole from the pinned commit and checked against the manifest (`dispute.HubWeights`); Hub unreachable means
+     unchecked.
+     - **Training changed with it:** it runs `program.py`'s ops one by one (`tracer.py`), so the states a worker posts
+       are its training's own. Gradients match autograd to ~1e-6. It's 2.2× slower a step on Qwen3-0.6B (1.62 s
+       against 0.72 s at batch 8); batching a step's sequences in each op is the follow-up.
+     - **Start gate:** `FINETUNE_QUORUM` = 2 (one to train, one to check): one honest checker is enough for DESIGN's
+       security statement.
+     - **New HTTP:** `GET /round/games`, `POST /move`; a dispute's defender may upload its states (quota per round).
+     - **Records:** `games` (signed moves and outcomes; no weights, and evidence by blob id), `checks/game`. A
+       validator replaying a round with disputes rebuilds each game's starting states from the proposer's checkpoints,
+       fetches the evidence and the job's dataset, and reads only weights it checked; no PyTorch. Moves get receipts.
+     - **Second review** (12 findings): one commit each on the PR. Left as known limits in DESIGN: colluders can tell a
+       canary by its checkpoints' ids; a split can name gigabytes on big adapters with many steps a segment.
+     `vibehash node --device` still exists for MLP checks. `testnet --job none` posts no demo job, for `train --base`.
+   - **hub.py:** `TensorCache` now fetches 64 MiB runs over six connections (1.5 GB in ~15 s here); manifests pin
+     `chat_template.jinja` too.
+   - **Tests:** `tests/test_finetune.py` (in CI with CPU PyTorch and `.[finetune]`; transformers/PEFT checks run where
+     they're installed; `VIBEHASH_REAL_MODELS=1` for Qwen3-0.6B). `tests/finetune_fixtures.py` makes tiny checkpoints.
+   - **Rolling it out:** this release makes block version 3, which a 0.5.x node refuses, so every validator runs it
+     before the first new block (as with version 2); on `vibehash-public-1` the node is the only validator, so
+     updating it is the switch. Size `--keep-rounds` to the disk (about 3 GB a round of 8 Qwen3-4B units). The public
+     network then needs two staked GPU workers before a fine-tune trains, and the node needs to reach
+     huggingface.co for disputes (byte ranges of the base model; a few MB each). The live chain was scanned on 2026-11-01
+     (height 6187): its one post_job (height 2) has no `base` field, so nothing on it changes meaning.
+   - **Not done:** `vibehash hub login` (gated Llamas need `HF_TOKEN` set by hand); manifests shared on the network
+     (each poster builds and caches its own); moments in bf16; cache limits on the worker; Intel/AMD/Apple
+     tolerances.
+
 ## Pre-deployment checklist
 
 Blockers before inviting anyone onto a public testnet:
@@ -170,7 +235,7 @@ Blockers before inviting anyone onto a public testnet:
 
 Known limits (fine for testnet, document rather than fix now):
 - One leader per round: it can't forge payments, bend the round rules (the other validators replay its record and vote it down) or drop messages it accepted (receipts) undetected. It can still refuse messages outright in the rounds it leads, and its weight-based check results are taken on trust unless someone rechecks them within the challenge window. The chain keeps going while validators holding more than two thirds of the stake are up. DESIGN §9 lists the fixes in order.
-- MLPs only; transformers and CNNs need new backend kernels and tolerance calibration.
+- MLPs, and LoRA fine-tunes of models one GPU holds (Llama, Mistral, Qwen, SmolLM). The public node can't run fine-tunes yet (FINETUNING.md, milestone B).
 - `Dataset.from_npz` loads the whole dataset into RAM; the node evaluates on the CPU.
 - Verifiers download ~2q checkpoints per task, which is significant bandwidth for big models.
 

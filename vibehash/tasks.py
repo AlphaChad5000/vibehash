@@ -9,7 +9,8 @@ from enum import Enum
 import numpy as np
 
 from .crypto import h256
-from .model import PRECISIONS, Dataset, ModelSpec
+from .finetune import LoraSpec, TokenDataset
+from .model import PRECISIONS, Dataset, ModelSpec, evaluate
 
 SYN_PER_VIBE = 100_000_000
 MAX_SPEC_BYTES = 4096
@@ -18,10 +19,19 @@ MAX_CHECKPOINT_BYTES = 2**30  # 1 GiB of weights (~268M float32); sent as chunke
 # What a job's rounds are sized for, so a modest computer on a home connection can always finish a unit in time:
 # an old laptop's CPU running the reference model (about 2 GFLOP/s), and 20 Mbit/s up, 100 Mbit/s down.
 REF_FLOPS = 2e9
+# Fine-tunes run on GPUs (finetune.py), so their reference is a gaming card: what this code sustains on a mid-range one,
+# in float32 with TF32 off. Training runs program.py's ops one by one (tracer.py), so an RTX 4070 SUPER sustains about
+# 3.2 TFLOP/s of a job's nominal FLOPs (Qwen3-0.6B, batch 8, 192 tokens: 1.62 s a step), an RTX 3060 about a third.
+# (It was 5e12, measured on batched autograd before training went op by op: phases were 3x too short for that card.)
+REF_GPU_FLOPS = 1.5e12
 REF_UPLOAD = 2.5e6  # bytes/s
 REF_DOWNLOAD = 12.5e6  # bytes/s
 CHECKED_SEGMENTS = 3  # segments of a unit the beacon challenges (CoordinatorConfig.challenge_segments)
 MAX_COMPUTE_S = 3600.0
+MAX_PHASE_S = 3600.0  # no phase of a round is longer (node.times_for), whatever a spec asks for
+# A dispute's split, in bytes of states the defender uploads in one move: a home connection (REF_UPLOAD, 20 Mbit/s)
+# moves 512 MB in about 3.5 minutes, the time a move has when a game's 15 moves share an hour.
+MAX_SPLIT_BYTES = 512 * 2**20
 
 
 class InvalidJob(ValueError):
@@ -34,7 +44,7 @@ class TrainingJob:
     requester: str
     budget: int  # syn escrowed by the requester
     fee_per_round: int  # syn released to the reward pool per fully-verified round
-    spec: ModelSpec = field(default_factory=ModelSpec)
+    spec: ModelSpec | LoraSpec = field(default_factory=ModelSpec)  # a LoraSpec makes it a fine-tune (finetune.py)
     data_source: dict = field(default_factory=lambda: {"kind": "synthetic", "seed": 7})
     init_seed: int = 11
     lr: float = 0.1
@@ -44,17 +54,31 @@ class TrainingJob:
     units_per_round: int = 16
     memory_mb: int = 1024  # minimum RAM/VRAM a rig needs to take or verify a unit
     tolerance: float = 1e-6  # relative distance allowed between replay and claim
-    max_update_ratio: float = 0.5  # |final - start| / |start| must stay below this
+    max_update_ratio: float = 0.5  # |final - start| / |start| must stay below this (a fine-tune's: LoraSpec.sane)
     compute_s: float = 0.0  # a compute phase the job asks for, in seconds; 0: sized from the job (phase_lengths)
     shards: int = 1  # blocks of layers a unit is split into, one worker each (shards.py, SHARDING.md); 1: whole units
-    _data: Dataset | None = field(default=None, repr=False)
+    _data: Dataset | TokenDataset | None = field(default=None, repr=False)
 
     def __post_init__(self):
         self.validate()
 
+    @property
+    def finetune(self) -> bool:
+        """Whether it fine-tunes a pretrained model's LoRA adapters (finetune.py) rather than training an MLP."""
+        return isinstance(self.spec, LoraSpec)
+
     # --- on-chain spec -------------------------------------------------------
 
     def to_spec(self) -> dict:
+        if self.finetune:  # a shape of its own, so MLP specs stay exactly as they were
+            spec = {"id": self.job_id, "fee_per_round": self.fee_per_round, **self.spec.to_json(),
+                    "data": self.data_source, "init_seed": self.init_seed, "lr": self.lr, "batch_size": self.batch_size,
+                    "steps_per_unit": self.steps_per_unit, "checkpoint_every": self.checkpoint_every,
+                    "units_per_round": self.units_per_round, "memory_mb": self.memory_mb, "tolerance": self.tolerance,
+                    "max_update_ratio": self.max_update_ratio}
+            if self.compute_s:
+                spec["compute_s"] = self.compute_s
+            return spec
         spec = {
             "id": self.job_id, "fee_per_round": self.fee_per_round,
             "model": {"n_in": self.spec.n_in, "n_out": self.spec.n_out,
@@ -80,6 +104,8 @@ class TrainingJob:
             raise InvalidJob("job spec too large")
         try:
             d = json.loads(text)
+            if is_finetune_spec(d):
+                return cls._from_finetune(d, requester, budget)
             m = d["model"]
             hidden = m["n_hidden"]
             hidden = int(hidden) if not isinstance(hidden, list) else tuple(int(h) for h in hidden)
@@ -96,12 +122,27 @@ class TrainingJob:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
             raise InvalidJob(f"malformed job spec: {e}") from e
 
+    @classmethod
+    def _from_finetune(cls, d: dict, requester: str, budget: int) -> "TrainingJob":
+        if set(d) - FINETUNE_KEYS:
+            raise InvalidJob(f"a fine-tune's spec has no field {sorted(set(d) - FINETUNE_KEYS)[0]!r}")
+        return cls(
+            job_id=d["id"], requester=requester, budget=budget, fee_per_round=int(d["fee_per_round"]),
+            spec=LoraSpec.from_json(d, seed=int(d["init_seed"])), data_source=dict(d["data"]),
+            init_seed=int(d["init_seed"]), lr=float(d["lr"]), batch_size=int(d["batch_size"]),
+            steps_per_unit=int(d["steps_per_unit"]), checkpoint_every=int(d["checkpoint_every"]),
+            units_per_round=int(d["units_per_round"]), memory_mb=int(d["memory_mb"]), tolerance=float(d["tolerance"]),
+            max_update_ratio=float(d["max_update_ratio"]), compute_s=float(d.get("compute_s", 0)),
+        )
+
     def validate(self) -> None:
         def need(cond, msg):
             if not cond:
                 raise InvalidJob(msg)
 
         need(isinstance(self.job_id, str) and _JOB_ID.match(self.job_id), "job id must be 1-64 chars of a-z 0-9 . _ -")
+        if self.finetune:
+            return self._validate_finetune(need)
         need(self.spec.precision in PRECISIONS, "precision must be 'float64' or 'float32'")
         hidden = self.spec.hidden
         need(1 <= len(hidden) <= 8 and all(isinstance(h, int) and 1 <= h <= 8192 for h in hidden), "1-8 hidden layers of width 1-8192")
@@ -127,22 +168,70 @@ class TrainingJob:
         else:
             need(False, "data kind must be 'synthetic' or 'npz'")
 
+    def _validate_finetune(self, need) -> None:
+        problems = self.spec.problems()
+        need(not problems, "; ".join(problems))
+        need(self.spec.seed == self.init_seed, "a fine-tune's LoRA seed is its init_seed")
+        need(self.spec.n_params * 4 <= MAX_CHECKPOINT_BYTES,
+             f"adapters too large: at most {MAX_CHECKPOINT_BYTES // 2**30} GB of them and their optimiser state")
+        need(0 < self.lr <= 1 and 1 <= self.batch_size <= 1024, "lr / batch size out of range")
+        need(1 <= self.checkpoint_every <= self.steps_per_unit <= 10_000, "steps out of range")
+        need(self.steps_per_unit % self.checkpoint_every == 0, "checkpoint_every must divide steps_per_unit")
+        need(1 <= self.units_per_round <= 10_000 and 1 <= self.memory_mb <= 1_000_000, "units / memory out of range")
+        need(0 < self.tolerance <= 1e-1 and 0 < self.max_update_ratio <= 10, "tolerance out of range")
+        need(self.fee_per_round >= 0 and self.budget >= 0, "negative fee or budget")
+        need(self.compute_s == 0 or 5 <= self.compute_s <= MAX_COMPUTE_S,
+             f"compute_s is 0 (sized from the job) or 5-{MAX_COMPUTE_S:.0f} seconds")
+        need(self.shards == 1, "fine-tunes train whole models: shards is 1")
+        need(self.data_source.get("kind") == "tokens" and set(self.data_source) == {"kind", "sha256"}
+             and re.fullmatch(r"[0-9a-f]{64}", str(self.data_source.get("sha256", ""))),
+             'a fine-tune\'s data is {"kind": "tokens", "sha256": ...}')
+        # Its disputes must be playable from a home connection, or a slow honest defender loses to a false accuser
+        # (the third review's finding B). (A DeepSeek job's program will count its own: deepseek_program.)
+        if not getattr(self, "deepseek", False):
+            from .program import dispute_size
+
+            moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
+            need(split <= MAX_SPLIT_BYTES,
+                 f"a dispute over one of its units would upload {split / 2**20:.0f} MB of states in one move, more than "
+                 f"{MAX_SPLIT_BYTES // 2**20} MB: use fewer steps a segment, shorter sequences or fewer LoRA targets")
+            took = moves * self.phase_lengths()["move"]
+            need(took <= MAX_PHASE_S,
+                 f"a dispute over one of its units would take {took / 60:.0f} minutes at home upload speeds, more than "
+                 f"the {MAX_PHASE_S / 60:.0f} a dispute phase has: use fewer steps a segment or shorter sequences")
+
     # --- data ------------------------------------------------------------------
 
     @property
-    def data(self) -> Dataset:
+    def data(self) -> Dataset | TokenDataset:
         if self._data is None:
             if self.data_source["kind"] != "synthetic":
                 raise InvalidJob(f"dataset for {self.job_id} not loaded; call attach_data()")
             self._data = Dataset.synthetic(self.spec, self.data_source["seed"])
         return self._data
 
-    def attach_data(self, data: Dataset, file_sha256: str) -> None:
+    def attach_data(self, data: Dataset | TokenDataset, file_sha256: str) -> None:
         """Attach a downloaded dataset after checking it's the one the requester committed to."""
         if file_sha256 != self.data_source.get("sha256"):
             raise InvalidJob("dataset hash does not match the job's commitment")
-        data.check_shape(self.spec)
+        if self.finetune != isinstance(data, TokenDataset):
+            raise InvalidJob("a fine-tune trains on token sequences, and other jobs on tables")
+        if self.finetune:
+            try:
+                data.check(self.spec)
+            except Exception as e:  # noqa: BLE001 - whatever is wrong with a poster's file, it's this job's problem
+                raise InvalidJob(f"the dataset doesn't suit the job: {e}") from None
+        else:
+            data.check_shape(self.spec)
         self._data = data
+
+    def evaluate(self, params: np.ndarray, backend=None) -> tuple[float, float]:
+        """(loss, accuracy) of these weights on the job's held-back data: for an MLP, cross-entropy and the share of
+        rows classified right; for a fine-tune, cross-entropy and the share of reply tokens predicted right."""
+        if self.finetune:
+            from . import finetune
+            return finetune.evaluate(self.spec, self.data, params, backend)
+        return evaluate(self.spec, params, self.data.x_val, self.data.y_val)
 
     @property
     def sharded(self) -> bool:
@@ -172,10 +261,43 @@ class TrainingJob:
         of checkpoints whose upload failed; in verify, fetch and replay the challenged segments of two units. A job
         can ask for a longer compute phase (compute_s), for bigger units. Nodes use these or their own phase
         lengths, whichever are longer."""
-        b = self.checkpoint_bytes
-        unit = b / REF_DOWNLOAD + self.unit_flops / REF_FLOPS + self.n_segments * b / REF_UPLOAD
-        check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / REF_FLOPS
-        return {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
+        b, ref = self.checkpoint_bytes, REF_GPU_FLOPS if self.finetune else REF_FLOPS
+        unit = b / REF_DOWNLOAD + self.unit_flops / ref + self.n_segments * b / REF_UPLOAD
+        check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / ref
+        out = {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
+        if self.finetune:  # its disputes: as many moves as its program's tree is deep, the dearest re-running a segment
+            from .program import dispute_size  # and moving a split's states (the defender up, the challenger down)
+
+            moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
+            out |= {"moves": moves,
+                    "move": self.unit_flops / self.n_segments / ref + split / REF_UPLOAD + split / REF_DOWNLOAD}
+        return out
+
+
+def is_finetune_spec(d) -> bool:
+    """Whether a parsed spec is a fine-tune's: it has `lora`, and a `model` without `n_in`. That's a shape every node
+    before fine-tunes refused (an MLP's model has n_in), so no spec they took, whatever extra fields it carried (a
+    stray "base", say: they ignored unknown fields), changes meaning now."""
+    return isinstance(d, dict) and "lora" in d and isinstance(d.get("model"), dict) and "n_in" not in d["model"]
+
+
+# Every field a fine-tune's spec may have (TrainingJob.to_spec): anything else is refused rather than ignored.
+FINETUNE_KEYS = {"id", "fee_per_round", "base", "manifest", "model", "lora", "seq_len", "optimizer", "precision", "data",
+                 "init_seed", "lr", "batch_size", "steps_per_unit", "checkpoint_every", "units_per_round", "memory_mb",
+                 "tolerance", "max_update_ratio", "compute_s"}
+
+
+def load_dataset(path, max_bytes: int | None = None) -> Dataset | TokenDataset:
+    """A dataset file of either kind: a table for an MLP (model.Dataset), or token sequences for a fine-tune
+    (finetune.TokenDataset), told apart by the arrays inside. Never unpickles; refuses anything else."""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as z:
+            tokens = bool({"train_ids", "train_ids.npy"} & set(z.namelist()))
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"not a dataset (.npz): {e}") from e
+    return TokenDataset.from_npz(path, max_bytes) if tokens else Dataset.from_npz(path, max_bytes)
 
 
 @dataclass(frozen=True)
@@ -249,7 +371,8 @@ class Verdict(str, Enum):
     FAILED_SANITY = "failed_sanity"  # NaN, wrong start/final, oversized update
     FAILED_REPLAY = "failed_replay"  # spot-check replay mismatch
     FAILED_REDUNDANCY = "failed_redundancy"  # lost a full-replay arbitration
+    UNCHECKED = "unchecked"  # a fine-tune's claim nobody answered for, or the referee couldn't decide: unpaid, unslashed
 
     @property
     def is_fraud(self) -> bool:
-        return self not in (Verdict.ACCEPTED, Verdict.MISSED_DEADLINE, Verdict.WITHHELD)
+        return self not in (Verdict.ACCEPTED, Verdict.MISSED_DEADLINE, Verdict.WITHHELD, Verdict.UNCHECKED)

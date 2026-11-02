@@ -264,6 +264,12 @@ def cmd_node(a):
     if bool(a.tls_cert) != bool(a.tls_key):
         sys.exit("--tls-cert and --tls-key go together")
     context = tls.server_context(a.tls_cert, a.tls_key) if a.tls_cert else None
+    if a.device != "cpu":  # where the node replays the work nobody checked, and scores each round's model
+        from . import compute
+        try:
+            compute.use(compute.get_backend(a.device, logging.getLogger("vibehash.node")))
+        except RuntimeError as e:
+            sys.exit(f"error: {e}")
     node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                 keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
                 announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20)).start()
@@ -637,7 +643,7 @@ def _pick_model() -> str | None:
     for i, m in enumerate(catalog.CATALOG, 2):
         f = facts.get(m.repo)
         about = f"{catalog.params_text(f.parameters)}, {catalog.size_text(f.weight_bytes)}, {f.licence}" if f else ""
-        print(f"  {i:2}  {m.name:<20}  {about:<36}  coming")
+        print(f"  {i:2}  {m.name:<20}  {about:<36}  {catalog.status_of(f, m)}")
     last = len(catalog.CATALOG) + 1
     while True:
         try:
@@ -654,8 +660,8 @@ def _pick_model() -> str | None:
 
 
 def _preflight(a) -> None:
-    """`train --base`: what fine-tuning that model would take. Fine-tuning isn't live yet, so it ends there, before
-    the node or the wallet is touched, and exits with status 1: no job was posted."""
+    """`train --base` without data: what fine-tuning that model would take. It ends there, before the node or the
+    wallet is touched, and exits with status 1: no job was posted."""
     from . import catalog
 
     ref, model = catalog.resolve(a.base)
@@ -672,10 +678,100 @@ def _preflight(a) -> None:
     sys.exit(1)
 
 
+def _progress(label_width: int = 40):
+    """A one-line progress report on stderr, for hub.Progress callbacks: (bytes done, bytes in all, what)."""
+    last = [0.0]
+
+    def show(done: int, total: int, what: str) -> None:
+        now = time.monotonic()
+        if done < total and now - last[0] < 0.25:
+            return
+        last[0] = now
+        frac = done / total if total else 1.0
+        print(f"\r  {what[:label_width]:<{label_width}} {frac:6.1%}  {done / 1e9:5.2f} / {total / 1e9:.2f} GB",
+              end="" if done < total else "\n", file=sys.stderr, flush=True)
+    return show
+
+
+def _recent_workers(node: NodeClient, rounds: int = 20) -> int | None:
+    """How many workers were paid for training in the network's last rounds, or None if the node can't say."""
+    try:
+        height = node.status()["height"]
+        blocks = node.get(f"/blocks?from={max(1, height - rounds + 1)}&to={height}") if height else []
+        return len({a for b in blocks if b.get("summary") for a in b["summary"].get("worker_flops", {})})
+    except (NodeError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _finetune(a) -> None:
+    """`train DATA --base MODEL`: fine-tune an open-weight model's LoRA adapters on chats or text (finetune.py). The
+    pre-flight comes first; the weights are streamed once to pin their hashes only if the poster agrees; then one
+    question before anything is uploaded, posted or spent."""
+    from . import catalog, finetune, hub, trainui
+    from .blobs import file_sha256
+
+    try:
+        ref, _ = catalog.resolve(a.base)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    src = Path(a.data)
+    if not src.is_file():
+        sys.exit(f"error: {src} doesn't exist")
+    facts, _ = catalog.lookup([ref])
+    f = facts.get(ref)
+    if f is not None and f.architecture is not None and not catalog.ready(f):  # needs a team, or isn't one we train
+        return _preflight(a)
+    job_id = a.id or f"{re.sub(r'[^a-z0-9._-]+', '-', src.stem.lower()).strip('-._')[:40] or 'chats'}-{secrets.token_hex(2)}"
+    home = _job_home(job_id)
+    if home.exists():
+        sys.exit(f"you already have a job called {job_id}; pick another name with --id")
+
+    def check_weights(total: int) -> bool:
+        print(f"To pin the model, its weights are checked first: {total / 1e9:.1f} GB streamed once from Hugging Face "
+              "and hashed tensor by tensor (nothing is kept; done once per model).")
+        return ask("Check them now?", a.yes)
+    url = node_of(a)
+    print(f"Reading {src.name} with {ref}'s tokenizer and chat template…", file=sys.stderr)
+    try:
+        p = finetune.plan(src, ref, job_id=job_id, budget=a.budget, fee=a.fee, rank=a.rank, lr=a.lr,
+                          max_len=a.max_len, units_per_round=a.units, ask=check_weights, progress=_progress(),
+                          licence=f.licence if f else None)
+    except (finetune.DataError, hub.HubError, hub.IntegrityError, ValueError, OSError) as e:
+        sys.exit(f"error: {e}")
+    node = NodeClient(url)
+    p.workers = _recent_workers(node)
+    print("\n" + p.describe(src.name) + "\n")
+    if not ask("Post it?", a.yes):
+        print("Nothing was posted, and nothing was spent.")
+        return
+    job, spec = p.job, p.job.spec
+    npz = p.prepared.data.save(home / "dataset.npz")
+    job.data_source = {"kind": "tokens", "sha256": file_sha256(npz)}
+    job.validate()
+    (home / "job.json").write_text(json.dumps({
+        "job_id": job_id, "node": url, "source": str(src.resolve()), "kind": "finetune", "base": spec.base,
+        "train_rows": len(p.prepared.data.train_len), "val_rows": len(p.prepared.data.val_len), "budget": a.budget,
+        "fee": a.fee}, indent=2))
+    keys = load_wallet(wallet_of(a))
+    try:
+        node.upload_dataset(keys, npz)
+        node.send_tx(keys, "post_job", "system", a.budget, job.spec_json())
+    except NodeError:
+        shutil.rmtree(home, ignore_errors=True)
+        raise
+    settings.save(last_job=job_id)
+    print(f"Posted job {job_id}: fine-tuning {spec.repo} on {src.name}")
+    if trainui.supported(a.plain):
+        _follow(job_id, url, budget=a.budget, posted=True)
+    else:
+        print(f"\nWatch it train:     {prog()} job watch\n"
+              f"When it's trained:  {prog()} job download   (a LoRA adapter for transformers, PEFT and vLLM)")
+
+
 def cmd_train(a):
     """A CSV file in, a training job on the network out, with sensible model settings chosen for it. On a terminal
-    it then follows the job on the live training dashboard. `--base` is for fine-tuning an open-weight model, which
-    is coming: for now it shows what that would take, and posts nothing."""
+    it then follows the job on the live training dashboard. With `--base` and a file of chats or text, it fine-tunes
+    an open-weight model instead (_finetune); `--base` alone shows what that model would take."""
     from . import catalog, tabular, trainui
     from .blobs import file_sha256
 
@@ -689,7 +785,7 @@ def cmd_train(a):
             if a.data is None:
                 sys.exit(f"no data: `{prog()} example` writes a sample, fruit.csv, to try")
     if a.base is not None:
-        return _preflight(a)
+        return _finetune(a) if a.data is not None else _preflight(a)
     if a.data is None:
         sys.exit(f"which data? `{prog()} train data.csv` trains a small model sized to a CSV file, and "
                  f"`{prog()} example` writes one to try. Fine-tuning open-weight models is coming: `{prog()} models`")
@@ -795,8 +891,9 @@ def cmd_job_status(a):
           + (f", in round {now['round']} right now" if now.get("job_id") == job_id else ""))
     if rounds:
         acc = [r["val_acc"] for r in rounds]
+        held = "of held-back reply tokens predicted" if info["spec"].get("base") else "on held-back rows"
         print(f"  rounds     {len(rounds)} done, {sum(r['accepted_units'] for r in rounds):,} units of training accepted")
-        print(f"  accuracy   {acc[-1]:.1%} on held-back rows (started at {acc[0]:.1%}; best {max(acc):.1%})")
+        print(f"  accuracy   {acc[-1]:.1%} {held} (started at {acc[0]:.1%}; best {max(acc):.1%})")
         if len(acc) > 1:
             print(f"             {_sparkline(acc)}")
         print(f"  loss       {rounds[-1]['val_loss']:.4f}")
@@ -861,6 +958,8 @@ def cmd_job_download(a):
     job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
     weights = np.frombuffer(raw, dtype=job.wire_dtype).astype(np.float64)
     receipt_path = _job_home(job_id) / "job.json"
+    if job.finetune:
+        return _download_adapter(a, job, info, weights, receipt_path)
     n_in, n_out = job.spec.n_in, job.spec.n_out
     if receipt_path.exists():
         r = json.loads(receipt_path.read_text())
@@ -881,6 +980,32 @@ def cmd_job_download(a):
     print(f"saved {out}: {n_in} inputs → {label or 'class'} ({', '.join(classes[:6])}{' …' if len(classes) > 6 else ''}), "
           f"trained for {len(rounds)} rounds{score}\n"
           f"Use it on new rows:  {prog()} predict new-rows.csv")
+
+
+def _download_adapter(a, job, info: dict, weights, receipt_path: Path) -> None:
+    """A fine-tune's result: its LoRA adapter as a PEFT folder (finetune.export_peft)."""
+    from . import finetune
+
+    spec, rounds = job.spec, info["rounds"]
+    source = json.loads(receipt_path.read_text()).get("source") if receipt_path.exists() else None
+    out = Path(a.out or (f"{Path(source).stem}-lora" if source else f"{job.job_id}-lora"))
+    loss = rounds[-1]["val_loss"] if rounds else None
+    finetune.export_peft(spec, weights, out, {
+        "job_id": job.job_id, "rounds trained": sum(1 for r in rounds if r.get("accepted_units")),
+        "held-back loss": f"{rounds[0]['val_loss']:.4f} for the model the first round started from, {loss:.4f} for "
+                          "the one the last scored round started from (a fine-tune's workers score each round's start)"
+                          if rounds else None,
+        "data": f"sha256 {job.data_source['sha256']}", "model height": (info.get("model") or {}).get("height")})
+    settings.save(last_model=str(out.resolve()))
+    done = sum(1 for r in rounds if r.get("accepted_units"))
+    trained = (f"trained in {done} round{'s' * (done != 1)}; held-back loss {loss:.4f} as the last scored round began "
+               "(workers score each round's model in the job's next round)") if done else \
+        "not trained yet: B is still zero, so it changes nothing"
+    print(f"saved {out}/: a LoRA adapter for {spec.repo} at {spec.commit[:12]}, {trained}\n"
+          "Use it with transformers and PEFT:\n\n"
+          f"  base = AutoModelForCausalLM.from_pretrained(\"{spec.repo}\", revision=\"{spec.commit}\")\n"
+          f"  model = PeftModel.from_pretrained(base, \"{out.as_posix()}\")\n\n"
+          f"or vLLM: vllm serve {spec.repo} --revision {spec.commit} --enable-lora --lora-modules mine={out.as_posix()}")
 
 
 def cmd_predict(a):
@@ -934,10 +1059,10 @@ class _Downloaded:
         return self.arrays[blob_id]
 
     def attach(self, job) -> None:
-        from .model import Dataset
+        from .tasks import load_dataset
 
         sha = job.data_source["sha256"]
-        job.attach_data(Dataset.from_npz(self.node.download("dataset", sha, self.datasets)), sha)
+        job.attach_data(load_dataset(self.node.download("dataset", sha, self.datasets)), sha)
 
 
 def cmd_chain_verify(a):
@@ -989,7 +1114,8 @@ def cmd_chain_verify(a):
                     # The round's checkpoints are with the validator that led it.
                     source = NodeClient(leader) if leader and leader.rstrip("/") != node.url else node
                     kept = _Downloaded(source, Path(scratch.name)) if window and block.height >= first_kept else None
-                    found = replay_block(chain, block, record_of(block.height), kept, recheck_stats if kept else None)
+                    found = replay_block(chain, block, record_of(block.height), kept, recheck_stats if kept else None,
+                                         datasets=_Downloaded(source, Path(scratch.name)))  # (disputes' referee)
                     problems += [f"block {block.height}: {p}" for p in found]
                     replayed += 1
                     rechecked_rounds += kept is not None
@@ -1141,6 +1267,9 @@ def cmd_testnet(a):
             n.server.server_close()
             n.store.close()
         sys.exit(f"error: {e}")
+    from . import compute
+    before = compute.active()
+    compute.use(clients[0][1].backend)  # the node checks what nobody else did, and scores fine-tunes, on the same device
     for n in nodes:
         n.start()
     api, s = NodeClient(node.url), node.chain.state
@@ -1157,7 +1286,7 @@ def cmd_testnet(a):
     def ensure_job():
         nonlocal posted
         s = node.chain.state
-        if any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
+        if a.job == "none" or any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
             return  # a job is running, or the one just posted hasn't reached a block yet
         job = template_job(f"demo-{len(s.jobs) + 1}", a.job == "gpu", keys["requester"].address, a.budget)
         if s.balance(keys["requester"].address) >= job.budget + node.coord.config.min_fee:
@@ -1226,6 +1355,7 @@ def cmd_testnet(a):
             t.join(timeout=10)
         for n in nodes:
             n.stop()
+        compute.use(before)
     if dash:
         print(f"{dash.summary()}\nThe chain and wallets are kept in {d}; run it again to carry on.\n\n{hints}")
 
@@ -1271,7 +1401,8 @@ def parser() -> argparse.ArgumentParser:
                         "every block (default 1; fixed when the testnet is first made)")
     p.add_argument("--dir", help=f"where its wallets and chain live (default {settings.home() / 'testnet'})")
     p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 lets other computers join"); p.add_argument("--port", type=int, default=8545)
-    p.add_argument("--job", choices=["gpu", "small"], default="gpu", help="the job template to train (see `job template`)")
+    p.add_argument("--job", choices=["gpu", "small", "none"], default="gpu", help="the job template to train (see `job "
+                   "template`), or none: post your own, with `train --node` and the testnet's requester.json wallet")
     p.add_argument("--budget", type=to_syn, default="500", help="VIBE per job; a new job is posted when one runs out")
     p.add_argument("--device", default="auto", help="what the workers train on: auto, cpu, cuda, xpu, mps")
     p.add_argument("--rounds", type=int, help="stop after this many rounds (default: run until Ctrl+C)")
@@ -1317,6 +1448,8 @@ def parser() -> argparse.ArgumentParser:
                    help="another node to sync from and gossip to (validators find each other from the chain anyway)")
     p.add_argument("--announce", metavar="URL", help="the address other nodes reach this one at, if not --host:--port")
     p.add_argument("--dataset", action="append", help="add an .npz dataset to this node's store")
+    p.add_argument("--device", default="cpu", help="where the node checks work its checkers didn't and scores each round: "
+                   "cpu (default), auto, cuda, xpu or mps. Fine-tunes want a GPU here (and PyTorch)")
     p.add_argument("--keep-rounds", type=int, default=10,
                    help="rounds whose opened checkpoints stay downloadable, so anyone can re-run their checks (default 10)")
     p.add_argument("--max-job-mb", type=float, default=64.0, metavar="MB",  # node.MAX_JOB_BYTES, which says why
@@ -1383,8 +1516,15 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("train", help="train a model on a CSV file: posts it as a job for the network to train")
     p.add_argument("data", nargs="?", help="CSV with a header row: numeric input columns, plus the column to predict "
                    "(on a terminal, leave it out to pick a model from a menu)")
-    p.add_argument("--base", metavar="MODEL", help="fine-tune an open-weight model: a name from `models`, org/name or a "
-                   "huggingface.co address. Coming, not live yet: this shows what it would take and posts nothing")
+    p.add_argument("--base", metavar="MODEL", help="fine-tune an open-weight model on a file of chats or text (JSON "
+                   "lines of {\"messages\": [...]} or {\"text\": ...}): a name from `models`, org/name or a "
+                   "huggingface.co address. Without a data file, shows what the model would take")
+    p.add_argument("--rank", type=int, default=16, help="fine-tunes: LoRA rank (default 16)")
+    p.add_argument("--lr", type=float, help="fine-tunes: Adam's learning rate (default: by model size)")
+    p.add_argument("--max-len", type=int, default=512, help="fine-tunes: longest sequence in tokens; longer chats are "
+                   "cut (default 512, at most 2048; longer sequences make disputes too big to play from home)")
+    p.add_argument("--units", type=int, default=8, help="fine-tunes: units of training a round (default 8)")
+    p.add_argument("--yes", "-y", action="store_true", help="fine-tunes: don't ask before checking weights or posting")
     p.add_argument("--label", help="the column to predict (default: the last one)")
     p.add_argument("--budget", type=to_syn, default="100", help="VIBE to spend, paid only for work that passes its checks (default 100)")
     p.add_argument("--fee", type=to_syn, default="10", help="VIBE per round of training (default 10)")
@@ -1418,8 +1558,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--node", help=NODE)
     p.add_argument("--plain", action="store_true", help="print a line per event instead of the live dashboard")
     p.set_defaults(fn=cmd_job_watch)
-    p = j.add_parser("download", help="save a job's trained model to use with `predict`")
-    p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--out", help="file to save (default JOB.npz)")
+    p = j.add_parser("download", help="save a job's trained model to use with `predict`, or a fine-tune's LoRA adapter")
+    p.add_argument("job_id", nargs="?", help="default: the last job you trained")
+    p.add_argument("--out", help="file to save (default JOB.npz), or a fine-tune's folder (default DATA-lora)")
     p.add_argument("--node", help=NODE); p.set_defaults(fn=cmd_job_download)
     p = j.add_parser("template", help="write a starter job file, for full control with post-job")
     p.add_argument("--out", default="job.json"); p.add_argument("--id", default="my-first-job")

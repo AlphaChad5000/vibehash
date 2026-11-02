@@ -46,7 +46,10 @@ BOOTSTRAP = "bootstrap"  # genesis memo: stake that votes but can never be withd
 #      burns it, never pays it as bounty; coins finishing unbonding are released after the round's slashes; a
 #      cancel_job leaves the fee its job owes the block's own round; a proposer slashed in its own round isn't paid for
 #      proposing; the last voting validator can't unstake or leave; payouts are split in exact fractions.
-VERSION = 2
+#   3: a post_job may be a fine-tune (tasks.is_finetune_spec), whose rounds are record version 4. Earlier versions
+#      refuse one, as nodes before fine-tunes did, so a chain can't hold one until its validators all know them.
+VERSION = 3
+FINETUNE_VERSION = 3
 # User txs per block, as canonical JSON of to_dict(). A leader proposes its block and the round's record in one JSON
 # message, which nodes take up to 4 MiB of (node.MAX_JSON); 1 MiB leaves the rest for the record. That's about 2,400
 # plain transfers (430 bytes), or 64 of the largest tx a node relays (MAX_TX_BYTES).
@@ -432,6 +435,8 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
             job = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount)
         except InvalidJob as e:
             raise InvalidBlock(str(e)) from e
+        if job.finetune and version < FINETUNE_VERSION:
+            raise InvalidBlock(f"a fine-tune can be posted only in a block of version {FINETUNE_VERSION} or later")
         if job.job_id in s.jobs:
             raise InvalidBlock("job id already used")
         s._debit(tx.sender, tx.amount)

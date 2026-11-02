@@ -11,6 +11,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "cryptography>=42"]
+# Posting a fine-tune reads chats with the model's own tokenizer and chat template. Workers don't need these; they
+# need PyTorch, whose right build `vibehash install-gpu` picks for the GPU.
+optional-dependencies = {finetune = ["tokenizers>=0.15", "jinja2>=3.1"]}
 keywords = ["proof-of-useful-work", "distributed-training", "cryptocurrency", "testnet"]
 classifiers = [
     "Development Status :: 3 - Alpha",

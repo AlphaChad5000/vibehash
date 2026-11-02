@@ -16,6 +16,10 @@ field by field. It checks:
     each member had to open, every edge where neighbours disagreed and the
     signed edge message that said who lied, who checked each cell, and the
     canaries made of cells;
+  * for a fine-tune (record version 4): every dispute, move by move (each a signed
+    message), with the referee's verdict on its last op re-run from the evidence
+    (base-model weights fetched and checked against the job's manifest, never
+    taken from the record);
   * every verdict, slash, missed deadline and payment share.
 
 Given the round's checkpoints (`checkpoints`: something with .array(blob_id,
@@ -33,6 +37,7 @@ from . import shards as sh
 from .coordinator import Coordinator, CoordinatorConfig, ProtocolError
 from .crypto import h256
 from .ledger import Block, Chain, canonical
+from .merkle import MerkleError
 from .tasks import InvalidJob, Reveal
 from .wire import WireError, commitment_in, open_envelope
 
@@ -46,10 +51,13 @@ def _sender(env: dict, kind: str, chain: Chain, round_no: int) -> tuple[str, dic
     return addr, body
 
 
-def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, stats: dict | None = None) -> list[str]:
+def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, stats: dict | None = None,
+                 datasets=None, roots=None) -> list[str]:
     """Problems found re-running `block`'s round on `chain`, which must be the chain just before `block`.
     An empty list means every decision in the block follows from its record (and, with `checkpoints`, every
-    weight-based result it records checks out). `stats` collects how many results were re-checked or couldn't be."""
+    weight-based result it records checks out). `stats` collects how many results were re-checked or couldn't be.
+    `datasets` (a node's Store, or anything with .attach(job)) gives a fine-tune's data to a round with disputes,
+    whose referee needs it; other rounds replay without any."""
     s = block.summary
     if s is None:
         return []
@@ -58,6 +66,8 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
     try:
         rules = record["rules"]
         c = Coordinator(chain, config=CoordinatorConfig(**rules), replay=record, recheck=checkpoints)
+        c.datasets = datasets
+        c.roots = roots if roots is not None else checkpoints
         c.open_round()
         if c.r.job_id != s.job_id:
             return [f"the record is for job {c.r.job_id}, the block for {s.job_id}"]
@@ -82,9 +92,21 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
         for env in record["verdicts"]:
             addr, body = _sender(env, "verdict", chain, c.r.round_no)
             bad = body.get("bad_segment")
-            c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env)
+            c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
+                             score=body.get("score"))
+        if c.start_disputes():  # version 4: a fine-tune's disputes, move by move, refereed again from the record
+            entries = {e["id"]: e for e in record["games"]}
+            if sorted(entries) != sorted(c.r.games):
+                raise ProtocolError("the record's disputes aren't the ones the round had")
+            for gid in sorted(entries):
+                e = entries[gid]
+                for env in e["moves"]:
+                    addr, body = _sender(env, "move", chain, c.r.round_no)
+                    c.submit_move(addr, body, envelope=env)
+        elif record.get("games"):
+            raise ProtocolError("the record has disputes, but the round had none")
         replayed = c.replayed_summary(s.proposer)
-    except (ProtocolError, WireError, InvalidJob, KeyError, TypeError, ValueError) as e:
+    except (ProtocolError, WireError, InvalidJob, MerkleError, KeyError, TypeError, ValueError) as e:
         return [f"the round can't be replayed from its record: {e}"]
     if stats is not None:
         stats["rechecked"] = stats.get("rechecked", 0) + c.rechecked

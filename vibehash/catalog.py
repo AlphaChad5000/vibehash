@@ -1,8 +1,10 @@
 """Popular open-weight models to fine-tune, and what training each one would take.
 
-Fine-tuning isn't live on the network yet (FINETUNING.md, DEEPSEEK.md): today `vibehash train` trains a small model
-sized to a CSV file. This is the menu of what's coming. `vibehash models` lists it, `vibehash train --base NAME`
-describes one model and posts nothing, and the guide's command builder shows the same list, baked into the page
+`vibehash train DATA --base NAME` fine-tunes a model one GPU holds, of a family finetune.py trains (`ready`), on a
+network whose node runs this version (it needs no GPU: workers check and score the work): a local `testnet` today, the
+public network once its node is updated (FINETUNING.md). Models that need a
+team of GPUs are coming (DEEPSEEK.md). `vibehash models` lists them all, `vibehash train --base NAME` alone describes
+one and posts nothing, and the guide's command builder shows the same list, baked into the page
 (scripts/bake_models.py).
 
 The choice of models is ours: the most downloaded text models of the big open-weight makers on Hugging Face in
@@ -34,7 +36,9 @@ GPU_GB = (12, 24, 32)  # gaming cards: an RTX 4070 SUPER has 12 GB, a 4090 24, a
 USABLE = 0.75  # of a card's memory, for weights; the rest is for activations, adapters and the CUDA context
 CACHE_TTL = 24 * 3600  # seconds a model's facts are reused before Hugging Face is asked again
 TIMEOUT_S = 8.0  # for each request, with no retries: a Hub that's out of reach should cost seconds, not minutes
-TODAY = "small models sized to a CSV file"  # the one kind of model the network trains today
+TODAY = "small models sized to a CSV file"  # what the public network trains today
+# Architectures finetune.py trains (its FAMILIES, by the name config.json gives them).
+ARCHITECTURES = {"LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM", "SmolLM3ForCausalLM"}
 FINETUNING = "https://github.com/AlphaChad5000/vibehash/blob/main/FINETUNING.md"
 # The owner's words, shown wherever model names and emblems are (here, the guide, the README, emblems.py).
 DISCLAIMER = ("Disclaimer: All product names, logos, and brands are property of their respective owners and are "
@@ -297,6 +301,15 @@ def params_text(n: int | None) -> str:
     return "?" if n is None else f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.0f}M" if n >= 1e6 else f"{n:,}"
 
 
+def ready(f: Facts | None, model: Model | None = None) -> bool:
+    """Whether finetune.py can fine-tune it today: an architecture it trains, held by one gaming GPU."""
+    return f is not None and not f.pickle_only and f.architecture in ARCHITECTURES and team(f, model).get(GPU_GB[0]) == 1
+
+
+def status_of(f: Facts | None, model: Model | None = None) -> str:
+    return "ready" if ready(f, model) else "coming"
+
+
 def team_text(t: dict[int, int | None]) -> str:
     return " / ".join("-" if t.get(gb) is None else str(t[gb]) for gb in GPU_GB) if t else "?"
 
@@ -312,8 +325,10 @@ def checked_text(t: float) -> str:
 
 
 def status_line(prog: str = "vibehash") -> str:
-    return (f"Status: today the network trains {TODAY} only (`{prog} train data.csv`). Fine-tuning these "
-            "open-weight models is coming, not live yet.")
+    return (f"Status: \"ready\" models fine-tune with `{prog} train chats.jsonl --base NAME` on a network whose node runs "
+            f"this version (a local `{prog} testnet` today; the public network once its node is updated). Today the "
+            f"public network trains {TODAY} (`{prog} train data.csv`). Fine-tuning models that need a team of GPUs is "
+            "coming.")
 
 
 def to_json(facts: dict[str, Facts], errors: dict[str, str]) -> dict:
@@ -321,7 +336,7 @@ def to_json(facts: dict[str, Facts], errors: dict[str, str]) -> dict:
     out = []
     for m in CATALOG:
         f = facts.get(m.repo)
-        row = {"name": m.name, "title": m.title, "repo": m.repo, "url": m.url, "status": "coming"}
+        row = {"name": m.name, "title": m.title, "repo": m.repo, "url": m.url, "status": status_of(f, m)}
         row.update({k: v for k, v in asdict(f).items() if k != "repo"} if f else {})
         if f:
             row["checked"] = datetime.fromtimestamp(f.checked, timezone.utc).isoformat(timespec="seconds")
@@ -329,20 +344,23 @@ def to_json(facts: dict[str, Facts], errors: dict[str, str]) -> dict:
             row["team"] = {str(gb): n for gb, n in team(f, m).items()}
         row["error"] = errors.get(m.repo)
         out.append(row)
-    return {"today": f"{TODAY} (vibehash train data.csv)", "fine_tuning": "coming, not live on the network yet",
+    return {"today": f"{TODAY} (vibehash train data.csv)",
+            "fine_tuning": "ready models: vibehash train DATA --base NAME, on a node that runs fine-tunes (a local "
+                           "testnet; not the public network yet); the others are coming",
             "gpu_gb": list(GPU_GB), "usable_fraction": USABLE, "models": out, "disclaimer": DISCLAIMER}
 
 
 def table(facts: dict[str, Facts], errors: dict[str, str], width: int = 120, prog: str = "vibehash") -> str:
     """The catalog as `vibehash models` prints it. The repository column is left out when it wouldn't fit."""
-    head = ["name", "parameters", "experts", "weights", "licence", "gated", "GPUs at " + " / ".join(map(str, GPU_GB)) + " GB"]
+    head = ["name", "parameters", "experts", "weights", "licence", "gated", "GPUs at " + " / ".join(map(str, GPU_GB)) + " GB",
+            "status"]
     rows = []
     for m in CATALOG:
         f = facts.get(m.repo)
         rows.append([m.name, params_text(f.parameters) if f else "?", experts_text(f),
                      (size_text(f.weight_bytes) + ("*" if f.estimated else "")) if f else "?",
                      (f.licence or "not stated") if f else "?", ("yes" if f.gated else "no") if f else "?",
-                     team_text(team(f, m)) if f else "?", m.repo])
+                     team_text(team(f, m)) if f else "?", status_of(f, m), m.repo])
     widths = [max(len(r[i]) for r in rows + [head + ["Hugging Face"]]) for i in range(len(head) + 1)]
     with_repo = sum(widths) + 2 * len(widths) <= width
     if with_repo:
@@ -375,7 +393,8 @@ def table(facts: dict[str, Facts], errors: dict[str, str], width: int = 120, pro
                    + ("" if max(when) - min(when) < 60 else f" to {checked_text(max(when))}") + ".")
     if not with_repo:
         out.append(f"`{prog} models --json` gives each model's Hugging Face page.")
-    out.append(f"`{prog} train --base NAME` shows what training one would take; it posts nothing.")
+    out.append(f"`{prog} train --base NAME` shows what training one would take, and posts nothing; "
+               f"`{prog} train chats.jsonl --base NAME` fine-tunes a ready one.")
     out.append(DISCLAIMER)
     return "\n".join(out)
 
@@ -422,9 +441,17 @@ def preflight(ref: str, model: Model | None, f: Facts, data: Path | None = None,
         lines.append("Tokenizer no tokenizer.json, which turning text into training data needs")
     if data is not None:
         lines.append(f"Data      {data.name}: {size_text(data.stat().st_size)}" + (f" of {kind}" if (kind := data_kind(data)) else ""))
-    lines += ["", "Not yet: fine-tuning open-weight models isn't live on the network, so nothing was posted and nothing "
-              "was spent.",
-              f"What works today: a small model sized to a CSV file, `{prog} train data.csv`. What's coming: {FINETUNING}"]
+    if ready(f, model) and data is None:
+        lines += ["", f"Ready: `{prog} train chats.jsonl --base {model.name if model else f.repo}` fine-tunes it on chats "
+                  "(JSON lines of {\"messages\": [...]}) or text ({\"text\": ...}): a pre-flight, then one question "
+                  "before anything is posted.",
+                  f"It runs on a network whose node runs this version (no GPU needed there): a local `{prog} testnet --job "
+                  f"none` today, the public network once its node is updated. Nothing was posted and nothing was spent. More: {FINETUNING}"]
+    else:
+        lines += ["", "Not yet: fine-tuning this model isn't live on the network (it needs a team of GPUs, or an "
+                  "architecture that isn't supported yet), so nothing was posted and nothing was spent.",
+                  f"What works today: a small model sized to a CSV file, `{prog} train data.csv`, and fine-tunes of the "
+                  f"models `{prog} models` marks ready. What's coming: {FINETUNING}"]
     return "\n".join(lines)
 
 

@@ -20,13 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
-from . import hardware, receipts, settings, tls
+from . import finetune, hardware, receipts, settings, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
 from .ledger import Block, Tx, canonical
-from .model import Dataset, params_hash
-from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob
+from .model import params_hash
+from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
 from .wire import blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
 from .worker import HardwareProfile, Worker
 
@@ -210,7 +210,7 @@ class NodeClient:
 
     def upload_dataset(self, keys: KeyPair, path: str | Path) -> str:
         path = Path(path)
-        Dataset.from_npz(path)  # catch a bad file here rather than after uploading gigabytes
+        load_dataset(path)  # catch a bad file here rather than after uploading gigabytes
         sha = file_sha256(path)
         self.upload(keys, "dataset", path, sha)
         return sha
@@ -284,10 +284,15 @@ class WorkerClient:
                              fp_noise=0, backend=self.backend, blobs=self.blobs)
         self.jobs: dict[str, TrainingJob] = {}
         self.speed: dict[str, float] = {}
+        self.cannot: dict[str, str] = {}  # jobs this worker can't run, and why
         self.done: dict[tuple[int, str], bool] = {}
         self.units: dict[int, list] = {}
         self.start_blob: dict[int, str] = {}
         self.uploaded: dict[int, set[str]] = {}  # checkpoints the node confirmed it has, by round
+        self.attempt_of: dict[int, str | None] = {}  # the attempt at each round those confirmations were for
+        self.moved: set[tuple] = set()  # (round, dispute, move number) the node took our move for
+        self.unsent: dict[tuple, dict] = {}  # moves worked out whose sending failed: sent again, not worked out again
+        self.party: dict = {}  # this round's tracer.Party, for its disputes
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
@@ -352,6 +357,12 @@ class WorkerClient:
     def runs_on_gpu(self, job: TrainingJob) -> bool:
         return self.backend.name != "cpu" and job.spec.precision == "float32"
 
+    def can_run(self, job: TrainingJob) -> str | None:
+        """Why this worker can't take the job's units, or None if it can."""
+        if job.finetune and not finetune.available():
+            return f"job {job.job_id} fine-tunes {job.spec.repo}, which needs PyTorch: `vibehash install-gpu`"
+        return None
+
     def memory_for(self, job: TrainingJob) -> int:
         """GPU memory for jobs the GPU runs, system RAM otherwise (float64 jobs always run on the CPU)."""
         if self.memory_override:
@@ -364,11 +375,23 @@ class WorkerClient:
         if job_id not in self.jobs:
             info = self.node.get(f"/job/{job_id}")
             job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
-            if job.data_source["kind"] == "npz":
+            why = self.can_run(job)
+            if why:
+                self.jobs[job_id] = job
+                self.cannot[job_id] = why
+                log.warning("skipping it: %s", why)
+                return job
+            if job.data_source["kind"] in ("npz", "tokens"):
                 sha = job.data_source["sha256"]
                 self.datasets.prune_partial(keep={sha})  # other datasets' downloads that never finished
                 path = self.node.download("dataset", sha, self.datasets)  # hash-checked on arrival
-                job.attach_data(Dataset.from_npz(path), sha)
+                job.attach_data(load_dataset(path), sha)
+            if job.finetune:  # the base model, fetched once and kept on the GPU (finetune.runtime)
+                self.stats.activity = f"fetching {job.spec.repo} to fine-tune it"
+                log.info("job %s fine-tunes %s: loading it on %s", job_id, job.spec.repo, finetune.device_of(self.backend))
+                def fetching(done: int, total: int, what: str) -> None:
+                    self.stats.activity = f"{what}: {done / 1e9:.2f} / {total / 1e9:.2f} GB"
+                finetune.runtime(job.spec, job.data, finetune.device_of(self.backend), progress=fetching)
             self.jobs[job_id] = job
             self.speed[job_id] = self.flops_override or hardware.benchmark(job, 0.5, self.backend)
             where = self.backend.describe() if self.runs_on_gpu(job) else "CPU"
@@ -437,6 +460,14 @@ class WorkerClient:
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join
+        if rnd is not None and self.attempt_of.get(rnd, s.get("attempt")) != s.get("attempt"):
+            # Another leader, or the same node after a restart, has none of what went up for the abandoned attempt:
+            # without this the reveal names checkpoints the node doesn't have, and the units count as withheld.
+            self.uploaded.pop(rnd, None)
+        if rnd is not None:
+            self.attempt_of[rnd] = s.get("attempt")
+            for old in [k for k in self.attempt_of if k < rnd - 100]:
+                del self.attempt_of[old]
         if rnd is not None and s.get("beacon_commit"):
             self.secret_commits.setdefault((rnd, s.get("attempt")), s["beacon_commit"])
             for old in [k for k in self.secret_commits if k[0] < rnd - 100]:  # rounds we never sent anything in
@@ -447,6 +478,10 @@ class WorkerClient:
             st.activity = "joining at the next round"
         st.new_round(rnd)
         job = self.job(s["job_id"])
+        if job.job_id in self.cannot:
+            st.activity = self.cannot[job.job_id]
+            self.done[key] = True
+            return
         st.job, st.flops_per_sec = job, self.speed[job.job_id]
         k = self.keys
 
@@ -460,7 +495,8 @@ class WorkerClient:
             st.assigned = len(units)
             committed = []
             if not units:
-                st.activity = "no units for us this round" if st.rounds else "joining at the next round"
+                why = (s.get("waiting") or {}).get(job.job_id)
+                st.activity = why or ("no units for us this round" if st.rounds else "joining at the next round")
             if units:
                 p = self.node.get("/round/params")
                 self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
@@ -502,23 +538,13 @@ class WorkerClient:
                 for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
                     if res and not res["ok"]:
                         log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])
+        elif phase == "dispute":  # a fine-tune's disputes: a move in each that waits on us, every poll until it ends
+            self._disputes(rnd, job)
+            return
         elif phase == "verify":
-            tasks = self.node.signed(k, "tasks", {"round": rnd})["tasks"]
-            st.busy = bool(tasks)
-            try:
-                for i, t in enumerate(tasks, 1):
-                    st.activity = f"checking other workers' results ({i} of {len(tasks)})"
-                    unit = unit_in(t["unit"])
-                    openings = {}
-                    for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
-                        self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
-                        openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
-                    ok, bad = self.worker.verify(job, unit, openings, t["segments"])
-                    self._try(self._signed, "verdict", {"round": rnd, "task_id": t["task_id"], "ok": bool(ok), "bad_segment": bad})
-                    st.checked += 1
-                    st.checks += 1
-            finally:
-                st.busy = False
+            absent = self.worker.verifier_behavior == "absent"  # tests only: a checker that never answers
+            tasks = [] if absent else self.node.signed(k, "tasks", {"round": rnd})["tasks"]
+            self._answer(rnd, job, tasks)
             st.activity = "round done; waiting for the block"
             if tasks:
                 log.info("round %d: verified %d tasks", rnd, len(tasks))
@@ -530,6 +556,87 @@ class WorkerClient:
         else:
             return
         self.done[key] = True
+
+    def _answer(self, rnd: int, job: TrainingJob, tasks: list[dict]) -> None:
+        """Do this phase's tasks and send a verdict for each: replay segments, or score a fine-tune's starting model
+        on its held-back data."""
+        st = self.stats
+        st.busy = bool(tasks)
+        try:
+            for i, t in enumerate(tasks, 1):
+                if st.phase_ends and time.time() > st.phase_ends:
+                    # The node refuses verdicts now, and a fine-tune's disputes may be waiting on this worker's move.
+                    log.warning("round %d: the verify phase ended with %d tasks left unchecked", rnd, len(tasks) - i + 1)
+                    break
+                kind = t.get("kind", "check")
+                body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
+                if kind == "score":
+                    st.activity = "scoring the round's starting model on the held-back data"
+                    body["score"] = list(self.worker.score(job, self._round_start(rnd, job)))
+                else:
+                    st.activity = f"checking other workers' results ({i} of {len(tasks)})"
+                    openings = {}
+                    for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
+                        self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
+                        openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
+                    ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"])
+                    body |= {"ok": bool(ok), "bad_segment": bad}
+                self._try(self._signed, "verdict", body)
+                st.checked += 1
+                st.checks += 1
+        finally:
+            st.busy = False
+
+    def _disputes(self, rnd: int, job: TrainingJob) -> None:
+        """Make our move in each of this round's disputes that waits on us (dispute.py): as the defender, post the
+        states between our training's ops, or the evidence for one op; as the challenger, name where they go wrong."""
+        st, me = self.stats, self.keys.address
+        games = [g for g in self.node.get("/round/games") if g["turn"] != "done"
+                 and (g["defender"] if g["turn"] in ("split", "evidence") else g["challenger"]) == me
+                 and (rnd, g["id"], g["n"]) not in self.moved]
+        if not games:
+            st.activity = "waiting on this round's disputes"
+            return
+        from .program import Program
+        from .tracer import Party
+
+        party = self.party.get(rnd)
+        if party is None:
+            from . import finetune
+            from .worker import tamper
+
+            rt = finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
+            party = self.party[rnd] = Party(rt, job.spec, job.data, _Remote(self),
+                                            tamper if self.worker.behavior == "tamper" else None)
+            self.party = {rnd: party}
+        st.busy = True
+        try:
+            for g in games:
+                if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
+                    continue  # tests only: a challenger that goes quiet
+                st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
+                key = (rnd, g["id"], g["n"])
+                move = self.unsent.pop(key, None)
+                if move is None:
+                    prog = Program.of(job, int(g["seed"]))
+                    move = (party.pick(prog, g) if g["turn"] == "pick" else {"split": party.split(prog, g)}
+                            if g["turn"] == "split" else {"evidence": party.remote.put(party.evidence(prog, g))})
+                # Made only once the node takes it: a send that fails is tried again next time round, until the game's
+                # move count passes it (taken after all, or too late).
+                if self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move}) is None:
+                    self.unsent = {k: v for k, v in self.unsent.items() if k[0] == rnd} | {key: move}
+                else:
+                    self.moved.add(key)
+        finally:
+            st.busy = False
+
+    def _round_start(self, rnd: int, job: TrainingJob) -> np.ndarray:
+        """The weights this round started from, fetched if it trained nothing this round."""
+        if rnd not in self.start_blob:
+            p = self.node.get("/round/params")
+            self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
+            self.start_blob[rnd] = p["blob"]
+        return self.blobs.load(self.start_blob[rnd], job.wire_dtype, job.spec.n_params)
 
     @staticmethod
     def _try(fn, *args):
@@ -552,3 +659,22 @@ class WorkerClient:
                 log.exception("unexpected error; skipping to the next phase")
                 time.sleep(2)
             time.sleep(self.poll_s)
+
+
+class _Remote:
+    """A dispute's states and evidence, through the node's blob endpoints (tracer.Party's `remote`)."""
+
+    def __init__(self, client: WorkerClient):
+        self.client = client
+
+    def put(self, raw: bytes) -> str:
+        c = self.client
+        bid = c.blobs.put_array(np.frombuffer(raw, dtype=np.uint8), "uint8")
+        c.node.upload(c.keys, "blob", c.blobs.path(bid), bid)
+        return bid
+
+    def get(self, bid: str) -> bytes:
+        c = self.client
+        if not c.blobs.has(bid):
+            c.node.download("blob", bid, c.blobs)
+        return c.blobs.path(bid).read_bytes()

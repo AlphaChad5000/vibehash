@@ -18,8 +18,22 @@ import numpy as np
 from .blobs import BlobStore, file_sha256
 from .consensus import check_certificate
 from .ledger import Block, Chain, canonical
-from .model import Dataset
-from .tasks import InvalidJob, TrainingJob
+from .tasks import InvalidJob, TrainingJob, load_dataset
+
+
+def record_blobs(record: dict) -> set[str]:
+    """Blob ids a round's record points to: its reveals' opened checkpoints and finals, and its disputes' evidence (an
+    evidence move names its blob). A validator fetches them all from the proposer to replay the round, so the proposer
+    keeps them (the third review's finding A: evidence pruned at the round's end left validators nothing to referee)."""
+    keep: set[str] = set()
+    for rv in record.get("reveals", []):
+        keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+    for g in record.get("games", []):
+        for env in g.get("moves", []):
+            move = (env.get("body") or env).get("move") if isinstance(env, dict) else None
+            if isinstance(move, dict) and isinstance(move.get("evidence"), str):
+                keep.add(move["evidence"])
+    return keep
 
 
 class Store:
@@ -119,14 +133,13 @@ class Store:
         return None if row is None else json.loads(row[0])
 
     def evidence(self, tip: int, rounds: int) -> set[str]:
-        """Blob ids of the checkpoints the last `rounds` records point to: the opened checkpoints and finals
-        anyone re-checking those rounds needs (replay.py). Everything else can go."""
+        """Blob ids the last `rounds` records point to (record_blobs): what anyone re-checking those rounds needs
+        (replay.py). Everything else can go."""
         keep: set[str] = set()
         with self.lock:
             rows = self.db.execute("SELECT record FROM round_records WHERE height > ?", (tip - rounds,)).fetchall()
         for (text,) in rows:
-            for rv in json.loads(text).get("reveals", []):
-                keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+            keep |= record_blobs(json.loads(text))
         return keep
 
     def save_round(self, job_id: str, height: int, accepted: int, val_loss: float, val_acc: float) -> None:
@@ -151,7 +164,7 @@ class Store:
     def add_dataset(self, src: str | Path) -> str:
         """Copy a local dataset into the store, validating it first. Returns its sha256."""
         src = Path(src)
-        Dataset.from_npz(src)  # refuse files that aren't a loadable, pickle-free dataset
+        load_dataset(src)  # refuse files that aren't a loadable, pickle-free dataset
         sha = file_sha256(src)
         dest = self.dataset_path(sha)
         if not dest.exists():
@@ -162,10 +175,10 @@ class Store:
 
     def check_dataset(self, path: Path) -> None:
         """Raises InvalidJob unless `path` is a real, pickle-free dataset (with no more data than its size allows, see
-        Dataset.from_npz). Uploads and downloads run it on the finished file before it's kept (BlobStore.write_chunk),
+        load_dataset). Uploads and downloads run it on the finished file before it's kept (BlobStore.write_chunk),
         so a dataset in the store never needs deleting, even when a check fails for some other reason."""
         try:
-            Dataset.from_npz(path)
+            load_dataset(path)
         except Exception as e:
             raise InvalidJob(f"not a valid dataset: {e}") from e
 
@@ -173,4 +186,4 @@ class Store:
         path = self.dataset_path(job.data_source["sha256"])
         if not path.exists():
             raise InvalidJob(f"dataset {job.data_source['sha256'][:12]}… not available on this node")
-        job.attach_data(Dataset.from_npz(path), file_sha256(path))
+        job.attach_data(load_dataset(path), file_sha256(path))

@@ -358,6 +358,25 @@ class DistantWorkerTest(unittest.TestCase):
         self.assertEqual(drops, [])
 
 
+class RerunRoundTest(unittest.TestCase):
+    def test_a_round_run_again_gets_its_checkpoints_again(self):
+        """What a worker remembers the node has is for one attempt at a round: another leader, or the node after a
+        restart, runs the round again without them, and a reveal naming them would leave the units withheld."""
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        c = WorkerClient("http://127.0.0.1:9", KeyPair.generate(b"rerun"), device="cpu", cache_dir=tmp.name)
+        status = {"genesis_hash": "g", "height": 4, "round": 5, "attempt": "a", "phase": "reveal", "phase_ends": 0}
+        c._follow_leader = lambda: dict(status)
+        c.done[(5, "a", "reveal")] = c.done[(5, "b", "reveal")] = True  # nothing else to do in either
+        c.step()
+        c.uploaded[5] = {"blob-sent-in-attempt-a"}
+        c.step()
+        self.assertEqual(c.uploaded[5], {"blob-sent-in-attempt-a"})
+        status["attempt"] = "b"
+        c.step()
+        self.assertNotIn(5, c.uploaded)
+
+
 class LiveNetworkTest(unittest.TestCase):
     """A real node on localhost, real HTTP, worker clients (one cheating), uploaded data."""
 

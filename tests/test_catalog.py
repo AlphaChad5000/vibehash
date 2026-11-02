@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.test_hub import FakeHub, HubTestCase, shard1, shard2, sharded_files, single_files
+from tests.test_hub import CONFIG, FakeHub, HubTestCase, shard1, shard2, sharded_files, single_files
 from vibehash import catalog, cli, emblems, hub
 from vibehash.catalog import Facts, Model
 
@@ -217,12 +217,13 @@ class ModelsCommandTests(CatalogTestCase):
         os.environ["COLUMNS"] = "200"
         code, out, _ = self.run_cli("models")
         self.assertEqual(code, 0, out)
-        self.assertIn("Status: today the network trains small models sized to a CSV file only", out)
-        self.assertIn("Fine-tuning these open-weight models is coming, not live yet.", out)
+        self.assertIn("Status: \"ready\" models fine-tune with `", out)
+        self.assertIn("Today the public network trains small models sized to a CSV file", out)
+        self.assertIn("Fine-tuning models that need a team of GPUs is coming.", out)
         self.assertRegex(out, r"name\s+Hugging Face\s+parameters\s+experts\s+weights\s+licence\s+gated\s+GPUs at 12 / 24 / 32 GB")
         self.assertRegex(out, r"tiny\s+acme/tiny\s+38,049\s+2 of 8\s+\S+ kB\s+mit\s+no\s+1 / 1 / 1")
         self.assertIn("moe ", out)
-        self.assertIn("train --base NAME` shows what training one would take; it posts nothing", out)
+        self.assertIn("train --base NAME` shows what training one would take, and posts nothing", out)
         self.assertEqual(out.rstrip("\n").split("\n")[-1], DISCLAIMER)  # the last line
         os.environ["COLUMNS"] = "70"
         out = self.run_cli("models")[1]
@@ -261,8 +262,8 @@ class TrainBaseTests(CatalogTestCase):
 
     def assert_nothing_posted(self, code, out):
         self.assertEqual(code, 1, out)
-        self.assertIn("Not yet: fine-tuning open-weight models isn't live on the network, so nothing was posted and "
-                      "nothing was spent.", out)
+        self.assertIn("Not yet: fine-tuning this model isn't live on the network (it needs a team of GPUs, or an "
+                      "architecture that isn't supported yet), so nothing was posted and nothing was spent.", out)
         self.assertIn("What works today: a small model sized to a CSV file", out)
         self.assertFalse((self.tmp / "home" / "jobs").exists())
 
@@ -285,6 +286,14 @@ class TrainBaseTests(CatalogTestCase):
             self.assertIn("Model     acme/other\n", out)
             self.assertIn("Licence   apache-2.0, not gated", out)
             self.assertIn("Data      chats.jsonl: 5.0 kB of JSON lines", out)
+
+    def test_a_model_it_fine_tunes_today(self):
+        config = {**CONFIG, "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}
+        self.fake.add_commit("acme/qwen", {**single_files(), "config.json": json.dumps(config).encode()})
+        code, out, _ = self.run_cli("train", "--base", "acme/qwen")
+        self.assertEqual(code, 1, out)
+        self.assertIn("Ready: `python -m vibehash train chats.jsonl --base acme/qwen` fine-tunes it", out)
+        self.assertIn("Nothing was posted and nothing was spent.", out)
 
     def test_a_gated_model(self):
         repo = self.gated_with_hidden_hashes()
