@@ -197,3 +197,56 @@ class ForwardOpTests(unittest.TestCase):
             chosen, gates = moe.route(xx, ds.Choices())
             self.judge(mk("ds_gates", "g", ["s", "c"], {"norm": cfg.norm_topk_prob, "route_scale": cfg.route_scale},
                           gates.shape, [sc.shape, chosen.shape]), {"s": sc, "c": chosen.float()}, gates, "gates")
+
+    def verdict(self, op, before, after, tile):
+        """What the node decides from a defender's evidence for one tile (dispute.make_evidence and judge_evidence)."""
+        before = {k: np.asarray(v, dtype=np.float32) for k, v in before.items()}
+        after = {**before, **{k: np.asarray(v, dtype=np.float32) for k, v in after.items()}}
+        mb, _ = dispute.state_manifest(before)
+        ma, _ = dispute.state_manifest(after)
+        ev, _, _ = dispute.make_evidence(op, tile, before, after, (mb, ma), dispute.Outside(None, None, self.src, keep=False))
+        return dispute.judge_evidence(op, tile, merkle.state_root(mb), merkle.state_root(ma), ev,
+                                      dispute.Outside(None, None, self.src, keep=False))
+
+    def test_choices_are_judged_by_whole_rows(self):
+        cfg, g = self.cfg, torch.Generator().manual_seed(7)
+        # Experts: a top-k of the biased scores, distinct, any order.
+        sc = torch.randn(6, 24, generator=g)
+        chosen = sc.topk(4, dim=-1).indices.float().numpy()
+        op = mk("ds_experts", "c", ["s"], {}, chosen.shape, [sc.shape])
+        self.assertEqual(self.verdict(op, {"s": sc.numpy()}, {"c": chosen}, 0)[0], "defender")
+        self.assertEqual(self.verdict(op, {"s": sc.numpy()}, {"c": chosen[:, ::-1].copy()}, 0)[0], "defender")
+        worse = chosen.copy()
+        worse[2, 1] = sc[2].argsort()[0]  # the worst expert in place of a chosen one
+        self.assertEqual(self.verdict(op, {"s": sc.numpy()}, {"c": worse}, 0)[0], "challenger")
+        twice = chosen.copy()
+        twice[3, 1] = twice[3, 0]
+        self.assertEqual(self.verdict(op, {"s": sc.numpy()}, {"c": twice}, 0)[0], "challenger")
+        # Picks: 300 of up to 600 positions, so a row spans two tiles; query r sees (r + 1) // ratio of them.
+        T, n, K, ratio = 610, 600, 300, 1
+        visible = (torch.arange(1, T + 1) // ratio)[:, None]
+        sp = torch.randn(T, n, generator=g).masked_fill(torch.arange(n)[None, :] >= visible, -float("inf"))
+        idx = sp.topk(K, dim=-1).indices.sort(dim=-1).values
+        picks = torch.where(idx < visible, idx, -1).float().numpy()
+        sp = sp.numpy()
+        op = mk("ds_picks", "p", ["s"], {"ratio": ratio}, picks.shape, [sp.shape])
+        for r in (100, 450):  # a query with fewer than K positions open (-1 padding), and one with more
+            for tile in ((r * K) // 256, (r * K + K - 1) // 256):
+                self.assertEqual(self.verdict(op, {"s": sp}, {"p": picks}, tile)[0], "defender", (r, tile))
+        bad = picks.copy()
+        row = bad[450]
+        out_ = [j for j in np.argsort(sp[450]) if j not in set(row.astype(int)) and np.isfinite(sp[450, j])][0]
+        row[np.argmax(row)] = out_  # a low-scoring position in place of the last pick
+        bad[450] = np.sort(row)
+        for tile in ((450 * K) // 256, (450 * K + K - 1) // 256):  # whichever tile of the row is named
+            self.assertEqual(self.verdict(op, {"s": sp}, {"p": bad}, tile)[0], "challenger")
+        # Candidate blocks: deepseek.candidate_blocks' mask; dropping the pinned block is refused.
+        cs = torch.randn(1, 5, 40, generator=g)
+        vis = torch.tensor([[9], [17], [25], [33], [40]])
+        cs = cs.masked_fill(torch.arange(40) >= vis, -float("inf"))
+        mask = ds.candidate_blocks(cs, vis, 2, 4)[0].float().numpy()
+        op = mk("ds_candidates", "m", ["s"], {"block": 4, "topk_blocks": 2, "ratio": 1}, mask.shape, [(5, 40)])
+        self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": mask}, 0)[0], "defender")
+        drop = mask.copy()
+        drop[3, (33 - 1) // 4 * 4:(33 - 1) // 4 * 4 + 4] = 0
+        self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": drop}, 0)[0], "challenger")

@@ -234,6 +234,13 @@ class Inputs:
     def __init__(self, shapes: dict, outside: Outside, leaves: dict | None = None, full: dict | None = None):
         self.shapes, self.outside, self.leaves, self.full = shapes, outside, leaves or {}, full
         self.used: dict[str, set[int]] = {}
+        self.after: "Inputs | None" = None  # the op's output, for the ops judged by whole rows (referee.CHOICES)
+
+    def out_row(self, name, r):
+        """Row r of the op's output, as the state after it holds it (proven leaves, or the party's array)."""
+        if self.after is None:
+            raise referee.Missing(f"{name}'s row {r}")
+        return self.after.row(name, r)
 
     def shape(self, name):
         if name not in self.shapes:
@@ -345,11 +352,13 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
     ok, why = True, f"{op.describe()} only drops tensors"
     if op.out:
         x = Inputs(shapes or {n: a.shape for n, a in before.items()}, outside, full=before)
+        x.after = Inputs({op.out: tuple(after[op.out].shape)}, outside, full={op.out: after[op.out]})
         said = np.ascontiguousarray(after[op.out], dtype="<f4").reshape(-1)[tile * LEAF:(tile + 1) * LEAF]
         ok, why = referee.judge(op, x, tile, said)
         for name, idx in sorted(x.used.items()):
             header["tensors"][f"in:{name}"], chunks[f"in:{name}"] = _proof(before[name], idx)
-        header["tensors"][f"out:{op.out}"], chunks[f"out:{op.out}"] = _proof(after[op.out], [tile])
+        out_idx = {tile} | x.after.used.get(op.out, set())  # (whole rows, for a choice)
+        header["tensors"][f"out:{op.out}"], chunks[f"out:{op.out}"] = _proof(after[op.out], out_idx)
     return merkle.pack(header, chunks), ok, why
 
 
@@ -398,6 +407,8 @@ def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) 
             return "challenger", f"the evidence doesn't show tile {tile} of {op.out}"
         shapes = {n: (e[2], e[3]) for n, e in before.items()}
         x = Inputs(shapes, outside, leaves={n: v for (s, n), v in leaves.items() if s == "in"})
+        x.after = Inputs({op.out: (after[op.out][2], after[op.out][3])}, outside,
+                         leaves={op.out: leaves.get(("out", op.out), {})})
         ok, why = referee.judge(op, x, tile, said)
         return ("defender" if ok else "challenger"), why
     except referee.Missing as e:

@@ -552,6 +552,9 @@ OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
 EXACT = {"embed", "scatter"}  # copies: no rounding at all
 # kind -> fn(op, said) giving why a tile's numbers can't be an honest output's (a dtype they can't be in), or None
 FORMATS: dict = {}
+# kind -> fn(op, x, r, row) giving (whether row r of the output is a choice its inputs allow, why): ops that choose
+# (a top-k), judged by whole rows rather than within a bound
+CHOICES: dict = {}
 
 
 class Missing(LookupError):
@@ -574,6 +577,18 @@ def tile_rows(shape: tuple[int, int], leaf: int) -> list[tuple[int, int, int]]:
 def judge(op, x, leaf: int, said: np.ndarray) -> tuple[bool, str]:
     """Whether the worker's numbers `said` for one tile of `op`'s output are what float32 can make of its inputs.
     (passed, why) — `why` names the worst number either way, for the record."""
+    if op.kind in CHOICES:  # a choice: judged by whole rows of the output against the scores it was chosen from
+        said = np.asarray(said, dtype=np.float64)
+        at = 0
+        for r, c0, c1 in tile_rows(op.shape, leaf):
+            row = x.out_row(op.out, r)
+            if said.shape[0] < at + c1 - c0 or not np.array_equal(row[c0:c1], said[at:at + c1 - c0]):
+                return False, f"{op.kind} → {op.out}: the tile isn't row {r} of the output"
+            ok, why = CHOICES[op.kind](op, x, r, row)
+            if not ok:
+                return False, f"{op.kind} → {op.out}, row {r}: {why}"
+            at += c1 - c0
+        return True, f"{op.kind} → {op.out}: the rows are choices their scores allow"
     want = [OPS[op.kind](op, x, r, c0, c1) for r, c0, c1 in tile_rows(op.shape, leaf)]
     v = np.concatenate([w.v for w in want])
     e = np.concatenate([w.e for w in want])

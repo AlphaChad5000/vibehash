@@ -578,6 +578,99 @@ def op_ds_gates(op, x, r, c0, c1):
         g = rf.div(g, rf.add(rf.esum(g[None])[0:1], E(np.array([rf.f32(1e-20)]))))
     return rf.scale(g, rf.f32(a.get("route_scale", 1.0)))[c0:c1]
 
+# --- choices: judged by whole rows (referee.CHOICES), exactly, against the committed scores ----------------------------
+# A choice is a function of scores the state already holds, and those were judged in their own op (within their
+# bounds). So a worker may break near-ties either way, as its own scores fall, but may choose nothing its scores don't
+# allow: the rules are deepseek.choice_gap's and candidate_gap's, for one row.
+
+def _ints(row) -> np.ndarray | None:
+    row = np.asarray(row, dtype=np.float64)
+    if not np.all(np.isfinite(row)) or not np.array_equal(row, np.round(row)):
+        return None
+    return row.astype(np.int64)
+
+
+def gap_ok(scores: np.ndarray, chosen: np.ndarray, k: int) -> tuple[bool, str]:
+    """deepseek.choice_gap ≤ 0 for one row: distinct options in range (-1 only as padding), as many as there are
+    finite scores up to k, and no option left out scoring above one chosen."""
+    n = len(scores)
+    if np.any(chosen < -1) or np.any(chosen >= n):
+        return False, "it names an option out of range"
+    real = chosen[chosen >= 0]
+    if len(set(real.tolist())) != len(real):
+        return False, "it names an option twice"
+    need = min(int(np.isfinite(scores).sum()), k)
+    if len(real) < need:
+        return False, f"it leaves a slot empty while {need} options have a finite score"
+    mask = np.zeros(n, dtype=bool)
+    mask[real] = True
+    worst = scores[mask].min() if mask.any() else np.inf
+    best = scores[~mask].max() if (~mask).any() else -np.inf
+    if best > worst and best != -np.inf:
+        return False, f"it leaves out an option scoring {float(best)!r}, above a chosen one's {float(worst)!r}"
+    return True, ""
+
+
+def choice_ds_experts(op, x, r, row):
+    """MoE.route's choice: k distinct experts, a top-k of the biased scores (deepseek.check_experts, choice_gap)."""
+    chosen = _ints(row)
+    if chosen is None:
+        return False, "the experts aren't whole numbers"
+    if np.any(chosen < 0):
+        return False, "every token goes to k experts: no -1"
+    return gap_ok(x.row(op.ins[0], r), chosen, len(chosen))
+
+
+def choice_ds_picks(op, x, r, row):
+    """Indexer.forward's picks for query r: ascending positions it can see, -1 (none) only after them and only where
+    fewer than k positions are open (deepseek.check_picks), and a top-k of its index scores, -inf where it can't see
+    or outside its candidate blocks (choice_gap)."""
+    picks = _ints(row)
+    if picks is None:
+        return False, "the picks aren't whole numbers"
+    visible = (r + 1) // op.attrs["ratio"]
+    valid = picks >= 0
+    if np.any(picks[valid] >= visible):
+        return False, f"it picks a position query {r} can't see yet"
+    if np.any(valid[1:] & ~valid[:-1]) or np.any(np.diff(picks[valid]) <= 0):
+        return False, "picks are ascending, with any -1 after them"
+    return gap_ok(x.row(op.ins[0], r), picks, len(picks))
+
+
+def choice_ds_candidates(op, x, r, row):
+    """deepseek.candidate_blocks for query r, as a 0/1 mask over the compressed tokens: whole blocks, at most
+    topk_blocks of them, none unreachable, the block of its newest visible position always, and the rest the best
+    blocks by their best score (candidate_gap)."""
+    a = op.attrs
+    blk, top = a["block"], a["topk_blocks"]
+    mask = np.asarray(row, dtype=np.float64)
+    if not np.all((mask == 0) | (mask == 1)):
+        return False, "a candidate mask is 0 or 1"
+    score = x.row(op.ins[0], r)
+    width = len(score)
+    nb = -(-width // blk)
+    pad = np.full(nb * blk, -np.inf)
+    pad[:width] = score
+    blocks = pad.reshape(nb, blk).max(1)
+    pinned = ((r + 1) // a["ratio"] - 1) // blk
+    if 0 <= pinned < nb:
+        blocks[pinned] = np.inf
+    m = np.zeros(nb * blk, dtype=bool)
+    m[:width] = mask == 1
+    kept = m.reshape(nb, blk).any(1)
+    if not np.array_equal(np.repeat(kept, blk)[:width], mask == 1):
+        return False, "the mask isn't whole blocks"
+    if kept.sum() > top or np.any(kept & (blocks == -np.inf)):
+        return False, f"it keeps more than {top} blocks, or one this query can't reach"
+    need = min(int((blocks > -np.inf).sum()), top)
+    if kept.sum() < need:
+        return False, f"it keeps {int(kept.sum())} blocks where {need} are open"
+    worst = blocks[kept].min() if kept.any() else np.inf
+    best = blocks[~kept].max() if (~kept).any() else -np.inf
+    if best > worst and best != -np.inf:
+        return False, "it leaves out a block scoring above one it keeps (or the pinned one)"
+    return True, ""
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
 EXACT = {"ds_round_fp8", "ds_round_fp4"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
@@ -596,6 +689,8 @@ def bf16_only(op, said: np.ndarray):
     return None
 
 
+CHOICES = {name[7:]: fn for name, fn in globals().items() if name.startswith("choice_ds_")}
 rf.OPS.update(OPS)
 rf.EXACT.update(EXACT)
+rf.CHOICES.update(CHOICES)
 rf.FORMATS.update({k: bf16_only for k in CAST})
