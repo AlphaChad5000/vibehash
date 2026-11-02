@@ -919,8 +919,10 @@ costs nothing. What the job has to record:
 - **Phases that slow miners can make.** A unit's deadline (`deadline`) assumes
   the slowest link the network takes (25 Mbit/s down, 10 up) and 1 ms a token a
   layer, about 4× §7's estimate. It doubles that, and is never under 10 minutes.
-  A claim past its deadline goes to another miner (`Line.expire`, tested). The
-  training unit kind sizes its phases the same way.
+  A prep round's compute phase ends sooner once every unit handed out is
+  committed (`Coordinator.prep_committed`), so fast miners don't wait out a slow
+  one's time. A claim past its deadline goes to another miner (`Line.expire`,
+  tested). The training unit kind sizes its phases the same way.
 - **The loss curve.** /network's job summary (`netstats.py`, from
   `store.job_rounds`) and the worker dashboard already show it for fine-tunes.
 - **What each worker manages.** `deepseek_top.Meter` gives a unit's seconds,
@@ -1027,7 +1029,8 @@ merge). [x] done, [ ] to do.
     bucket; the node reads it at the reveal and checks it names the unit's
     objects; two checkers replay the unit. The node signs links for a unit's own
     objects only, during compute (`Coordinator.may_sign`, the "sign" message);
-    the compute phase is the unit's deadline; `Line.summary` is the job
+    the compute phase is the unit's deadline, ending once every unit is
+    committed (`Coordinator.prep_committed`); `Line.summary` is the job
     summary's "prep" field. The last unit's round pins the root and writes the
     manifest. Tested end to end over HTTP (`tests/test_deepseek_network.py`).
   - [x] The DeepSeek training unit (`deepseek_unit.py`): records read from the

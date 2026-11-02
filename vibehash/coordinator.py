@@ -878,6 +878,18 @@ class Coordinator:
         r.commitments[key] = c
         r.record["commitments"].append(commitment_out(c))
 
+    @_locked
+    def prep_committed(self) -> bool:
+        """Whether a prep round's compute phase can end early: every unit handed out has its commitment. A miner commits
+        once its unit's outputs and commitment are in the bucket, so it has nothing left to do in the phase, which is
+        sized for the slowest miner (deepseek_graph.deadline). A round with no units handed out runs its full length.
+        Other rounds keep theirs: they're sized to the work, and a sharded job's teams trade edges during compute."""
+        r = self.r
+        if r is None or self.phase != Phase.COMPUTE or not r.prep:
+            return False
+        held = [(uid, a) for a, uids in r.assignments.items() for uid in uids]
+        return bool(held) and all(k in r.commitments for k in held)
+
     # --- 3. beacon + reveal -------------------------------------------------------------
 
     @_locked

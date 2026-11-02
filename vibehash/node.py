@@ -225,15 +225,18 @@ class Node:
         """Whether validators run this chain (else this node seals blocks alone)."""
         return bool(self.chain.state.validators)
 
-    def _wait(self, seconds: float, still=None) -> bool:
-        """Sleep through a phase. False if we're stopping, or `still()` turns false (the round's no longer wanted)."""
+    def _wait(self, seconds: float, still=None, done=None) -> bool:
+        """Sleep through a phase. False if we're stopping, or `still()` turns false (the round's no longer wanted).
+        `done()`: the phase's work is all in, so it ends now rather than when its time runs out."""
         self.phase_ends = end = time.time() + seconds
-        if still is None:
+        if still is None and done is None:
             return not self.stopping.wait(seconds)
         while (left := end - time.time()) > 0:
-            if self.stopping.wait(min(left, 0.2)) or not still():
+            if self.stopping.wait(min(left, 0.2)) or (still is not None and not still()):
                 return False
-        return still()
+            if done is not None and done():
+                break
+        return still() if still is not None else not self.stopping.is_set()
 
     def _evidence(self) -> set[str]:
         """Checkpoints and dispute evidence recent rounds' records point to (storage.record_blobs), kept for
@@ -349,8 +352,11 @@ class Node:
         c.start_compute()
         log.info("  %d workers registered; %d units assigned, %d unassigned", len(c.r.regs),
                  sum(len(v) for v in c.r.assignments.values()), c.r.unassigned)
-        for step, wait in ((c.start_reveal, t.compute_s), (c.start_verify, t.reveal_s), (None, t.verify_s)):
-            if not self._wait(wait, still):
+        # A prep round's compute phase is a unit's deadline (deepseek_graph.deadline: ten minutes at least, for the slowest
+        # miner the network takes), so it ends once every unit handed out is committed (Coordinator.prep_committed).
+        for step, wait, done in ((c.start_reveal, t.compute_s, c.prep_committed), (c.start_verify, t.reveal_s, None),
+                                 (None, t.verify_s, None)):
+            if not self._wait(wait, still, done):
                 return False
             if step:
                 step()

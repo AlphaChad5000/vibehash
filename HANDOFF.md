@@ -115,6 +115,12 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 
 ## Current state
 
+**Unreleased: a prep round ends its compute phase once every unit is committed.** The phase is a unit's deadline,
+never under 10 minutes (deepseek_graph.deadline), and it used to run out in full, so a round took about 660 s however
+fast its miners were. Now the node goes on to the reveal as soon as every unit handed out is committed
+(Coordinator.prep_committed); a unit still out keeps the full time. Only the node needs it: miners already poll.
+
+
 **Release 0.5.6 (2026-11-02): prep pieces stay with their miners.** A prep round now takes ready units a piece at a
 time (round robin), and each piece goes first to the miners it stands with by rendezvous hashing (coordinator._spread,
 _affinity). So a miner fetches the few pieces it's given once, instead of every 29.6 GB piece in turn, which needed

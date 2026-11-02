@@ -1,10 +1,12 @@
 """Each job's rounds are as long as its size needs, so a modest computer on a home connection can still download,
 train and upload a unit of a big model in time. And records made before a rule existed still replay."""
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from vibehash.coordinator import CoordinatorConfig
+from vibehash.coordinator import Coordinator, CoordinatorConfig, Phase
 from vibehash.crypto import KeyPair
 from vibehash.ledger import Chain
 from vibehash.model import ModelSpec
@@ -71,6 +73,56 @@ class PhaseLengthTests(unittest.TestCase):
         self.assertGreater(longer.compute_s, 20)
         self.assertGreater(longer.round_s, same.round_s)
         self.assertEqual(longer.register_s, 3)
+
+
+class PrepComputeTests(unittest.TestCase):
+    """A prep round's compute phase is a unit's deadline, ten minutes at least for the slowest miner the network takes:
+    it ends once every unit handed out is committed, not when the time runs out."""
+
+    def round(self, assignments, committed, prep=True, phase=Phase.COMPUTE):
+        units = {u for us in assignments.values() for u in us}
+        r = SimpleNamespace(prep={u: f"layers-00-03-c{i:05d}" for i, u in enumerate(sorted(units))} if prep else {},
+                            assignments=assignments, commitments=dict.fromkeys(committed))
+        return SimpleNamespace(lock=threading.Lock(), phase=phase, r=r)
+
+    def test_it_ends_once_every_unit_handed_out_is_committed(self):
+        given = {"a": ["u0", "u1"], "b": ["u2"]}
+        done = lambda *keys: Coordinator.prep_committed(self.round(given, keys))  # noqa: E731
+        self.assertFalse(done())
+        self.assertFalse(done(("u0", "a"), ("u2", "b")), "one of a's units isn't in")
+        self.assertTrue(done(("u0", "a"), ("u1", "a"), ("u2", "b")))
+        self.assertFalse(Coordinator.prep_committed(self.round({}, [])), "nothing handed out: the full phase")
+        self.assertFalse(Coordinator.prep_committed(self.round({"a": ["u0"]}, [("u0", "a")], prep=False)),
+                         "other rounds keep their phases")
+        self.assertFalse(Coordinator.prep_committed(self.round({"a": ["u0"]}, [("u0", "a")], phase=Phase.REVEAL)))
+
+    def test_the_node_goes_on_to_the_reveal(self):
+        def run(committed: bool, compute_s: float) -> tuple[float, list[str]]:
+            t, steps = PhaseTimes(register_s=0, compute_s=compute_s, reveal_s=0, verify_s=0), []
+            c = SimpleNamespace(
+                lock=threading.Lock(), job=lambda j: SimpleNamespace(wire_dtype=None),
+                r=SimpleNamespace(round_no=1, job_id="j", start=None, regs={}, assignments={}, unassigned=0),
+                start_compute=lambda: steps.append("compute"), start_reveal=lambda: steps.append("reveal"),
+                start_verify=lambda: steps.append("verify"), start_disputes=lambda now: False,
+                prep_committed=lambda: committed)
+            node = SimpleNamespace(coord=c, blobs=SimpleNamespace(put_array=lambda a, d: None), times=t,
+                                   times_for=lambda job: t, stopping=threading.Event(), phase_ends=0.0)
+            node._wait = lambda *a: Node._wait(node, *a)
+            began = time.monotonic()
+            self.assertTrue(Node._run_round(node))
+            return time.monotonic() - began, steps
+        took, steps = run(True, 600)
+        self.assertLess(took, 5)
+        self.assertEqual(steps, ["compute", "reveal", "verify"])
+        took, _ = run(False, 0.6)
+        self.assertGreaterEqual(took, 0.6, "a unit still out: the phase runs its time")
+
+    def test_a_phase_with_its_work_in_still_stops_for_the_node(self):
+        node = SimpleNamespace(stopping=threading.Event(), phase_ends=0.0)
+        self.assertTrue(Node._wait(node, 600, done=lambda: True))
+        self.assertFalse(Node._wait(node, 600, still=lambda: False, done=lambda: False), "the round's no longer wanted")
+        node.stopping.set()
+        self.assertFalse(Node._wait(node, 600, done=lambda: False))
 
 
 class CapacityTests(unittest.TestCase):
