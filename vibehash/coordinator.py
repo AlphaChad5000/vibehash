@@ -879,16 +879,26 @@ class Coordinator:
         r.record["commitments"].append(commitment_out(c))
 
     @_locked
-    def prep_committed(self) -> bool:
-        """Whether a prep round's compute phase can end early: every unit handed out has its commitment. A miner commits
-        once its unit's outputs and commitment are in the bucket, so it has nothing left to do in the phase, which is
-        sized for the slowest miner (deepseek_graph.deadline). A round with no units handed out runs its full length.
-        Other rounds keep theirs: they're sized to the work, and a sharded job's teams trade edges during compute."""
+    def all_in(self) -> bool:
+        """Whether everything this phase waits for is in, so the node can end it before its time runs out (but never
+        sooner than its own length for the phase: Node._run_round). In compute, a commitment for every unit handed out
+        (a worker commits once its unit's checkpoints, or a prep unit's outputs, are uploaded, so it has nothing left to
+        do in the phase); in reveal, a reveal or a verdict for every commitment; in verify, a verdict on every task
+        someone was given (one nobody could be given never gets one). Nothing the record could hold comes in after
+        that: each is taken once, so a phase that ran its full time would record the same round. A phase with nothing to
+        wait for is all in at once, as in a round nobody was handed work in: nobody registered who fits, or a
+        fine-tune without its quorum (`waiting`). A sharded job's phases never are: its teams trade edges during
+        compute and send edge evidence during the reveal (submit_edge_evidence)."""
         r = self.r
-        if r is None or self.phase != Phase.COMPUTE or not r.prep:
+        if r is None or self.job(r.job_id).sharded:
             return False
-        held = [(uid, a) for a, uids in r.assignments.items() for uid in uids]
-        return bool(held) and all(k in r.commitments for k in held)
+        if self.phase == Phase.COMPUTE:
+            return all((uid, a) in r.commitments for a, uids in r.assignments.items() for uid in uids)
+        if self.phase == Phase.REVEAL:
+            return all(k in r.reveals or k in r.results for k in r.commitments)
+        if self.phase == Phase.VERIFY:
+            return all(t.verdict is not None for t in r.tasks.values() if t.verifier)
+        return False
 
     # --- 3. beacon + reveal -------------------------------------------------------------
 

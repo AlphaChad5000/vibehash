@@ -107,7 +107,7 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
   - The simulator's `_proposer` picks only staked workers.
   - Also fixed: `apply_block` now refuses a second genesis block appended to a chain, which previously re-applied the allocations.
   - Tests: `tests/test_earn_in.py`.
-- **Round length follows the job (2026-10-29).** `TrainingJob.phase_lengths()` sizes compute, reveal and verify so a reference machine (`tasks.REF_FLOPS` 2 GFLOP/s, `REF_UPLOAD` 20 Mbit/s, `REF_DOWNLOAD` 100 Mbit/s) can download the weights, train a unit and upload its checkpoints. An optional job field `compute_s` (5–3600) asks for a longer compute phase; it's omitted from specs when 0, so old job specs are byte-identical. `Node.times_for(job)` uses the longer of the node's phases and the job's. `Coordinator.timing` writes the round's compute seconds into `record["rules"]["compute_s"]`, which capacity uses. `Engine(propose_wait=...)` makes validators wait as long as the longest funded job's round. **A replay now copies the recorded rules verbatim:** before, it rebuilt them from today's config, so adding `max_newcomers` would have made every older record hash differently and fail `chain verify` (test: `test_round_length.py`).
+- **Round length follows the job (2026-10-29).** `TrainingJob.phase_lengths()` sizes compute, reveal and verify so a reference machine (`tasks.REF_FLOPS` 2 GFLOP/s, `REF_UPLOAD` 20 Mbit/s, `REF_DOWNLOAD` 100 Mbit/s) can download the weights, train a unit and upload its checkpoints. An optional job field `compute_s` (5–3600) asks for a longer compute phase; it's omitted from specs when 0, so old job specs are byte-identical. `Node.times_for(job)` uses the longer of the node's phases and the job's, at most: a phase ends once everything it waits for is in (`Coordinator.all_in`), never sooner than the node's own length for it, so a round nobody works in lasts the node's own round and none is shorter (2026-11-02). `Coordinator.timing` writes the round's compute seconds into `record["rules"]["compute_s"]`, which capacity uses. `Engine(propose_wait=...)` makes validators wait as long as the longest funded job's round. **A replay now copies the recorded rules verbatim:** before, it rebuilt them from today's config, so adding `max_newcomers` would have made every older record hash differently and fail `chain verify` (test: `test_round_length.py`).
 - **Jobs with budget left take turns, one round each** (`Coordinator.active_job_id`). Before 2026-10-29 it was first come, first served, so a new job waited for every earlier job to spend its budget.
 - **Job posters can get their model back.** `GET /job/<id>` reports each round's validation loss/accuracy (SQLite `job_rounds`, written when a round is sealed) and the model's size and sha256; `GET /job/<id>/model?offset=` serves the weights. They're public, because workers receive them every round anyway.
 - **A replay must match the segment's own update to within 1% (`UPDATE_TOLERANCE`), not just the job's `tolerance`.** For big or nearly trained models one segment's whole update can be smaller than the tolerance, and then a worker who resubmits its start weights untrained (the `freezer` test cheat) would pass. Replica comparisons use the same `reproduces()` rule.
@@ -115,10 +115,21 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
 
 ## Current state
 
-**Unreleased: a prep round ends its compute phase once every unit is committed.** The phase is a unit's deadline,
-never under 10 minutes (deepseek_graph.deadline), and it used to run out in full, so a round took about 660 s however
-fast its miners were. Now the node goes on to the reveal as soon as every unit handed out is committed
-(Coordinator.prep_committed); a unit still out keeps the full time. Only the node needs it: miners already poll.
+**Unreleased: a phase ends once its work is in, and a round nobody works in lasts the node's own 38 s.** On the
+public node the DeepSeek pilot, which nobody mines, took 1,521 s a round (its phases are a prep unit's deadline and
+its checks', never under 10 minutes), alternating with fruit-demo's 39 s ones: a newcomer earning its stake on
+fruit-demo got a paid round every 26 minutes. Now compute, reveal and verify each end as soon as everything they wait
+for is in (Coordinator.all_in: every unit handed out committed, every commitment revealed, every task answered), but
+never sooner than the node's own length for the phase (Node._run_round). So a round in which nothing was handed out
+(nobody registered who fits, or a fine-tune short of its quorum) lasts exactly the node's own round, and the pilot's
+empty rounds take 38 s; a unit or verdict still out keeps the job's full time. No round is shorter than the node's
+own, so a chain nobody mines still seals a block every 38 s, not every few seconds, and the mainnet halvings keep
+their timing. Records, blocks and replays are unchanged: rules.compute_s is still the job's, and nothing more can come
+in once a phase is all in. Only the node needs it: workers already poll. Expected on the public node, with nobody on
+the pilot: fruit-demo and the pilot alternate at about 39 s each, so a fruit-demo round every 78 s or so (20 times
+as often); a qwen3-0.6b fine-tune's round (264 s at 192 tokens) ends once its 8 units, reveals and checks are in,
+however fast that is. This folds in the commit before it, which ended a prep round's compute phase once every unit
+was committed (then Coordinator.prep_committed, with no floor).
 
 
 **Release 0.5.6 (2026-11-02): prep pieces stay with their miners.** A prep round now takes ready units a piece at a

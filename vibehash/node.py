@@ -126,7 +126,8 @@ class PhaseTimes:
 
     @property
     def round_s(self) -> float:
-        """The longest a round can take: validators wait for a proposal accordingly (_propose_wait)."""
+        """The longest a round can take: validators wait for a proposal accordingly (_propose_wait). A node's own
+        (Node.times) is also the shortest any of its rounds takes (Node._run_round)."""
         return self.register_s + self.compute_s + self.reveal_s + self.verify_s + self.dispute_s
 
 
@@ -225,16 +226,18 @@ class Node:
         """Whether validators run this chain (else this node seals blocks alone)."""
         return bool(self.chain.state.validators)
 
-    def _wait(self, seconds: float, still=None, done=None) -> bool:
+    def _wait(self, seconds: float, still=None, done=None, least: float = 0.0) -> bool:
         """Sleep through a phase. False if we're stopping, or `still()` turns false (the round's no longer wanted).
-        `done()`: the phase's work is all in, so it ends now rather than when its time runs out."""
-        self.phase_ends = end = time.time() + seconds
+        `done()`: the phase's work is all in, so it ends then rather than when its time runs out, though not before
+        `least` seconds. /status's `phase_ends` stays the latest it can end: nobody it waits for is cut short."""
+        began = time.time()
+        self.phase_ends = end = began + seconds
         if still is None and done is None:
             return not self.stopping.wait(seconds)
         while (left := end - time.time()) > 0:
             if self.stopping.wait(min(left, 0.2)) or (still is not None and not still()):
                 return False
-            if done is not None and done():
+            if done is not None and time.time() - began >= least and done():
                 break
         return still() if still is not None else not self.stopping.is_set()
 
@@ -332,31 +335,45 @@ class Node:
 
     def _propose_wait(self) -> float:
         """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
-        own rounds the longest job with budget left runs, since its leader may be running that one."""
+        own rounds the longest job with budget left runs, since its leader may be running that one. It's the most a
+        round can take: one that ends sooner (_run_round) is proposed sooner, and voted on as soon as it comes."""
         s = self.chain.state
         longest = max((self.times_for(s.job(j)).round_s for j, v in s.escrow.items() if v > 0), default=0.0)
         return self.engine.timeouts.propose + 1.5 * max(0.0, longest - self.times.round_s)
 
     def _run_round(self, still=None) -> bool:
         """Drive an open round through its phases. False if it was given up: we're stopping, or `still()` says the
-        round's no longer wanted (another block was decided at its height)."""
-        c = self.coord
+        round's no longer wanted (another block was decided at its height).
+
+        How long the phases last. Registration: this node's own length (self.times). Compute, reveal and verify: at
+        least this node's own length for each, and at most the round's (times_for: longer where the job needs it, as
+        for a big model's transfers or a DeepSeek prep unit's deadline, ten minutes at least), ending in between as soon
+        as everything the phase waits for is in (Coordinator.all_in: every unit handed out committed, every commitment
+        revealed, every task answered). So a round in which nothing was handed out (nobody registered who fits, or a
+        fine-tune short of its quorum) lasts exactly this node's own round, 38 s by default, however long the job's
+        are: the DeepSeek pilot's took 1,521 s with nobody mining it. Never less, though there's nothing to wait for:
+        any job with budget keeps rounds coming (_has_work), so a chain nobody mines would otherwise seal a block every
+        few seconds, and the mainnet schedule's halvings are timed by blocks of the default round
+        (economics.MAINNET_BLOCK_S). Nothing in a round's record or block but its timestamp depends on when a phase
+        ended: the compute seconds capacity reads (record["rules"]["compute_s"], Coordinator.timing) are still the
+        job's, and nothing more can come in once a phase is all in."""
+        c, own = self.coord, self.times
         with c.lock:
             job = c.job(c.r.job_id)
             self.start_blob = self.blobs.put_array(c.r.start, job.wire_dtype)
         t = self.times_for(job)
-        longer = f" ({t.round_s:.0f} s rounds for its size)" if t.round_s > self.times.round_s + 0.5 else ""
+        longer = f" (up to {t.round_s:.0f} s rounds for its size)" if t.round_s > own.round_s + 0.5 else ""
         log.info("round %d open for job %s%s", c.r.round_no, c.r.job_id, longer)
         if not self._wait(t.register_s, still):
             return False
         c.start_compute()
-        log.info("  %d workers registered; %d units assigned, %d unassigned", len(c.r.regs),
-                 sum(len(v) for v in c.r.assignments.values()), c.r.unassigned)
-        # A prep round's compute phase is a unit's deadline (deepseek_graph.deadline: ten minutes at least, for the slowest
-        # miner the network takes), so it ends once every unit handed out is committed (Coordinator.prep_committed).
-        for step, wait, done in ((c.start_reveal, t.compute_s, c.prep_committed), (c.start_verify, t.reveal_s, None),
-                                 (None, t.verify_s, None)):
-            if not self._wait(wait, still, done):
+        held = sum(len(v) for v in c.r.assignments.values())
+        short = f"; nothing to wait for: a {own.round_s:.0f} s round" if longer and not held and not job.sharded else ""
+        log.info("  %d workers registered; %d units assigned, %d unassigned%s", len(c.r.regs), held, c.r.unassigned,
+                 short)
+        for step, least, most in ((c.start_reveal, own.compute_s, t.compute_s),
+                                  (c.start_verify, own.reveal_s, t.reveal_s), (None, own.verify_s, t.verify_s)):
+            if not self._wait(most, still, c.all_in, min(least, most)):
                 return False
             if step:
                 step()
@@ -828,7 +845,9 @@ class Node:
                     except (TypeError, IndexError, ValueError) as e:
                         raise WireError(f"a link request is [method, name, query]: {e}") from None
                     c.may_sign(addr, method, name, query)
-                    # A write's link dies with the compute phase it was for: nothing lands in a unit's objects after it.
+                    # A write's link dies when the compute phase it was for ends at the latest: one that ends
+                    # sooner, its units all committed (Coordinator.all_in), leaves it working to then (DEEPSEEK.md
+                    # §8's launch list).
                     left = max(1, int(self.phase_ends - time.time())) if method in ("PUT", "POST") else None
                     urls.append(self.bucket(method, f"{r.job_id}/{name}", {k: str(v) for k, v in query.items()},
                                             expires=left))
