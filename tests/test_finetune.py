@@ -25,7 +25,7 @@ from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair
 from vibehash.ledger import Chain, canonical
 from vibehash.model import Dataset, ModelSpec
-from vibehash.tasks import MAX_SPEC_BYTES, InvalidJob, TrainingJob, load_dataset
+from vibehash.tasks import MAX_SPEC_BYTES, REF_GPU_FLOPS, InvalidJob, TrainingJob, load_dataset
 from vibehash.verification import adam_impossible, rescale_update, reproduces
 
 try:
@@ -204,7 +204,7 @@ class SpecTests(unittest.TestCase):
         job = job_of()
         self.assertEqual(job.checkpoint_bytes, 4 * s.n_params)
         lengths = job.phase_lengths()
-        self.assertGreater(lengths["compute"], job.unit_flops / 5e12)  # a gaming GPU's rate, not the laptop CPU's
+        self.assertGreater(lengths["compute"], job.unit_flops / REF_GPU_FLOPS)  # a gaming GPU's rate, not a laptop CPU's
         self.assertLess(lengths["compute"], 600)
         self.assertGreater(ft.memory_mb(s, 8, 1_500_000_000), 2000)
 
@@ -1500,8 +1500,12 @@ class LiveNetworkTests(unittest.TestCase):
         from vibehash.node import PhaseTimes
         # Seven workers in one process take turns on a GPU (finetune._Runtime.busy): longer phases than the MLP tests'.
         # A dispute's move gets as long as the verify phase, and a defender may still be checking when its dispute opens.
+        # Without one (CI's runners), training op by op takes several times longer than these phases allow, and most
+        # units missed the compute phase: so phases are five times as long there.
+        slow = 1 if torch.cuda.is_available() else 5
         node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(
-            self, 7, times=PhaseTimes(register_s=1.0, compute_s=10.0, reveal_s=3.0, verify_s=15.0, idle_s=0.3))
+            self, 7, times=PhaseTimes(register_s=1.0, compute_s=10.0 * slow, reveal_s=3.0 * slow, verify_s=15.0 * slow,
+                                      idle_s=0.3))
         clients[-1].worker.verifier_behavior = "false_accuser"  # its rejections become disputes it loses
         wallets.save(req, d / "requester.json", None)
 
@@ -1520,7 +1524,7 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertIn("60 examples (60 chats", said)
         self.assertIn("Posted job chats-1", said)
 
-        run_until(node, clients, stop, 5, seconds=600)  # the job's block and four rounds (the first while workers join)
+        run_until(node, clients, stop, 5, seconds=600 * slow)  # the job's block and four rounds (the first: joining)
         info = api.get("/job/chats-1")
         spec = TrainingJob.from_spec_json(json.dumps(info["spec"]), "", 0).spec
         self.assertEqual(spec.repo, "tiny/qwen3")
