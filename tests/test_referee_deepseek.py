@@ -435,6 +435,41 @@ class BackwardOpTests(_OpCase):
         self.check("ds_moe_scores_bwd", ["l", "ds"], {"temp": cfg.gate_temp}, {"l": lg.detach(), "ds": dscf},
                    dlf, dlg, "moe_scores_bwd")
 
+    def test_sinkhorn_backward(self):
+        """The forward commits its iterates (ds_hc_split_trace); the backward, from them, matches autograd through
+        _sinkhorn_split, and its float32 passes the referee's bound, which carries each step's rounding through the
+        exact maps after it."""
+        cfg, st = self.cfg, self.state
+        hc, iters, eps, T = cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps, 5
+        sc, base = st["layers.1.hc_attn_scale"].double(), st["layers.1.hc_attn_base"].double()
+        m = (self.rnd(T, 24, s=2)).requires_grad_()
+        pre, post, comb = ds._sinkhorn_split(m, sc, base, hc, iters, eps)
+        d = self.rnd(T, 24)
+        gm, = torch.autograd.grad(torch.cat([pre, post, comb.flatten(-2)], -1), m, d)
+        mf, scf, bf, df = m.detach().float(), sc.float(), base.float(), d.float()
+        soft = (mf[:, 8:] * scf[2] + bf[8:]).view(T, hc, hc).softmax(-1)
+        cs = [soft + eps]
+        cs.append(cs[-1] / (cs[-1].sum(-2, keepdim=True) + eps))
+        for _ in range(iters - 1):
+            cs.append(cs[-1] / (cs[-1].sum(-1, keepdim=True) + eps))
+            cs.append(cs[-1] / (cs[-1].sum(-2, keepdim=True) + eps))
+        trace = torch.cat([soft.flatten(1)] + [c.flatten(1) for c in cs], 1)
+        attrs = {"scale": "layers.1.hc_attn_scale", "base": "layers.1.hc_attn_base", "hc": hc, "iters": iters, "eps": eps,
+                 "num": "f32"}
+        self.judge(mk("ds_hc_split_trace", "tr", ["m"], attrs, trace.shape, [m.shape]), {"m": m.detach()}, trace,
+                   "hc_split_trace")
+        dy = df[:, 8:].view(T, hc, hc)
+        kinds = ["col"] + ["row", "col"] * (iters - 1)
+        for t in reversed(range(len(kinds))):
+            dim = -1 if kinds[t] == "row" else -2
+            dy = (dy - (cs[t + 1] * dy).sum(dim, keepdim=True)) / (cs[t].sum(dim, keepdim=True) + eps)
+        dz = soft * (dy - (soft * dy).sum(-1, keepdim=True))
+        s0, s1 = torch.sigmoid(mf[:, :4] * scf[0] + bf[:4]), torch.sigmoid(mf[:, 4:8] * scf[1] + bf[4:8])
+        got = torch.cat([df[:, :4] * (s0 * (1 - s0)) * scf[0], (df[:, 4:8] * (2 * (s1 * (1 - s1)))) * scf[1],
+                         dz.flatten(1) * scf[2]], 1)
+        self.check("ds_hc_split_bwd", ["d", "m", "tr"], attrs, {"d": d, "m": m.detach(), "tr": trace}, got, gm,
+                   "hc_split_bwd")
+
     def test_attention(self):
         cfg, st = self.cfg, self.state
         T, H, hd, n, k, W = 90, cfg.n_heads, cfg.head_dim, 30, 3, 40

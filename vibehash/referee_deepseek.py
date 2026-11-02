@@ -350,7 +350,7 @@ def hc_split(m: np.ndarray, sc: np.ndarray, base: np.ndarray, hc: int, iters: in
     return rf._cat(pre, post, E(comb.v.reshape(-1), comb.e.reshape(-1)))
 
 
-def sinkhorn(k: E, iters: int, eps: float) -> E:
+def sinkhorn(k: E, iters: int, eps: float, steps: int | None = None) -> E:
     """The kernel's normalisations of a positive matrix k, columns first, then rows and columns iters - 1 times, each
     a / (sum + eps), with a bound that doesn't double at every step as elementwise bounds would.
 
@@ -371,7 +371,7 @@ def sinkhorn(k: E, iters: int, eps: float) -> E:
     tau = -np.log1p(-rf.gamma(n))  # a float sum of n positive terms
     rho = np.zeros((n, 2))  # [lo, hi] per row
     kap = np.zeros((n, 2))  # per column
-    for step in ["col"] + ["row", "col"] * (iters - 1):
+    for step in (["col"] + ["row", "col"] * (iters - 1))[:steps]:  # (steps: only the first so many, for the trace)
         mat, own, other = (a, rho, kap) if step == "row" else (a.T, kap, rho)
         s = np.array([math_fsum(r) for r in mat])
         w = mat / s[:, None]
@@ -976,6 +976,115 @@ def op_ds_attn_dkv(op, x, r, c0, c1):
            np.where(np.arange(len(coef)) % 2 == 0, rf.U * np.abs(coef * c), 0.0))  # scale · dS, rounded
     y = rf.contract(E(ce.v[None], ce.e[None]), np.array(rows).T)[0]
     return _acc(op, x, r, c0, c1, y, 4)
+
+# --- Sinkhorn's backward ----------------------------------------------------------------------------------------------
+# The forward commits its iterates (ds_hc_split_trace: the softmax, then every normalised matrix), so the backward is
+# a chain of linear maps of exactly known coefficients. Each float32 step adds a rounding error; the error at the end
+# is exactly the sum of each step's error carried through the remaining maps, whose product is computed here in
+# float64 and taken in absolute value: no doubling at every step, as elementwise bounds would give.
+
+def op_ds_hc_split_trace(op, x, r, c0, c1):
+    """The forward of _sinkhorn_split's comb, all of it: [softmax (hc·hc) | c0 = softmax + eps | each normalised
+    matrix after it, 2·iters - 1 of them], row-major, in num.hi. ins (mixes); attrs scale, base, hc, iters, eps."""
+    a = op.attrs
+    hc, e32 = a["hc"], rf.f32(a["eps"])
+    m, sc, base = E(x.row(op.ins[0], r)), vec(x, a["scale"]), vec(x, a["base"])
+    z = rf.add(rf.scale(m[2 * hc:], rf.f32(sc[2])), E(base[2 * hc:]))
+    z = E(z.v.reshape(hc, hc), z.e.reshape(hc, hc))
+    top = E(z.v.max(-1, keepdims=True), z.e.max(-1, keepdims=True))
+    ex = rf.exp(rf.sub(z, top))
+    soft = rf.div(ex, _sum(ex, 1))
+    k = rf.add(soft, E(e32))
+    out = [soft, k] + [sinkhorn(k, a["iters"], e32, steps=n) for n in range(1, 2 * a["iters"])]
+    v = np.concatenate([t.v.reshape(-1) for t in out])
+    e = np.concatenate([t.e.reshape(-1) for t in out])
+    return E(v[c0:c1], e[c0:c1])
+
+
+def _line_map(a: np.ndarray, y: np.ndarray, eps: float, rows: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The backward of y = a / (Σa + eps) along rows (or columns) of an hc×hc matrix, as a 16×16 matrix acting on the
+    flattened gradient: da_i = (dy_i - Σ_j y_j · dy_j) / S per line, S = Σ_line a + eps. Also S per element."""
+    n = a.shape[0]
+    L, S = np.zeros((n * n, n * n)), np.zeros(n * n)
+    for line in range(n):
+        idx = [line * n + j for j in range(n)] if rows else [j * n + line for j in range(n)]
+        s = math_fsum(a.reshape(-1)[idx]) + eps
+        for i in idx:
+            S[i] = s
+            for j in idx:
+                L[i, j] = ((1.0 if i == j else 0.0) - y.reshape(-1)[j]) / s
+    return L, S
+
+
+def sinkhorn_backward(dcomb: np.ndarray, trace: np.ndarray, hc: int, iters: int, eps: float) -> E:
+    """d(softmax input) for comb's gradient `dcomb` (flattened hc·hc), given the forward's committed iterates `trace`
+    ([softmax, c0, c1, ..., c_last], each hc·hc). Steps, from the last: da = (dy - Σ y·dy) / S per line (S from the
+    iterate before it), through the first column step; then through + eps (the identity) and the softmax:
+    dz = y_s · (dy - Σ y_s·dy) per row. Each step in float32 rounds: Σ y·dy (a sum of products), dy - δ, and / S (S
+    itself a rounded sum); the bound carries each step's rounding through the exact maps after it."""
+    n2 = hc * hc
+    its = trace.reshape(-1, n2)  # [softmax, c0, c1, ..., c_last]
+    soft, cs = its[0], its[1:]
+    kinds = ["col"] + ["row", "col"] * (iters - 1)
+    maps, steps = [], []
+    for t in reversed(range(len(kinds))):  # step t takes cs[t] to cs[t + 1]
+        L, S = _line_map(cs[t].reshape(hc, hc), cs[t + 1].reshape(hc, hc), eps, kinds[t] == "row")
+        maps.append(L)
+        steps.append(("line", cs[t + 1], S, kinds[t] == "row"))
+    Ls = np.zeros((n2, n2))  # the softmax's backward, per row
+    for row in range(hc):
+        idx = range(row * hc, (row + 1) * hc)
+        for i in idx:
+            for j in idx:
+                Ls[i, j] = soft[i] * ((1.0 if i == j else 0.0) - soft[j])
+    maps.append(Ls)
+    steps.append(("soft", soft, None, True))
+    v = np.asarray(dcomb, dtype=np.float64)
+    vs, errs, carried = [v], [], []  # exact values, each step's rounding bound, and the maps after each step
+    err_now = np.zeros(n2)
+    for L, (kind, y, S, rows) in zip(maps, steps):
+        lines = [list(range(i * hc, (i + 1) * hc)) if rows else list(range(i, n2, hc)) for i in range(hc)]
+        big = np.abs(v) + err_now  # |the float input| at most
+        eb = np.zeros(n2)
+        for idx in lines:
+            ys = np.abs(y[idx])
+            dsum = math_fsum(ys * big[idx]) * (1 + 2 * rf.gamma(hc + 1))
+            delta_err = rf.gamma(hc + 1) * dsum  # Σ y·dy: hc products and their sum
+            for i in idx:
+                diff = big[i] + dsum
+                if kind == "line":
+                    s = S[i]
+                    s_err = rf.gamma(hc + 1) * s  # S = Σa + eps, rounded
+                    eb[i] = (delta_err + rf.U * diff) / s + (diff * (1 + rf.U)) * s_err / (s * (s - s_err)) + rf.U * diff / s
+                else:
+                    eb[i] = abs(y[i]) * (delta_err + rf.U * diff) + rf.U * abs(y[i]) * diff
+        v = L @ v
+        carried = [L @ c for c in carried] + [np.eye(n2)]
+        errs.append(eb)
+        err_now = sum(np.abs(c) @ e for c, e in zip(carried, errs))
+        vs.append(v)
+    return E(v, err_now * (1 + 1e-9))  # (and float64's own rounding of the exact chain)
+
+
+def op_ds_hc_split_bwd(op, x, r, c0, c1):
+    """_sinkhorn_split's backward to the mixes [24]: pre's through σ' (dpre · σ(1 - σ) · scale0), post's
+    (dpost · 2σ(1 - σ) · scale1), comb's through every normalisation and the softmax (sinkhorn_backward) times
+    scale2. ins (dsplit [T, 24], mixes, trace [T, 16 · (2·iters + 1)]); attrs scale, base, hc, iters, eps."""
+    a = op.attrs
+    hc, e32 = a["hc"], rf.f32(a["eps"])
+    d, m = x.row(op.ins[0], r), x.row(op.ins[1], r)
+    sc, base = vec(x, a["scale"]), vec(x, a["base"])
+
+    def through_sigmoid(lo, hi, k, two):
+        z = rf.add(rf.scale(E(m[lo:hi]), rf.f32(sc[k])), E(base[lo:hi]))
+        s = sigmoid(z)
+        g = rf.mul(E(d[lo:hi]), rf.mul(s, rf.sub(E(1.0), s)))
+        return rf.scale(rf.scale(g, 2.0) if two else g, rf.f32(sc[k]))
+    dpre = through_sigmoid(0, hc, 0, False)
+    dpost = through_sigmoid(hc, 2 * hc, 1, True)
+    dz = sinkhorn_backward(d[2 * hc:], x.row(op.ins[2], r), hc, a["iters"], e32)
+    dcomb = rf.scale(dz, rf.f32(sc[2]))
+    return rf._cat(dpre, dpost, dcomb)[c0:c1]
 
 # --- choices: judged by whole rows (referee.CHOICES), exactly, against the committed scores ----------------------------
 # A choice is a function of scores the state already holds, and those were judged in their own op (within their
