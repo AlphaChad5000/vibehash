@@ -57,7 +57,7 @@ import json
 import math
 import os
 import shutil
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -68,16 +68,15 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from . import settings
+from .deepseek_config import (BLOCK, COMMIT, IMAGE_ONLY, LORA_MODULES, LORA_TARGETS, REPO, Config,  # noqa: F401
+                              EngramLayout, _is_prime)  # (re-exported: ds.Config, ds.REPO ...)
 
-REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
-COMMIT = "314113f8a7dadb388215396ba5fbee2c610a04d6"  # the weights and reference code this was checked against
 
-BLOCK = 32  # one scale per 32x32 block of an FP8 matrix, per 32 inputs of an FP4 one, per 32 activations
 FP8_MAX, FP4_MAX = 448.0, 6.0
 # E2M1 values by 4-bit code: the low three bits the magnitude, the high one the sign (convert.py's FP4_TABLE).
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
-SCORE_FUNCS = ("softmax", "sigmoid", "sqrtsoftplus")
-IMAGE_ONLY = (".gate.bias_vl",)  # checkpoint tensors only image tokens use
+HEAD_CHUNK = 512  # positions whose logits are made at once
+VOCAB_CHUNK = 8192  # head rows cast to float32 at once: 168 MB of DeepSeek-V4.1's
 
 
 def configure_torch() -> None:
@@ -94,144 +93,6 @@ def configure_torch() -> None:
 
 
 # --- the shape -----------------------------------------------------------------------------------------------------
-
-# config.json's text_config names, where they differ from the reference's (inference/config.json's).
-_HF_NAMES = {"hidden_size": "dim", "moe_intermediate_size": "moe_inter_dim", "num_hidden_layers": "n_layers",
-             "num_attention_heads": "n_heads", "qk_rope_head_dim": "rope_head_dim", "rms_norm_eps": "norm_eps",
-             "num_experts_per_tok": "n_activated_experts", "scoring_func": "score_func",
-             "routed_scaling_factor": "route_scale", "sliding_window": "window_size",
-             "kv_source_layer_ids": "kv_source_layers", "index_source_layer_ids": "index_source_layers",
-             "candidate_source_layer_id": "candidate_source_layer", "engram_pad_token_id": "engram_pad_id"}
-
-
-@dataclass(frozen=True)
-class Config:
-    """The model's shape. Field names and defaults are the reference's ModelArgs, so inference/config.json loads with
-    from_dict and the defaults are its small 5-layer test model; flash() is the real one, and from_hf reads the
-    Hub's config.json. Fields of ModelArgs this doesn't use (vision, MTP/DSpark, runtime limits) are left out."""
-    vocab_size: int = 129280
-    dim: int = 1024
-    moe_inter_dim: int = 1024
-    n_layers: int = 5
-    n_heads: int = 16
-    n_routed_experts: int = 8
-    n_shared_experts: int = 1
-    n_activated_experts: int = 2
-    score_func: str = "sqrtsoftplus"
-    gate_temp: float = 1.0
-    norm_topk_prob: bool = True
-    route_scale: float = 1.0
-    swiglu_limit: float = 0.0
-    q_lora_rank: int = 256
-    head_dim: int = 128
-    rope_head_dim: int = 32
-    norm_eps: float = 1e-20
-    o_groups: int = 8
-    o_lora_rank: int = 256
-    window_size: int = 128
-    compress_ratios: tuple[int, ...] = (0, 2, 2, 1, 1, 0)  # one per layer (MTP layers' too): 0 = window only
-    kv_source_layers: tuple[int, ...] = (1, 3)
-    index_source_layers: tuple[int, ...] = (1, 3)
-    compress_rope_theta: float = 40000.0
-    original_seq_len: int = 0  # > 0 turns on YaRN, in the layers that compress
-    rope_theta: float = 10000.0
-    rope_factor: float = 40
-    beta_fast: int = 32
-    beta_slow: int = 1
-    index_n_heads: int = 16
-    index_head_dim: int = 64
-    index_topk: int = 64
-    candidate_source_layer: int = -1  # < 0: no candidate blocks
-    candidate_topk_blocks: int = 0
-    candidate_block_size: int = 0
-    hc_mult: int = 4
-    hc_sinkhorn_iters: int = 20
-    hc_eps: float = 1e-6
-    engram_layer_ids: tuple[int, ...] = ()
-    engram_num_embeddings: tuple[int, ...] = ()  # table rows per engram layer: the sum of its bucket primes
-    engram_max_ngram_size: int = 1
-    engram_vocab_size: int = 0  # where each (n-gram size, head)'s search for its bucket prime starts
-    engram_n_heads: int = 0
-    engram_head_dim: int = 0
-    engram_pad_id: int = 2  # the token that fills n-gram slots before the sequence starts
-    engram_compressed_vocab_size: int = 0  # every hash multiplier derives from it
-    dtype: str = "fp8"  # how the checkpoint stores matrices; only DeepSeek's own formats are read
-    expert_dtype: str = "fp4"
-
-    def __post_init__(self):
-        def need(ok, what):
-            if not ok:
-                raise ValueError(f"unsupported DeepSeek-V4.1 shape: {what}")
-        need(self.dtype == "fp8" and self.expert_dtype == "fp4", "weights stored other than as FP8 with FP4 experts")
-        need(self.score_func in SCORE_FUNCS, f"score_func {self.score_func!r}")
-        need(self.n_shared_experts == 1, "a shared expert count other than 1")
-        need(len(self.compress_ratios) >= self.n_layers, "fewer compress_ratios than layers")
-        for name in ("dim", "q_lora_rank", "head_dim", "moe_inter_dim", "index_head_dim", "o_lora_rank"):
-            need(getattr(self, name) % BLOCK == 0, f"{name} not a multiple of {BLOCK} (the quantisation block)")
-        need(self.n_heads * self.head_dim % (self.o_groups * BLOCK) == 0, "heads that don't split into o_groups")
-        need(self.rope_head_dim % 2 == 0 and self.rope_head_dim <= self.head_dim, "rope_head_dim")
-        kv = ix = None
-        for i in range(self.n_layers):
-            if i in self.kv_source_layers:
-                kv = self.compress_ratios[i]
-            if i in self.index_source_layers:
-                ix = kv
-            if self.compress_ratios[i]:
-                need(kv == self.compress_ratios[i] and ix == kv,
-                     f"layer {i} compresses but no kv and index source at or before it has its ratio")
-        if self.engram_layer_ids:
-            need(len(self.engram_num_embeddings) == len(self.engram_layer_ids), "engram_num_embeddings")
-            need(self.engram_max_ngram_size >= 2 and self.engram_head_dim % BLOCK == 0, "engram n-grams or head_dim")
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Config":
-        """From the reference's own config (inference/config.json): its keys are these fields' names; others ignored."""
-        names = {f.name for f in fields(cls)}
-        return cls(**{k: tuple(v) if isinstance(v, list) else v for k, v in d.items() if k in names})
-
-    @classmethod
-    def from_hf(cls, config: dict) -> "Config":
-        """From the Hub's config.json (transformers' deepseek_v41, its shape in text_config)."""
-        text = config.get("text_config", config)
-        for key, want in (("hidden_act", "silu"), ("topk_method", "noaux_tc"), ("num_key_value_heads", 1)):
-            if text.get(key, want) != want:
-                raise ValueError(f"unsupported DeepSeek-V4.1 shape: {key} {text[key]!r}")
-        d = {_HF_NAMES.get(k, k): v for k, v in text.items()}
-        rope = text.get("rope_scaling") or {}
-        if rope.get("rope_type") == "yarn":
-            d.update(rope_factor=rope["factor"], beta_fast=rope["beta_fast"], beta_slow=rope["beta_slow"],
-                     original_seq_len=rope["original_max_position_embeddings"])
-        return cls.from_dict(d)
-
-    @classmethod
-    def flash(cls) -> "Config":
-        """DeepSeek-V4.1-Flash, as inference/config.json at COMMIT has it."""
-        return cls(dim=5120, moe_inter_dim=2304, n_layers=40, n_heads=64, n_routed_experts=384, n_activated_experts=6,
-                   route_scale=1.5, swiglu_limit=10.0, q_lora_rank=1280, head_dim=512, rope_head_dim=64, o_lora_rank=1024,
-                   compress_ratios=(0, 0) + (2,) * 18 + (1,) * 20 + (0, 0, 0), kv_source_layers=(2, 8, 14, 20),
-                   index_source_layers=(2, 8, 14, 20, 24, 28, 32, 36), compress_rope_theta=160000,
-                   original_seq_len=65536, rope_theta=10000, rope_factor=16, index_n_heads=32, index_head_dim=128,
-                   index_topk=512, candidate_source_layer=20, candidate_topk_blocks=2048, candidate_block_size=8,
-                   engram_layer_ids=(1, 14), engram_num_embeddings=(384006168, 384016682), engram_max_ngram_size=4,
-                   engram_vocab_size=16000000, engram_n_heads=8, engram_head_dim=256, engram_compressed_vocab_size=99092)
-
-    def ratio(self, layer: int) -> int:
-        return self.compress_ratios[layer]
-
-    def source(self, layer: int, kind: str) -> int | None:
-        """The layer whose compressed keys and index keys (kind "kv") or picks (kind "index") `layer` uses: the last
-        kv or index source at or before it."""
-        sources = self.kv_source_layers if kind == "kv" else self.index_source_layers
-        return max((i for i in sources if i <= layer), default=None)
-
-    def rope_args(self, layer: int) -> tuple:
-        """(dim, original_seq_len, base, factor, beta_fast, beta_slow) of a layer's rotary table: compressing layers
-        use compress_rope_theta and YaRN, window-only ones the plain rope_theta."""
-        if self.ratio(layer):
-            return self.rope_head_dim, self.original_seq_len, self.compress_rope_theta, self.rope_factor, \
-                self.beta_fast, self.beta_slow
-        return self.rope_head_dim, 0, self.rope_theta, self.rope_factor, self.beta_fast, self.beta_slow
-
 
 @dataclass(frozen=True)
 class Numerics:
@@ -433,8 +294,8 @@ class _FrozenMatmul(torch.autograd.Function):
     def backward(ctx, dy):
         weight, scale = ctx.saved_tensors
         w = _dequant_on(weight, scale, dy)
-        if ctx.groups == 1:
-            return dy @ w, None, None, None
+        if ctx.groups == 1:  # dy · W, as a linear with Wᵀ laid out row by row: 35x faster than dy @ w on a CPU
+            return F.linear(dy, w.t().contiguous()), None, None, None
         return torch.einsum("...gr,grd->...gd", dy, w.view(ctx.groups, -1, w.size(1))), None, None, None
 
 
@@ -514,11 +375,16 @@ class Dense(nn.Module):
 class QLinear(nn.Module):
     """A frozen quantised projection, held as stored: `weight` is FP8 E4M3 [out, in] (or with fp4, E2M1 packed in
     int8 [out, in/2]) and `scale` its ue8m0 scales. Its input is rounded to FP8 first, as the reference's FP8 and FP4
-    GEMMs take theirs."""
+    GEMMs take theirs.
+
+    `lora`, when set, is a LoRA adapter (A [rank, in], B [out, rank], scaling): the projection then adds
+    ((x·Aᵀ)·Bᵀ)·scaling, from its input before the FP8 rounding (the rounding is part of the frozen layer), in
+    num.hi, and rounds the sum to the activation dtype, which is what PEFT does with float32 adapters on a bf16
+    layer. It isn't part of the state dict: adapters are a job's, the layer DeepSeek's."""
 
     def __init__(self, inp: int, out: int, num: Numerics, device=None, fp4: bool = False, groups: int = 1):
         super().__init__()
-        self.num, self.groups = num, groups
+        self.num, self.groups, self.lora = num, groups, None
         if fp4:
             self.register_buffer("weight", torch.empty(out, inp // 2, dtype=torch.int8, device=device))
             self.register_buffer("scale", torch.empty(out, inp // BLOCK, dtype=torch.float8_e8m0fnu, device=device))
@@ -528,11 +394,19 @@ class QLinear(nn.Module):
                                                       device=device))
 
     def forward(self, x):
-        return self.matmul(self.num.fp8(x))
+        return self.adapt(self.matmul(self.num.fp8(x)), x)
 
     def matmul(self, x):
         """x · Wᵀ for an x already rounded."""
         return _FrozenMatmul.apply(x, self.weight, self.scale, self.groups)
+
+    def adapt(self, y, x):
+        """y, the projection of x, plus the adapter's share when there is one."""
+        if self.lora is None:
+            return y
+        a, b, scaling = self.lora
+        hi = self.num.hi
+        return (y.to(hi) + F.linear(F.linear(x.to(hi), a.to(hi)), b.to(hi)) * scaling).to(y.dtype)
 
 
 class Compressor(nn.Module):
@@ -652,10 +526,12 @@ class Indexer(nn.Module):
                 choices.candidates = candidate_blocks(score, visible, cfg.candidate_topk_blocks,
                                                       cfg.candidate_block_size)
         elif 0 <= cfg.candidate_source_layer < self.layer:
-            if choices.candidates is None:
+            if choices.candidates is not None:
+                score = score.masked_fill(~choices.candidates.to(score.device), -math.inf)
+            elif score.size(-1) > cfg.candidate_topk_blocks * cfg.candidate_block_size:
                 raise ValueError(f"layer {self.layer} picks inside layer {cfg.candidate_source_layer}'s candidate "
                                  "blocks: run that layer first, or pass its blocks in Choices.candidates")
-            score = score.masked_fill(~choices.candidates.to(score.device), -math.inf)
+            # else: no more blocks than the source keeps, so it keeps every one a query can reach: nothing to mask
         if choices.keep_scores:
             choices.scores[("picks", self.layer)] = score
         if picks is not None:
@@ -756,7 +632,7 @@ class Attention(nn.Module):
                 if self.indexer is not None:
                     side.index_k = self.indexer.keys(latent, ccos, csin)
                 side.compress_kv = num.fp4(_rope(latent, ccos, csin, num), 16, e4m3_scale=True)
-            comp = self._side(side, "compress_kv", (b, s // r))
+            comp = self._side(side, "compress_kv", (b, s // r)).to(x.dtype)  # FP4 values: exact in any dtype
             if self.indexer is not None:
                 picks = choices.picks.get(self.layer)
                 n = comp.size(1)
@@ -768,7 +644,7 @@ class Attention(nn.Module):
                     picks = x.new_empty(b, s, 0, dtype=torch.long)
                 elif picks is None or choices.keep_scores or (self.layer == cfg.candidate_source_layer
                                                               and choices.candidates is None):
-                    index_k = self._side(side, "index_k", (b, n))
+                    index_k = self._side(side, "index_k", (b, n)).to(x.dtype)
                     picks = self.indexer(x, qr, index_k, cos, sin, choices, picks)
                 choices.picks[self.layer] = side.picks = picks
             picks = self._side(side, "picks", (b, s))
@@ -802,7 +678,7 @@ class Expert(nn.Module):
 
     def forward(self, x, gate=None):
         xq, hi = self.num.fp8(x), self.num.hi
-        g, u = self.w1.matmul(xq).to(hi), self.w3.matmul(xq).to(hi)
+        g, u = self.w1.adapt(self.w1.matmul(xq), x).to(hi), self.w3.adapt(self.w3.matmul(xq), x).to(hi)
         if self.limit > 0:
             u, g = u.clamp(-self.limit, self.limit), g.clamp(max=self.limit)
         h = F.silu(g) * u
@@ -836,9 +712,18 @@ class MoE(nn.Module):
         return s.sigmoid() if cfg.score_func == "sigmoid" else F.softplus(s).sqrt()
 
     def forward(self, x, choices: Choices):
+        hi, shape = self.num.hi, x.shape
+        x = x.reshape(-1, self.cfg.dim)
+        chosen, gates = self.route(x, choices)
+        y = torch.zeros_like(x, dtype=hi)
+        for e, tok, slot in self.assignments(chosen):
+            y.index_add_(0, tok, self.experts[e](x[tok], gates[tok, slot, None]).to(hi))
+        return self.combine(y, x).view(shape)
+
+    def route(self, x, choices: Choices):
+        """x [tokens, dim] -> (chosen experts [tokens, k], their gates [tokens, k]): the committed choice if there
+        is one, else the biased scores' top-k (recorded in choices); the gates from the unbiased scores."""
         cfg, hi, k = self.cfg, self.num.hi, self.cfg.n_activated_experts
-        shape = x.shape
-        x = x.reshape(-1, cfg.dim)
         scores = self.scores(x)
         chosen = choices.experts.get(self.layer)
         if chosen is not None:
@@ -854,78 +739,26 @@ class MoE(nn.Module):
         gates = scores.gather(1, chosen)
         if cfg.norm_topk_prob and k > 1:
             gates = gates / (gates.sum(dim=-1, keepdim=True) + 1e-20)  # 1e-20, not norm_eps: as in training
-        gates = gates * cfg.route_scale
-        y = torch.zeros_like(x, dtype=hi)
-        flat = chosen.flatten()
-        order = torch.argsort(flat, stable=True)  # by expert, then by token, as torch.where(indices == e) lists them
-        start = 0
-        for e, n in enumerate(torch.bincount(flat, minlength=cfg.n_routed_experts).tolist()):
+        return chosen, gates * cfg.route_scale
+
+    def assignments(self, chosen) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+        """[(expert, its tokens, the slot each chose it in)], experts ascending, tokens ascending within each: the
+        order the routed experts' outputs are summed in, as torch.where(indices == e) lists them in the reference."""
+        k, flat = self.cfg.n_activated_experts, chosen.flatten()
+        order = torch.argsort(flat, stable=True)
+        out, start = [], 0
+        for e, n in enumerate(torch.bincount(flat, minlength=self.cfg.n_routed_experts).tolist()):
             if n:
-                tok, slot = order[start:start + n] // k, order[start:start + n] % k
-                y.index_add_(0, tok, self.experts[e](x[tok], gates[tok, slot, None]).to(hi))
+                out.append((e, order[start:start + n] // k, order[start:start + n] % k))
                 start += n
-        y = y + self.shared_experts(x).to(hi)
-        return y.to(x.dtype).view(shape)
+        return out
+
+    def combine(self, routed, x):
+        """The routed experts' sum (in num.hi) plus the shared expert's output on x, in the activation dtype."""
+        return (routed + self.shared_experts(x).to(self.num.hi)).to(x.dtype)
 
 
 # --- engram ----------------------------------------------------------------------------------------------------------
-
-def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin: these bases are exact for every n below 3.3e24."""
-    if n < 2:
-        return False
-    small = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-    for p in small:
-        if n % p == 0:
-            return n == p
-    d, r = n - 1, 0
-    while d % 2 == 0:
-        d, r = d // 2, r + 1
-    for a in small:
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(r - 1):
-            x = x * x % n
-            if x == n - 1:
-                break
-        else:
-            return False
-    return True
-
-
-@dataclass(frozen=True)
-class EngramLayout:
-    """Where n-grams land in the tables (the reference's EngramLayout and compute_hash_multipliers). Every (engram
-    layer, n-gram size, head) has its own range of rows, a prime number of them, drawn in order and never reused."""
-    primes: tuple[tuple[tuple[int, ...], ...], ...]  # [engram layer][n-gram size - 2][head]
-    multipliers: tuple[tuple[int, ...], ...]  # [engram layer][look-back]: odd, small enough not to overflow int64
-
-    @classmethod
-    @lru_cache(8)
-    def of(cls, cfg: Config) -> "EngramLayout":
-        primes, seen = [], set()
-        for _ in cfg.engram_layer_ids:
-            per_size = []
-            for _ in range(cfg.engram_max_ngram_size - 1):
-                sizes, p = [], cfg.engram_vocab_size - 1
-                for _ in range(cfg.engram_n_heads):
-                    p += 1
-                    while not _is_prime(p) or p in seen:
-                        p += 1
-                    seen.add(p)
-                    sizes.append(p)
-                per_size.append(tuple(sizes))
-            primes.append(tuple(per_size))
-        bound = max(1, (np.iinfo(np.int64).max // cfg.engram_compressed_vocab_size) // 2)
-        mults = tuple(tuple(int(v) * 2 + 1 for v in np.random.default_rng(10007 * layer).integers(
-            0, bound, size=(cfg.engram_max_ngram_size,), dtype=np.int64)) for layer in cfg.engram_layer_ids)
-        return cls(tuple(primes), mults)
-
-    def rows(self, i: int) -> int:
-        """Rows engram layer i's table has (config.json's engram_num_embeddings)."""
-        return sum(sum(per_size) for per_size in self.primes[i])
-
 
 def engram_hashes(tokens: torch.Tensor, token_map: torch.Tensor, cfg: Config) -> torch.Tensor:
     """[b, s, engram layers, (N-1) * heads] table rows each token reads: the reference's NgramHashState, for whole
@@ -1046,17 +879,34 @@ class Block(nn.Module):
 
     def forward(self, x, pre_mix, side: Side, choices: Choices, hashes=None, rows=None):
         """x [b, s, hc, dim] and pre_mix [b, s, hc] (the previous layer's) -> this layer's (x, pre_mix). `hashes`
-        ([b, s, cols]: this layer's slice of engram_hashes) or `rows` (their table rows) feed an engram layer."""
+        ([b, s, cols]: this layer's slice of engram_hashes) or `rows` (their table rows) feed an engram layer. A
+        stream in another dtype (from layers with other Numerics) is cast to this layer's first."""
+        h, x_mid, post, comb, ffn_pre = self.before_ffn(x, pre_mix, side, choices, hashes, rows)
+        return self.after_ffn(self.ffn(h, choices), x_mid, post, comb), ffn_pre
+
+    def before_ffn(self, x, pre_mix, side: Side, choices: Choices, hashes=None, rows=None):
+        """Everything up to the MoE: (its input h [b, s, dim], the stream after attention, the ffn's post and comb
+        coefficients, the pre_mix handed on). With after_ffn and MoE's stages, what forward does, one stage at a
+        time: deepseek_top's expert-major training runs them so."""
+        x, pre_mix = x.to(self.num.dtype), pre_mix.to(self.num.hi)
         if self.engram is not None:
             x = self.engram(x, hashes, rows)
         hi, residual = self.num.hi, x
         attn_pre, post, comb = self.hc_mixes(x, "attn")
         h = self.attn(self.attn_norm(hc_pre(x, pre_mix, hi)), side, choices)
         x = hc_post(h, residual, post, comb, hi)
-        residual = x
         ffn_pre, post, comb = self.hc_mixes(x, "ffn")
-        h = self.ffn(self.ffn_norm(hc_pre(x, attn_pre, hi)), choices)
-        return hc_post(h, residual, post, comb, hi), ffn_pre
+        return self.ffn_norm(hc_pre(x, attn_pre, hi)), x, post, comb, ffn_pre
+
+    def after_ffn(self, y, x_mid, post, comb):
+        return hc_post(y, x_mid, post, comb, self.num.hi)
+
+
+def _cross_entropy(h, t, w):
+    """Σ -log softmax(h·wᵀ)[t] for h in its (high) dtype, the head w cast to it VOCAB_CHUNK rows at a time: the
+    head in float32 at once would be 2.6 GB."""
+    logits = torch.cat([F.linear(h, w[v:v + VOCAB_CHUNK].to(h.dtype)) for v in range(0, w.size(0), VOCAB_CHUNK)], -1)
+    return (torch.logsumexp(logits, -1) - logits.gather(1, t[:, None])[:, 0]).sum()
 
 
 class Model(nn.Module):
@@ -1068,16 +918,20 @@ class Model(nn.Module):
     DeepSeek's safetensors load as they are (load_weights)."""
 
     def __init__(self, cfg: Config, layers=None, num: Numerics = Numerics(), device=None, embed: bool = True,
-                 head: bool = True, engram_table: bool = True):
+                 head: bool = True, engram_table: bool = True, layer_num: dict | None = None,
+                 head_num: Numerics | None = None):
+        """layer_num: {layer: Numerics} for layers computed otherwise than `num` (say, trained layers in float32 above
+        frozen ones in the reference's arithmetic); head_num likewise for the final norm and the head."""
         super().__init__()
-        self.cfg, self.num = cfg, num
+        self.cfg, self.num, self.head_num = cfg, num, head_num or num
         layers = range(cfg.n_layers) if layers is None else layers
-        self.layers = nn.ModuleDict({str(i): Block(cfg, i, num, device, engram_table) for i in layers})
+        layer_num = layer_num or {}
+        self.layers = nn.ModuleDict({str(i): Block(cfg, i, layer_num.get(i, num), device, engram_table) for i in layers})
         if embed:
             self.embed = Dense(cfg.dim, cfg.vocab_size, num, device)
         if head:
-            self.norm = RMSNorm(cfg.dim, cfg.norm_eps, num, device)
-            self.head = Dense(cfg.dim, cfg.vocab_size, num, device)
+            self.norm = RMSNorm(cfg.dim, cfg.norm_eps, self.head_num, device)
+            self.head = Dense(cfg.dim, cfg.vocab_size, self.head_num, device)
 
     def load_weights(self, state: dict, assign: bool = False):
         """Load checkpoint tensors (DeepSeek's names and formats), all of them: anything missing is an error. Tensors
@@ -1099,8 +953,34 @@ class Model(nn.Module):
 
     def logits(self, x, pre_mix):
         """The last layer's stream -> logits [b, s, vocab] in num.hi, every position."""
-        h = self.norm(hc_pre(x, pre_mix, self.num.hi))
-        return F.linear(h.to(self.num.hi), self.head.weight.to(self.num.hi))
+        hi = self.head_num.hi
+        h = self.norm(hc_pre(x.to(self.head_num.dtype), pre_mix.to(hi), hi))
+        return F.linear(h.to(hi), self.head.weight.to(hi))
+
+    def loss(self, x, pre_mix, targets, mask, chunk: int = HEAD_CHUNK):
+        """(Σ cross-entropy, count) of targets [b, s] at the positions mask [b, s] picks, from the last layer's
+        stream. The head is made `chunk` positions at a time, and with autograd each chunk's logits are recomputed in
+        the backward rather than kept: 4096 positions of a 129,280-word vocabulary would be 2 GB."""
+        hi = self.head_num.hi
+        h = self.norm(hc_pre(x.to(self.head_num.dtype), pre_mix.to(hi), hi))[mask]
+        t = targets[mask].to(h.device, torch.long)
+        h, w = h.to(hi), self.head.weight
+        total = h.new_zeros((), dtype=hi)
+        for s0 in range(0, h.size(0), chunk):
+            part = (h[s0:s0 + chunk], t[s0:s0 + chunk], w)
+            total = total + (checkpoint(_cross_entropy, *part, use_reentrant=False) if torch.is_grad_enabled()
+                             and h.requires_grad else _cross_entropy(*part))
+        return total, int(t.numel())
+
+    def lora_modules(self, targets=LORA_TARGETS) -> dict[str, "QLinear"]:
+        """{module path: QLinear} of the projections LoRA may adapt in this model's layers, in layer and target order.
+        Paths are the checkpoint's (layers.36.attn.wq_a), which is what an adapter file names them by."""
+        out = {}
+        for i, block in self.layers.items():
+            for t in targets:
+                out[f"layers.{i}.{LORA_MODULES[t]}"] = block.get_submodule(LORA_MODULES[t])
+        return out
+
 
     def run(self, x, pre_mix, side: Side, choices: Choices, hashes=None):
         """This model's layers, in order. hashes: engram_hashes(...) for the whole model's engram layers."""
@@ -1166,22 +1046,28 @@ SAFETENSORS_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8
                       "BF16": torch.bfloat16, "F32": torch.float32}
 
 
-def read_safetensors(path: str | Path, names=None, device="cpu") -> dict:
+def read_safetensors(path: str | Path, names=None, device="cpu", mmap: bool = False) -> dict:
     """Tensors of a local safetensors file (all, or those in `names`), as stored. The header is checked as
-    hub.parse_header checks any downloaded one."""
+    hub.parse_header checks any downloaded one. mmap=True maps the file instead of reading it (on the CPU): a
+    tensor's bytes come off the disk when it's used, and the OS can drop them again, so a PC with 16 GB of RAM can
+    train four layers of 7.4 GB, each expert read from the SSD as its turn comes (DEEPSEEK.md §8)."""
     from .hub import parse_header
     path = Path(path)
     with open(path, "rb") as f:
         n = int.from_bytes(f.read(8), "little")
         header = parse_header(f.read(n), path.stat().st_size, str(path))
+        mapped = np.memmap(path, np.uint8, "c") if mmap else None  # copy-on-write: writable, the file untouched
         out = {}
         for name, (dtype, shape, begin, end) in header.tensors.items():
             if names is not None and name not in names:
                 continue
             if dtype not in SAFETENSORS_DTYPES:
                 raise ValueError(f"{path.name}: tensor {name} is {dtype}, which DeepSeek-V4.1 doesn't use")
-            f.seek(header.data_start + begin)
-            raw = torch.frombuffer(bytearray(f.read(end - begin)), dtype=torch.uint8)
+            if mapped is not None:
+                raw = torch.from_numpy(mapped[header.data_start + begin:header.data_start + end])
+            else:
+                f.seek(header.data_start + begin)
+                raw = torch.frombuffer(bytearray(f.read(end - begin)), dtype=torch.uint8)
             out[name] = raw.view(SAFETENSORS_DTYPES[dtype]).reshape(shape).to(device)
     return out
 
@@ -1195,9 +1081,10 @@ PIECE = 64 * 2**20  # a weight file downloads in pieces this big, several at onc
 FETCHERS = 6
 
 
-def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=None, workers: int = FETCHERS) -> Path:
-    """One weight file of the pinned commit, downloaded whole into cache_dir() and checked against the sha256 the Hub
-    publishes for it. It comes in 64 MiB ranged reads over `workers` connections at once: the Hub's CDN slows a long
+def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=None, workers: int = FETCHERS,
+               folder: Path | None = None) -> Path:
+    """One weight file of the pinned commit, downloaded whole into `folder` (default cache_dir(); a miner's worker
+    lets modelstore choose it) and checked against the sha256 the Hub publishes for it. It comes in 64 MiB ranged reads over `workers` connections at once: the Hub's CDN slows a long
     single stream (measured: a fresh connection 30-37 MiB/s, one that had been running two minutes 1.5 MiB/s), and
     each piece is a fresh request. A dropped connection resumes within its piece, and a restart skips the pieces
     already written (listed in a .done file beside the .part). Refuses to start without room for it on the disk."""
@@ -1206,7 +1093,7 @@ def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=
     from .hub import Hub, IntegrityError, _FileCheck
     hub = hub or Hub()
     info = hub.list_files(repo, commit)[path]
-    folder = cache_dir(commit)
+    folder = Path(folder) if folder is not None else cache_dir(commit)
     folder.mkdir(parents=True, exist_ok=True)
     dest, part, listed = folder / path, folder / (path + ".part"), folder / (path + ".done")
     if dest.exists() and dest.stat().st_size == info.size:
@@ -1262,7 +1149,7 @@ def layer_files(layer: int, hub=None, repo: str = REPO, commit: str = COMMIT) ->
     return out
 
 
-def load_layer(layer: int, device="cpu", hub=None, log=None) -> dict:
+def load_layer(layer: int, device="cpu", hub=None, log=None, mmap: bool = False) -> dict:
     """Layer `layer`'s tensors from DeepSeek's checkpoint, fetching the files that hold them (each is one whole layer,
     7.4 GB) unless cached. Layers 1 and 14 also have an engram table in a 101 GB file: not fetched here (per-job
     slices of it are DEEPSEEK.md's step 4)."""
@@ -1270,7 +1157,7 @@ def load_layer(layer: int, device="cpu", hub=None, log=None) -> dict:
     for file, names in layer_files(layer, hub).items():
         if any(".engram.embed." in n for n in names):
             raise ValueError(f"layer {layer}'s engram table is in {file} (101 GB); load_layer doesn't fetch tables")
-        out.update(read_safetensors(fetch_file(file, hub, log=log), set(names), device))
+        out.update(read_safetensors(fetch_file(file, hub, log=log), set(names), device, mmap=mmap))
     return out
 
 

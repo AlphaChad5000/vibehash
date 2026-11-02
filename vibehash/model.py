@@ -202,6 +202,9 @@ def train_segment(spec: ModelSpec, data: Dataset, theta: np.ndarray, unit_seed: 
     """Run SGD steps [start_step, start_step + n_steps) on `backend` (default: this process's active one). A fine-tune's
     spec (finetune.LoraSpec) runs Adam steps on its adapters instead, on PyTorch (finetune.train_segment, which also
     takes `tamper`, a test's cheat in one op)."""
+    if getattr(spec, "kind", None) == "deepseek":  # a DeepSeek top-layers job's training unit (deepseek_unit.py)
+        from .deepseek_unit import train_segment as deepseek_segment
+        return deepseek_segment(spec, data, theta, unit_seed, start_step, n_steps, lr, batch_size, backend, tamper)
     if getattr(spec, "kind", None) == "lora":
         from .finetune import train_segment as lora_segment
         return lora_segment(spec, data, theta, unit_seed, start_step, n_steps, lr, batch_size, backend, tamper)

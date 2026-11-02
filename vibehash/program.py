@@ -123,6 +123,9 @@ class Program:
 
     @classmethod
     def of(cls, job, seed: int) -> "Program":
+        if getattr(job, "deepseek", False):  # a DeepSeek top-layers job's units (deepseek_program.py)
+            from .deepseek_program import DeepSeekProgram
+            cls = DeepSeekProgram
         return cls(job.spec, job.data, job.lr, job.batch_size, seed, job.n_segments, job.checkpoint_every)
 
     # --- the levels ---
@@ -357,7 +360,18 @@ def dispute_size(spec, batch_size: int, segments: int, per_segment: int) -> tupl
     Moves: for each level from the unit down to an op, a split and a pick for every 64-fold narrowing of its atoms (one
     at least, to descend into it), then the evidence. Bytes: what the states at a split's boundaries hold that the
     state before it didn't (the tensors written in a child that are still there at its end): above a sequence, the
-    adapters' B, m and v (between steps and segments) or G (between a step's sequences); below, activations."""
+    adapters' B, m and v (between steps and segments) or G (between a step's sequences); below, activations.
+
+    A DeepSeek spec's program (deepseek_program.py) is built from the job's records, so until it counts its own, its
+    step is taken as five rounds deep (inputs, a layer, its attention by sequence, ops) and a split as its adapters'."""
+    if hasattr(spec, "cut"):  # deepseek_job.DeepSeekSpec
+        def levels(n):
+            k = 1
+            while n > K:
+                n, k = -(-n // K), k + 1
+            return k
+        state = 4 * spec.n_params  # B, m and v
+        return 2 * (levels(segments) + levels(per_segment) + 5) + 1, (min(K, max(segments, per_segment)) - 1) * state
     d, T = dict(spec.dims), spec.seq_len
     config = {"model_type": d["family"], "vocab_size": d["vocab"], "hidden_size": d["hidden"],
               "num_hidden_layers": d["layers"], "num_attention_heads": d["heads"], "num_key_value_heads": d["kv_heads"],

@@ -81,6 +81,15 @@ def _post_job() -> list[list[str]] | None:
     return [["post-job", "--spec", spec, "--budget", budget]] if budget else None
 
 
+def _deepseek() -> list[list[str]] | None:
+    print("The DeepSeek job, think shorter's pilot, fine-tunes DeepSeek-V4.1-Flash's top layers. Your PC needs an\n"
+          "NVIDIA graphics card with 8 GB or more (RTX 20-series or newer), 16 GB of memory and about 40 GB free on an\n"
+          "SSD. It downloads about 30 GB of the model into the folder setup chose, and deletes it when the job ends,\n"
+          "unless you chose to keep it (`vibehash cache` shows what's there). A PC that can't take it keeps mining\n"
+          "other jobs.")
+    return [["worker", "--deepseek", "yes"]] if _yes("Mine it?") else None
+
+
 def _cancel() -> list[list[str]] | None:
     return [["cancel-job"]] if _yes("Cancel your last training job?") else None
 
@@ -123,6 +132,8 @@ SECTIONS = [
         Item("Start mining", "earn VIBE with this computer", ("worker",)),
         Item("My balance", "what you've earned and staked", ("balance",)),
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
+        Item("Mine the DeepSeek job", "think shorter's pilot: ~30 GB, asked first", ask=_deepseek,
+             usage="worker --deepseek yes"),
     ]),
     ("Train", [
         Item("Train a model on a CSV file", "post it as a job; the network trains it", ask=_train,
@@ -137,6 +148,7 @@ SECTIONS = [
     ("Settings", [
         Item("Set up again", "network, wallet, graphics card, stake", ("setup",)),
         Item("My wallet", "its address and where its file is", ("wallet", "show")),
+        Item("Model files", "what big models take on this PC; clear them", ("cache",)),
         Item("Update Vibe Hash", "install the latest release", action=_update),
         Item("Open the guide", "vibehash.org/guide, in your browser", action=lambda: webbrowser.open(GUIDE)),
         Item("More commands", "send, stake, predict, validators and the rest", submenu=MORE),

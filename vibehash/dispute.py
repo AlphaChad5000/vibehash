@@ -50,7 +50,20 @@ class WeightsUnavailable(Exception):
 # --- the base model's weights -----------------------------------------------------------------------------------------
 
 def decode(dtype: str, raw: bytes, cols: int) -> np.ndarray:
-    """Stored weights as float64, exactly: bf16 and f16 widen without rounding."""
+    """Stored weights as float64, exactly: bf16 and f16 widen without rounding, and DeepSeek's FP8 (E4M3), ue8m0
+    scales and FP4 (E2M1 codes packed two to an I8 byte, low nibble first: `cols` packed bytes give 2·cols values)
+    decode from their bits (referee_deepseek)."""
+    if dtype in ("F8_E4M3", "F8_E8M0", "I8"):
+        from . import referee_deepseek as rd
+
+        b = np.frombuffer(raw, np.uint8).reshape(-1, cols)
+        if dtype == "F8_E4M3":
+            return rd.E4M3[b]
+        if dtype == "F8_E8M0":
+            return rd.decode_e8m0(b)
+        return np.stack([rd.FP4[b & 15], rd.FP4[b >> 4]], -1).reshape(b.shape[0], 2 * cols)
+    if dtype in ("I32", "I64"):  # integer tables (DeepSeek's engram token map), exact up to 2^53
+        return np.frombuffer(raw, "<i4" if dtype == "I32" else "<i8").astype(np.float64).reshape(-1, cols)
     if dtype == "BF16":
         a = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
     elif dtype == "F16":
@@ -70,7 +83,7 @@ def _rows(shape) -> int:
     return int(shape[0]) if len(shape) > 1 else 1
 
 
-_ITEM = {"BF16": 2, "F16": 2, "F32": 4}
+_ITEM = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1, "I32": 4, "I64": 8}
 
 
 class HubWeights:
@@ -148,8 +161,9 @@ class Outside:
         return self._got[key]
 
     def lora_a(self, k) -> np.ndarray:
-        if k not in self._a:
-            self._a[k] = lora_a_one(self.spec, k).astype(np.float64)
+        if k not in self._a:  # a spec may draw its own (referee_deepseek.LoraLayout: DeepSeek's adapters)
+            fn = getattr(self.spec, "lora_a_of", None)
+            self._a[k] = (fn(k) if fn is not None else lora_a_one(self.spec, k)).astype(np.float64)
         return self._a[k]
 
     def tokens(self, seq):
@@ -185,6 +199,13 @@ class Inputs:
     def __init__(self, shapes: dict, outside: Outside, leaves: dict | None = None, full: dict | None = None):
         self.shapes, self.outside, self.leaves, self.full = shapes, outside, leaves or {}, full
         self.used: dict[str, set[int]] = {}
+        self.after: "Inputs | None" = None  # the op's output, for the ops judged by whole rows (referee.CHOICES)
+
+    def out_row(self, name, r):
+        """Row r of the op's output, as the state after it holds it (proven leaves, or the party's array)."""
+        if self.after is None:
+            raise referee.Missing(f"{name}'s row {r}")
+        return self.after.row(name, r)
 
     def shape(self, name):
         if name not in self.shapes:
@@ -322,6 +343,7 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
     ok, why = True, f"{op.describe()} only drops tensors"
     if op.out:
         x = Inputs(shapes or {n: a.shape for n, a in before.items()}, outside, full=before)
+        x.after = Inputs({op.out: tuple(after[op.out].shape)}, outside, full={op.out: after[op.out]})
         said = np.ascontiguousarray(after[op.out], dtype="<f4").reshape(-1)[tile * LEAF:(tile + 1) * LEAF]
         try:
             ok, why = referee.judge(op, x, tile, said)
@@ -329,7 +351,8 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
             ok, why = True, str(e)
         for name, idx in sorted(x.used.items()):
             header["tensors"][f"in:{name}"], chunks[f"in:{name}"] = _proof(before[name], idx)
-        header["tensors"][f"out:{op.out}"], chunks[f"out:{op.out}"] = _proof(after[op.out], [tile])
+        out_idx = {tile} | x.after.used.get(op.out, set())  # (whole rows, for a choice)
+        header["tensors"][f"out:{op.out}"], chunks[f"out:{op.out}"] = _proof(after[op.out], out_idx)
     return merkle.pack(header, chunks), ok, why
 
 
@@ -379,6 +402,8 @@ def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) 
             return "challenger", f"the evidence doesn't show tile {tile} of {op.out}"
         shapes = {n: (e[2], e[3]) for n, e in before.items()}
         x = Inputs(shapes, outside, leaves={n: v for (s, n), v in leaves.items() if s == "in"})
+        x.after = Inputs({op.out: (after[op.out][2], after[op.out][3])}, outside,
+                         leaves={op.out: leaves.get(("out", op.out), {})})
         ok, why = referee.judge(op, x, tile, said)
         return ("defender" if ok else "challenger"), why
     except referee.Missing as e:

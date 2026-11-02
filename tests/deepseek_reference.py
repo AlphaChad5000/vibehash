@@ -60,6 +60,23 @@ def fetch(hub=None):
     return out
 
 
+TOKENIZER = ("tokenizer.json", "6a15814dd25c934028034531da744c689f87ff21")  # its Git blob id at deepseek.COMMIT
+
+
+def fetch_tokenizer(hub=None):
+    """DeepSeek-V4.1-Flash's tokenizer.json (6 MB), fetched once and checked against its Git blob id."""
+    from vibehash.hub import Hub
+    path = folder() / TOKENIZER[0]
+    if not path.exists():
+        hub = hub or Hub()
+        info = hub.list_files(deepseek.REPO, deepseek.COMMIT)[TOKENIZER[0]]
+        if info.oid != TOKENIZER[1]:
+            raise ValueError(f"the Hub lists tokenizer.json as blob {info.oid}, not {TOKENIZER[1]}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(hub.get_file(deepseek.REPO, deepseek.COMMIT, TOKENIZER[0], info=info))
+    return path
+
+
 # --- stand-ins for inference/kernel.py -----------------------------------------------------------------------------
 
 FP4_TABLE = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)  # convert.py's

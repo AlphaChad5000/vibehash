@@ -45,6 +45,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from . import deepseek_graph as dsg
 from . import economics as econ
 from . import netstats, receipts, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
@@ -78,9 +79,11 @@ MAX_BLOCKS_REPLY = 4 * 2**20
 # anything more would be junk that every validator stores and every proposal carries.
 ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
 BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"round"}, "commit": {"round", "commitment"},
+          "sign": {"round", "requests"},
           "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"},
           "move": {"round", "game", "n", "move"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
+MAX_COMMITMENT = 2**20  # a prep unit's commitment in the bucket: roots, digests and a leaf a record, a few KB
 MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
 # What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
 # a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
@@ -94,6 +97,17 @@ MAX_JOB_BYTES = 64 * 2**20
 # for days. A job that would need more simply gets fewer units done a round.
 MAX_PHASE_S = tasks.MAX_PHASE_S
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
+
+
+def bucket_from_env() -> dsg.Signer | None:
+    """The bucket for DeepSeek jobs' hand-offs, from $VIBEHASH_BUCKET_HOST (my-bucket.nyc3.digitaloceanspaces.com),
+    $VIBEHASH_BUCKET_REGION, $VIBEHASH_BUCKET_KEY and $VIBEHASH_BUCKET_SECRET (and $VIBEHASH_BUCKET_SCHEME, https
+    unless set): the operator sets them on the node at launch. None if they aren't set."""
+    import os
+    env = {k: os.environ.get(f"VIBEHASH_BUCKET_{k}") for k in ("HOST", "REGION", "KEY", "SECRET", "SCHEME")}
+    if not all(env[k] for k in ("HOST", "REGION", "KEY", "SECRET")):
+        return None
+    return dsg.Signer(env["HOST"], env["REGION"], env["KEY"], env["SECRET"], scheme=env["SCHEME"] or "https")
 
 
 class Busy(Exception):
@@ -121,10 +135,13 @@ class Node:
                  times: PhaseTimes | None = None, config: CoordinatorConfig | None = None, keep_rounds: int = 10,
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
-                 max_job_bytes: int = MAX_JOB_BYTES):
+                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
-        `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job."""
+        `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
+        `bucket`: the storage DeepSeek jobs hand off through (deepseek_graph.Signer, its keys this node's): workers get
+        links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
+        reads one from the environment)."""
         self.times = times or PhaseTimes()
         self.keep_rounds = keep_rounds  # rounds whose checkpoints stay available to re-check (the challenge window)
         self.max_job_bytes = max_job_bytes
@@ -135,6 +152,9 @@ class Node:
         self.chain = self.store.open_chain(genesis)
         self.genesis = genesis
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
+        self.bucket = bucket
+        if bucket is not None:
+            self.coord.prep_store = self.prep_store
         self.coord.timing = lambda job: self.times_for(job).compute_s * 0.8  # capacity leaves slack, as above
         self.blobs: BlobStore = self.store.blobs
         self.coord.trace_blobs = TraceBlobs(self.blobs)
@@ -264,16 +284,44 @@ class Node:
         log.info("block %d sealed: %d units accepted, %d fraud, val acc %s, pool %.3f VIBE",
                  rep.block.height, rep.block.summary.accepted_units, fraud, acc, rep.pool / SYN_PER_VIBE)
 
+    def prep_store(self, job) -> dsg.PresignedStore:
+        """A DeepSeek job's objects in the bucket, under its id, as this node reaches them (signing its own links):
+        two tries, a minute each, no long waits, since the node may be holding its lock."""
+        return dsg.PresignedStore(lambda m, n, q=None: self.bucket(m, f"{job.job_id}/{n}", q), tries=2,
+                                  wait=lambda s: time.sleep(min(s, 1.0)), timeout=60)
+
+    def _prep_commitment(self, body: dict) -> bytes | None:
+        """A prep unit's commitment from the bucket, for its reveal: read before the coordinator's lock is taken (a
+        slow bucket mustn't freeze the node), and no bigger than MAX_COMMITMENT. None if it can't be had."""
+        d = body.get("reveal")
+        if self.bucket is None or not isinstance(d, dict) or not d.get("prep"):
+            return None
+        c = self.coord
+        with c.lock:
+            r = c.r
+            if r is None or body.get("round") != r.round_no or str(d.get("unit_id")) not in r.prep:
+                return None
+            job = c.job(r.job_id)
+            name = dsg.unit_commit(c.prep(job).graph.units[r.prep[str(d["unit_id"])]])
+        try:
+            return self.prep_store(job).get(name, cap=MAX_COMMITMENT)
+        except (OSError, ValueError) as e:
+            log.info("a prep unit's commitment %s: %s", name, e)
+            return None
+
     def times_for(self, job) -> PhaseTimes:
         """A round's phase lengths for `job`: this node's, or longer where the job's size needs it (or the job asks
         for a longer compute phase). See TrainingJob.phase_lengths."""
         t, need = self.times, job.phase_lengths()
+        if job.deepseek:  # a prep unit's transfers at the slowest link the network takes (deepseek_graph.deadline)
+            need = need | {"compute": max(need["compute"], job.spec.prep_seconds())}
         verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
         # A dispute has as many moves as the job's program is deep (need["moves"], program.dispute_size), and each as
         # long as its dearest takes (need["move"]: re-running a segment, and a split's states up and down), or verify
         # if that's longer. Most moves take a second or two, and the phase ends as soon as every dispute has; it's this
-        # long only for a party that makes every move just in time. A job whose moves need more than MAX_PHASE_S in
-        # all gets less for each: a defender too slow for it loses (DESIGN, "Time").
+        # long only for a party that makes every move just in time (a DeepSeek job's prep rounds have no games yet:
+        # their dispute phase ends at once). A job whose moves need more than MAX_PHASE_S in all gets less for each: a
+        # defender too slow for it loses (DESIGN, "Time").
         moves = need.get("moves", 0)
         move = min(max(verify, need["move"]), MAX_PHASE_S / moves) if moves else 0.0
         return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
@@ -393,7 +441,8 @@ class Node:
                                 else replay_block(self.chain, block, record,
                                                   datasets=PeerDatasets(self, self.chain.state.validators.get(
                                                       address_of(block.proposer_pubkey))),
-                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey))))
+                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey)),
+                                                  records=self.prep_store if self.bucket is not None else None))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -632,8 +681,15 @@ class Node:
         else:
             height, data, sha = self._model_bytes(job_id)
             model = {"height": height, "bytes": len(data), "sha256": sha}
-        return {"spec": json.loads(s.jobs[job_id]), "owner": s.job_owner[job_id], "escrow": s.escrow.get(job_id, 0),
-                "rounds": self.store.job_rounds(job_id), "model": model}
+        out = {"spec": json.loads(s.jobs[job_id]), "owner": s.job_owner[job_id], "escrow": s.escrow.get(job_id, 0),
+               "rounds": self.store.job_rounds(job_id), "model": model}
+        if "deepseek" in out["spec"]:  # where its prep is, and the records' root once it's done (trainers check it)
+            try:
+                state = self.coord.prep(self.coord.job(job_id))
+                out["prep"] = {"done": state.done, "root": state.root}
+            except Exception:  # noqa: BLE001 - its data isn't on this node
+                out["prep"] = {"done": False, "root": None}
+        return out
 
     def _model_bytes(self, job_id: str) -> tuple[int, bytes, str]:
         """The job's latest trained weights at its precision, serialised once per round. Workers get the weights every
@@ -675,6 +731,11 @@ class Node:
         jobs = [netstats.job_summary(j, json.loads(spec), s.escrow.get(j, 0), self.store.job_rounds(j), current,
                                      lambda h: blocks[h].timestamp if 0 <= h < len(blocks) else None)
                 for j, spec in list(s.jobs.items())]
+        for j in jobs:  # a DeepSeek job's prep, as the front page draws it (netstats: "prep")
+            if "deepseek" in json.loads(s.jobs[j["id"]]):
+                prep = self.coord.prep_summary(j["id"], now)
+                if prep is not None:
+                    j["prep"] = prep
         order = {"training": 0, "open": 1, "finished": 2}
         jobs.sort(key=lambda j: (order[j["status"]], -j["escrow"], j["id"]))
         return {"chain_id": self.chain.chain_id, "height": tip.height, "time": tip.timestamp, "now": now,
@@ -721,9 +782,10 @@ class Node:
             raise WireError("malformed envelope")
         if not set(env["body"]) <= BODIES.get(kind, set()):
             raise WireError(f"a {kind} message has only {', '.join(sorted(BODIES.get(kind, ())))}")
-        if len(canonical(env)) > {"reveal": MAX_REVEAL, "move": MAX_MOVE}.get(kind, MAX_MESSAGE):
+        if len(canonical(env)) > {"reveal": MAX_REVEAL, "move": MAX_MOVE, "sign": MAX_REVEAL}.get(kind, MAX_MESSAGE):
             raise WireError(f"{kind} message too large")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
+        commitment = self._prep_commitment(body) if kind == "reveal" else None
         with c.lock:
             r = c.r
             if r is None or body.get("round") != r.round_no:
@@ -733,7 +795,12 @@ class Node:
                 entry = c.register(addr, float(body["flops_per_sec"]), int(body["memory_mb"]), envelope=env)
                 return {"ok": True, "receipt": self._receipt(kind, entry)}
             if kind == "assignment":
-                return {"units": [u.to_dict() for u in c.assignment(addr)]}
+                units = c.assignment(addr)
+                out = {"units": [u.to_dict() for u in units]}
+                if r.prep:  # a DeepSeek prep round: which unit of the work graph each is, and what its inputs must be
+                    out["prep"] = {u.unit_id: r.prep[u.unit_id] for u in units}
+                    out["want"] = c.prep(job).want()
+                return out
             if kind == "commit":
                 cm = commitment_in(body["commitment"])
                 if cm.worker != addr:
@@ -742,6 +809,38 @@ class Node:
                     raise WireError("a commitment's digest is a SHA-256")
                 c.commit(cm)
                 return {"ok": True, "receipt": self._receipt(kind, commitment_out(cm))}
+            if kind == "sign":  # a DeepSeek unit's links to the bucket (deepseek_rounds; Coordinator.may_sign)
+                reqs = body["requests"]
+                if self.bucket is None:
+                    raise ProtocolError("this node has no bucket for DeepSeek jobs' hand-offs")
+                if not isinstance(reqs, list) or not 1 <= len(reqs) <= 64:
+                    raise WireError("a sign message asks for 1-64 links")
+                urls = []
+                for req in reqs:
+                    try:
+                        method, name, query = str(req[0]), str(req[1]), dict(req[2] or {})
+                    except (TypeError, IndexError, ValueError) as e:
+                        raise WireError(f"a link request is [method, name, query]: {e}") from None
+                    c.may_sign(addr, method, name, query)
+                    # A write's link dies with the compute phase it was for: nothing lands in a unit's objects after it.
+                    left = max(1, int(self.phase_ends - time.time())) if method in ("PUT", "POST") else None
+                    urls.append(self.bucket(method, f"{r.job_id}/{name}", {k: str(v) for k, v in query.items()},
+                                            expires=left))
+                return {"urls": urls}
+            if kind == "reveal" and isinstance(body.get("reveal"), dict) and body["reveal"].get("prep"):
+                d = body["reveal"]  # a DeepSeek prep unit's: the root of its commitment in the bucket, and the salt
+                try:
+                    root, salt = bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"])
+                    if len(root) != 32 or len(salt) > 64:
+                        raise WireError("more in it than a reveal has")
+                    rv = Reveal(str(d["unit_id"]), str(d["worker"]), root, salt, None, {})
+                except (KeyError, TypeError, ValueError, AttributeError) as e:
+                    raise WireError(f"bad reveal: {e}") from e
+                if rv.worker != addr:
+                    raise ProtocolError("can only reveal for yourself")
+                wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": root.hex(), "salt": salt.hex(), "prep": True}
+                verdict = c.reveal(rv, wire=wire, commitment=commitment)
+                return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "reveal":
                 d = body["reveal"]
                 try:
@@ -769,7 +868,9 @@ class Node:
                 for t in c.tasks_for(addr):
                     d = {"task_id": t.task_id, "unit": t.unit.to_dict(), "segments": t.segments, "dtype": job.wire_dtype,
                          "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
-                    if t.kind != "check":  # fine-tunes': only new workers get these, so old ones see what they always did
+                    if t.kind == "prep":  # a DeepSeek prep unit's: what to replay, and what to check it against
+                        d |= {"kind": "prep", **c.prep_task(t)}
+                    elif t.kind != "check":  # fine-tunes': only new workers get these, so old ones see what they always did
                         d |= {"kind": t.kind}
                     tasks.append(d)
                 return {"tasks": tasks}

@@ -40,9 +40,14 @@ from .verification import replay_openings, required_openings
 
 def tamper(where: tuple, op) -> float | None:
     """The "tamper" behaviour's one cheat a segment (tracer.Executor's `tamper`): step 2 of each segment of 4, its
-    second sequence, layer 1's backward, the attention's gradient for the values, scaled by 1.25."""
-    if len(where) >= 3 and where[0].startswith("step ") and int(where[0].split()[1]) % 4 == 2 \
-            and where[1].split(" (")[0].endswith("sequence 1") and where[2] == "layer 1 backward" and op.kind == "attn_dv":
+    second sequence, layer 1's backward, the attention's gradient for the values, scaled by 1.25. A DeepSeek unit's
+    (deepseek_program.py): step 2 of each 4, a layer's backward, its first sequence's attention gradient for the keys
+    (which are the values)."""
+    if len(where) < 3 or not where[0].startswith("step ") or int(where[0].split()[1]) % 4 != 2:
+        return None
+    if where[1].split(" (")[0].endswith("sequence 1") and where[2] == "layer 1 backward" and op.kind == "attn_dv":
+        return 1.25
+    if where[1].endswith(" backward") and where[2].endswith("sequence 0") and op.kind == "ds_attn_dkv":
         return 1.25
     return None
 
@@ -163,6 +168,9 @@ class Worker:
         """A fine-tune's score task: (loss, accuracy) of the round's starting model on the job's held-back data."""
         if self.verifier_behavior in ("lazy", "false_accuser"):
             return 0.01, 0.99  # made up, as a scorer who doesn't run the model would
+        if job.deepseek:  # the top layers, on the held-back sequences' records
+            from . import deepseek_unit
+            return deepseek_unit.evaluate(job.spec, job.data, start, self.backend)
         from . import finetune
         return finetune.evaluate(job.spec, job.data, start, self.backend)
 
