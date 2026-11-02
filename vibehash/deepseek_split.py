@@ -62,7 +62,7 @@ from .deepseek import Choices, Side
 from .deepseek_graph import (  # noqa: F401 - re-exported: the graph and storage, without PyTorch
     ROWS_PER_PIECE, SIDE, pieces, needs, emits, row_ranges, stream_name, side_name, rows_name, commit_name,
     block_names, Unit, Graph, plan, Line, deadline, Tampered, Missing, Mirrors, LocalStore, PresignedStore, Signer,
-    presign, rows_commit_name, unit_commit)
+    presign, rows_commit_name, unit_commit, check_block, unpack_np, RecordReader)
 
 try:
     from compression import zstd as _zstd  # Python 3.14's standard library
@@ -446,25 +446,6 @@ def manifest(cut: top.Cut, seqs, chunks, last: list[dict], fp8: bool = False) ->
             "blocks": [{"file": block_names(c)[0], "first": ch[0], "count": len(ch), "leaves": m["leaves"]}
                        for c, (ch, m) in enumerate(zip(chunks, last))],
             "root": merkle_root(leaves).hex()}
-
-
-def check_block(manifest: dict, c: int, data: bytes, meta: bytes, root: str | None = None) -> list[tuple[int, bytes]]:
-    """Chunk c's block file and its JSON, checked: the manifest's leaves against its root, that root against the one
-    the job pinned (`root`), and each record against its leaf (the record's bytes and its per-layer hashes). -> [(the
-    sequence's index in the dataset, its record's bytes)]."""
-    leaves = [bytes.fromhex(leaf) for b in manifest["blocks"] for leaf in b["leaves"]]
-    if merkle_root(leaves).hex() != manifest["root"] or (root is not None and manifest["root"] != root):
-        raise Tampered("the manifest isn't the dataset the job pinned")
-    meta = json.loads(meta)
-    out = []
-    for j, i in enumerate(meta["sequences"]):
-        rec = data[meta["offsets"][j]:meta["offsets"][j + 1]]
-        leaf = hashlib.sha256(hashlib.sha256(rec).digest()
-                              + b"".join(bytes.fromhex(h) for h in meta["layer_hashes"][j])).hexdigest()
-        if leaf != manifest["blocks"][c]["leaves"][j]:
-            raise Tampered(f"{block_names(c)[0]}: record {j} isn't the one the manifest commits to")
-        out.append((i, rec))
-    return out
 
 
 def read_block(store, manifest: dict, c: int, root: str | None = None) -> list[tuple[int, dict]]:

@@ -3,10 +3,13 @@
 
 - LocalRunTests: the job is posted; prep rounds hand out the work graph's ready units, workers run them through the
   bucket and commit to their commitments, and two checkers replay each. One worker bends its first unit's output (and
-  its commitment to match): a checker rejects it, it ends unchecked (unpaid, nobody slashed: deepseek_rounds' interim
-  rule, with no DeepSeek program in the referee yet), and the unit goes out again. Once every unit is in, the node
-  pins the records' root, the one-PC prep's to the bit, and the job's rounds train from the records: claims checked,
-  paid, and scored on the held-back sequences. An outside auditor replays every round from its record alone.
+  its commitment to match): a checker rejects it, it ends unchecked (unpaid, nobody slashed: prep units aren't
+  refereed yet), and the unit goes out again. Once every unit is in, the node pins the records' root, the one-PC
+  prep's to the bit, and the job's rounds train from the records, op by op (deepseek_program.py): claims checked,
+  paid, and scored on the held-back sequences. The same worker trains with one op's output scaled; a checker rejects
+  its claim and the node referees the dispute down to that op (referee_deepseek.py) and slashes it. Another worker
+  rejects an honest claim, loses its dispute and is slashed for a false accusation. An outside auditor replays every
+  round from its record and the token file, the games included.
 """
 import json
 import logging
@@ -74,9 +77,11 @@ class LocalRunTests(unittest.TestCase):
                     times=PhaseTimes(register_s=1.0, compute_s=20.0, reveal_s=3.0, verify_s=20.0, idle_s=0.3),
                     config=CoordinatorConfig(canaries_per_round=1, newcomer_units=6), bucket=self.s3.signer()).start()
         self.addCleanup(node.stop)
+        behaviors = [("honest", "honest"), ("honest", "false_accuser"), ("tamper", "honest")]
         clients = [WorkerClient(node.url, k, memory_mb=8192, flops_override=1e12, poll_s=0.1, device="cpu",
-                                cache_dir=self.tmp / f"cache{i}", deepseek=True) for i, k in enumerate(workers)]
-        cheat, bent = clients[-1], {}
+                                cache_dir=self.tmp / f"cache{i}", deepseek=True, behavior=b, verifier_behavior=v)
+                   for i, (k, (b, v)) in enumerate(zip(workers, behaviors))]
+        cheat, bent = clients[2], {}  # clients[1] rejects honest claims
 
         def bend(store, unit, commit):
             """The cheat's first layers unit: an output it hands on, scaled up, and its commitment made to match."""
@@ -95,9 +100,9 @@ class LocalRunTests(unittest.TestCase):
 
         api = NodeClient(node.url)
         sha = api.upload_dataset(req, path)
-        job = TrainingJob(job_id=JOB, requester=req.address, budget=200 * VIBE, fee_per_round=1, spec=spec,
+        job = TrainingJob(job_id=JOB, requester=req.address, budget=200 * VIBE, fee_per_round=VIBE, spec=spec,
                           data_source={"kind": "deepseek", "sha256": sha, "train": [0, 104], "heldback": [104, 130]},
-                          init_seed=spec.seed, lr=1e-3, batch_size=4, steps_per_unit=4, checkpoint_every=2,
+                          init_seed=spec.seed, lr=1e-3, batch_size=4, steps_per_unit=4, checkpoint_every=4,
                           units_per_round=8, memory_mb=8000, tolerance=1e-4, max_update_ratio=1.0)
         api.send_tx(req, "post_job", "system", 200 * VIBE, job.spec_json())
 
@@ -113,7 +118,8 @@ class LocalRunTests(unittest.TestCase):
             except NodeError:  # not in a block yet
                 return False
             return bool((info.get("prep") or {}).get("root")) and any(
-                np.isfinite(r.get("val_loss", np.nan)) for r in info["rounds"])
+                np.isfinite(r.get("val_loss", np.nan)) for r in info["rounds"]) and any(
+                api.get(f"/round/{b.height}/record").get("games") for b in node.chain.blocks if b.summary)
         deadline = time.time() + 900
         while not trained() and time.time() < deadline:
             time.sleep(0.5)
@@ -155,8 +161,9 @@ class LocalRunTests(unittest.TestCase):
         self.assertGreater(accepted[bent["unit"]], bent["round"])
         rejections = [v for v in first["verdicts"] if not v["body"]["ok"]]
         self.assertTrue(rejections, first["verdicts"])
-        slashes = [s for b in node.chain.blocks if b.summary for s in b.summary.slashes]
-        self.assertEqual(slashes, [])
+        by_height = {b.height: api.get(f"/round/{b.height}/record") for b in node.chain.blocks if b.summary}
+        self.assertEqual([s for b in node.chain.blocks if b.summary and by_height[b.height].get("prep")
+                          for s in b.summary.slashes], [])  # prep units aren't refereed yet: nobody slashed
         sealed = next(b.summary for b in node.chain.blocks if b.summary and b.summary.params_hash and
                       api.get(f"/round/{b.height}/record")["round"] == bent["round"])
         self.assertTrue(sealed.verifier_flops, "the checkers were paid")
@@ -166,16 +173,31 @@ class LocalRunTests(unittest.TestCase):
         self.assertTrue(training)
         self.assertTrue(all(r["version"] == 4 for r in records))
         self.assertTrue(any(np.isfinite(r["val_loss"]) for r in info["rounds"]))
-        self.assertTrue(any(node.chain.state.balance(w.address) for w in workers), "workers were paid")
+        self.assertTrue(node.chain.state.balance(workers[0].address), "the honest worker was paid")
         self.assertLess(node.chain.state.escrow[JOB], 200 * VIBE)
 
-        # An outside auditor replays every round from its record, the prep's included, without the text or the bucket.
+        # The disputes: refereed op by op, the cheat's down to the op it scaled; both bad workers slashed.
+        games = [g for r in training for g in r.get("games", [])]
+        lost = [g for g in games if g["defender"] == workers[2].address and g["outcome"] == "challenger"]
+        self.assertTrue(lost, [(g["defender"][:12], g["outcome"], g["detail"]) for g in games])
+        self.assertTrue(any(g["detail"].startswith("ds_attn_dkv") for g in lost), [g["detail"] for g in lost])
+        self.assertTrue(any(g["challenger"] == workers[1].address and g["outcome"] == "defender" for g in games),
+                        [(g["challenger"][:12], g["outcome"], g["detail"]) for g in games])
+        slashes = [s for b in node.chain.blocks if b.summary and not by_height[b.height].get("prep")
+                   for s in b.summary.slashes]
+        self.assertTrue(any(s[0] == workers[2].address and s[2] == "failed_replay" and s[1] == workers[0].address
+                            for s in slashes), slashes)  # caught by the honest checker, who gets the bounty
+        self.assertTrue(any(s[0] == workers[1].address and s[2] == "false accusation" for s in slashes), slashes)
+        self.assertFalse([s for s in slashes if s[0] == workers[0].address], slashes)
+
+        # An outside auditor replays every round from its record, the prep's and the games included: with the job's
+        # token file (a game's tree is built from it), without the bucket (a game's record keeps the rows it read).
         audit = Chain.from_genesis(api.get("/genesis"))
         for d in api.get(f"/blocks?from=1&to={node.chain.tip.height}"):
             block = Block.from_dict(d)
             if block.summary is not None:
-                self.assertEqual(replay_block(audit, block, api.get(f"/round/{block.height}/record")), [],
-                                 f"block {block.height}")
+                self.assertEqual(replay_block(audit, block, api.get(f"/round/{block.height}/record"),
+                                              datasets=node.store), [], f"block {block.height}")
             audit.append(block)
         self.assertEqual(audit.tip.hash, node.chain.tip.hash)
 

@@ -297,9 +297,9 @@ class Node:
         verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
         # A dispute's dearest move re-runs a segment (a challenger checking each step of one), which takes no longer
         # than checking a claim's segments: as long as verify. Most moves take a second or two, and the phase ends as
-        # soon as every dispute has; it's this long only for a party that makes every move just in time. DeepSeek's
-        # claims have no games yet (deepseek_rounds), so no dispute phase.
-        move = min(verify, MAX_PHASE_S / DISPUTE_MOVES) if job.finetune and not job.deepseek else 0.0
+        # soon as every dispute has; it's this long only for a party that makes every move just in time (a DeepSeek
+        # job's prep rounds have no games yet: their dispute phase ends at once).
+        move = min(verify, MAX_PHASE_S / DISPUTE_MOVES) if job.finetune else 0.0
         return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
                           min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s,
                           DISPUTE_MOVES * move, move)

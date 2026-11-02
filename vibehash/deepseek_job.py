@@ -41,6 +41,24 @@ def config(name: str) -> Config:
     return CONFIGS[name]()
 
 
+def weight_source(spec: "DeepSeekSpec"):
+    """Where the node's referee reads a DeepSeek job's weights (dispute.Outside's source). The tiny config's are
+    random_weights(tiny_config(), 0) (tests and local testnets: needs PyTorch). Flash's come from the Hub by byte
+    range, checked against per-tensor hashes, which the pinned weights don't have yet: until they do, a dispute of a
+    Flash unit ends unchecked."""
+    if spec.config_name == "tiny":
+        from .deepseek_unit import tiny_weights
+        from .referee_deepseek import StateWeights
+        return StateWeights(tiny_weights(spec))
+    from .dispute import WeightsUnavailable
+
+    class _None:
+        def shape(self, name):
+            raise WeightsUnavailable("DeepSeek-V4.1-Flash's per-tensor hashes aren't pinned yet")
+        read = shape
+    return _None()
+
+
 def weights_digest(listing: dict) -> str:
     """MANIFESTS["flash"] from a Hub listing ({name: info with .lfs_sha256}) of the pinned commit."""
     rows = sorted((n, i.lfs_sha256) for n, i in listing.items() if n.endswith(".safetensors"))

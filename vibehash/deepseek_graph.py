@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-from .deepseek_config import Config, Cut
+from .deepseek_config import BLOCK, Config, Cut
 
 ROWS_PER_PIECE = 2**18  # deepseek_prep.extract_rows' piece of a table: row ranges start and end on these
 SIDE = ("compress_kv", "index_k", "picks")
@@ -290,6 +290,14 @@ class Mirrors:
                 continue
         raise Missing(name)
 
+    def get_range(self, name: str, start: int, end: int) -> bytes:
+        for s in self.stores:
+            try:
+                return s.get_range(name, start, end)
+            except OSError:
+                continue
+        raise Missing(name)
+
     def has(self, name: str) -> bool:
         return any(s.has(name) for s in self.stores)
 
@@ -312,6 +320,11 @@ class LocalStore:
 
     def get(self, name: str) -> bytes:
         return (self.folder / name).read_bytes()
+
+    def get_range(self, name: str, start: int, end: int) -> bytes:
+        with open(self.folder / name, "rb") as f:
+            f.seek(start)
+            return f.read(end - start)
 
     def has(self, name: str) -> bool:
         return (self.folder / name).exists()
@@ -426,6 +439,17 @@ class PresignedStore:
             at += len(piece)
         return b"".join(pieces)
 
+    def get_range(self, name: str, start: int, end: int) -> bytes:
+        """Bytes [start, end) of an object, `part` at a time."""
+        pieces, at = [], start
+        while at < end:
+            piece, _ = self._call("GET", name, headers={"Range": f"bytes={at}-{min(at + self.part, end) - 1}"})
+            if not piece:
+                raise OSError(f"{name}: an empty range at byte {at}")
+            pieces.append(piece)
+            at += len(piece)
+        return b"".join(pieces)
+
     def has(self, name: str) -> bool:
         return self._size(name) is not None
 
@@ -481,3 +505,98 @@ def presign(method: str, host: str, key: str, region: str, access_key: str, secr
     for part in (day, region, "s3", "aws4_request"):
         k = hmac.new(k, part.encode(), hashlib.sha256).digest()
     return f"{scheme}://{host}{path}?{q}&X-Amz-Signature={hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()}"
+
+
+# --- the records, without PyTorch: the node's referee reads them ---------------------------------------------------------
+
+RECORD_FORMAT = "vibehash-deepseek-top/1"  # deepseek_top.pack writes them
+
+
+def check_block(manifest: dict, c: int, data: bytes, meta: bytes, root: str | None = None) -> list[tuple[int, bytes]]:
+    """Chunk c's block file and its JSON, checked: the manifest's leaves against its root, that root against the one
+    the job pinned (`root`), and each record against its leaf (the record's bytes and its per-layer hashes). -> [(the
+    sequence's index in the dataset, its record's bytes)]."""
+    _check_manifest(manifest, root)
+    meta = json.loads(meta)
+    out = []
+    for j, i in enumerate(meta["sequences"]):
+        rec = data[meta["offsets"][j]:meta["offsets"][j + 1]]
+        _check_record(manifest, c, j, rec, meta)
+        out.append((i, rec))
+    return out
+
+
+def _check_manifest(manifest: dict, root: str | None) -> None:
+    from .crypto import merkle_root
+    leaves = [bytes.fromhex(leaf) for b in manifest["blocks"] for leaf in b["leaves"]]
+    if merkle_root(leaves).hex() != manifest["root"] or (root is not None and manifest["root"] != root):
+        raise Tampered("the manifest isn't the dataset the job pinned")
+
+
+def _check_record(manifest: dict, c: int, j: int, rec: bytes, meta: dict) -> None:
+    leaf = hashlib.sha256(hashlib.sha256(rec).digest()
+                          + b"".join(bytes.fromhex(h) for h in meta["layer_hashes"][j])).hexdigest()
+    if leaf != manifest["blocks"][c]["leaves"][j]:
+        raise Tampered(f"{block_names(c)[0]}: record {j} isn't the one the manifest commits to")
+
+
+_NP = {"int32": "<i4", "int16": "<i2", "int64": "<i8", "uint8": "u1", "float32": "<f4", "bool": "u1"}
+
+
+def unpack_np(record: bytes) -> dict:
+    """A record's parts (deepseek_top.pack's) as NumPy arrays, exactly: bf16 widened to float32, FP8 streams
+    dequantised."""
+    import numpy as np
+
+    line, blob = record.split(b"\n", 1)
+    head = json.loads(line)
+    if head.get("format") != RECORD_FORMAT:
+        raise ValueError(f"not a {RECORD_FORMAT} record")
+    out, at = {}, 0
+    for name, dtype, shape in head["parts"]:
+        size = {"bfloat16": 2, "float8_e4m3fn": 1, "float8_e8m0fnu": 1}.get(dtype) or np.dtype(_NP[dtype]).itemsize
+        n = int(np.prod(shape)) * size
+        raw = blob[at:at + n]
+        at += n
+        if dtype == "bfloat16":
+            a = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
+        elif dtype in ("float8_e4m3fn", "float8_e8m0fnu"):
+            from . import referee_deepseek as rd
+            b = np.frombuffer(raw, np.uint8)
+            a = (rd.E4M3[b] if dtype == "float8_e4m3fn" else rd.decode_e8m0(b)).astype(np.float32)
+        else:
+            a = np.frombuffer(raw, _NP[dtype])
+        out[name] = a.reshape(shape)
+    if at != len(blob):
+        raise ValueError("a record with bytes left over")
+    if "x_fp8" in out:
+        q, s = out.pop("x_fp8"), out.pop("x_scale")
+        out["x"] = (q.reshape(*q.shape[:-1], -1, BLOCK) * s[..., None]).reshape(q.shape).astype(np.float32)
+    return out
+
+
+class RecordReader:
+    """A job's records as the node's referee reads them, one at a time and without PyTorch: a chunk's index (its
+    offsets and per-layer hashes) once, then each record by byte range, checked against its leaf, and the manifest
+    against the root the job pinned."""
+
+    def __init__(self, store, manifest: dict, root: str):
+        _check_manifest(manifest, root)
+        self.store, self.manifest = store, manifest
+        self.where = {}
+        for c, b in enumerate(manifest["blocks"]):
+            for j in range(b["count"]):
+                self.where[b["first"] + j] = (c, j)
+        self.metas: dict[int, dict] = {}
+
+    def record_bytes(self, seq: int) -> bytes:
+        c, j = self.where[seq]
+        if c not in self.metas:
+            self.metas[c] = json.loads(self.store.get(block_names(c)[1]))
+        meta = self.metas[c]
+        rec = self.store.get_range(block_names(c)[0], meta["offsets"][j], meta["offsets"][j + 1])
+        _check_record(self.manifest, c, j, rec, meta)
+        return rec
+
+    def record_np(self, seq: int) -> dict:
+        return unpack_np(self.record_bytes(seq))

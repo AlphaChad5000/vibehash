@@ -9,10 +9,10 @@ JSON deepseek_split writes to the bucket); its reveal is that root and salt; two
 (deepseek_worker.check_unit) and say whether it holds. Settling adds "accepted": {graph unit: what later units and
 the records need of its commitment}, and "root" when it's the last.
 
-Disputes. PR #5's judge referees an llm.py fine-tune down to one op; DeepSeek has no program for it yet. So for
-now a DeepSeek claim any counted checker rejects ends unchecked (unpaid, not slashed) and its unit goes out again in
-a later round: a cheat gains nothing, and is never caught either. DEEPSEEK.md §8 lists it as a known weakness, until
-DeepSeek's ops are in the referee.
+Disputes. A training round's are refereed as a fine-tune's (deepseek_program.py, referee_deepseek.py). A prep
+unit has no program in the referee yet, so for now a prep claim any counted checker rejects ends unchecked (unpaid,
+not slashed) and its unit goes out again in a later round: a cheat gains nothing, and is never caught either.
+DEEPSEEK.md §8 lists it as a known weakness, until prep units are refereed (before launch).
 """
 from __future__ import annotations
 

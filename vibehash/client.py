@@ -641,9 +641,16 @@ class WorkerClient:
             from . import finetune
             from .worker import tamper
 
-            rt = finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
-            party = self.party[rnd] = Party(rt, job.spec, job.data, _Remote(self),
-                                            tamper if self.worker.behavior == "tamper" else None)
+            cheat = tamper if self.worker.behavior == "tamper" else None
+            if job.deepseek:  # its program and weights (deepseek_tracer), on its records
+                from .deepseek_tracer import Party as DeepSeekParty
+                from .deepseek_unit import runtime as deepseek_runtime
+                self.ds.records(rnd, job)
+                rt = deepseek_runtime(job.spec, finetune.device_of(self.backend))
+                party = DeepSeekParty(rt, job.spec, job.data, _Remote(self), cheat)
+            else:
+                rt = finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
+                party = Party(rt, job.spec, job.data, _Remote(self), cheat)
             self.party = {rnd: party}
         st.busy = True
         try:

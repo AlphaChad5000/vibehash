@@ -450,7 +450,7 @@ def op_ds_compress(op, x, r, c0, c1):
 def op_ds_index_scores(op, x, r, c0, c1):
     """Indexer.scores for query r: Σ_h relu(q_h · k_t) · w_h for each compressed token t, -inf for those it can't
     see yet ((r + 1) // ratio of them). The einsum, the product and the sum each round to the activation dtype.
-    ins (q [T, H·D], index keys [n, D], w [T, H]); attrs heads, ratio."""
+    ins (q [T, H·D], index keys [n, D], w [T, H][, candidates [T, n] 0/1]); attrs heads, ratio."""
     a, num = op.attrs, _num(op)
     H = a["heads"]
     D = op.ishapes[0][1] // H
@@ -466,6 +466,9 @@ def op_ds_index_scores(op, x, r, c0, c1):
         prod = cast(rf.mul(sc, E(w[:, None])), num)
         tot = cast(_sum(prod, 0), num)
         v[:hi - c0], e[:hi - c0] = tot.v[0], tot.e[0]
+    if len(op.ins) > 3:  # the candidate source's blocks: -inf outside them (Indexer.forward)
+        out = x.get(op.ins[3], r, r + 1, c0, c1)[0] == 0
+        v, e = np.where(out, -np.inf, v), np.where(out, 0.0, e)
     return E(v, e)
 
 
@@ -756,15 +759,17 @@ def op_ds_hc_post_dres(op, x, r, c0, c1):
 
 
 def op_ds_hc_post_dsplit(op, x, r, c0, c1):
-    """hc_post's backward to its split row: zero for pre, dpost_k = dout_k · y, dcomb_jk = dout_k · res_j (dots over
-    dim). ins (dout [T, hc·dim], y [T, dim], residual [T, hc·dim]); attrs hc."""
+    """hc_post's backward to its split row: pre's from the next sublayer's hc_pre (ins[3], copied; zero without it),
+    dpost_k = dout_k · y, dcomb_jk = dout_k · res_j (dots over dim). ins (dout [T, hc·dim], y [T, dim], residual
+    [T, hc·dim][, dpre [T, hc]]); attrs hc."""
     hc = op.attrs["hc"]
     dim = op.ishapes[1][1]
     dout = x.row(op.ins[0], r).reshape(hc, dim)
     y, res = x.row(op.ins[1], r), x.row(op.ins[2], r).reshape(hc, dim)
     dpost = rf.contract(E(dout), y[None])[:, 0]
     dcomb = rf.contract(E(res), dout)  # [j, k]
-    out = rf._cat(E(np.zeros(hc)), E(dpost.v, dpost.e), E(dcomb.v.reshape(-1), dcomb.e.reshape(-1)))
+    dpre = E(x.row(op.ins[3], r)) if len(op.ins) > 3 else E(np.zeros(hc))
+    out = rf._cat(dpre, E(dpost.v, dpost.e), E(dcomb.v.reshape(-1), dcomb.e.reshape(-1)))
     return out[c0:c1]
 
 
@@ -794,7 +799,7 @@ def op_ds_swiglu_bwd(op, x, r, c0, c1):
     a = op.attrs
     lim = a.get("limit", 0)
     dh, g, u = (x.get(n, r, r + 1, c0, c1)[0] for n in op.ins[:3])
-    gate = x.get(op.ins[3], r, r + 1, 0, 1)[0, 0]
+    gate = x.get(op.ins[3], r, r + 1, 0, 1)[0, 0] if len(op.ins) > 3 else 1.0  # (the shared expert's: none)
     gc, uc = (np.minimum(g, lim), np.clip(u, -lim, lim)) if lim > 0 else (g, u)
     dg_ = rf.mul(E(dh), E(gate))
     if a["part"] == "u":
@@ -1256,13 +1261,169 @@ def choice_ds_candidates(op, x, r, row):
         return False, "it leaves out a block scoring above one it keeps (or the pinned one)"
     return True, ""
 
+
+# --- a training step's rows: its records, sequences sliced out and put back, the experts by slot -----------------------
+# deepseek_program.py runs a step's sequences together, N rows; attention a sequence at a time. The routed experts go by
+# slot: row t·k + j is token t's j-th chosen expert's, so the program's shapes follow from the data alone.
+
+class RecordSource:
+    """A DeepSeek job's records as the referee reads them, through the weights' interface (dispute.Outside's source):
+    record.{seq}.{part} is a float32 tensor of that part's rows, so the rows a game's referee read are kept with the
+    weights in its record (dispute.Recorded), and a validator replays it without the bucket. `data` has the job's
+    token file (.tokens) and its records (.records: deepseek_unit.Records on a worker, deepseek_graph.RecordReader on
+    the node, each checking a record against the pinned root as it reads it)."""
+
+    def __init__(self, data):
+        self.data = data
+        self.got: dict[int, dict] = {}
+
+    def _parts(self, seq: int) -> dict:
+        if seq not in self.got:
+            if getattr(self.data, "records", None) is None:
+                from .dispute import WeightsUnavailable
+                raise WeightsUnavailable("the job's records can't be read")
+            if len(self.got) > 16:
+                self.got.clear()
+            rec = self.data.records.record_np(seq)
+            tok = rec["tokens"].astype(np.int64)
+            parts = {"x": rec["x"].reshape(rec["x"].shape[0], -1), "pre": rec["pre"], "mask": rec["mask"][:, None],
+                     "targets": np.concatenate([tok[1:], tok[:1]])[rec["mask"] == 1][:, None]}
+            for name in ("compress_kv", "index_k", "picks", "candidates"):
+                if name in rec:
+                    parts[name] = rec[name]
+            self.got[seq] = {k: np.ascontiguousarray(v, dtype="<f4").reshape(v.shape[0], -1) for k, v in parts.items()}
+        return self.got[seq]
+
+    def _part(self, name: str) -> np.ndarray:
+        _, seq, part = name.split(".", 2)
+        parts = self._parts(int(seq))
+        if part not in parts:
+            raise rf.Missing(name)
+        return parts[part]
+
+    def shape(self, name):
+        return "F32", tuple(self._part(name).shape)
+
+    def read(self, name, r0, r1) -> bytes:
+        return self._part(name)[r0:r1].tobytes()
+
+
+class Sources:
+    """The model's weights and, under record.*, the job's records (RecordSource): one source for dispute.Outside."""
+
+    def __init__(self, weights, records: RecordSource):
+        self.weights, self.records = weights, records
+
+    def _of(self, name):
+        return self.records if name.startswith("record.") else self.weights
+
+    def shape(self, name):
+        return self._of(name).shape(name)
+
+    def read(self, name, r0, r1) -> bytes:
+        return self._of(name).read(name, r0, r1)
+
+
+def _learned(data, s: int) -> int:
+    t = data.tokens
+    a = int(np.concatenate([[0], np.cumsum(t.lengths)])[s])
+    return int(t.learn[a + 1:a + int(t.lengths[s])].sum())
+
+
+def op_ds_record(op, x, r, c0, c1):
+    """A step's inputs from the job's records (deepseek_top.pack's parts): rows of x [T, hc·dim], pre [T, hc] or mask
+    [T, 1] for each of attrs seqs, one after another; targets [P, 1], the next token at each learned position; or one
+    sequence's compress_kv, index_k, picks or candidates. Read as record.{seq}.{part} (RecordSource), checked against
+    the pinned root. Exact."""
+    a, data = op.attrs, x.outside.data
+    part, seqs = a["part"], [int(s) for s in a["seqs"]]
+    s = seqs[0]
+    if part in ("x", "pre", "mask", "targets"):
+        for s in seqs:
+            n = _learned(data, s) if part == "targets" else int(data.tokens.lengths[s])
+            if r < n:
+                break
+            r -= n
+        else:
+            raise rf.Missing(f"row {r} of the step's records")
+    return E(x.weight(f"record.{s}.{part}", r, r + 1)[0, c0:c1])
+
+
+def op_ds_slice(op, x, r, c0, c1):
+    """Rows [r0, r1) of a tensor: a sequence's, out of a step's. Exact."""
+    r0 = op.attrs["r0"]
+    return E(x.get(op.ins[0], r0 + r, r0 + r + 1, c0, c1)[0])
+
+
+def op_ds_cat(op, x, r, c0, c1):
+    """Tensors' rows one after another: a step's, from its sequences'. Exact."""
+    for name, (rows, _) in zip(op.ins, op.ishapes):
+        if r < rows:
+            return E(x.get(name, r, r + 1, c0, c1)[0])
+        r -= rows
+    raise rf.Missing(f"row {r} of {op.out}")
+
+
+def op_ds_reshape(op, x, r, c0, c1):
+    """The same numbers, row-major, in another shape ([N·k, d] and [N, k·d]). Exact."""
+    cols, width = op.ishapes[0][1], op.shape[1]
+    at, end, parts = r * width + c0, r * width + c1, []
+    while at < end:
+        row, col = divmod(at, cols)
+        stop = min(end, (row + 1) * cols)
+        parts.append(x.get(op.ins[0], row, row + 1, col, col + stop - at)[0])
+        at = stop
+    return E(np.concatenate(parts) if parts else np.zeros(0))
+
+
+def _slot_expert(x, chosen: str, t: int, j: int) -> int:
+    e = x.get(chosen, t, t + 1, j, j + 1)[0, 0]
+    if not (np.isfinite(e) and e == int(e) and e >= 0):
+        raise rf.Missing(f"token {t}'s expert {j}")
+    return int(e)
+
+
+def op_ds_moe_linear(op, x, r, c0, c1):
+    """An expert's projection for one slot: row r = t·k + j uses expert chosen[t, j]'s matrix (attrs weight, a pattern
+    with {e}), on src[t] (attrs per_token: w1, w3) or src[r] (w2), dequantised as ds_qlinear's. ins (src,
+    chosen [N, k])."""
+    a = op.attrs
+    t, j = divmod(r, op.ishapes[1][1])
+    src = x.row(op.ins[0], t if a["per_token"] else r)
+    w = qrows(x, a["weight"].format(e=_slot_expert(x, op.ins[1], t, j)), c0, c1)
+    return cast(rf.contract(E(src[None]), w)[0], _num(op))
+
+
+def op_ds_moe_linear_bwd(op, x, r, c0, c1):
+    """ds_moe_linear's backward to its input, for one slot: dy · W of the slot's expert (dy[t] with attrs per_token,
+    else dy[r]), then + acc. ins (dy, chosen[, acc])."""
+    a = op.attrs
+    t, j = divmod(r, op.ishapes[1][1])
+    dy = x.row(op.ins[0], t if a.get("per_token") else r)
+    base = a["weight"].format(e=_slot_expert(x, op.ins[1], t, j))
+    y = _contract_rows(dy, lambda o0, o1: qrows(x, base, o0, o1)[:, c0:c1], op.ishapes[0][1])
+    return _acc(op, x, r, c0, c1, y, 2)
+
+
+def op_ds_moe_dx(op, x, r, c0, c1):
+    """The routed experts' gradients to token r's input: its k slots' rows added in ascending expert order (as
+    ds_moe_sum adds their outputs), then + acc. ins (dxs [N·k, dim], chosen [N, k][, acc])."""
+    k = op.ishapes[1][1]
+    chosen = x.row(op.ins[1], r).astype(np.int64)
+    y = None
+    for j in np.argsort(chosen, kind="stable"):
+        o = E(x.get(op.ins[0], r * k + int(j), r * k + int(j) + 1, c0, c1)[0])
+        y = o if y is None else rf.add(y, o)
+    return _acc(op, x, r, c0, c1, y, 2)
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_ds_")}
-EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows", "ds_rows", "ds_unrows"}
+EXACT = {"ds_round_fp8", "ds_round_fp4", "ds_embed", "ds_engram_rows", "ds_rows", "ds_unrows", "ds_record", "ds_slice",
+         "ds_cat", "ds_reshape"}
 # Ops whose result is cast to the activation dtype: under "ref", every number of an honest tile is a bf16 number
 # (or -inf, the indexer's mask). Rounding error of a bf16 step can't be caught by a bound, but a number between
 # two bf16 numbers can be refused exactly.
 CAST = {"ds_qlinear", "ds_scale", "ds_rmsnorm", "ds_rope", "ds_hc_pre", "ds_hc_post", "ds_compress", "ds_index_scores",
-        "ds_swiglu", "ds_dense", "ds_attn", "ds_engram_gate", "ds_moe_sum"}
+        "ds_swiglu", "ds_dense", "ds_attn", "ds_engram_gate", "ds_moe_sum", "ds_moe_linear"}
 
 
 def bf16_only(op, said: np.ndarray):

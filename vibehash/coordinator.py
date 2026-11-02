@@ -1384,7 +1384,7 @@ class Coordinator:
             return False
         job = self.job(r.job_id)
         r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
-        if job.deepseek:  # no DeepSeek program in the referee yet: a rejected claim ends unchecked (deepseek_rounds)
+        if r.prep:  # prep units aren't refereed yet: a rejected claim ends unchecked (deepseek_rounds)
             return False
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
@@ -1477,9 +1477,27 @@ class Coordinator:
                     raise dg.MoveRefused(f"state {root[:12]}…: {name} isn't uploaded, or doesn't hash as its manifest says")
 
     def _weight_source(self, job: TrainingJob):
+        if job.deepseek:  # its weights, and its records as record.* (referee_deepseek.RecordSource)
+            from . import referee_deepseek as rd
+            from .deepseek_job import weight_source
+            self._records(job)
+            weights = self.weight_source(job) if self.weight_source is not None else weight_source(job.spec)
+            return rd.Sources(weights, rd.RecordSource(job.data))
         if self.weight_source is not None:
             return self.weight_source(job)
         return dg.HubWeights(job.data.parsed_manifest())
+
+    def _records(self, job: TrainingJob) -> None:
+        """A DeepSeek job's records for the referee (referee_deepseek's ds_record), read from the bucket and checked
+        against the root its prep pinned (deepseek_graph.RecordReader): set once, on a node with the bucket."""
+        if not job.deepseek or getattr(job.data, "records", None) is not None or self.prep_store is None:
+            return
+        state = self.prep(job)
+        if state.root is None:
+            return
+        store = self.prep_store(job)
+        manifest = json.loads(store.get("manifest.json"))
+        job.data.records = dsg.RecordReader(store, manifest, state.root)
 
     @_locked
     def game_views(self) -> list[dict]:
@@ -1792,10 +1810,10 @@ class Coordinator:
                 r.slashes.append([g.challenger, None, "false accusation"])
         for key in sorted(r.reveals):
             lost = [g for g in games[key] if g.outcome == "challenger"]
-            rejected = job.deepseek and any(not t.verdict[0] for t in answered[key])
+            rejected = bool(r.prep) and any(not t.verdict[0] for t in answered[key])
             if rejected:  # (deepseek_rounds: no game to settle it, so nobody is paid or slashed for it)
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
-                                            "a checker rejected it, and DeepSeek's claims aren't refereed yet")
+                                            "a checker rejected it, and prep units aren't refereed yet")
             elif lost:
                 g = lost[0]
                 self._fraud(key, Verdict.FAILED_REDUNDANCY if g.why == "replicas" else Verdict.FAILED_REPLAY,

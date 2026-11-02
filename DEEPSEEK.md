@@ -1008,11 +1008,35 @@ merge). [x] done, [ ] to do.
     and `Meter`'s stats in the round's record.
   - [x] The judge (PR #5's bisection game, op table, record version 4) merged
     in (2026-11-01).
-  - [ ] The referee's DeepSeek ops, and disputes of prep units and DeepSeek
-    training units through the judge. Until then, the interim rule
-    (`deepseek_rounds.py`, the owner's call): a DeepSeek claim any counted
-    checker rejects ends unchecked, unpaid and unslashed, and its unit goes out
-    again. A cheat gains nothing but is never caught. Two weaknesses:
+  - [x] Training units refereed through the judge, losers slashed as for
+    fine-tunes.
+    - `deepseek_program.py` is a training unit's tree of ops. Each step runs its
+      sequences together, layer by layer, so each layer's experts stream once a
+      pass. Attention runs a sequence at a time. The routed experts go by slot
+      (row t·k + j uses token t's j-th expert), so the tree follows from the
+      data alone, as a game needs.
+    - `deepseek_tracer.py` runs those ops in PyTorch. Units train by it, so a
+      worker's dispute states chain to its checkpoints.
+    - `referee_deepseek.py` checks each op in NumPy on the node (the fine-tune
+      session wrote it). A step's records are read as `record.{seq}.{part}`
+      through the weights' interface, so a game's record keeps the rows it
+      read and replays without the bucket.
+    - Tested (`tests/test_deepseek_program.py`, tiny config):
+      - op by op agrees with autograd to about 1e-7;
+      - every honest op passes the referee, and 3% bends fail;
+      - a trainer that scaled one op loses its game at that op.
+    - The local run (`tests/test_deepseek_network.py`) has a tampering
+      trainer and a false accuser, both slashed.
+  - [ ] Per-tensor hashes of Flash's trained layers and head. The node's
+    referee needs them to read weight slices by range from the Hub, checked.
+    The job pins only file-level hashes (`MANIFESTS`), so until then a dispute
+    of a Flash training unit ends unchecked (`deepseek_job.weight_source`).
+  - [ ] Prep units refereed: their program in the reference's bf16, chunk
+    wide, and commitments of per-layer state roots. Until then, the interim
+    rule (`deepseek_rounds.py`): a prep claim any counted checker rejects ends
+    unchecked, unpaid and unslashed, and its unit goes out again. A cheat gains
+    nothing but is never caught. The owner wants prep refereed before launch.
+    Two weaknesses until then:
     - One checker that rejects everything costs honest miners their pay for
       those units, and the prep a round's delay each time, with no penalty.
       Its stake is never at risk, since there's no game to lose.

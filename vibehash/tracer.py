@@ -383,6 +383,10 @@ class Party:
     def executor(self, prog, honest: bool) -> Executor:
         return Executor(self.rt, self.spec, prog, None if honest else self.tamper)
 
+    def source(self):
+        """The base model's weights as this worker holds them, for running the referee itself (dispute.Outside)."""
+        return TorchWeights(self.rt.model)
+
     def load(self, root: str) -> tuple[dict, bytes]:
         if root not in self.states:
             m = self.remote.get(root)
@@ -443,7 +447,7 @@ class Party:
         node, _ = node_at(prog, view["root"], view["path"])
         op = node.atoms[view["lo"]]
         (before, mb), (after, ma) = self.load(view["a"]), self.load(view["b"])
-        out = Outside(self.spec, self.data, TorchWeights(self.rt.model), keep=False)
+        out = Outside(self.spec, self.data, self.source(), keep=False)
         b, a = _AsNumpy(before), _AsNumpy(after)
         evidence, _, _ = make_evidence(op, view["tile"], b, a, (mb, ma), out, shapes=b.shapes())
         return evidence
@@ -494,7 +498,7 @@ class Party:
         size = torch.nn.functional.pad(_size(y), (0, pad)).view(n, -1).amax(1)
         off = torch.nan_to_num(diff / (size + 1e-30), nan=float("inf"))
         order = torch.argsort(off, descending=True)[:CANDIDATES].tolist()
-        out = Outside(self.spec, self.data, TorchWeights(self.rt.model), keep=False)
+        out = Outside(self.spec, self.data, self.source(), keep=False)
         full = _AsNumpy(before)
         theirs = after[op.out].detach().cpu().numpy().reshape(-1)
         for tile in order:

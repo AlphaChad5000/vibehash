@@ -121,6 +121,9 @@ class Program:
 
     @classmethod
     def of(cls, job, seed: int) -> "Program":
+        if getattr(job, "deepseek", False):  # a DeepSeek top-layers job's units (deepseek_program.py)
+            from .deepseek_program import DeepSeekProgram
+            cls = DeepSeekProgram
         return cls(job.spec, job.data, job.lr, job.batch_size, seed, job.n_segments, job.checkpoint_every)
 
     # --- the levels ---

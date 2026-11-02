@@ -3,9 +3,10 @@ top layers from the prep's records, as model.train_segment runs a fine-tune's, a
 loss. model.train_segment and tasks.TrainingJob.evaluate come here for a deepseek_job.DeepSeekSpec.
 
 A unit's state is finetune.py's: the vector [B | m | v] over spec.modules(), Adam's moments zeroed at each round's
-start. Step t of a unit (from 0) trains on batch_indices(unit_seed, t) of the job's training sequences, each its own
-micro-batch, with bias correction for t + 1, through deepseek_top.train_step_streamed in float32, so a checker on
-other hardware replays it to float32 rounding.
+start. Step t of a unit (from 0) trains on batch_indices(unit_seed, t) of the job's training sequences, with bias
+correction for t + 1, by running deepseek_program.py's ops one by one (deepseek_tracer.Executor) in float32: the same
+ops a dispute re-runs and the node's referee checks, so a worker's states chain to the checkpoints it committed to.
+deepseek_top.train_step is the same step through autograd: the program agrees with it to float32 rounding.
 """
 from __future__ import annotations
 
@@ -21,7 +22,6 @@ from . import deepseek as ds
 from . import deepseek_split as split
 from . import deepseek_top as top
 from .deepseek_job import DeepSeekData, DeepSeekSpec  # noqa: F401 - DeepSeekData: callers' import
-from .model import batch_indices
 
 
 class Records:
@@ -51,10 +51,18 @@ class Records:
                 tmp.replace(path)
         return np.memmap(path, np.uint8, "r"), json.loads(meta_path.read_text())["offsets"]
 
-    def record(self, seq: int) -> dict:
+    def record_bytes(self, seq: int) -> bytes:
         c, j = self.where[seq]
         data, offsets = self._chunk(c)
-        return top.unpack(bytes(data[offsets[j]:offsets[j + 1]]))
+        return bytes(data[offsets[j]:offsets[j + 1]])
+
+    def record(self, seq: int) -> dict:
+        return top.unpack(self.record_bytes(seq))
+
+    def record_np(self, seq: int) -> dict:
+        """The record as NumPy arrays (deepseek_graph.unpack_np): what the referee reads (referee_deepseek's
+        ds_record), on a worker building its evidence as on the node."""
+        return split.unpack_np(self.record_bytes(seq))
 
     def examples(self, seqs, device="cpu") -> list[top.Example]:
         """One micro-batch a sequence, on `device`."""
@@ -67,6 +75,15 @@ class _Runtime:
     cut: top.Cut
     device: str
     busy: threading.Lock = field(default_factory=threading.Lock)
+    _weights: dict | None = None
+
+    @property
+    def weights(self) -> dict:
+        """The trained layers' and the head's tensors by checkpoint name, as the model holds them (the routed
+        experts wherever their tensors are): what deepseek_tracer's ops read."""
+        if self._weights is None:
+            self._weights = dict(self.model.state_dict())
+        return self._weights
 
 
 _runtimes: dict = {}
@@ -122,25 +139,25 @@ def _vector(ad: top.Adapters) -> np.ndarray:
 
 
 def train_segment(spec: DeepSeekSpec, data: DeepSeekData, theta: np.ndarray, unit_seed: int, start_step: int,
-                  n_steps: int, lr: float, batch_size: int, backend=None) -> np.ndarray:
-    """Adam steps [start_step, start_step + n_steps) of a unit from the state vector `theta` ([B | m | v])."""
+                  n_steps: int, lr: float, batch_size: int, backend=None, tamper=None) -> np.ndarray:
+    """Adam steps [start_step, start_step + n_steps) of a unit from the state vector `theta` ([B | m | v]), op by op
+    (deepseek_program, deepseek_tracer). `tamper` is the Executor's, for tests of a worker that cheats in one op."""
+    from .deepseek_program import DeepSeekProgram
+    from .deepseek_tracer import Executor
     from .finetune import device_of
+    from .program import join_theta, split_theta
     if data.records is None:
         raise RuntimeError("the job's prep isn't done: no records to train on yet")
     device = device_of(backend)
     rt = runtime(spec, device)
-    ad = _adapters(spec, theta, device)
-    train = data.train
-    with rt.busy:
-        ad.attach(rt.model)
+    prog = DeepSeekProgram(spec, data, lr, batch_size, unit_seed)
+    with rt.busy, torch.no_grad():
+        st = {k: torch.tensor(v, device=device) for k, v in split_theta(spec, theta).items()}
+        ex = Executor(rt, spec, prog, tamper)
         for t in range(start_step, start_step + n_steps):
-            seqs = [train[i] for i in batch_indices(unit_seed, t, len(train), batch_size)]
-            batches = data.records.examples(seqs, device)
-            if device == "cpu":
-                top.train_step(rt.model, rt.cut, ad, batches, t + 1, lr)
-            else:
-                top.train_step_streamed(rt.model, rt.cut, ad, batches, t + 1, lr, device=device)
-    return _vector(ad)
+            node = prog.step(t)
+            ex.run_atoms(node, 0, len(node.atoms), st, (node.label,))
+        return join_theta(spec, {k: v.cpu().numpy() for k, v in st.items()})
 
 
 @torch.no_grad()
