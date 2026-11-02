@@ -665,7 +665,7 @@ class WorkerClient:
                 key = (rnd, g["id"], g["n"])
                 move = self.unsent.pop(key, None)
                 if move is None:
-                    if job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's (deepseek_client)
+                    if job is not None and job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's
                         prog, p = self.ds.prep_game(rnd, job, g, party.remote)
                     else:
                         prog, p = Program.of(job, int(g["seed"])), party
