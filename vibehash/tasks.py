@@ -9,6 +9,7 @@ from enum import Enum
 import numpy as np
 
 from .crypto import h256
+from .deepseek_job import DeepSeekData, DeepSeekSpec, TokenFile, is_deepseek_spec
 from .finetune import LoraSpec, TokenDataset
 from .model import PRECISIONS, Dataset, ModelSpec, evaluate
 
@@ -58,8 +59,14 @@ class TrainingJob:
 
     @property
     def finetune(self) -> bool:
-        """Whether it fine-tunes a pretrained model's LoRA adapters (finetune.py) rather than training an MLP."""
+        """Whether it fine-tunes a pretrained model's LoRA adapters (finetune.py) rather than training an MLP. A
+        DeepSeek top-layers job (deepseek_job.py) is one too: its training rounds are a fine-tune's."""
         return isinstance(self.spec, LoraSpec)
+
+    @property
+    def deepseek(self) -> bool:
+        """Whether it's a DeepSeek-V4.1 top-layers job: a prep of the frozen layers, then training rounds."""
+        return isinstance(self.spec, DeepSeekSpec)
 
     # --- on-chain spec -------------------------------------------------------
 
@@ -98,6 +105,8 @@ class TrainingJob:
             raise InvalidJob("job spec too large")
         try:
             d = json.loads(text)
+            if is_deepseek_spec(d):
+                return cls._from_finetune(d, requester, budget, deepseek=True)
             if is_finetune_spec(d):
                 return cls._from_finetune(d, requester, budget)
             m = d["model"]
@@ -117,12 +126,14 @@ class TrainingJob:
             raise InvalidJob(f"malformed job spec: {e}") from e
 
     @classmethod
-    def _from_finetune(cls, d: dict, requester: str, budget: int) -> "TrainingJob":
-        if set(d) - FINETUNE_KEYS:
-            raise InvalidJob(f"a fine-tune's spec has no field {sorted(set(d) - FINETUNE_KEYS)[0]!r}")
+    def _from_finetune(cls, d: dict, requester: str, budget: int, deepseek: bool = False) -> "TrainingJob":
+        keys = FINETUNE_KEYS | ({"deepseek"} if deepseek else set())
+        if set(d) - keys:
+            raise InvalidJob(f"a fine-tune's spec has no field {sorted(set(d) - keys)[0]!r}")
         return cls(
             job_id=d["id"], requester=requester, budget=budget, fee_per_round=int(d["fee_per_round"]),
-            spec=LoraSpec.from_json(d, seed=int(d["init_seed"])), data_source=dict(d["data"]),
+            spec=(DeepSeekSpec if deepseek else LoraSpec).from_json(d, seed=int(d["init_seed"])),
+            data_source=dict(d["data"]),
             init_seed=int(d["init_seed"]), lr=float(d["lr"]), batch_size=int(d["batch_size"]),
             steps_per_unit=int(d["steps_per_unit"]), checkpoint_every=int(d["checkpoint_every"]),
             units_per_round=int(d["units_per_round"]), memory_mb=int(d["memory_mb"]), tolerance=float(d["tolerance"]),
@@ -177,9 +188,24 @@ class TrainingJob:
         need(self.compute_s == 0 or 5 <= self.compute_s <= MAX_COMPUTE_S,
              f"compute_s is 0 (sized from the job) or 5-{MAX_COMPUTE_S:.0f} seconds")
         need(self.shards == 1, "fine-tunes train whole models: shards is 1")
+        if self.deepseek:
+            return self._validate_deepseek_data(need)
         need(self.data_source.get("kind") == "tokens" and set(self.data_source) == {"kind", "sha256"}
              and re.fullmatch(r"[0-9a-f]{64}", str(self.data_source.get("sha256", ""))),
              'a fine-tune\'s data is {"kind": "tokens", "sha256": ...}')
+
+    def _validate_deepseek_data(self, need) -> None:
+        """A DeepSeek job's data: its text as token ids (deepseek_prep's .npz), and which sequences train and which
+        are held back for the scorers: {"kind": "deepseek", "sha256", "train": [first, end], "heldback": [...]}."""
+        d = self.data_source
+
+        def span(x):
+            return isinstance(x, list) and len(x) == 2 and all(type(v) is int for v in x) and 0 <= x[0] < x[1]
+        need(d.get("kind") == "deepseek" and set(d) == {"kind", "sha256", "train", "heldback"}
+             and re.fullmatch(r"[0-9a-f]{64}", str(d.get("sha256", ""))) and span(d.get("train"))
+             and span(d.get("heldback")) and (d["train"][1] <= d["heldback"][0] or d["heldback"][1] <= d["train"][0]),
+             "a DeepSeek job's data is {\"kind\": \"deepseek\", \"sha256\": ..., \"train\": [first, end], "
+             "\"heldback\": [first, end]}, the two apart")
 
     # --- data ------------------------------------------------------------------
 
@@ -191,10 +217,19 @@ class TrainingJob:
             self._data = Dataset.synthetic(self.spec, self.data_source["seed"])
         return self._data
 
-    def attach_data(self, data: Dataset | TokenDataset, file_sha256: str) -> None:
+    def attach_data(self, data: Dataset | TokenDataset | TokenFile, file_sha256: str) -> None:
         """Attach a downloaded dataset after checking it's the one the requester committed to."""
         if file_sha256 != self.data_source.get("sha256"):
             raise InvalidJob("dataset hash does not match the job's commitment")
+        if self.deepseek or isinstance(data, TokenFile):
+            if not (self.deepseek and isinstance(data, TokenFile)):
+                raise InvalidJob("a DeepSeek job's data is its token file (deepseek_job.TokenFile), and no other job's")
+            try:
+                data.check(self.spec, self.data_source)
+            except ValueError as e:
+                raise InvalidJob(f"the dataset doesn't suit the job: {e}") from None
+            self._data = DeepSeekData(data, dict(self.data_source))
+            return
         if self.finetune != isinstance(data, TokenDataset):
             raise InvalidJob("a fine-tune trains on token sequences, and other jobs on tables")
         if self.finetune:
@@ -209,6 +244,9 @@ class TrainingJob:
     def evaluate(self, params: np.ndarray, backend=None) -> tuple[float, float]:
         """(loss, accuracy) of these weights on the job's held-back data: for an MLP, cross-entropy and the share of
         rows classified right; for a fine-tune, cross-entropy and the share of reply tokens predicted right."""
+        if self.deepseek:
+            from . import deepseek_unit
+            return deepseek_unit.evaluate(self.spec, self.data, params, backend)
         if self.finetune:
             from . import finetune
             return finetune.evaluate(self.spec, self.data, params, backend)
@@ -261,17 +299,20 @@ FINETUNE_KEYS = {"id", "fee_per_round", "base", "manifest", "model", "lora", "se
                  "tolerance", "max_update_ratio", "compute_s"}
 
 
-def load_dataset(path, max_bytes: int | None = None) -> Dataset | TokenDataset:
-    """A dataset file of either kind: a table for an MLP (model.Dataset), or token sequences for a fine-tune
-    (finetune.TokenDataset), told apart by the arrays inside. Never unpickles; refuses anything else."""
+def load_dataset(path, max_bytes: int | None = None) -> Dataset | TokenDataset | TokenFile:
+    """A dataset file of any kind: a table for an MLP (model.Dataset), token sequences for a fine-tune
+    (finetune.TokenDataset), or a DeepSeek job's token file (deepseek_job.TokenFile), told apart by the arrays inside.
+    Never unpickles; refuses anything else."""
     import zipfile
 
     try:
         with zipfile.ZipFile(path) as z:
-            tokens = bool({"train_ids", "train_ids.npy"} & set(z.namelist()))
+            names = {n.removesuffix(".npy") for n in z.namelist()}
     except zipfile.BadZipFile as e:
         raise ValueError(f"not a dataset (.npz): {e}") from e
-    return TokenDataset.from_npz(path, max_bytes) if tokens else Dataset.from_npz(path, max_bytes)
+    if names == {"tokens", "lengths", "learn"}:
+        return TokenFile.from_npz(path, max_bytes)
+    return TokenDataset.from_npz(path, max_bytes) if "train_ids" in names else Dataset.from_npz(path, max_bytes)
 
 
 @dataclass(frozen=True)

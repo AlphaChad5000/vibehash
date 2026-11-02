@@ -394,21 +394,27 @@ def manifest(cut: top.Cut, seqs, chunks, last: list[dict], fp8: bool = False) ->
             "root": merkle_root(leaves).hex()}
 
 
-def read_block(store, manifest: dict, c: int, root: str | None = None) -> list[tuple[int, dict]]:
-    """Chunk c's records, as a trainer or a scorer reads its shard from the bucket: each one checked against its leaf
-    in the manifest (the record's bytes and its per-layer hashes), the manifest's leaves against its root, and that
-    root against the one the job pinned (`root`). -> [(the sequence's index in the dataset, its record's tensors)]."""
+def check_block(manifest: dict, c: int, data: bytes, meta: bytes, root: str | None = None) -> list[tuple[int, bytes]]:
+    """Chunk c's block file and its JSON, checked: the manifest's leaves against its root, that root against the one
+    the job pinned (`root`), and each record against its leaf (the record's bytes and its per-layer hashes). -> [(the
+    sequence's index in the dataset, its record's bytes)]."""
     leaves = [bytes.fromhex(leaf) for b in manifest["blocks"] for leaf in b["leaves"]]
     if merkle_root(leaves).hex() != manifest["root"] or (root is not None and manifest["root"] != root):
         raise Tampered("the manifest isn't the dataset the job pinned")
-    bin_name, meta_name = block_names(c)
-    data, meta = store.get(bin_name), json.loads(store.get(meta_name))
+    meta = json.loads(meta)
     out = []
     for j, i in enumerate(meta["sequences"]):
         rec = data[meta["offsets"][j]:meta["offsets"][j + 1]]
         leaf = hashlib.sha256(hashlib.sha256(rec).digest()
                               + b"".join(bytes.fromhex(h) for h in meta["layer_hashes"][j])).hexdigest()
         if leaf != manifest["blocks"][c]["leaves"][j]:
-            raise Tampered(f"{bin_name}: record {j} isn't the one the manifest commits to")
-        out.append((i, top.unpack(rec)))
+            raise Tampered(f"{block_names(c)[0]}: record {j} isn't the one the manifest commits to")
+        out.append((i, rec))
     return out
+
+
+def read_block(store, manifest: dict, c: int, root: str | None = None) -> list[tuple[int, dict]]:
+    """Chunk c's records, as a trainer or a scorer reads its shard from the bucket, checked (check_block). ->
+    [(the sequence's index in the dataset, its record's tensors)]."""
+    bin_name, meta_name = block_names(c)
+    return [(i, top.unpack(rec)) for i, rec in check_block(manifest, c, store.get(bin_name), store.get(meta_name), root)]
