@@ -241,12 +241,13 @@ class ForwardOpTests(unittest.TestCase):
         for tile in ((450 * K) // 256, (450 * K + K - 1) // 256):  # whichever tile of the row is named
             self.assertEqual(self.verdict(op, {"s": sp}, {"p": bad}, tile)[0], "challenger")
         # Candidate blocks: deepseek.candidate_blocks' mask; dropping the pinned block is refused.
-        cs = torch.randn(1, 5, 40, generator=g)
-        vis = torch.tensor([[9], [17], [25], [33], [40]])
-        cs = cs.masked_fill(torch.arange(40) >= vis, -float("inf"))
+        T = n = 40
+        vis = torch.arange(1, T + 1)[:, None]
+        cs = torch.randn(1, T, n, generator=g).masked_fill(torch.arange(n) >= vis, -float("inf"))
         mask = ds.candidate_blocks(cs, vis, 2, 4)[0].float().numpy()
-        op = mk("ds_candidates", "m", ["s"], {"block": 4, "topk_blocks": 2, "ratio": 1}, mask.shape, [(5, 40)])
-        self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": mask}, 0)[0], "defender")
+        op = mk("ds_candidates", "m", ["s"], {"block": 4, "topk_blocks": 2, "ratio": 1}, mask.shape, [(T, n)])
+        for tile in range(merkle.n_leaves(T, n)):
+            self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": mask}, tile)[0], "defender", tile)
         drop = mask.copy()
-        drop[3, (33 - 1) // 4 * 4:(33 - 1) // 4 * 4 + 4] = 0
-        self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": drop}, 0)[0], "challenger")
+        drop[30, 28:32] = 0  # query 30's newest position, 30, is in block 7: always kept
+        self.assertEqual(self.verdict(op, {"s": cs[0].numpy()}, {"m": drop}, (30 * n) // 256)[0], "challenger")
