@@ -349,12 +349,15 @@ table); other GPU vendors; the tilelang kernels themselves; decoding. And
 
 ## 8. The first project: train only the top layers
 
-**Status (2026-11-01): designed and prototyped on one PC; the speed and quality
-runs wait for the PC to be free.** Code in `vibehash/deepseek_top.py`, tests in
+**Status (2026-11-01): designed and prototyped on one PC. There are no offline
+speed and quality runs: by the owner's decision, DeepSeek is proven on its
+first live training job, which measures itself ("The first job measures
+itself" below).** Code in `vibehash/deepseek_top.py`, tests in
 `tests/test_deepseek_top.py`. The prep is mining work: small units that anyone
 holding their layers can run, check or challenge (`vibehash/deepseek_split.py`,
 "The split prep" below). There is no preparer role. The one-PC prep is a dev
-and test tool. Numbers marked *estimate* aren't measured yet.
+and test tool. Numbers marked *estimate* get replaced by what the first live job
+measures.
 
 **Why this shape.** Miners won't give up 350 GB of SSD, so each should need
 about a game install's worth. And teams passing activations live (§2–§3) are
@@ -490,7 +493,7 @@ forward is `train_step`'s exactly. The gradients agree to float32 rounding
 | Kept for the backward, float32 (measured on the CPU at real sizes) | 878 KB a token (the whole layer's graph) | 368 KB a token (the attention stage's; the MoE stages keep a few rows) |
 | Longest sequence on 12 GB (with 1.4–2.4 GB taken by the desktop) | about 1,500 tokens | — |
 | On 8 GB / 6 GB | doesn't fit | roughly 7,000 / 4,500 tokens (*estimate*: the counts, about 280 KB a token the step keeps on the GPU, the indexer's transient scores at 128 KB per token of context, and a token × token score matrix) |
-| Speed | §7: 0.6–0.75 ms a token a layer in bf16; float32 *to be measured* | *to be measured*: the same PCIe traffic, plus 384 small copies and launches a layer |
+| Speed | §7: 0.6–0.75 ms a token a layer in bf16; float32 *measured on the first live job* | *measured on the first live job*: the same PCIe traffic, plus 384 small copies and launches a layer |
 
 Without recomputing (keeping every layer's graph through the step), four layers
 need 3.5 MB a token, so 8 GB holds about 1,500 tokens for the whole step.
@@ -761,9 +764,14 @@ the trainers reading the records once and a month of storing them:
   codec can change. The chain of digests ties each unit's input to its producer's
   output (tested).
 
-Anyone holding the piece's layers can replay a unit. A dispute bisects over the
-piece's G layers to one layer, then over that layer's ops, down to one op the
-node referees on its CPU (the table above).
+Anyone holding the piece's layers can replay a unit (`replay`, tested). It runs
+the unit again from the same checked inputs, writing nothing, and gives each
+sequence's first layer whose hash differs. That's where a challenge starts: the
+state entering that layer is agreed (its hash is the one the unit committed for
+the layer before), and the layer's output isn't. Either side serves that agreed
+state (`state_before`, tested to hash as committed), and the dispute bisects
+through that layer's ops, down to one op the node referees on its CPU (the
+table above).
 - A wrong output poisons everything above it for that chunk. Waiting out each
   unit's window before the next reads it puts every window on the critical path.
   With 1-hour windows, 1M tokens at G = 4 take 13.1 h instead of 4.1 h (36
@@ -793,7 +801,13 @@ commitments. The options:
 - **(a) For v1: a DigitalOcean Spaces bucket the operator pays for.**
   - The node signs a URL per object and method, so miners need no account
     (`presign`: S3's Signature Version 4, checked against AWS's worked example;
-    `PresignedStore` uses the URLs).
+    `Signer` on the node, `PresignedStore` on the miner). A signed URL can't be
+    bent to another method, object or part.
+  - Nothing big travels in one request. A hand-off goes up as S3's multipart
+    upload, in 64 MiB parts, each retried on its own. Its progress is kept in a
+    journal, so after a crash only the parts not yet acknowledged are sent. It
+    comes down in 64 MiB ranges. Tested against a local S3 that checks every
+    signature, through a link failing every third request, and cut off part way.
   - It costs $5 a month for 250 GiB stored and 1 TiB out, then $0.01 a GiB out
     and $0.02 a GiB-month stored. Uploads are free.
   - Each object is deleted once every unit that reads it is accepted
@@ -853,45 +867,67 @@ the whole dataset, then is deleted, and the next is fetched.
 
 **The training footprint.** Trained layers change every step, so they stay
 inside one miner: no live relay. The per-miner knob is K, counting the 1.3 GB
-head: K = 4 is 30.9 GB, K = 2 16.1 GB, K = 1 8.7 GB. `scripts/topk_quality.py`
-now also runs Qwen3's top 2 layers and top 1, standing in by fraction for
-DeepSeek's top 2.9 and 1.4, so the owner can see what each step down costs.
+head: K = 4 is 30.9 GB, K = 2 16.1 GB, K = 1 8.7 GB. What each step down costs in
+quality is for live jobs to show. `scripts/topk_quality.py` would also run
+Qwen3's top 2 layers and top 1, standing in by fraction for DeepSeek's top 2.9
+and 1.4.
 
-**Quality: what training only the top costs** (`scripts/topk_quality.py`).
-Qwen3-0.6B (28 layers), LoRA-FA on q, k, v and o, the same steps and data,
-held-back loss on 237 everyday chats. It compares all layers, the top 6 (~20%),
-the top 3 (~10%), and the top 2 and 1 (DeepSeek's K = 2 and K = 1, by
-fraction). *Not run yet*: the run was stopped while the PC was needed. It
-resumes from partial results and takes about 30 minutes on a free 4070 SUPER.
-Qwen3-4B in float32 won't fit under 10 GB of GPU memory.
+**Quality: what training only the top costs.** The first live job's loss
+curve answers it. The offline comparison, `scripts/topk_quality.py`, is skipped
+but kept:
+- Qwen3-0.6B (28 layers), LoRA-FA on q, k, v and o, the same steps and data,
+  held-back loss on 237 everyday chats;
+- all layers against the top 6 (~20%), the top 3 (~10%), and the top 2 and 1
+  (DeepSeek's K = 2 and K = 1, by fraction);
+- resumable, about 30 minutes on a free 4070 SUPER. Qwen3-4B in float32 won't
+  fit under 10 GB of GPU memory.
+
+**The first job measures itself.** VIBE has no value yet, so a weak first result
+costs nothing. What the job has to record:
+- **Phases that slow miners can make.** A unit's deadline (`deadline`) assumes
+  the slowest link the network takes (25 Mbit/s down, 10 up) and 1 ms a token a
+  layer, about 4× §7's estimate. It doubles that, and is never under 10 minutes.
+  A claim past its deadline goes to another miner (`Line.expire`, tested). The
+  training unit kind sizes its phases the same way.
+- **The loss curve.** /network's job summary (`netstats.py`, from
+  `store.job_rounds`) and the worker dashboard already show it for fine-tunes.
+- **What each worker manages.** `deepseek_top.Meter` gives a unit's seconds,
+  tokens a second and peak GPU memory.
+  - Every prep unit's commitment carries them, with the bytes and seconds it
+    read and wrote ("stats", outside any hash).
+  - The training unit kind reports the same per step into the worker's stats
+    and logs.
+  - So the run gives the real speeds, links and memory, which replace this
+    section's *estimates*.
 
 **Build order for this route** (replacing §5's 3–7 for the first project):
 1. Done (§7): `deepseek.py`.
 2. Done, prototype: LoRA on it, precompute, layer-major and expert-major
    training, records and their root, exactness tests, PEFT format.
-3. *Measure* on a free PC: `scripts/deepseek_top_bench.py` (precompute and
-   training speed, with layer 2 standing in for each top layer), the streamed
-   schedule's speed and largest sequence on 6 and 8 GB (a cap on GPU memory),
-   and `scripts/topk_quality.py`.
-4. *Train the top 4 for real.* Their 30.9 GB are downloaded (2026-11-01). Still
-   to do: loss on real chats, which needs a prep's records, and DeepSeek's own
-   top-4 vs top-8 (60.4 GB, not downloaded).
+3. *Off the critical path:* the offline runs, skipped by the owner. The scripts
+   stay: `scripts/deepseek_top_bench.py` (speed, with layer 2 standing in for
+   each top layer), the streamed schedule's 6 and 8 GB caps, and
+   `scripts/topk_quality.py`. Their numbers come from the first live job.
+4. *Train the top 4 for real*, as the first live job. Its 30.9 GB are downloaded
+   (2026-11-01). DeepSeek's own top 4 against top 8 (60.4 GB, not downloaded)
+   is for a later job.
 5. *The prep, for real.* The split prep (`deepseek_split`) is the design,
    prototyped and tested exact to the one-PC prep. It has the work graph, exact
    lossless hand-offs checked against their writers' digests, untrusted hosts
    behind `Mirrors`, presigned storage, and optimistic consumption with
    rollback and redo. The one-PC `deepseek_prep` is the dev and test tool: one
-   resumable command, with its table streaming tried on the real Hub. Still to
-   do:
-   - wiring the split's units into the node after PR #5 merges: claims,
-     presigned URLs, windows, pay;
-   - multipart uploads, so a 1.8 GB hand-off survives a flaky link;
-   - hosts run by miners (each uploader's own storage, or peer to peer) behind
-     `Mirrors`, to retire the bucket as a central point;
-   - a run on real weights, piece by piece;
-   - answering challenges by replaying a unit;
-   - FP8 hand-offs measured on consecutive real bottom layers (layers 0–3,
-     29.6 GB), which would cut a cut's 28 KB a token to 17 KB if harmless.
+   resumable command, with its table streaming tried on the real Hub.
+   - Done since: multipart, resumable uploads and ranged downloads; answering
+     a challenge by replaying a unit (`replay`, `state_before`); claim
+     deadlines; each unit's stats.
+   - Still to do, once PR #5 merges: wiring the units into the node (claims,
+     presigned URLs, windows, pay).
+   - Still to do, later:
+     - hosts run by miners (each uploader's own storage, or peer to peer) behind
+       `Mirrors`, to retire the bucket as a central point;
+     - a run on real weights, piece by piece;
+     - FP8 hand-offs measured on consecutive real bottom layers (layers 0–3,
+       29.6 GB), which would cut a cut's 28 KB a token to 17 KB if harmless.
 6. *A DeepSeek unit kind,* once PR #5 merges: a spec with the cut and targets,
    the record dataset in place of token ids, `train_step_streamed` behind
    `train_segment`, and miners' data shards.

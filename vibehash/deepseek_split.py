@@ -28,9 +28,16 @@ against the digest its writer committed to (`want`, from the node), so a host th
 storage, peers. So a host can only withhold, and a withheld object can be made again by anyone holding its piece,
 from its inputs, to the bit (Line.redo). v1's host is a bucket the operator pays for: PresignedStore uses URLs the
 node signs (`presign`: S3's query-string signature, which DigitalOcean Spaces takes), so miners need no storage
-account of their own. LocalStore is a folder. `Line` is the node's side: which units can be claimed, optimistic
-consumption of outputs not yet past their challenge window, rollback when a challenge succeeds, redoing a unit
-whose output went missing, and which objects can be deleted.
+account of their own. LocalStore is a folder. Big objects go up in parts and come down in ranges, each retried on its own, and an
+upload resumes after a crash: a 1.8 GB hand-off survives a home link. `Line` is the node's side: which units can be
+claimed, deadlines that a slow miner can meet, optimistic consumption of outputs not yet past their challenge
+window, rollback when a challenge succeeds, redoing a unit whose output went missing, and which objects can be
+deleted.
+
+Checking: `replay` runs a committed unit again from its inputs and says where it disagrees, the first layer for each
+sequence; `state_before` serves what enters that layer, which both sides of a dispute hand the referee. Each unit's
+commitment also carries what it cost (seconds, tokens a second, peak GPU memory, bytes moved): the first live job
+measures the real numbers.
 
 Wiring into the node waits for PR #5's work units. run_local runs a whole plan on one machine, in order: a dev and
 test tool, not a role.
@@ -40,11 +47,13 @@ from __future__ import annotations
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -221,6 +230,7 @@ class Line:
     def __init__(self, graph: Graph):
         self.graph = graph
         self.state = {name: "pending" for name in graph.units}
+        self.due: dict[str, float | None] = {}
 
     def claimable(self, holds=None) -> list[Unit]:
         """Pending units whose inputs are all written, for a miner holding layers `holds` (None: any)."""
@@ -234,9 +244,19 @@ class Line:
                 out.append(u)
         return out
 
-    def claim(self, name: str) -> None:
+    def claim(self, name: str, now: float = 0.0, seconds: float | None = None) -> None:
+        """A miner takes the unit, with `seconds` to finish it (see `deadline`; None: no limit)."""
         assert self.state[name] == "pending", (name, self.state[name])
         self.state[name] = "claimed"
+        self.due[name] = None if seconds is None else now + seconds
+
+    def expire(self, now: float) -> list[str]:
+        """Claimed units past their deadline go back to pending, for another miner. -> them."""
+        late = [n for n, st in self.state.items() if st == "claimed" and self.due.get(n) is not None
+                and now > self.due[n]]
+        for n in late:
+            self.state[n] = "pending"
+        return late
 
     def done(self, name: str) -> None:
         self.state[name] = "done"
@@ -264,6 +284,16 @@ class Line:
         for n in back:
             self.state[n] = "pending"
         return back
+
+
+def deadline(read_bytes: float, write_bytes: float, layer_tokens: float, slack: float = 2.0, down: float = 3e6,
+             up: float = 1.25e6, gpu_ms: float = 1.0, floor: float = 600.0) -> float:
+    """Seconds a miner gets for a unit: its transfers at the slowest link the network takes (25 Mbit/s down, 10 up),
+    its compute (layers x tokens) at 1 ms a token a layer (about 4x §7's estimate for a 4070 SUPER), times `slack`,
+    and at least `floor`. Generous on purpose: one too short throws a slow miner's work away and stalls the line;
+    one too long only delays reclaiming a vanished miner's unit. Units report what they really took (their
+    commitment's "stats"), which says how far the first live job's numbers let later jobs tighten it."""
+    return max(floor, slack * (read_bytes / down + write_bytes / up + layer_tokens * gpu_ms / 1e3))
 
 
 # --- hand-offs: one object per (what, chunk), lossless ------------------------------------------------------------------
@@ -380,55 +410,157 @@ class LocalStore:
 
 
 class PresignedStore:
-    """A bucket reached through URLs the node signs for each object and method (`sign(method, name) -> url`), so a
-    miner needs no account with the storage provider. Retries with growing waits: home links drop."""
+    """A bucket reached through URLs the node signs, `sign(method, name, query) -> url` (query: S3's sub-resource
+    parameters, as for a part of a multipart upload; {} for a plain object), so a miner needs no account with the
+    storage provider.
 
-    def __init__(self, sign, tries: int = 8):
-        self.sign, self.tries = sign, tries
+    Home links drop, so nothing big travels in one request. An object over `part` bytes goes up as S3's multipart
+    upload, each part retried on its own with growing waits, and its progress kept in `journal` (a folder): run
+    again after a crash, it sends only the parts not yet acknowledged. An object comes down in ranges of `part`
+    bytes, each retried on its own."""
 
-    def _call(self, method: str, name: str, data: bytes | None = None) -> bytes:
+    PART = 64 * 2**20  # S3 takes parts of 5 MiB to 5 GiB, at most 10,000: up to 640 GB at this size
+
+    def __init__(self, sign, tries: int = 8, part: int = PART, journal: Path | None = None, wait=time.sleep):
+        self.sign, self.tries, self.part, self.wait = sign, tries, part, wait
+        self.journal = Path(journal) if journal else None
+
+    def _call(self, method: str, name: str, query: dict | None = None, data: bytes | None = None,
+              headers: dict | None = None):
+        """-> (body, response headers). A fresh URL each try; a 404 isn't retried."""
         for attempt in range(self.tries):
-            req = urllib.request.Request(self.sign(method, name), data=data, method=method)
+            req = urllib.request.Request(self.sign(method, name, query or {}), data=data, method=method,
+                                         headers=headers or {})
             try:
                 with urllib.request.urlopen(req, timeout=600) as r:
-                    return r.read()
+                    return r.read(), r.headers
             except urllib.error.HTTPError as e:
                 if e.code == 404 or attempt == self.tries - 1:
                     raise
-            except OSError:
+                e.close()
+            except (OSError, http.client.HTTPException):  # dropped, reset, cut short
                 if attempt == self.tries - 1:
                     raise
-            time.sleep(min(600, 15 * 2 ** attempt))
+            self.wait(min(600, 15 * 2 ** attempt))
         raise AssertionError("unreachable")
 
     def put(self, name: str, data: bytes) -> None:
-        self._call("PUT", name, data)
+        if len(data) <= self.part:
+            self._call("PUT", name, data=data)
+        else:
+            self._multipart(name, data)
+
+    def _multipart(self, name: str, data: bytes, fresh: bool = False) -> None:
+        tag = hashlib.sha256(name.encode() + b"\0" + hashlib.sha256(data).digest()).hexdigest()[:40]
+        path = self.journal / f"{tag}.json" if self.journal else None
+        state = None if fresh or path is None or not path.exists() else json.loads(path.read_text())
+        if state is None:
+            body, _ = self._call("POST", name, {"uploads": ""})
+            state = {"name": name, "upload": _xml_text(body, "UploadId"), "parts": {}}
+            self._save(path, state)
+        n = -(-len(data) // self.part)
+        for i in range(1, n + 1):
+            if str(i) in state["parts"]:
+                continue
+            try:
+                _, headers = self._call("PUT", name, {"partNumber": str(i), "uploadId": state["upload"]},
+                                        data[(i - 1) * self.part:i * self.part])
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and not fresh:  # the upload expired or was aborted: start it again
+                    e.close()
+                    return self._multipart(name, data, fresh=True)
+                raise
+            state["parts"][str(i)] = headers["ETag"]
+            self._save(path, state)
+        parts = "".join(f"<Part><PartNumber>{i}</PartNumber><ETag>{state['parts'][str(i)]}</ETag></Part>"
+                        for i in range(1, n + 1))
+        try:
+            body, _ = self._call("POST", name, {"uploadId": state["upload"]},
+                                 f"<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>".encode())
+        except urllib.error.HTTPError as e:  # a 404 here can mean the completion went through and its answer didn't
+            if e.code != 404 or self._size(name) != len(data):
+                raise
+            e.close()
+            body = b""
+        if b"<Error>" in body:  # S3 can answer 200 and still fail a completion
+            raise OSError(f"completing the upload of {name}: {body[:300]!r}")
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+    def _save(self, path: Path | None, state: dict) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, path)
+
+    def _size(self, name: str) -> int | None:
+        try:
+            _, headers = self._call("HEAD", name)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return None
+        return int(headers.get("Content-Length", -1))
 
     def get(self, name: str) -> bytes:
-        return self._call("GET", name)
+        first, headers = self._call("GET", name, headers={"Range": f"bytes=0-{self.part - 1}"})
+        total = int(headers["Content-Range"].rsplit("/", 1)[1]) if headers.get("Content-Range") else len(first)
+        pieces, at = [first], len(first)
+        while at < total:
+            piece, _ = self._call("GET", name, headers={"Range": f"bytes={at}-{min(at + self.part, total) - 1}"})
+            if not piece:
+                raise OSError(f"{name}: an empty range at byte {at} of {total}")
+            pieces.append(piece)
+            at += len(piece)
+        return b"".join(pieces)
 
     def has(self, name: str) -> bool:
-        try:
-            self._call("HEAD", name)
-            return True
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return False
-            raise
+        return self._size(name) is not None
 
     def delete(self, name: str) -> None:
-        self._call("DELETE", name)
+        try:
+            self._call("DELETE", name)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # already gone: what was wanted
+                raise
+            e.close()
+
+
+def _xml_text(body: bytes, tag: str) -> str:
+    """The text of the first element named `tag` in an S3 answer, whatever its namespace."""
+    for el in ElementTree.fromstring(body).iter():
+        if el.tag.rsplit("}", 1)[-1] == tag:
+            return el.text or ""
+    raise OSError(f"no <{tag}> in {body[:300]!r}")
+
+
+class Signer:
+    """The node's side of PresignedStore, for a bucket whose key it holds: `signer(method, name, query)` -> a URL
+    for object prefix + name. The node checks that a unit may read or write a name before it signs for it."""
+
+    def __init__(self, host: str, region: str, access_key: str, secret_key: str, prefix: str = "",
+                 expires: int = 3600, scheme: str = "https"):
+        self.host, self.region, self.access_key, self.secret_key = host, region, access_key, secret_key
+        self.prefix, self.expires, self.scheme = prefix, expires, scheme
+
+    def __call__(self, method: str, name: str, query: dict | None = None) -> str:
+        return presign(method, self.host, self.prefix + name, self.region, self.access_key, self.secret_key,
+                       self.expires, query=query, scheme=self.scheme)
 
 
 def presign(method: str, host: str, key: str, region: str, access_key: str, secret_key: str, expires: int = 3600,
-            when: datetime.datetime | None = None) -> str:
+            when: datetime.datetime | None = None, query: dict | None = None, scheme: str = "https") -> str:
     """A URL that lets its holder do `method` on object `key` of the bucket at `host` (say
     my-bucket.nyc3.digitaloceanspaces.com, region nyc3) for `expires` seconds: S3's Signature Version 4 in the
-    query string. The node signs, holding the key; the miner only sees the URL."""
+    query string. `query`: sub-resource parameters signed with it ({"uploads": ""} starts a multipart upload,
+    {"partNumber": "3", "uploadId": ...} is its third part). The node signs, holding the key; the miner only sees
+    the URL, and can't change its method, object or parameters without breaking the signature."""
     when = when or datetime.datetime.now(datetime.timezone.utc)
     stamp, day = when.strftime("%Y%m%dT%H%M%SZ"), when.strftime("%Y%m%d")
     scope = f"{day}/{region}/s3/aws4_request"
-    query = {"X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": f"{access_key}/{scope}",
+    query = {**{k: str(v) for k, v in (query or {}).items()},
+             "X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": f"{access_key}/{scope}",
              "X-Amz-Date": stamp, "X-Amz-Expires": str(expires), "X-Amz-SignedHeaders": "host"}
     q = "&".join(f"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}" for k, v in sorted(query.items()))
     path = "/" + quote(key, safe="/-_.~")
@@ -437,23 +569,28 @@ def presign(method: str, host: str, key: str, region: str, access_key: str, secr
     k = ("AWS4" + secret_key).encode()
     for part in (day, region, "s3", "aws4_request"):
         k = hmac.new(k, part.encode(), hashlib.sha256).digest()
-    return f"https://{host}{path}?{q}&X-Amz-Signature={hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()}"
+    return f"{scheme}://{host}{path}?{q}&X-Amz-Signature={hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()}"
 
 
 # --- running units -------------------------------------------------------------------------------------------------------
 
-def _get(store, name: str, digests: dict, want: dict | None = None) -> dict[str, torch.Tensor]:
+def _get(store, name: str, digests: dict, want: dict | None = None, io: dict | None = None) -> dict[str, torch.Tensor]:
     """An object's tensors from the first host whose copy matches the digest its writer committed to (want[name];
     none: any copy)."""
     altered = False
     for host in (store.stores if isinstance(store, Mirrors) else (store,)):
+        t0 = time.perf_counter()
         try:
-            got = decode(host.get(name))
+            data = host.get(name)
+            got = decode(data)
         except OSError:  # this host hasn't got it (a 404 is an OSError too)
             continue
         except ValueError:  # not even an object
             altered = True
             continue
+        if io is not None:
+            io["read_bytes"] += len(data)
+            io["read_seconds"] += time.perf_counter() - t0
         d = digest(got)
         if want is None or name not in want or d == want[name]:
             digests[name] = d
@@ -462,9 +599,23 @@ def _get(store, name: str, digests: dict, want: dict | None = None) -> dict[str,
     raise Tampered(name) if altered else Missing(name)
 
 
-def _put(store, name: str, tensors: dict, digests: dict) -> None:
-    store.put(name, encode(tensors))
-    digests[name] = digest(tensors)
+def _put(store, name: str, obj, digests: dict, io: dict | None = None) -> None:
+    """Write an object (tensors, encoded; or bytes as they are) and note its digest."""
+    data = encode(obj) if isinstance(obj, dict) else obj
+    t0 = time.perf_counter()
+    store.put(name, data)
+    if io is not None:
+        io["wrote_bytes"] += len(data)
+        io["write_seconds"] += time.perf_counter() - t0
+    digests[name] = _digest_of(obj)
+
+
+def _digest_of(obj) -> str:
+    return digest(obj) if isinstance(obj, dict) else hashlib.sha256(obj).hexdigest()
+
+
+def _io() -> dict:
+    return {"read_bytes": 0, "read_seconds": 0.0, "wrote_bytes": 0, "write_seconds": 0.0}
 
 
 def run_rows(source, store, seqs, chunks, cut: top.Cut, layer: int, r: int, token_map, work: Path,
@@ -492,16 +643,18 @@ def run_rows(source, store, seqs, chunks, cut: top.Cut, layer: int, r: int, toke
     return {"format": FORMAT, "unit": ["rows", layer, r], "range": [lo, hi], "inputs": {}, "outputs": outputs}
 
 
-def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=None, work: Path | None = None,
-              device="cpu", whole_layer_gb: float = 14.0, fp8: bool = False, ranges: int = 15,
-              align: int = ROWS_PER_PIECE, want: dict | None = None) -> dict:
-    """A layers unit (piece [a, b) over chunk c, as `plan` made it), reading its inputs from `store` (a host, or
-    Mirrors of several) and writing its outputs there, the arithmetic deepseek_prep's (run_layer), to the bit. want:
-    {object: digest} from its inputs' writers' commitments, which the node holds; an input that doesn't match is
-    Tampered. -> its commitment, also stored."""
+def _compute(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map, work, device, whole_layer_gb: float,
+             ranges: int, align: int, want: dict | None, only=None, stop: int | None = None, io: dict | None = None):
+    """A layers unit's arithmetic: its inputs read (and checked against `want`), then its layers a..stop-1 (stop:
+    the piece's end) over its chunk's sequences, or over those at positions `only` in the chunk (each sequence's
+    arithmetic is its own, so a sequence replayed alone hashes as it did in its chunk). -> (states, each sequence's
+    hash after each layer, the inputs' digests, the positions)."""
     a, b, c = unit.a, unit.b, unit.chunk
-    cfg, num, members = cut.cfg, ds.Numerics(), chunks[c]
-    need, inputs, outputs = needs(cut, a, b), {}, {}
+    stop = b if stop is None else stop
+    cfg, num = cut.cfg, ds.Numerics()
+    pos = list(range(len(chunks[c]))) if only is None else list(only)
+    members = [chunks[c][j] for j in pos]
+    need, inputs = needs(cut, a, b), {}
     if a == 0:
         embed = source.embed()
         states = []
@@ -512,25 +665,25 @@ def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=N
             pre[..., 0] = 1
             states.append((x.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1), pre, Side(), Choices()))
     else:
-        got = _get(store, stream_name(c, a), inputs, want)
-        states = [(got[f"{j}.x"], got[f"{j}.pre"], Side(), Choices()) for j in range(len(members))]
+        got = _get(store, stream_name(c, a), inputs, want, io)
+        states = [(got[f"{j}.x"], got[f"{j}.pre"], Side(), Choices()) for j in pos]
         for kind, src in need.items():
             if kind == "engram":
                 continue
-            got = _get(store, side_name(c, kind, src), inputs, want)
-            for j, (_, _, side, choices) in enumerate(states):
+            got = _get(store, side_name(c, kind, src), inputs, want, io)
+            for (_, _, side, choices), j in zip(states, pos):
                 t = got.get(str(j))  # absent: the sequence had none (candidate blocks of a short one)
                 if kind == "candidates":
                     choices.candidates = t
                 else:
                     setattr(side, kind, t)
     slices = {}
-    for layer in need.get("engram", []):
-        parts = [_get(store, rows_name(c, layer, r), inputs, want)
+    for layer in (layer for layer in need.get("engram", []) if layer < stop):
+        parts = [_get(store, rows_name(c, layer, r), inputs, want, io)
                  for r in range(len(row_ranges(cfg, layer, ranges, align)))]
         slices[layer] = prep.Slice(*(torch.cat([p[k] for p in parts]).numpy() for k in ("ids", "weight", "scale")))
-    hashes = [[] for _ in members]
-    for layer in range(a, b):
+    hashes = [[] for _ in pos]
+    for layer in range(a, stop):
         block = prep._load_block(cfg, layer, source.layer(layer, work), device, whole_layer_gb)
         rows = None
         if layer in slices:
@@ -541,43 +694,112 @@ def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=N
         for j, (x, pre, side, choices) in enumerate(states):
             hashes[j].append(prep.layer_hash(x, pre, side, choices, layer, cfg).hex())
         del block
-    commit = {"format": FORMAT, "unit": ["layers", a, b, c], "inputs": inputs, "outputs": outputs,
-              "layer_hashes": hashes}
+    return states, hashes, inputs, pos
+
+
+def _outputs(store, seqs, chunks, cut: top.Cut, unit: Unit, states, hashes, inputs: dict, fp8: bool = False):
+    """What a layers unit writes, {name: tensors, or bytes}, and for the last piece its records' leaves."""
+    a, b, c = unit.a, unit.b, unit.chunk
+    members, out = chunks[c], {}
     if b < cut.first:
         stream = {}
         for j, (x, pre, _, _) in enumerate(states):
             stream[f"{j}.x"], stream[f"{j}.pre"] = x, pre
-        _put(store, stream_name(c, b), stream, outputs)
+        out[stream_name(c, b)] = stream
         for kind, src in emits(cut, a, b).items():
             made = {str(j): (choices.candidates if kind == "candidates" else getattr(side, kind))
                     for j, (_, _, side, choices) in enumerate(states)}
-            _put(store, side_name(c, kind, src), {k: v for k, v in made.items() if v is not None}, outputs)
-    else:  # the last piece: the job's records, as deepseek_prep writes a block
-        earlier = []
-        for name in (i for i in unit.inputs if i.endswith(".json")):  # the earlier pieces' commitments, in order
-            data = store.get(name)
-            inputs[name] = hashlib.sha256(data).hexdigest()
-            earlier.append(json.loads(data)["layer_hashes"])
-        every = [[h for part in earlier for h in part[j]] + hashes[j] for j in range(len(members))]
-        records, leaves = [], []
-        for j, i in enumerate(members):
-            x, pre, side, choices = states[j]
-            kept, cand = top.crossing_of(cut, side, choices, seqs[i][0].numel())
-            ex = top.Example(seqs[i][0][None], seqs[i][1][None], x.cpu(), pre.cpu(), kept, cand)
-            rec = top.pack(ex, 0, fp8_stream=fp8)
-            records.append(rec)
-            leaves.append(hashlib.sha256(hashlib.sha256(rec).digest()
-                                         + b"".join(bytes.fromhex(h) for h in every[j])).hexdigest())
-        bin_name, meta_name = block_names(c)
-        store.put(bin_name, b"".join(records))
-        meta = json.dumps({"sequences": list(members), "offsets": np.cumsum([0] + [len(r) for r in records]).tolist(),
-                           "layer_hashes": every}).encode()
-        store.put(meta_name, meta)
-        outputs[bin_name], outputs[meta_name] = hashlib.sha256(b"".join(records)).hexdigest(), \
-            hashlib.sha256(meta).hexdigest()
+            out[side_name(c, kind, src)] = {k: v for k, v in made.items() if v is not None}
+        return out, None
+    earlier = []  # the last piece: the job's records, as deepseek_prep writes a block
+    for name in (i for i in unit.inputs if i.endswith(".json")):  # the earlier pieces' commitments, in order
+        data = store.get(name)
+        inputs[name] = hashlib.sha256(data).hexdigest()
+        earlier.append(json.loads(data)["layer_hashes"])
+    every = [[h for part in earlier for h in part[j]] + hashes[j] for j in range(len(members))]
+    records, leaves = [], []
+    for j, i in enumerate(members):
+        x, pre, side, choices = states[j]
+        kept, cand = top.crossing_of(cut, side, choices, seqs[i][0].numel())
+        ex = top.Example(seqs[i][0][None], seqs[i][1][None], x.cpu(), pre.cpu(), kept, cand)
+        rec = top.pack(ex, 0, fp8_stream=fp8)
+        records.append(rec)
+        leaves.append(hashlib.sha256(hashlib.sha256(rec).digest()
+                                     + b"".join(bytes.fromhex(h) for h in every[j])).hexdigest())
+    bin_name, meta_name = block_names(c)
+    out[bin_name] = b"".join(records)
+    out[meta_name] = json.dumps({"sequences": list(members),
+                                 "offsets": np.cumsum([0] + [len(r) for r in records]).tolist(),
+                                 "layer_hashes": every}).encode()
+    return out, leaves
+
+
+def run_piece(source, store, seqs, chunks, cut: top.Cut, unit: Unit, token_map=None, work: Path | None = None,
+              device="cpu", whole_layer_gb: float = 14.0, fp8: bool = False, ranges: int = 15,
+              align: int = ROWS_PER_PIECE, want: dict | None = None) -> dict:
+    """A layers unit (piece [a, b) over chunk c, as `plan` made it), reading its inputs from `store` (a host, or
+    Mirrors of several) and writing its outputs there, the arithmetic deepseek_prep's (run_layer), to the bit. want:
+    {object: digest} from its inputs' writers' commitments, which the node holds; an input that doesn't match is
+    Tampered. -> its commitment, also stored. Its "stats" (seconds, tokens a second, peak GPU memory, bytes and
+    seconds of transfer) aren't hashed by anything: they're the run's measurements."""
+    io = _io()
+    with top.Meter(device) as meter:
+        states, hashes, inputs, _ = _compute(source, store, seqs, chunks, cut, unit, token_map, work, device,
+                                             whole_layer_gb, ranges, align, want, io=io)
+    objects, leaves = _outputs(store, seqs, chunks, cut, unit, states, hashes, inputs, fp8)
+    outputs = {}
+    for name, obj in objects.items():
+        _put(store, name, obj, outputs, io)
+    commit = {"format": FORMAT, "unit": ["layers", unit.a, unit.b, unit.chunk], "inputs": inputs, "outputs": outputs,
+              "layer_hashes": hashes}
+    if leaves is not None:
         commit["leaves"] = leaves
-    store.put(commit_name(c, a), json.dumps(commit).encode())
+    tokens = sum(len(seqs[i][0]) for i in chunks[unit.chunk]) * (unit.b - unit.a)
+    commit["stats"] = {**meter.stats(tokens), **{k: round(v, 3) for k, v in io.items()}}
+    store.put(commit_name(unit.chunk, unit.a), json.dumps(commit).encode())
     return commit
+
+
+def replay(source, store, seqs, chunks, cut: top.Cut, unit: Unit, commit: dict, token_map=None,
+           work: Path | None = None, device="cpu", whole_layer_gb: float = 14.0, fp8: bool = False, ranges: int = 15,
+           align: int = ROWS_PER_PIECE, want: dict | None = None) -> dict:
+    """Check a committed layers unit: run it again from the same inputs (checked against `want`), writing nothing.
+    Anyone holding the piece's layers can. -> {"agrees", "disagree": [(sequence's position in the chunk, the first
+    layer whose hash differs)], "outputs": [objects whose digest differs]}. A disagreement is where a challenge
+    starts: what enters that layer is agreed (the hash before it matches, or it's the unit's checked input), what
+    leaves it isn't, and state_before gives both sides' referee what enters it."""
+    states, hashes, inputs, _ = _compute(source, store, seqs, chunks, cut, unit, token_map, work, device,
+                                         whole_layer_gb, ranges, align, want)
+    objects, leaves = _outputs(store, seqs, chunks, cut, unit, states, hashes, inputs, fp8)
+    disagree = []
+    for j, (mine, theirs) in enumerate(zip(hashes, commit["layer_hashes"])):
+        for k, h in enumerate(mine):
+            if k >= len(theirs) or theirs[k] != h:
+                disagree.append((j, unit.a + k))
+                break
+    outs = [n for n, obj in objects.items() if commit["outputs"].get(n) != _digest_of(obj)]
+    if leaves is not None and leaves != commit.get("leaves"):
+        outs.append("leaves")
+    return {"agrees": not disagree and not outs, "disagree": disagree, "outputs": outs}
+
+
+def state_before(source, store, seqs, chunks, cut: top.Cut, unit: Unit, j: int, layer: int, token_map=None,
+                 work: Path | None = None, device="cpu", whole_layer_gb: float = 14.0, ranges: int = 15,
+                 align: int = ROWS_PER_PIECE, want: dict | None = None) -> tuple[dict, str | None]:
+    """What enters `layer` for the sequence at position j of a layers unit's chunk, replayed from the unit's inputs:
+    -> ({"x", "pre", and the side channels and candidate blocks it reuses}, its hash after layer - 1 as the unit
+    committed it, or None at the piece's first layer, whose input is a checked object). Either side of a dispute at
+    (j, layer) can serve it, so the bisection inside the layer starts from an agreed state."""
+    states, hashes, _, _ = _compute(source, store, seqs, chunks, cut, unit, token_map, work, device,
+                                    whole_layer_gb, ranges, align, want, only=[j], stop=layer)
+    x, pre, side, choices = states[0]
+    out = {"x": x, "pre": pre}
+    for kind in SIDE:
+        if getattr(side, kind) is not None:
+            out[kind] = getattr(side, kind)
+    if choices.candidates is not None:
+        out["candidates"] = choices.candidates
+    return out, (hashes[0][-1] if hashes[0] else None)
 
 
 def run_local(source, store, seqs, chunks, cut: top.Cut, bounds, token_map=None, work: Path | None = None,

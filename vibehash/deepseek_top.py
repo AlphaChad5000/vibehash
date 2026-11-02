@@ -30,6 +30,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -390,6 +391,33 @@ def forward_streamed(block, states: list, device, rows=None) -> list:
         y = moe.combine(p[7], p[0]).view(p[8])
         states[j] = (block.after_ffn(y, p[1], p[2], p[3]), p[4], states[j][2], states[j][3])
     return [p[7] for p in parts]
+
+
+class Meter:
+    """Seconds, tokens a second and peak GPU memory of what runs inside it: what a unit reports with its work, so
+    the first live job measures the real numbers (DEEPSEEK.md §8)."""
+
+    def __init__(self, device="cpu"):
+        self.cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        self.seconds, self.peak = 0.0, 0
+
+    def __enter__(self):
+        if self.cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if self.cuda:
+            torch.cuda.synchronize()
+            self.peak = torch.cuda.max_memory_allocated()
+        self.seconds = time.perf_counter() - self.t0
+
+    def stats(self, tokens: int) -> dict:
+        """tokens: what was processed (layer-tokens for a prep unit, tokens for a training step)."""
+        return {"seconds": round(self.seconds, 3), "tokens": tokens,
+                "tokens_per_s": round(tokens / max(self.seconds, 1e-9), 1), "peak_gpu_gb": round(self.peak / 2**30, 3)}
 
 
 class _OnDevice:

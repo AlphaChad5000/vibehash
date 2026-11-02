@@ -1,17 +1,29 @@
 """vibehash/deepseek_split.py: the prep cut into units that miners run, connected by stored hand-offs.
 
 - PlanTests: what each piece of DeepSeek-V4.1-Flash reads and writes, the work graph, and the node's Line
-  (claims, optimistic consumption, rollback, deletion of what everyone has read).
+  (claims and their deadlines, optimistic consumption, rollback, deletion of what everyone has read).
 - CodecTests: hand-offs decode to exactly what was encoded, and a commitment doesn't depend on the compression.
 - PresignTests: the S3 signature is AWS's own worked example's.
+- StoreTests, against FakeS3 (an S3 bucket on localhost that checks every URL's signature): big objects go up in
+  parts and come down in ranges, through a link that drops every third request; an upload cut off part way resumes
+  from its journal, sending only the parts not yet acknowledged; a signed URL can't be bent to another method or part.
 - SplitTests (small config, CPU): a prep split into pieces of 1 and 2 layers, the engram table in several row
-  ranges, writes exactly deepseek_prep's records and Merkle root, whatever order its units run in. No host needs
-  trusting: an altered hand-off is caught and another host's copy used, and a withheld one is made again.
+  ranges, writes exactly deepseek_prep's records and Merkle root, whatever order its units run in, and through the
+  bucket too. No host needs trusting: an altered hand-off is caught and another host's copy used, and a withheld one
+  is made again. A replay agrees with an honest unit, and finds the layer a bent one disagrees at, with an agreed
+  state entering it.
 """
 import datetime
+import hashlib
 import json
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ElementTree
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
@@ -23,6 +35,122 @@ try:
     from tests.test_deepseek_prep import dataset
 except ImportError:
     torch = None
+
+
+class FakeS3:
+    """An S3 bucket on localhost, as much of one as PresignedStore uses: objects with ranged reads, multipart
+    uploads, and every URL's signature checked (a 403 otherwise). `fail(method, query)` -> True answers that request
+    with a 500; `log` lists what was asked: (method, key, sub-resource query, Range)."""
+
+    def __init__(self, access="AKIDFAKE", secret="fake-secret", region="test"):
+        self.access, self.secret, self.region = access, secret, region
+        self.objects, self.uploads, self.log = {}, {}, []
+        self.fail = lambda method, query: False
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                fake.handle(self, "GET")
+
+            def do_PUT(self):
+                fake.handle(self, "PUT")
+
+            def do_POST(self):
+                fake.handle(self, "POST")
+
+            def do_HEAD(self):
+                fake.handle(self, "HEAD")
+
+            def do_DELETE(self):
+                fake.handle(self, "DELETE")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.host = f"127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def signer(self, **kw):
+        return split.Signer(self.host, self.region, self.access, self.secret, scheme="http", **kw)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def signed(self, method, key, q):
+        sub = {k: v for k, v in q.items() if not k.startswith("X-Amz-")}
+        try:
+            when = datetime.datetime.strptime(q["X-Amz-Date"], "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+            url = split.presign(method, self.host, key, self.region, self.access, self.secret,
+                                int(q["X-Amz-Expires"]), when, sub, "http")
+        except (KeyError, ValueError):
+            return False
+        return url.endswith("X-Amz-Signature=" + q.get("X-Amz-Signature", "-"))
+
+    def handle(self, h, method):
+        url = urllib.parse.urlsplit(h.path)
+        q = dict(urllib.parse.parse_qsl(url.query, keep_blank_values=True))
+        key = urllib.parse.unquote(url.path[1:])
+        body = h.rfile.read(int(h.headers.get("Content-Length") or 0))
+        sub = {k: v for k, v in q.items() if not k.startswith("X-Amz-")}
+        if not self.signed(method, key, q):
+            return self.send(h, 403)
+        self.log.append((method, key, sub, h.headers.get("Range")))
+        if self.fail(method, sub):
+            return self.send(h, 500)
+        if method == "PUT" and "partNumber" in sub:
+            parts = self.uploads.get(sub.get("uploadId"))
+            if parts is None:
+                return self.send(h, 404)
+            parts[int(sub["partNumber"])] = body
+            return self.send(h, 200, headers={"ETag": '"%s"' % hashlib.md5(body).hexdigest()})
+        if method == "PUT":
+            self.objects[key] = body
+            return self.send(h, 200)
+        if method == "POST" and "uploads" in sub:
+            upload = f"upload-{len(self.log)}"
+            self.uploads[upload] = {}
+            return self.send(h, 200, ('<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult '
+                                      'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>b</Bucket>'
+                                      f'<Key>{key}</Key><UploadId>{upload}</UploadId>'
+                                      '</InitiateMultipartUploadResult>').encode())
+        if method == "POST":
+            parts = self.uploads.get(sub.get("uploadId"))
+            if parts is None:
+                return self.send(h, 404)
+            listed = [(int(p.find("PartNumber").text), p.find("ETag").text)
+                      for p in ElementTree.fromstring(body).iter("Part")]
+            if [n for n, _ in listed] != sorted(parts) or \
+                    any(e != '"%s"' % hashlib.md5(parts[n]).hexdigest() for n, e in listed):
+                return self.send(h, 400, b"<Error><Code>InvalidPart</Code></Error>")
+            self.objects[key] = b"".join(parts[n] for n, _ in listed)
+            del self.uploads[sub["uploadId"]]
+            return self.send(h, 200, b"<CompleteMultipartUploadResult><Key>k</Key></CompleteMultipartUploadResult>")
+        data = self.objects.get(key)
+        if data is None:
+            return self.send(h, 404)
+        if method == "HEAD":
+            return self.send(h, 200, headers={"Content-Length": str(len(data))}, head=True)
+        if method == "DELETE":
+            del self.objects[key]
+            return self.send(h, 204)
+        if h.headers.get("Range"):
+            lo, hi = (int(v) for v in h.headers["Range"].removeprefix("bytes=").split("-"))
+            hi = min(hi, len(data) - 1)
+            return self.send(h, 206, data[lo:hi + 1], {"Content-Range": f"bytes {lo}-{hi}/{len(data)}"})
+        return self.send(h, 200, data)
+
+    @staticmethod
+    def send(h, code, body=b"", headers=None, head=False):
+        h.send_response(code)
+        for k, v in (headers or {}).items():
+            h.send_header(k, v)
+        if not head:
+            h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        if not head:
+            h.wfile.write(body)
 
 
 @unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
@@ -83,6 +211,18 @@ class PlanTests(unittest.TestCase):
         self.assertIn(split.stream_name(0, 9), gone)  # everyone who reads it is past their window
         self.assertNotIn(split.rows_name(0, 1, 0), gone)  # its rows unit isn't accepted yet
 
+    def test_deadlines(self):
+        line = split.Line(split.plan(self.cut, [[0]], split.pieces(36, 4)))
+        name = line.claimable()[0].name
+        # a 64K-token chunk through 4 layers: 1.85 GB in, 1.83 GB out, at the slowest link the network takes
+        seconds = split.deadline(1.85e9, 1.83e9, 4 * 65536)
+        self.assertGreater(seconds, 3600)
+        line.claim(name, now=100.0, seconds=seconds)
+        self.assertEqual(line.expire(100.0 + 3600), [])
+        self.assertEqual(line.expire(100.0 + seconds + 1), [name])  # a vanished miner's unit goes to another
+        self.assertEqual(line.state[name], "pending")
+        self.assertEqual(split.deadline(0, 0, 0), 600.0)
+
     def test_order(self):
         graph = split.plan(self.cut, [[0], [1], [2]], split.pieces(36, 4))
         seen = set()
@@ -121,6 +261,7 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(split.digest(split.decode(a)), split.digest(split.decode(b)))
 
 
+@unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
 class PresignTests(unittest.TestCase):
     def test_aws_example(self):
         # AWS's worked example of a presigned GET (Signature Version 4, query-string authentication).
@@ -129,6 +270,96 @@ class PresignTests(unittest.TestCase):
                             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", 86400, when)
         self.assertTrue(url.startswith("https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm="))
         self.assertTrue(url.endswith("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"))
+
+
+@unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
+class StoreTests(unittest.TestCase):
+    DATA = bytes(range(256)) * 41  # 10,496 bytes: 11 parts of 1 KiB
+
+    def setUp(self):
+        self.s3 = FakeS3()
+        self.addCleanup(self.s3.close)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.journal = Path(tmp.name) / "journal"
+
+    def store(self, **kw):
+        return split.PresignedStore(self.s3.signer(), part=1024, journal=self.journal, wait=lambda s: None, **kw)
+
+    def parts(self):
+        return [int(e[2]["partNumber"]) for e in self.s3.log if "partNumber" in e[2]]
+
+    def test_small_and_missing(self):
+        st = self.store()
+        st.put("c00000/x", b"hello")
+        self.assertEqual(st.get("c00000/x"), b"hello")
+        self.assertTrue(st.has("c00000/x"))
+        st.delete("c00000/x")
+        self.assertFalse(st.has("c00000/x"))
+        with self.assertRaises(OSError) as e:  # what _get takes as "this host hasn't got it"
+            st.get("c00000/x")
+        e.exception.close()
+        st.delete("c00000/x")  # already gone: fine
+        self.assertEqual(self.parts(), [])
+
+    def test_parts_and_ranges(self):
+        st = self.store()
+        st.put("big", self.DATA)
+        self.assertEqual(self.parts(), list(range(1, 12)))
+        self.assertEqual(self.s3.objects["big"], self.DATA)
+        self.assertEqual(list(self.journal.glob("*.json")), [])  # finished: nothing left to resume
+        self.s3.log.clear()
+        self.assertEqual(st.get("big"), self.DATA)
+        self.assertEqual(len([e for e in self.s3.log if e[0] == "GET" and e[3]]), 11)
+
+    def test_flaky_link(self):
+        count = [0]
+
+        def fail(method, query):  # every third request fails
+            count[0] += 1
+            return count[0] % 3 == 0
+        self.s3.fail = fail
+        st = self.store()
+        st.put("big", self.DATA)
+        self.assertEqual(st.get("big"), self.DATA)
+
+    def test_resumes_after_a_crash(self):
+        def fail(method, query):  # the link dies after four parts
+            return "partNumber" in query and int(query["partNumber"]) > 4
+        self.s3.fail = fail
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.store(tries=2).put("big", self.DATA)
+        e.exception.close()
+        self.s3.fail = lambda method, query: False
+        self.s3.log.clear()
+        self.store().put("big", self.DATA)  # another process, the same journal
+        self.assertEqual(self.parts(), list(range(5, 12)))  # only the parts not yet acknowledged
+        self.assertEqual(self.s3.objects["big"], self.DATA)
+
+    def test_restarts_a_lost_upload(self):
+        self.s3.fail = lambda method, query: "partNumber" in query and int(query["partNumber"]) > 3
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.store(tries=1).put("big", self.DATA)
+        e.exception.close()
+        self.s3.fail = lambda method, query: False
+        self.s3.uploads.clear()  # the bucket dropped the unfinished upload
+        self.s3.log.clear()
+        self.store().put("big", self.DATA)
+        self.assertEqual(self.parts(), [4] + list(range(1, 12)))  # part 4 finds it gone, then all over again
+        self.assertEqual(self.s3.objects["big"], self.DATA)
+
+    def test_signature_binds_method_object_and_part(self):
+        sign = self.s3.signer()
+        bent = [urllib.request.Request(sign("GET", "x"), data=b"evil", method="PUT"),
+                urllib.request.Request(sign("PUT", "x").replace("/x?", "/y?"), data=b"evil", method="PUT"),
+                urllib.request.Request(sign("PUT", "x", {"partNumber": "1", "uploadId": "u"})
+                                       .replace("partNumber=1", "partNumber=2"), data=b"evil", method="PUT")]
+        for req in bent:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req)
+            self.assertEqual(e.exception.code, 403)
+            e.exception.close()
+        self.assertEqual(self.s3.objects, {})
 
 
 @unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
@@ -243,6 +474,45 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(split.digest(split.decode(bucket.get(name))), made[name])
         last(bucket)
         self.assertEqual(bucket.get(split.block_names(0)[0]), records)
+
+    def test_through_the_bucket(self):
+        s3 = FakeS3()
+        self.addCleanup(s3.close)
+        store = split.PresignedStore(s3.signer(prefix="job-1/"), part=4096, journal=self.tmp / "journal",
+                                     wait=lambda s: None)
+        m = split.run_local(prep.LocalSource(self.state), store, self.seqs, self.chunks, self.cut, split.pieces(4, 2),
+                            self.tmap, self.tmp / "bucket" / "work", ranges=3, align=1)
+        self.assert_same(m, store)
+        self.assertTrue(any("partNumber" in e[2] for e in s3.log))  # streams big enough to go up in parts
+        self.assertTrue(all(k.startswith("job-1/") for k in s3.objects))
+
+    def test_replay_answers_a_challenge(self):
+        bounds = split.pieces(4, 2)
+        _, store = self.split("replay", bounds)
+        unit = split.plan(self.cut, self.chunks, bounds, 3, align=1).units["layers-02-04-c00000"]
+        commit = json.loads(store.get(split.commit_name(0, 2)))
+        kw = dict(token_map=self.tmap, work=self.tmp / "replay" / "work", ranges=3, align=1,
+                  want=json.loads(store.get(split.commit_name(0, 0)))["outputs"])
+        src, j = prep.LocalSource(self.state), len(self.chunks[0]) - 1
+        args = (src, store, self.seqs, self.chunks, self.cut, unit)
+        self.assertEqual(split.replay(*args, commit, **kw), {"agrees": True, "disagree": [], "outputs": []})
+        stats = commit["stats"]
+        self.assertEqual(stats["tokens"], 2 * sum(len(self.seqs[i][0]) for i in self.chunks[0]))
+        self.assertGreater(stats["read_bytes"], 0)
+        self.assertIn("peak_gpu_gb", stats)
+        bent = json.loads(json.dumps(commit))  # a holder who bent layer 3 of the chunk's last sequence
+        bent["layer_hashes"][j][1] = "00" * 32
+        bent["leaves"][j] = "00" * 32
+        found = split.replay(*args, bent, **kw)
+        self.assertFalse(found["agrees"])
+        self.assertEqual(found["disagree"], [(j, 3)])
+        self.assertEqual(found["outputs"], ["leaves"])
+        state, h = split.state_before(*args, j, 3, **kw)  # what both sides hand the referee
+        self.assertEqual(h, commit["layer_hashes"][j][0])  # agreed: layer 2's committed hash
+        self.assertTrue({"x", "pre"} <= set(state))
+        first, h = split.state_before(*args, j, 2, **kw)
+        self.assertIsNone(h)  # the piece's input: a checked object
+        self.assertTrue(torch.equal(first["x"], split.decode(store.get(split.stream_name(0, 2)))[f"{j}.x"]))
 
     def test_commitment_chain(self):
         _, store = self.split("chain", split.pieces(4, 1))
