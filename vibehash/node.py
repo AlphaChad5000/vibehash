@@ -419,7 +419,8 @@ class Node:
                                 else replay_block(self.chain, block, record,
                                                   datasets=PeerDatasets(self, self.chain.state.validators.get(
                                                       address_of(block.proposer_pubkey))),
-                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey))))
+                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey)),
+                                                  records=self.prep_store if self.bucket is not None else None))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:

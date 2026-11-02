@@ -848,6 +848,10 @@ commitments. The options:
 - **The hand-off bucket.** It can't alter data undetected, but it can withhold
   or delete it, and its operator can stop paying. What that costs is
   recomputation, as above. The way out is (b) or (c) behind `Mirrors`.
+  A validator re-refereeing a DeepSeek game reads the records from it
+  (`replay_block`'s `records`), each checked against the pinned root. One
+  without read access can't, and would refuse the block: a second validator
+  needs the bucket's read keys or a copy of the records.
 - **The weights' source.** DeepSeek's weights and engram tables come from one
   Hugging Face repo, pinned by commit and checked by sha256. The licence is MIT,
   so anyone may mirror them: a convenience, not a dependency.

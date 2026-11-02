@@ -365,6 +365,7 @@ class Coordinator:
         self.weight_source = None
         self.roots = None  # a replay's: where a dispute's checkpoints come from (.array(blob_id, job)), to check its states
         self.datasets = None  # a replay's: where a fine-tune's data comes from (.attach(job) or .attach_dataset(job))
+        self.records = None  # a replay's: a DeepSeek job's bucket (job -> store), its disputes' records read from it
         self.move_s = 60.0
         self._programs: dict = {}
         self.disputes: list[str] = []  # recorded results a recheck contradicted
@@ -1634,13 +1635,15 @@ class Coordinator:
 
     def _records(self, job: TrainingJob) -> None:
         """A DeepSeek job's records for the referee (referee_deepseek's ds_record), read from the bucket and checked
-        against the root its prep pinned (deepseek_graph.RecordReader): set once, on a node with the bucket."""
-        if not job.deepseek or getattr(job.data, "records", None) is not None or self.prep_store is None:
+        against the root its prep pinned (deepseek_graph.RecordReader): set once, on a node with the bucket (or a
+        replay given one, self.records)."""
+        bucket = self.prep_store or self.records
+        if not job.deepseek or getattr(job.data, "records", None) is not None or bucket is None:
             return
         state = self.prep(job)
         if state.root is None:
             return
-        store = self.prep_store(job)
+        store = bucket(job)
         manifest = json.loads(store.get("manifest.json"))
         job.data.records = dsg.RecordReader(store, manifest, state.root)
 

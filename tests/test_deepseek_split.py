@@ -290,6 +290,27 @@ class PresignTests(unittest.TestCase):
         self.assertTrue(url.startswith("https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm="))
         self.assertTrue(url.endswith("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"))
 
+    def test_the_node_reads_its_bucket_from_the_environment(self):
+        """The hand-off bucket (DigitalOcean Spaces vibehash-handoffs, region tor1) comes from the node's environment,
+        never the repo; its links are virtual-hosted, signed for tor1. Fake keys: the real ones live on the node."""
+        from unittest import mock
+
+        from vibehash.node import bucket_from_env
+        env = {"VIBEHASH_BUCKET_HOST": "vibehash-handoffs.tor1.digitaloceanspaces.com", "VIBEHASH_BUCKET_REGION": "tor1",
+               "VIBEHASH_BUCKET_KEY": "DO00FAKEKEY", "VIBEHASH_BUCKET_SECRET": "fake-secret"}
+        with mock.patch.dict("os.environ", env, clear=False):
+            signer = bucket_from_env()
+        self.assertEqual((signer.host, signer.region, signer.scheme), (env["VIBEHASH_BUCKET_HOST"], "tor1", "https"))
+        when = datetime.datetime(2026, 11, 2, tzinfo=datetime.timezone.utc)
+        url = split.presign("PUT", signer.host, "think-shorter-pilot/c00000/stream-04", "tor1", "DO00FAKEKEY",
+                            "fake-secret", 3600, when, {"partNumber": "3", "uploadId": "u-1"})
+        self.assertTrue(url.startswith("https://vibehash-handoffs.tor1.digitaloceanspaces.com/think-shorter-pilot/"
+                                       "c00000/stream-04?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential="
+                                       "DO00FAKEKEY%2F20261102%2Ftor1%2Fs3%2Faws4_request"), url)
+        self.assertIn("&partNumber=3&uploadId=u-1&", url)  # sub-resources signed with it, sorted
+        with mock.patch.dict("os.environ", {**env, "VIBEHASH_BUCKET_SECRET": ""}, clear=False):
+            self.assertIsNone(bucket_from_env())  # no key yet: the node runs no DeepSeek prep
+
 
 @unittest.skipIf(torch is None, "needs PyTorch 2.8 or later")
 class StoreTests(unittest.TestCase):

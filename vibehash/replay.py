@@ -52,12 +52,13 @@ def _sender(env: dict, kind: str, chain: Chain, round_no: int) -> tuple[str, dic
 
 
 def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, stats: dict | None = None,
-                 datasets=None, roots=None) -> list[str]:
+                 datasets=None, roots=None, records=None) -> list[str]:
     """Problems found re-running `block`'s round on `chain`, which must be the chain just before `block`.
     An empty list means every decision in the block follows from its record (and, with `checkpoints`, every
     weight-based result it records checks out). `stats` collects how many results were re-checked or couldn't be.
     `datasets` (a node's Store, or anything with .attach(job)) gives a fine-tune's data to a round with disputes,
-    whose referee needs it; other rounds replay without any."""
+    whose referee needs it; other rounds replay without any. `records` (job -> store, as Node.prep_store) is a DeepSeek
+    job's bucket, which its disputes' referee reads the records from."""
     s = block.summary
     if s is None:
         return []
@@ -68,6 +69,7 @@ def replay_block(chain: Chain, block: Block, record: dict, checkpoints=None, sta
         c = Coordinator(chain, config=CoordinatorConfig(**rules), replay=record, recheck=checkpoints)
         c.datasets = datasets
         c.roots = roots if roots is not None else checkpoints
+        c.records = records
         c.open_round()
         if c.r.job_id != s.job_id:
             return [f"the record is for job {c.r.job_id}, the block for {s.job_id}"]

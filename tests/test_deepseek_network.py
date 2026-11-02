@@ -8,8 +8,9 @@
   pins the records' root, one machine's to the bit, and the job's rounds train from the records, op by op
   (deepseek_program.py): claims checked, paid, and scored on the held-back sequences. The same worker trains with one
   op's output scaled; a checker rejects its claim and the node referees the dispute down to that op
-  (referee_deepseek.py) and slashes it. Another worker rejects an honest claim, loses its dispute and is slashed for a
-  false accusation. An outside auditor replays every round from its record and the token file, the games included.
+  (referee_deepseek.py) and slashes it. Another worker rejects an honest claim, finds no op the referee would refuse,
+  and withdraws: unpaid, not slashed. An outside auditor replays every round from its record and the token file, and
+  referees every game again from the node's blobs and the records in the bucket.
 """
 import json
 import logging
@@ -31,7 +32,7 @@ try:
     from vibehash.coordinator import CoordinatorConfig
     from vibehash.crypto import KeyPair
     from vibehash.ledger import Block, Chain
-    from vibehash.node import Node, PhaseTimes
+    from vibehash.node import LeaderBlobs, Node, PhaseTimes
     from vibehash.replay import replay_block
     from vibehash.tasks import SYN_PER_VIBE as VIBE, TrainingJob
     from tests.test_deepseek_split import FakeS3
@@ -176,30 +177,34 @@ class LocalRunTests(unittest.TestCase):
         self.assertTrue(node.chain.state.balance(workers[0].address), "the honest worker was paid")
         self.assertLess(node.chain.state.escrow[JOB], 200 * VIBE)
 
-        # The disputes: refereed op by op, the cheat's down to the op it scaled; both bad workers slashed.
+        # The disputes: refereed op by op, the cheat's down to the op it scaled, and slashed; the false accuser, finding
+        # no op the referee would refuse, withdraws its rejections (unpaid, not slashed).
         games = [g for r in training for g in r.get("games", [])]
         lost = [g for g in games if g["defender"] == workers[2].address and g["outcome"] == "challenger"]
         self.assertTrue(lost, [(g["defender"][:12], g["outcome"], g["detail"]) for g in games])
         self.assertTrue(any(g["detail"].startswith("ds_attn_dkv") for g in lost), [g["detail"] for g in lost])
-        self.assertTrue(any(g["challenger"] == workers[1].address and g["outcome"] == "defender" for g in games),
+        self.assertTrue(any(g["challenger"] == workers[1].address and g["outcome"] == "withdrawn" for g in games),
                         [(g["challenger"][:12], g["outcome"], g["detail"]) for g in games])
         slashes = [s for b in node.chain.blocks if b.summary and not by_height[b.height].get("prep")
                    for s in b.summary.slashes]
         self.assertTrue(any(s[0] == workers[2].address and s[2] == "failed_replay" and s[1] == workers[0].address
                             for s in slashes), slashes)  # caught by the honest checker, who gets the bounty
-        self.assertTrue(any(s[0] == workers[1].address and s[2] == "false accusation" for s in slashes), slashes)
-        self.assertFalse([s for s in slashes if s[0] == workers[0].address], slashes)
+        self.assertFalse([s for s in slashes if s[0] in (workers[0].address, workers[1].address)], slashes)
 
-        # An outside auditor replays every round from its record, the prep's and the games included: with the job's
-        # token file (a game's tree is built from it), without the bucket (a game's record keeps the rows it read).
+        # An outside auditor replays every round from its record, the prep's included, and referees every game again:
+        # with the job's token file (a game's tree is built from it), the node's blobs (the games' states and
+        # evidence) and the bucket (the records the referee reads), as a validator does.
+        stats = {}
         audit = Chain.from_genesis(api.get("/genesis"))
         for d in api.get(f"/blocks?from=1&to={node.chain.tip.height}"):
             block = Block.from_dict(d)
             if block.summary is not None:
-                self.assertEqual(replay_block(audit, block, api.get(f"/round/{block.height}/record"),
-                                              datasets=node.store), [], f"block {block.height}")
+                self.assertEqual(replay_block(audit, block, api.get(f"/round/{block.height}/record"), stats=stats,
+                                              datasets=node.store, roots=LeaderBlobs(node, block.summary.proposer),
+                                              records=node.prep_store), [], f"block {block.height}")
             audit.append(block)
         self.assertEqual(audit.tip.hash, node.chain.tip.hash)
+        self.assertFalse(stats.get("unchecked"), stats)
 
 
 if __name__ == "__main__":
