@@ -1448,6 +1448,14 @@ class Coordinator:
                 if g.turn != "done" and g.deadline and now > g.deadline:
                     dg.silence(g)
 
+    @_locked
+    def end_disputes(self, now: float) -> None:
+        """The dispute phase is over: each unfinished game is judged by its own move's deadline (dispute.cut_short)."""
+        r = self.r
+        if r is not None and self.phase == Phase.DISPUTE:
+            for g in r.games.values():
+                dg.cut_short(g, now)
+
     def disputes_done(self) -> bool:
         r = self.r
         return r is None or all(g.turn == "done" for g in r.games.values())
@@ -1681,6 +1689,10 @@ class Coordinator:
         r = self.r
         job = self.job(r.job_id)
         for g in r.games.values():
+            if g.turn != "done" and self.replaying:  # the leader's clock: its phase ended before the move was due
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                if (entry.get("outcome"), entry.get("detail")) == ("unchecked", dg.PHASE_ENDED):
+                    g.end("unchecked", dg.PHASE_ENDED)
             dg.silence(g)  # whoever's move it still is didn't make it
         verifier_flops: dict[str, int] = defaultdict(int)
         missed: set[str] = set()

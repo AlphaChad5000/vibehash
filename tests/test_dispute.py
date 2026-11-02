@@ -251,7 +251,24 @@ class GameTests(_Tiny):
         self.assertEqual(g.outcome, "challenger", g.detail)
         self.assertEqual(g.leaf.kind, "attn_dv")
         self.assertTrue(g.detail.startswith("attn_dv → b.dv"), g.detail)
-        self.assertLessEqual(len(g.moves), 13)
+        from vibehash.program import dispute_size
+        self.assertLessEqual(len(g.moves), dispute_size(self.spec, self.batch, 1, self.per)[0])
+
+    def test_the_dispute_phase_has_room_for_the_deepest_game(self):
+        """The second review's finding 6: the phase had room for 14 moves, fewer than real trees take. program.
+        dispute_size counts them from the spec alone; on a tiny model it agrees with a walk of every atom of the real
+        program's tree."""
+        from vibehash.program import Node, dispute_size
+
+        self.tiny()
+        prog = Program(self.spec, self.data, self.lr, self.batch, self.seed, 2, self.per)
+
+        def rounds(n):
+            return 1 if n <= 64 else 1 + rounds(-(-n // 64))
+
+        def deepest(node):
+            return rounds(len(node.atoms)) + max((deepest(a) for a in node.atoms if isinstance(a, Node)), default=0)
+        self.assertEqual(dispute_size(self.spec, self.batch, 2, self.per)[0], 2 * deepest(prog.unit()) + 1)
 
     def test_an_honest_defender_beats_a_false_challenger(self):
         """A challenger that picks the last child at every level, and the first tile of the op it ends at."""

@@ -633,8 +633,11 @@ Each step:
        on shapes and tokens, never on the numbers). Attention's backward reads every query position of a group's
        heads: on Qwen2.5-3B at 4096 tokens, 96 MB of leaves. A job's `seq_len` is at most `finetune.MAX_SEQ_LEN` =
        4096 to keep that bounded.
-   - **Its length:** a game takes about 5 or 6 splits, as many picks and the evidence; `node.DISPUTE_MOVES` = 14 is the
-     most. Each move has `move_s` to be made, as long as the verify phase.
+   - **Its length:** a split and a pick for each 64-fold narrowing at each level from its root down to an op (one
+     at least, to descend), then the evidence. `program.dispute_size` counts the most from the job's spec: on Qwen3-4B,
+     15 moves at 4 steps a segment, 17 at 64, 21 for one segment of 10,000 steps (13 to 19 on Qwen3-0.6B). Each move
+     has `move_s` to be made: re-running a segment, plus the largest split's states uploaded and downloaded at the
+     reference speeds (also `dispute_size`), or the verify phase if that's longer.
    - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede instead of picking.
      - **A checker that concedes withdraws its rejection.** It isn't slashed, but it forfeits its pay for checking that
        round and counts as having missed (reputation). Before naming a tile at an op, a checker runs the referee itself
@@ -642,6 +645,9 @@ Each step:
        never plays on to lose its stake.
      - **A replica that concedes,** or never moves, before its first pick goes without blame: it never chose to
        accuse.
+     - **When the phase ends** with a game unfinished, the party whose move it is loses only if that move's own
+       deadline has passed. If it hasn't, the game ends unchecked (`dispute.cut_short`), and nobody is slashed: the
+       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes.
 5. **The referee** works out, in float64, each output number's exact value given the defender's own inputs, and a bound
    on how far an honest float32 computation of it can land (`referee.E`, running error analysis). Each op is the
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
@@ -706,10 +712,15 @@ Each step:
 9. **Draws the leader can't steer.** Each claim's checkers are drawn from the round secret and the claim itself (unit
    and worker), the canaries and scorers from the secret and what they're for, and claims are taken in sorted order.
    The order a leader recorded the reveals in changes no other claim's draw.
-10. **Time.** A fine-tune's round length counts its dispute phase (`node.PhaseTimes.dispute_s` = `DISPUTE_MOVES` ×
-    `move_s`), so validators wait long enough for a disputed round. It's that long only for a party that makes every
-    move just in time: the phase ends when every dispute has. No phase is longer than `node.MAX_PHASE_S` (an hour),
-    whatever a spec asks for.
+10. **Time.** A fine-tune's round length counts its dispute phase (`node.PhaseTimes.dispute_s`: its most moves ×
+    `move_s`, from `program.dispute_size`), so validators wait long enough for a disputed round. It's that long only
+    for a party that makes every move just in time: the phase ends when every dispute has. No phase is longer than
+    `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
+    - **A limit:** a split can name gigabytes: K − 1 states of the adapters' B, m and v between steps (12.7 GB on
+      Qwen3-4B, all seven targets at rank 16, 64 steps a segment), or a layer's activations. At the reference upload
+      (2.5 MB/s) that's more than an hour, so such a job's moves get less time than they need (`MAX_PHASE_S` over the
+      moves), and a defender that slow loses. Jobs a node takes should keep a split to a few hundred MB: few steps a
+      segment (Qwen3-0.6B at 4 steps: 203 MB, 100 s).
 
 **The security statement:** with the node as referee, if at least one of a claim's checkers is honest and online, a
 claim whose float32 work deviates from honest float32 by more than the referee's bounds anywhere is found bad; an

@@ -85,7 +85,6 @@ MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
 # What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
 # a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
 MAX_TRACE_BLOB, MAX_TRACE_UPLOADS = 2 * 2**30, 16 * 2**30
-DISPUTE_MOVES = 14  # the most moves a dispute takes: unit, segment, step, sequence, layer and ops, two levels each
 # The biggest model this node relays a post_job for (--max-job-mb), as one checkpoint at the job's precision. Measured:
 # a float32 model's starting weights take ~7 times its checkpoint size to build (float64 copies), ~460 MB at 64 MB, and
 # a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
@@ -271,13 +270,15 @@ class Node:
         for a longer compute phase). See TrainingJob.phase_lengths."""
         t, need = self.times, job.phase_lengths()
         verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
-        # A dispute's dearest move re-runs a segment (a challenger checking each step of one), which takes no longer
-        # than checking a claim's segments: as long as verify. Most moves take a second or two, and the phase ends as
-        # soon as every dispute has; it's this long only for a party that makes every move just in time.
-        move = min(verify, MAX_PHASE_S / DISPUTE_MOVES) if job.finetune else 0.0
+        # A dispute has as many moves as the job's program is deep (need["moves"], program.dispute_size), and each as
+        # long as its dearest takes (need["move"]: re-running a segment, and a split's states up and down), or verify
+        # if that's longer. Most moves take a second or two, and the phase ends as soon as every dispute has; it's this
+        # long only for a party that makes every move just in time. A job whose moves need more than MAX_PHASE_S in
+        # all gets less for each: a defender too slow for it loses (DESIGN, "Time").
+        moves = need.get("moves", 0)
+        move = min(max(verify, need["move"]), MAX_PHASE_S / moves) if moves else 0.0
         return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
-                          min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s,
-                          DISPUTE_MOVES * move, move)
+                          min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s, moves * move, move)
 
     def _propose_wait(self) -> float:
         """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
@@ -314,6 +315,7 @@ class Node:
                 if self.stopping.wait(0.2) or (still is not None and not still()):
                     return False
                 c.expire_moves(time.time())
+            c.end_disputes(time.time())
             for g in sorted(c.r.games.values(), key=lambda g: g.gid):
                 log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, g.challenger[:10], g.defender[:10],
                          g.outcome or "unfinished")

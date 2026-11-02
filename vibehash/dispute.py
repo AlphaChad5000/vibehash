@@ -538,6 +538,20 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
         game.end(outcome, detail)
 
 
+PHASE_ENDED = "the dispute phase ended before the move was due"
+
+
+def cut_short(game: Game, now: float) -> None:
+    """The dispute phase ended with the game unfinished. A party past its move's deadline loses (silence); one whose
+    move wasn't due yet isn't blamed for the phase's length, and the game ends unchecked."""
+    if game.turn == "done":
+        return
+    if game.deadline and now > game.deadline:
+        silence(game)
+    else:
+        game.end("unchecked", PHASE_ENDED)
+
+
 def silence(game: Game) -> None:
     """The party whose move it is didn't make it: it loses. A replica challenging that never picked concedes."""
     if game.turn == "done":

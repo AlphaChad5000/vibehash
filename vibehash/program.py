@@ -15,7 +15,9 @@ so no op needs more than a block of the head's weights.
 """
 from __future__ import annotations
 
+import functools
 import math
+import types
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -343,3 +345,54 @@ class _Micro:
                   (T, d), ("b.dx", "b.dr"))
         live = tuple(n for n in self.shapes if n[:2] in ("a.", "b.")) + (f"h.{i}",) + (("g.h",) if i == 0 else ())
         self.emit("free", "", (), {}, (0, 0), live)
+
+
+@functools.lru_cache(maxsize=64)
+def dispute_size(spec, batch_size: int, segments: int, per_segment: int) -> tuple[int, int]:
+    """(the most moves a dispute over one unit takes, the most bytes of new tensors one split names), from the spec
+    alone: a node sizes a round's dispute phase before it has the job's data. A sequence of seq_len tokens stands in
+    for the data, since how many ops a layer, the head and Adam have, and their shapes, depend on lengths alone.
+
+    Moves: for each level from the unit down to an op, a split and a pick for every 64-fold narrowing of its atoms (one
+    at least, to descend into it), then the evidence. Bytes: what the states at a split's boundaries hold that the
+    state before it didn't (the tensors written in a child that are still there at its end): above a sequence, the
+    adapters' B, m and v (between steps and segments) or G (between a step's sequences); below, activations."""
+    d, T = dict(spec.dims), spec.seq_len
+    config = {"model_type": d["family"], "vocab_size": d["vocab"], "hidden_size": d["hidden"],
+              "num_hidden_layers": d["layers"], "num_attention_heads": d["heads"], "num_key_value_heads": d["kv_heads"],
+              "head_dim": d["head_dim"], "intermediate_size": d["ffn"], "tie_word_embeddings": d["tied"]}
+    data = types.SimpleNamespace(parsed_config=lambda: config, n_train=1, train_len=np.array([T]),
+                                 train_mask=np.ones((1, T), dtype=np.uint8))
+    p = Program(spec, data, 1e-4, 1, 0)
+
+    def rounds(n):
+        k = 1
+        while n > K:
+            n, k = -(-n // K), k + 1
+        return k
+
+    def below(atoms):
+        return rounds(len(atoms)) + max((below(a.atoms) for a in atoms if isinstance(a, Node)), default=0)
+
+    def split(atoms):
+        ends, alive, total = {g1 for _, g1 in groups(0, len(atoms))}, {}, 0
+        for i, a in enumerate(atoms):
+            for op in [a] if isinstance(a, Op) else a.ops():
+                if op.out:
+                    alive[op.out] = op.shape
+                for n in op.drops:
+                    alive.pop(n, None)
+            if i + 1 in ends and i + 1 < len(atoms):
+                total += sum(4 * r * c for r, c in alive.values())
+                alive = {}
+        return total
+
+    micros = [_Micro(p, 0, T, first).atoms() for first in (True, False)]
+    adam = p.adam_step(0).atoms
+    moves = 2 * (rounds(segments) + rounds(per_segment) + rounds(batch_size + 1)
+                 + max(*(below(m) for m in micros), below(adam))) + 1
+    g = 4 * spec.n_adapter
+    nodes = [m for m in micros] + [a.atoms for m in micros for a in m if isinstance(a, Node)] + [adam]
+    most = max([(min(K, segments) - 1) * 3 * g, (min(K, per_segment) - 1) * 3 * g, (min(K, batch_size + 1) - 1) * g]
+               + [split(n) for n in nodes])
+    return moves, most

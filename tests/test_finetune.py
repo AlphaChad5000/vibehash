@@ -116,16 +116,32 @@ class SpecTests(unittest.TestCase):
         for every move of a dispute made just in time. And no phase is longer than an hour, whatever a spec asks for."""
         from types import SimpleNamespace
 
-        from vibehash.node import DISPUTE_MOVES, MAX_PHASE_S, Node, PhaseTimes
+        from vibehash.node import MAX_PHASE_S, Node, PhaseTimes
         node = SimpleNamespace(times=PhaseTimes())
-        t = Node.times_for(node, job_of())
-        self.assertEqual((t.move_s, t.dispute_s), (t.verify_s, DISPUTE_MOVES * t.verify_s))
+        t, need = Node.times_for(node, job_of()), job_of().phase_lengths()
+        self.assertEqual((need["moves"], t.move_s), (13, max(t.verify_s, need["move"])))  # the tree's depth
+        self.assertEqual(t.dispute_s, need["moves"] * t.move_s)
         self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + t.verify_s + t.dispute_s)
         self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).dispute_s, 0)
         huge = TrainingJob("big", "", 1, 1, spec=ModelSpec(4096, (8192,) * 3, 1000, "float32"), batch_size=4096,
                            steps_per_unit=100_000, checkpoint_every=100_000)
         self.assertTrue(all(x <= MAX_PHASE_S for x in (Node.times_for(node, huge).compute_s,
                                                        Node.times_for(node, huge).verify_s)))
+        long = job_of(batch_size=1024, steps_per_unit=10_000, checkpoint_every=10_000)
+        self.assertEqual(long.phase_lengths()["moves"], 19)
+        self.assertLessEqual(Node.times_for(node, long).dispute_s, MAX_PHASE_S + 1e-6)
+
+    def test_the_tree_is_as_deep_as_the_reviewer_measured(self):
+        """The second review's finding 6 (t_depth): Qwen3-4B's games take 15 to 21 moves with its settings, Qwen3-0.6B's
+        13 to 19; a unit of one segment adds a level, which the reviewer's count left out."""
+        from vibehash.program import dispute_size
+
+        dims = dict(spec_of().dims) | {"hidden": 2560, "layers": 36, "heads": 32, "ffn": 9728}
+        for d, want in ((dims, (15, 17, 21)), (dict(spec_of().dims), (13, 15, 19))):
+            for targets in (("q", "k", "v", "o"), ft.TARGETS):
+                spec = spec_of(targets=targets, rank=16) if d["layers"] == 28 else                     ft.LoraSpec(base=spec_of().base, manifest="a" * 64, dims=d, targets=targets, rank=16)
+                got = tuple(dispute_size(spec, b, s, per)[0] for b, per, s in ((4, 4, 4), (64, 64, 2), (1024, 10_000, 1)))
+                self.assertEqual(got, want, (d["layers"], targets))
 
     def test_mlp_specs_are_unchanged(self):
         """Fine-tunes have a spec of their own; MLP jobs' specs keep exactly the fields they had."""
@@ -747,11 +763,12 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.proto.post_job(req, self.job)
         self.before = copy.deepcopy(self.proto.chain)
 
-    def round(self, answer=None, moves=None):
+    def round(self, answer=None, moves=None, cut=None):
         """One round: everyone trains and reveals honestly as their behaviour says; verify-phase tasks are answered by
         `answer(task, worker) -> (ok, bad) | None` (None: silent; default: as the worker would); disputes are played
         by their parties (tracer.Party) unless `moves(game, who) -> move | None | "default"` says otherwise (None: it
-        never moves). Returns the report."""
+        never moves). `cut(games) -> time` ends the dispute phase then (Coordinator.end_disputes), after setting the
+        games' deadlines. Returns the report."""
         p, c = self.proto, self.proto.coord
         c.open_round()
         r = c.r
@@ -775,6 +792,8 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.disputed = c.start_disputes()
         if self.disputed:
             self._play(moves)
+            if cut is not None:
+                c.end_disputes(cut(r.games))
         self.games = dict(r.games)
         return c.finalize(proposer_keys=p._proposer(beacon), timestamp=p.chain.tip.height + 1)
 
@@ -1016,6 +1035,33 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertIn((liar, "false accusation"), slashed)
         self.replays([rep])
 
+    def test_a_phase_cut_short_blames_only_a_party_past_its_deadline(self):
+        """The second review's finding 6: a dispute phase that ends with games unfinished judged them all by silence,
+        though a party's own move may not have been due yet. Now each game goes by its own deadline: past it, the party
+        loses; before it, the game ends unchecked and nobody is slashed. A validator replays both."""
+        from vibehash import dispute as dg
+
+        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        order = []
+
+        def moves(g, who):
+            if g["id"] not in order:
+                order.append(g["id"])
+            return None if g["id"] in order[:2] and who == g["defender"] else "default"  # two never split
+
+        def cut(games):
+            games[order[0]].deadline, games[order[1]].deadline = 100.0, 10.0
+            return 50.0
+        rep = self.round(moves=moves, cut=cut)
+        waiting, late = self.games[order[0]], self.games[order[1]]
+        self.assertEqual((waiting.outcome, waiting.detail), ("unchecked", dg.PHASE_ENDED))
+        self.assertEqual((late.outcome, late.detail), ("challenger", "the defender didn't split in time"))
+        slashed = {s[0] for s in rep.slashes}
+        self.assertIn(late.defender, slashed)
+        self.assertNotIn(waiting.defender, slashed - {late.defender})
+        self.replays([rep])
+
     def test_replicas_that_disagree_dispute_each_other(self):
         """Every unit replicated, one segment challenged: a tampering worker's unit and its honest twin's disagree, so
         each challenges the other. The honest twin finds the tampered op and wins; the tampering one finds nothing
@@ -1230,6 +1276,41 @@ def word_tokenizer(vocab: int) -> bytes:
 
 
 @unittest.skipUnless(torch is not None and HAVE_TOKENIZERS, "needs PyTorch, tokenizers and jinja2")
+class ClientMoveTests(unittest.TestCase):
+    def test_a_move_that_doesnt_get_through_is_sent_again(self):
+        """The second review's finding 6: the worker marked a move made before sending it, so one lost on the way was
+        never sent again and its party lost by silence. It's made only once the node takes it, and a failed one is sent
+        again as it was, not worked out again, until the game's move count passes it."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from vibehash.client import NodeError, WorkerClient, WorkerStats
+
+        game = {"id": "g1", "turn": "split", "defender": "me", "challenger": "them", "n": 3, "seed": 1}
+        node = SimpleNamespace(get=lambda path: [dict(game)])
+        party = SimpleNamespace(split=mock.Mock(return_value=["a" * 64, "b" * 64]))
+        w = WorkerClient.__new__(WorkerClient)
+        w.node, w.stats, w.moved, w.unsent = node, WorkerStats(), set(), {}
+        w.party, w.worker = {5: party}, SimpleNamespace(verifier_behavior="honest", keys=SimpleNamespace(address="me"))
+        sent = []
+
+        def signed(kind, body):
+            sent.append(body)
+            if len(sent) == 1:
+                raise NodeError("connection reset")
+            return {"id": "g1"}
+        w._signed = signed
+        with mock.patch("vibehash.program.Program.of"):
+            w._disputes(5, None)
+            self.assertEqual((w.moved, len(sent)), (set(), 1))
+            w._disputes(5, None)  # sent again, the same move
+            self.assertEqual(sent[1], sent[0])
+            self.assertEqual(party.split.call_count, 1)
+            self.assertEqual(w.moved, {(5, "g1", 3)})
+            w._disputes(5, None)  # taken: not sent a third time
+            self.assertEqual(len(sent), 2)
+
+
 class LiveNetworkTests(unittest.TestCase):
     """The whole thing over HTTP, offline: a fake Hugging Face (tests/test_hub.py) serving a tiny model and its
     tokenizer, a node and three workers, `vibehash train chats.jsonl --base`, rounds, and `vibehash job download`."""
