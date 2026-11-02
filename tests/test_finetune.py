@@ -1052,6 +1052,43 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertIsNotNone(mine[0][1])  # its first slash, the one the ledger takes, has its catcher
         self.replays([rep])
 
+    def test_a_replay_fetches_the_dataset_its_disputes_need(self):
+        """The second review's finding 10: a validator without a job's dataset refused every block with a dispute over
+        it (rebuilding a game's program needs the data), and a node syncing stopped at one whose job had ended. A
+        replay's datasets now come from node.PeerDatasets: the node's own, else fetched from the proposer (or the peer
+        that sent the block), then any peer, and checked on arrival."""
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from vibehash.client import NodeError
+        from vibehash.node import PeerDatasets
+        from vibehash.storage import Store
+
+        self.network([("honest", "honest")] * 3)
+        raw, asked = Path(self.path).read_bytes(), []
+
+        class Peer:
+            def __init__(self, url):
+                self.url = url
+
+            def download(self, kind, sha, store, check=None):
+                asked.append(self.url)
+                if self.url != "http://has-it":
+                    raise NodeError("node doesn't have it")
+                store.write_chunk(sha, 0, raw, len(raw), check=check)
+        store = Store(tmpdir(self))
+        self.addCleanup(store.db.close)
+        node = SimpleNamespace(store=store, peers=SimpleNamespace(urls=lambda: ["http://proposer", "http://has-it"],
+                                                                   client=lambda url, timeout: Peer(url)))
+        job = job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": self.sha})
+        PeerDatasets(node, "http://proposer").attach(job)
+        self.assertEqual(asked, ["http://proposer", "http://has-it"])
+        self.assertEqual(job.data.n_train, self.job.data.n_train)
+        PeerDatasets(node, "http://proposer").attach(job_of(self.tiny.spec(), data_source=job.data_source))
+        self.assertEqual(len(asked), 2)  # kept: not fetched again
+        with self.assertRaises(InvalidJob):  # nobody has it
+            PeerDatasets(node).attach(job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": "d" * 64}))
+
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
         challenger. Both are slashed as if they had lost at the referee."""

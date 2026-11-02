@@ -391,7 +391,9 @@ class Node:
                 if block.summary is not None:
                     record = value.get("record")
                     problems = (["no round record"] if not isinstance(record, dict)
-                                else replay_block(self.chain, block, record, datasets=self.store,
+                                else replay_block(self.chain, block, record,
+                                                  datasets=PeerDatasets(self, self.chain.state.validators.get(
+                                                      address_of(block.proposer_pubkey))),
                                                   roots=LeaderBlobs(self, address_of(block.proposer_pubkey))))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
@@ -488,7 +490,8 @@ class Node:
                 problem = check_certificate(d.get("certificate"), block.height, block.hash.hex(),
                                             self.chain.state.validator_set(), self.chain.chain_id)
             if problem is None and record is not None:
-                problem = "; ".join(replay_block(self.chain, block, record, datasets=self.store)) or None
+                problem = "; ".join(replay_block(self.chain, block, record,
+                                                 datasets=PeerDatasets(self, peer.url))) or None
         if problem:
             log.error("refusing block %d from %s: %s", block.height, peer.url, problem)
             return False
@@ -1047,6 +1050,29 @@ class TraceBlobs:
     def forget(self) -> None:
         """At a round's end: its roots go with its blobs."""
         self.roots = {}
+
+
+class PeerDatasets:
+    """A job's dataset for a replay whose disputes need it (which sequences a step trains on): this node's own, else
+    fetched (from `first`, the block's proposer or the peer that sent it, then any peer) and checked on arrival as an
+    upload is. Without it a validator would refuse every block with a dispute over a job whose data it hadn't fetched
+    yet, and a node syncing would stop at one whose job has since ended."""
+
+    def __init__(self, node: Node, first: str | None = None):
+        self.node, self.first = node, first
+
+    def attach(self, job) -> None:
+        store, sha = self.node.store, job.data_source.get("sha256", "")
+        if not store.datasets.has(sha):
+            urls = [self.first] if self.first else []
+            for url in urls + [u for u in self.node.peers.urls() if u != self.first]:
+                try:
+                    self.node.peers.client(url, timeout=120).download("dataset", sha, store.datasets,
+                                                                      check=store.check_dataset)
+                    break
+                except (NodeError, InvalidJob, BlobError, KeyError, TypeError, ValueError) as e:
+                    log.debug("dataset %s from %s: %s", sha[:12], url, e)
+        store.attach_dataset(job)
 
 
 class LeaderBlobs:

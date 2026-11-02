@@ -800,6 +800,8 @@ once a round would be a ledger change.
     the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
     without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each
     game's ends, and the job's dataset to rebuild the program; a plain replay of a round without disputes needs none.
+    A node that doesn't have the dataset fetches it from the block's proposer (or the peer that sent the block), then
+    any peer, checked on arrival (`node.PeerDatasets`), rather than refusing the block.
   - **Recheck:** besides version 2's, it rebuilds each dispute's root states from the checkpoints.
   - **MLP rounds** stay version 2, unchanged.
 - **What counts as a fine-tune:** a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`), a shape
