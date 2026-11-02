@@ -166,7 +166,14 @@ vibehash job download
 
 This writes `my-chats-lora/`. It holds `adapter_model.safetensors` and
 `adapter_config.json` in PEFT's format, and a README naming the base model,
-its pinned commit, the data's hash and the job id. Then:
+its pinned commit, the data's hash and the job id. Beside them go
+`training-history.csv`, the job's rounds one by one (held-back loss, reply
+tokens predicted right, units accepted, VIBE paid, budget left), and
+`TRAINING.md`, a short page of how it was trained: base model, data, rounds,
+loss from the first round to the last, VIBE spent, node, chain and dates.
+`vibehash job history` shows the same rounds at any time, from any computer
+(README, "Logs and records"). Each round's score is of the model the round
+started from, so the newest round's training shows in the next one's. Then:
 
 ```python
 from transformers import AutoModelForCausalLM

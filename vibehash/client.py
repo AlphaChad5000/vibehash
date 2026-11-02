@@ -262,6 +262,13 @@ class WorkerStats:
             self.round, self.assigned, self.trained, self.committed, self.checked = rnd, 0, 0, 0, 0
 
 
+class _NoLog:
+    """Where a worker that keeps no round log (records.RoundLog) notes its rounds: nowhere."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
 class WorkerClient:
     """Polls the node and plays its part in each phase. One instance per wallet.
 
@@ -310,6 +317,10 @@ class WorkerClient:
         self.secret_commits: dict[tuple[int, str], str] = {}
         self._told: dict[str, str] = {}  # the waiting message last explained for each job
         self._last_said = ("", 0.0)  # the last problem logged, and when (_say)
+        # What it did each round, a line once the round is sealed: a records.RoundLog when the command keeps one
+        # (`worker`, `testnet`), which sets it. `_sealed` keeps the blocks the receipts' audit fetched, for it.
+        self.record = _NoLog()
+        self._sealed: dict[int, tuple[dict, dict | None]] = {}
 
     @property
     def keys(self) -> KeyPair:
@@ -340,13 +351,17 @@ class WorkerClient:
             mine = [r for r in self.unaudited if r["round"] == rnd]
             self.unaudited = [r for r in self.unaudited if r["round"] != rnd]
             try:
-                block = Block.from_dict(self.node.get(f"/blocks?from={rnd}&to={rnd}")[0])
+                raw = self.node.get(f"/blocks?from={rnd}&to={rnd}")[0]
+                block = Block.from_dict(raw)
             except (NodeError, IndexError):
                 continue
             try:
                 record = self.node.get(f"/round/{rnd}/record")
             except NodeError:
                 record = None
+            if not isinstance(self.record, _NoLog):  # the round log reads the same block, and two facts of the record
+                self._sealed[rnd] = (raw, {"attempt": record.get("attempt"), "prep": "prep" in record}
+                                     if isinstance(record, dict) else None)
             seen = self.secret_commits.pop((rnd, record.get("attempt")), None) if isinstance(record, dict) else None
             if seen and record.get("beacon_commit") != seen:
                 detail = (f"round {rnd}: the leader's round secret isn't the one it committed to when the round "
@@ -360,6 +375,28 @@ class WorkerClient:
                     log.error("censored: %s (evidence in %s)", detail, self.receipt_file)
                 elif status not in ("recorded", "pending"):
                     log.warning("%s", detail)
+
+    def _seal_rounds(self, height: int) -> None:
+        """Write the round log's line for each round the chain has sealed: its block (the one the receipts' audit
+        fetched, else asked for here, from our own node) and our account, asked once for them all."""
+        due = self.record.due(height) or []
+        for old in [r for r in self._sealed if r < height - 100]:  # rounds the log never asked about
+            del self._sealed[old]
+        account = None
+        for rnd in due:
+            raw, extra = self._sealed.pop(rnd, (None, None))
+            if raw is None:
+                try:
+                    raw = self.home.get(f"/blocks?from={rnd}&to={rnd}")[0]
+                except (NodeError, IndexError, KeyError, TypeError) as e:
+                    self.record.missed_block(rnd, str(e))
+                    continue
+            if account is None:
+                try:
+                    account = self.home.account(self.keys.address)
+                except NodeError:
+                    account = {}
+            self.record.sealed(rnd, raw, extra, account)
 
     def runs_on_gpu(self, job: TrainingJob) -> bool:
         return self.backend.name != "cpu" and job.spec.precision == "float32"
@@ -466,6 +503,8 @@ class WorkerClient:
             raise NodeError("node switched networks (genesis changed); refusing to continue")
         if self.unaudited and min(r["round"] for r in self.unaudited) <= s["height"]:
             self.audit_receipts(s["height"])
+        if not isinstance(self.record, _NoLog):
+            self._seal_rounds(s["height"])
         rnd, phase = s["round"], s["phase"]
         st = self.stats
         st.phase, st.phase_ends, st.height = phase, s["phase_ends"], s["height"]
@@ -504,29 +543,41 @@ class WorkerClient:
             st.rounds += 1
             st.activity = "registered; waiting for work"
             log.info("round %d: registered", rnd)
+            self.record.begin(rnd, attempt=s.get("attempt"), chain_id=s.get("chain_id", ""), job_id=job.job_id,
+                              kind="deepseek" if job.deepseek else "finetune" if job.finetune else "mlp",
+                              speed=self.speed[job.job_id], leader=self.node.url)
         elif phase == "compute":
             given = self.node.signed(k, "assignment", {"round": rnd})
             units = [unit_in(u) for u in given["units"]]
             st.assigned = len(units)
+            self.record.note(rnd, assigned=len(units))
             committed = []
             if not units:
                 why = (s.get("waiting") or {}).get(job.job_id)
                 st.activity = why or ("no units for us this round" if st.rounds else "joining at the next round")
+                if why:
+                    self.record.note(rnd, note=str(why)[:300])
                 if why and self._told.get(job.job_id) != why:  # once a job, what the wait means for this worker
                     self._told[job.job_id] = why
                     log.info("%s", self._waiting(job, why, s))
             if units and given.get("prep"):  # a DeepSeek prep round: units of the work graph, through the bucket
                 st.busy = True
+                self.record.note(rnd, kind="deepseek-prep")
+                t0 = time.perf_counter()
                 try:
                     for c in self.ds.compute(rnd, job, units, given["prep"], given.get("want") or {}):
                         if self._try(self._signed, "commit", {"round": rnd, "commitment": commitment_out(c)}, commitment_out(c)):
                             st.committed += 1
                             st.units += 1
+                            self.record.add(rnd, committed=1)
                 finally:
                     st.busy = False
+                    self.record.add(rnd, train_s=time.perf_counter() - t0, trained=len(self.ds.unit_stats.get(rnd, [])))
+                    self.record.note(rnd, prep=self.ds.unit_stats.get(rnd, []), _unit_flops=[u.flops for u in units])
                 st.activity = "prep units committed; waiting for the reveal"
                 units = []
             elif units and job.deepseek:  # a DeepSeek training round: its records, once
+                self.record.note(rnd, kind="deepseek-training")
                 self.ds.records(rnd, job)
             if units:
                 p = self.node.get("/round/params")
@@ -539,20 +590,26 @@ class WorkerClient:
                 try:
                     for i, u in enumerate(units, 1):
                         st.activity = f"training unit {i} of {len(units)}"
+                        t0 = time.perf_counter()
                         c = self.worker.compute(u, job, start)
                         st.trained += 1
+                        t1 = time.perf_counter()
                         # Upload before committing: the reveal phase then only carries a small message, and uploads
                         # count toward the compute deadline, so a link too slow to deliver in time gets less work next round.
                         # Safe to send early: blob ids are content hashes nobody else can guess, and the commitment
                         # already binds the result before the beacon exists.
                         work = self.worker._work[u.unit_id]
                         st.activity = f"uploading unit {i} of {len(units)}"
-                        if self._try(self._upload, rnd, job, [*work.checkpoints[1:], work.final]) is not None:
+                        uploaded = self._try(self._upload, rnd, job, [*work.checkpoints[1:], work.final]) is not None
+                        self.record.add(rnd, trained=1, train_s=t1 - t0, upload_s=time.perf_counter() - t1)
+                        if uploaded:
                             if self._try(self._signed, "commit", {"round": rnd, "commitment": commitment_out(c)}, commitment_out(c)):
                                 committed.append(u)
                                 st.committed += 1
                                 st.units += 1
                                 st.training_flops += u.flops
+                                self.record.add(rnd, committed=1)
+                                self.record.append(rnd, "_unit_flops", u.flops)
                 finally:
                     st.busy = False
                 st.activity = f"committed {len(committed)} units; waiting for the reveal"
@@ -561,8 +618,11 @@ class WorkerClient:
         elif phase == "reveal" and s["beacon"]:
             for body in self.ds.reveals(rnd):  # a DeepSeek prep round's: each unit's commitment root
                 res = self._try(self._signed, "reveal", {"round": rnd, "reveal": body}, body)
+                if res is not None:
+                    self.record.add(rnd, revealed=1)
                 if res and not res["ok"]:
                     log.warning("round %d: prep unit %s rejected: %s", rnd, body["unit_id"], res["verdict"])
+                    self.record.append(rnd, "rejected", {"unit": body["unit_id"], "why": str(res["verdict"])[:300]})
             beacon = bytes.fromhex(s["beacon"])
             if self.units.get(rnd):
                 st.activity = "revealing the checkpoints the beacon picked"
@@ -571,15 +631,22 @@ class WorkerClient:
             # node with many units spends the phase waiting on round trips.
             with ThreadPoolExecutor(max(1, min(PARALLEL_REQUESTS, len(reveals)))) as pool:
                 for rv, res in zip(reveals, pool.map(lambda rv: self._try(self._send_reveal, rnd, job, rv), reveals)):
+                    if res is not None:
+                        self.record.add(rnd, revealed=1)
                     if res and not res["ok"]:
                         log.warning("round %d: unit %s rejected: %s", rnd, rv.unit_id, res["verdict"])
+                        self.record.append(rnd, "rejected", {"unit": rv.unit_id, "why": str(res["verdict"])[:300]})
         elif phase == "dispute":  # a fine-tune's disputes: a move in each that waits on us, every poll until it ends
             self._disputes(rnd, job)
             return
         elif phase == "verify":
             absent = self.worker.verifier_behavior == "absent"  # tests only: a checker that never answers
             tasks = [] if absent else self.node.signed(k, "tasks", {"round": rnd})["tasks"]
-            self._answer(rnd, job, tasks)
+            t0 = time.perf_counter()
+            try:
+                self._answer(rnd, job, tasks)
+            finally:
+                self.record.add(rnd, checks_given=len(tasks), **({"check_s": time.perf_counter() - t0} if tasks else {}))
             st.activity = "round done; waiting for the block"
             if tasks:
                 log.info("round %d: verified %d tasks", rnd, len(tasks))
@@ -608,7 +675,7 @@ class WorkerClient:
                 if kind == "prep":  # a DeepSeek prep unit: replayed, and its commitment held up against the replay
                     st.activity = f"checking another miner's prep unit ({i} of {len(tasks)})"
                     body["ok"] = bool(self.ds.check(rnd, job, t))
-                    self._try(self._signed, "verdict", body)
+                    self._verdict(rnd, kind, body)
                     st.checked += 1
                     st.checks += 1
                     continue
@@ -625,11 +692,17 @@ class WorkerClient:
                         openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
                     ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"])
                     body |= {"ok": bool(ok), "bad_segment": bad}
-                self._try(self._signed, "verdict", body)
+                self._verdict(rnd, kind, body)
                 st.checked += 1
                 st.checks += 1
         finally:
             st.busy = False
+
+    def _verdict(self, rnd: int, kind: str, body: dict) -> None:
+        """Send a task's verdict, and note it for the round log once the node has it."""
+        if self._try(self._signed, "verdict", body) is not None:
+            self.record.add(rnd, checks=1, **({"found_bad": 1} if not body["ok"] else {}))
+            self.record.tally(rnd, "check_kinds", kind)
 
     def _disputes(self, rnd: int, job: TrainingJob) -> None:
         """Make our move in each of this round's disputes that waits on us (dispute.py): as the defender, post the
@@ -682,6 +755,7 @@ class WorkerClient:
                     self.unsent = {k: v for k, v in self.unsent.items() if k[0] == rnd} | {key: move}
                 else:
                     self.moved.add(key)
+                    self.record.add(rnd, dispute_moves=1)
         finally:
             st.busy = False
 
