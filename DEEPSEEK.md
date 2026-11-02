@@ -662,17 +662,21 @@ everyday chats.
 *Experts: a chunk touches nearly all of each layer's.*
 - **Layer 0, on its real input.** Layer 0's input is the embedding itself, so
   its routing needs only its 170 MB outside the experts (read from the Hub by
-  range; routing doesn't run the experts). It is balanced: 4,096 tokens of chats
-  touch 362 of its 384 experts, the counts' CV is 1.4, and the busiest 10% take
-  43% of the picks. (The same over all 406K tokens is running.)
+  range; routing doesn't run the experts). Over 406K tokens of everyday chats:
+  - every one of its 384 experts has tokens by 262K tokens. A 64K-token chunk
+    touches 382, a 2K-token sequence 340;
+  - the load is uneven on chat text: the busiest 10% take 43% of the picks, and
+    12 experts get under 1% of the mean (the rarest, 2 picks in 406K tokens);
+  - at these rates a million tokens leave 0.007 experts untouched. So a million
+    tokens do touch them all.
 - **Off its input, it isn't.** Layer 2 fed the embedding directly, skipping
   layers 0–1, touches only 247 of 384 in 64K tokens, adding about 14 a doubling,
   with the busiest 10% taking 89%. Layers 36–39 on the stand-in chain are as
   skewed. So routing balance holds on the model's own inputs, which is all a
   prep ever feeds it.
 - So scoping by expert can't shrink a prep's download. A miner would have to run
-  the layer to learn which experts it needs, and a 64K-token chunk needs nearly
-  all of them.
+  the layer to learn which experts it needs, and a 64K-token chunk needs 382 of
+  384 (99.5%).
 - Splitting a layer's experts among people never pays.
   - Each token would go out to its 6 experts' holders and back: about 120 KB a
     token a layer (6 × 2 × 10 KB), against 28 KB a cut.
