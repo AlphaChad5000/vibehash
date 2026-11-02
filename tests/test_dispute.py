@@ -162,6 +162,41 @@ class RefereeTests(_Tiny):
         self.assertGreater(honest, 1000)
         self.assertGreater(caught, 0.98 * tampered)
 
+    def test_the_referee_reads_only_weights_it_checked(self):
+        """The second review's finding 2 (t_forged_weights): a replay refereed with whatever weights the record carried.
+        Now no weights are recorded, and dispute.HubWeights fetches a whole tensor and checks it against the job's
+        manifest before reading any of it: a Hub (or anyone between) serving other bytes leaves the game unchecked."""
+        from vibehash import hub
+
+        self.tiny()
+        raw = (self.model.folder / "model.safetensors").read_bytes()
+        manifest = hub.Manifest.from_bytes(self.model.manifest_bytes)
+        name = next(n for n in manifest.tensors if n.endswith("q_proj.weight"))
+
+        class File:
+            def __init__(self, data):
+                self.data = data
+
+            def iter_range(self, start, length):
+                yield self.data[start:start + length]
+
+        class Served:
+            def __init__(self, data):
+                self.data = data
+
+            def open(self, repo, commit, path, size=None, sha256=None):
+                return File(self.data)
+        e = manifest.tensors[name]
+        forged = bytearray(raw)
+        forged[e.offset + 7] ^= 0x40
+        for data, ok in ((raw, True), (bytes(forged), False)):
+            weights = dispute.HubWeights(manifest, hub=Served(data), cache=hub.TensorCache(tmpdir(self)))
+            if ok:
+                self.assertEqual(len(weights.read(name, 0, 2)), 2 * e.shape[1] * 2)
+            else:
+                with self.assertRaises(dispute.WeightsUnavailable):
+                    weights.read(name, 0, 2)
+
     def test_lora_a_one_matches_lora_a(self):
         self.tiny()
         whole = self.spec.lora_a()
