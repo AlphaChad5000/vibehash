@@ -85,6 +85,16 @@ SHARDED_RECORD_VERSION = 3
 FINETUNE_RECORD_VERSION = 4
 CHECKERS = 2  # checkers given each claim of a fine-tune, so one that doesn't answer leaves the other's verdict
 SCORERS = 3  # workers who score a fine-tune round's starting model; the record keeps the median
+MAX_GAMES = 4  # disputes one checker can open in a round (games_allowed); its further rejections are ignored
+
+
+def games_allowed(rep: float) -> int:
+    """Disputes a checker with reputation `rep` may open in a round: MAX_GAMES from the reputation a newcomer starts
+    with, one fewer for each round's worth of reputation it has lost since (economics.REP_LOSS_MISSED: a round in which
+    it withdrew a rejection, or missed a deadline), and never fewer than one. So accusing again and again costs more:
+    each round of it takes a dispute away, as well as that round's pay for checking and some of its pay rate."""
+    lost = max(0, round((econ.REP_START - rep) / econ.REP_LOSS_MISSED))
+    return max(1, MAX_GAMES - lost)
 # Staked workers able to run a fine-tune that must register before its round assigns work: a holder and one checker.
 # With the node refereeing disputes, a claim's verdict is right whenever one of its checkers is honest and online, so
 # one checker is enough to start; from three workers on, each claim gets two, so one going quiet leaves the other.
@@ -353,6 +363,7 @@ class Coordinator:
         # party has for each move.
         self.trace_blobs = None
         self.weight_source = None
+        self.roots = None  # a replay's: where a dispute's checkpoints come from (.array(blob_id, job)), to check its states
         self.datasets = None  # a replay's: where a fine-tune's data comes from (.attach(job) or .attach_dataset(job))
         self.move_s = 60.0
         self._programs: dict = {}
@@ -1385,10 +1396,16 @@ class Coordinator:
             return False
         job = self.job(r.job_id)
         r.void = {t.verifier for t in r.tasks.values() if t.canary and t.verdict is not None and t.verdict[0]}
+        opened = defaultdict(int)
         if r.prep:
-            self._prep_disputes(job)
+            self._prep_disputes(job, opened)
         for t in sorted(r.tasks.values(), key=lambda t: t.task_id):
             if t.kind == "check" and not t.canary and t.verdict is not None and not t.verdict[0] and t.verifier not in r.void:
+                # One challenger can't load a round with disputes, fewer the more it has accused in vain: the rest of
+                # its rejections are ignored (their claims stand on other verdicts).
+                if opened[t.verifier] >= games_allowed(self.chain.state.rep(t.verifier)):
+                    continue
+                opened[t.verifier] += 1
                 self._open_game(job, (t.unit.unit_id, t.submitter), t.verifier, "dispute", ["segment", t.verdict[1]])
         for uid, holders in sorted(r.holders.items()):
             keys = [(uid, a) for a in holders if (uid, a) in r.reveals]
@@ -1416,7 +1433,7 @@ class Coordinator:
                 self._programs[key] = Program.of(job, self.r.units[uid].seed)
         return self._programs[key]
 
-    def _prep_disputes(self, job: TrainingJob) -> None:
+    def _prep_disputes(self, job: TrainingJob, opened: dict) -> None:
         """A prep round's rejected layers units (rows units are copies of the tables: a rejected one ends unchecked).
         First the node checks a claim's outputs are its last committed state (deepseek_graph.handed_root, or
         records_root for the last piece: its objects decoded in NumPy): if not, the claim is fraud, its catcher the
@@ -1437,6 +1454,9 @@ class Coordinator:
                 if key not in r.results:
                     self._fraud(key, Verdict.FAILED_REPLAY, outcome, catcher=t.verifier, verifier=t.verifier)
                 continue
+            if opened[t.verifier] >= games_allowed(self.chain.state.rep(t.verifier)):  # as for a training round's
+                continue
+            opened[t.verifier] += 1
             self._open_prep_game(job, key, t.verifier)
 
     def _handoff(self, job: TrainingJob, key, gu) -> str:
@@ -1508,9 +1528,49 @@ class Coordinator:
                 self._put_trace(manifest)
                 out.append(state)
             return out
-        a, b = self._claim("game", gid, ends)
+        if self.replaying and self.roots is not None:  # a validator: the states are the checkpoints', or it refuses
+            a, b = self._replay_ends(job, key, root)
+            if self.replaying["checks"].get("game", {}).get(gid) != [a, b]:
+                raise ProtocolError(f"dispute {gid}'s starting states in the record aren't the reveal's checkpoints'")
+            r.record["checks"]["game"][gid] = [a, b]
+        else:
+            a, b = self._claim("game", gid, ends)
         g = dg.Game(gid, uid, defender, challenger, why, list(root), a, b, seed=r.units[uid].seed)
         r.games[gid] = g.start(self._program(job, uid))
+
+    def _replay_bytes(self, blob_id: str) -> bytes | None:
+        """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
+        None when it can't be had (an old round past its window): the game then can't be refereed again."""
+        get = getattr(self.roots, "bytes", None)
+        if get is None:
+            return None
+        try:
+            return get(blob_id)
+        except Exception:  # noqa: BLE001 - pruned or unreachable: as a checkpoint that's gone
+            return None
+
+    def _replay_ends(self, job: TrainingJob, key: tuple[str, str], root: list) -> list[str]:
+        """A game's starting and ending state roots, rebuilt from the checkpoints its claim's reveal names (fetched
+        through self.roots: the leader's blobs, for a validator). Refuses when they can't be had."""
+        uid, worker = key
+        wire = next((d for d in self.replaying.get("reveals", []) if d.get("unit_id") == uid and d.get("worker") == worker),
+                    None)
+        if wire is None:
+            raise ProtocolError(f"the record has no reveal for {uid} by {worker}")
+        openings = blob_openings_in(wire["openings"], job.n_segments)
+        if root[0] == "segment":
+            s = int(root[1])
+            ids = [openings[s][0], openings[s + 1][0]]
+        else:
+            ids = [openings[0][0], wire["final"]]
+        out = []
+        for bid in ids:
+            try:
+                theta = self.roots.array(bid, job)
+            except Exception as e:  # noqa: BLE001 - the checkpoint couldn't be had: nothing to check the record by
+                raise ProtocolError(f"checkpoint {str(bid)[:12]} for a dispute couldn't be fetched: {e}") from None
+            out.append(dg.checkpoint_state(job.spec, theta)[0])
+        return out
 
     # --- states and evidence on the node ---
 
@@ -1522,12 +1582,33 @@ class Coordinator:
     def _get_trace(self, blob_id: str) -> bytes | None:
         return None if self.trace_blobs is None else self.trace_blobs.get_bytes(blob_id)
 
+    def _trace_size(self, blob_id: str) -> int | None:
+        return None if self.trace_blobs is None else self.trace_blobs.size(blob_id)
+
+    def _check_evidence_size(self, g, blob_id: str, outside) -> None:
+        """Evidence no bigger than its tile can need (dispute.evidence_cap), checked before it's read."""
+        size = self._trace_size(blob_id) if dg._hex64(blob_id) else None
+        if size is None:
+            raise ProtocolError("evidence is the id of an uploaded blob")
+        if size > dg.MAX_EVIDENCE:
+            try:
+                cap = dg.evidence_cap(g.leaf, g.tile, outside)
+            except dg.WeightsUnavailable:  # the referee will say so (unchecked), on evidence it then doesn't read
+                return
+            if size > cap:
+                raise ProtocolError(f"evidence of {size} bytes is more than this tile can need ({cap})")
+
     def _check_states(self, roots: list[str]) -> None:
         """Every state a split names is on the node, with every tensor it names, each hashing as its manifest says:
-        the challenger can fetch them all."""
+        the challenger can fetch them all. Sizes are checked before anything is read or hashed."""
         from . import merkle
 
         for root in roots:
+            size = self._trace_size(root)
+            if size is None:
+                raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
+            if size > merkle.MAX_MANIFEST:
+                raise dg.MoveRefused(f"state {root[:12]}… is too big to be a manifest")
             m = self._get_trace(root)
             if m is None:
                 raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
@@ -1569,10 +1650,10 @@ class Coordinator:
 
     @_locked
     def submit_move(self, addr: str, body: dict, envelope: dict | None = None, now: float | None = None,
-                    evidence: bytes | None = None, weights: bytes | None = None) -> dict:
+                    evidence: bytes | None = None) -> dict:
         """One move of a dispute (dispute.play), `body` {"game", "n" (moves so far), "move"}. A replay passes the
-        evidence and the weights the referee used, from the record; a live node reads the evidence from its blobs
-        and the weights from the Hub."""
+        evidence from the record; a live node reads it from its blobs. Either way the referee reads the base model's
+        weights it checked itself against the job's manifest (dispute.HubWeights): none come from the record."""
         r = self._need(Phase.DISPUTE)
         g = r.games.get(body.get("game")) if isinstance(body, dict) else None
         if g is None:
@@ -1583,13 +1664,22 @@ class Coordinator:
             raise ProtocolError("too late: that move's deadline has passed")
         job = self.job(r.job_id)
         move, outside = body.get("move"), None
-        if isinstance(move, dict) and "evidence" in move:
-            if self.replaying:
-                source = dg.Recorded(weights) if weights is not None else dg.Unavailable()
-                outside = dg.Outside(job.spec, job.data, source, keep=False)
-            else:
-                evidence = self._get_trace(str(move["evidence"]))
-                outside = dg.Outside(job.spec, job.data, self._weight_source(job))
+        try:
+            kind = dg.whose(g, addr, move)  # before reading anything the move names
+        except dg.MoveRefused as e:
+            raise ProtocolError(str(e)) from None
+        if kind == "evidence":
+            outside = dg.Outside(job.spec, job.data, self._weight_source(job))
+            blob = str(move["evidence"])
+            if not self.replaying:
+                self._check_evidence_size(g, blob, outside)
+            evidence = self._replay_bytes(blob) if self.replaying else self._get_trace(blob)
+            if self.replaying and evidence is None:  # gone with its round's window: the record's outcome, unchecked
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
+                self.unchecked += 1
+                g.moves.append(envelope if envelope is not None else {"from": addr, **body})
+                return g.view()
         try:
             if not self.replaying and g.unit in r.prep and not g.moves:  # a prep game's ends: the defender's to post
                 self._check_states([g.a, g.b])
@@ -1597,10 +1687,6 @@ class Coordinator:
                     check_states=None if self.replaying else self._check_states)
         except dg.MoveRefused as e:
             raise ProtocolError(str(e)) from None
-        except dg.RecordIncomplete as e:
-            raise ProtocolError(f"the record can't referee dispute {g.gid}: {e}") from None
-        if self.replaying and g.evidence is not None and g.outcome != "unchecked":
-            g.weights = weights
         g.moves.append(envelope if envelope is not None else {"from": addr, **body})
         if now is not None:
             g.deadline = now + self.move_s
@@ -1614,6 +1700,14 @@ class Coordinator:
             for g in r.games.values():
                 if g.turn != "done" and g.deadline and now > g.deadline:
                     dg.silence(g)
+
+    @_locked
+    def end_disputes(self, now: float) -> None:
+        """The dispute phase is over: each unfinished game is judged by its own move's deadline (dispute.cut_short)."""
+        r = self.r
+        if r is not None and self.phase == Phase.DISPUTE:
+            for g in r.games.values():
+                dg.cut_short(g, now)
 
     def disputes_done(self) -> bool:
         r = self.r
@@ -1848,6 +1942,10 @@ class Coordinator:
         r = self.r
         job = self.job(r.job_id)
         for g in r.games.values():
+            if g.turn != "done" and self.replaying:  # the leader's clock: its phase ended before the move was due
+                entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
+                if (entry.get("outcome"), entry.get("detail")) == ("unchecked", dg.PHASE_ENDED):
+                    g.end("unchecked", dg.PHASE_ENDED)
             dg.silence(g)  # whoever's move it still is didn't make it
         verifier_flops: dict[str, int] = defaultdict(int)
         missed: set[str] = set()
@@ -1873,6 +1971,9 @@ class Coordinator:
             games[(g.unit, g.defender)].append(g)
             if g.outcome == "defender":
                 r.slashes.append([g.challenger, None, "false accusation"])
+        # A checker that withdrew its rejection (it found no number the referee would refuse) isn't slashed, but isn't
+        # paid for checking this round either: a rejection costs something even when it's taken back.
+        withdrawn = {g.challenger for g in r.games.values() if g.outcome == "withdrawn"}
         for key in sorted(r.reveals):
             if r.prep and key in r.results:  # found bad already: its outputs aren't its state (_prep_disputes)
                 continue
@@ -1897,26 +1998,11 @@ class Coordinator:
                 r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
                                             "no checker whose verdicts count answered for it")
         r.record["games"] = [g.entry() for _, g in sorted(r.games.items())]
+        # An offender pays one slash a round, its first (ledger._slash_txs): one with a catcher goes before a burn, or
+        # a cheater that also accused falsely (or approved a canary) would keep its catcher from the bounty.
+        r.slashes.sort(key=lambda s: s[1] is None)
 
         accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
-        offenders = {s[0] for s in r.slashes} | r.forfeit
-        worker_flops: dict[str, int] = defaultdict(int)
-        updates: dict[str, np.ndarray] = {}
-        if r.prep:  # a prep round: the work graph moves on, the model doesn't
-            return self._settle_prep(job, accepted, offenders, verifier_flops, missed, proposer)
-        for (uid, addr), rv in accepted.items():
-            if addr not in offenders:
-                worker_flops[addr] += r.units[uid].flops
-                updates.setdefault(uid, rv.final_params)
-        new_params = None
-
-        def average() -> str:
-            nonlocal new_params
-            self._weights(*(updates.values() if updates else [r.start]))
-            new_params = _mean(list(updates.values()), job) if updates else r.start
-            return params_hash(new_params).hex()
-        model_hash = self._claim("model", "params_hash", average)
-        if scores:        accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
         offenders = {s[0] for s in r.slashes} | r.forfeit
         worker_flops: dict[str, int] = defaultdict(int)
         updates: dict[str, np.ndarray] = {}
@@ -1946,10 +2032,10 @@ class Coordinator:
             job_id=r.job_id,
             accepted_units=len(updates),
             worker_flops=dict(sorted(worker_flops.items())),
-            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders},
+            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders | withdrawn},
             slashes=r.slashes,
             accepted=sorted(worker_flops),
-            missed=sorted(missed | r.forfeit | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
+            missed=sorted(missed | r.forfeit | withdrawn | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
             params_hash=model_hash,
             proposer=proposer,
             record_hash=h256(canonical(r.record)).hex(),
@@ -2152,7 +2238,7 @@ class _MemoryBlobs:
 
     def __init__(self):
         self.data: dict[str, bytes] = {}
-        self.roots: dict[str, str] = {}
+        self.roots: dict[tuple, str] = {}
 
     def put_bytes(self, raw: bytes) -> str:
         import hashlib
@@ -2164,12 +2250,15 @@ class _MemoryBlobs:
     def get_bytes(self, bid: str) -> bytes | None:
         return self.data.get(bid)
 
+    def size(self, bid: str) -> int | None:
+        return len(self.data[bid]) if bid in self.data else None
+
     def tensor_root(self, bid: str, rows: int, cols: int) -> str | None:
         from . import merkle
 
         raw = self.data.get(bid)
         if raw is None or len(raw) != rows * cols * 4:
             return None
-        if bid not in self.roots:
-            self.roots[bid] = merkle.root_of(np.frombuffer(raw, "<f4").reshape(rows, cols))
-        return self.roots[bid]
+        if (bid, rows, cols) not in self.roots:  # by shape: the same bytes make another root in another shape
+            self.roots[bid, rows, cols] = merkle.root_of(np.frombuffer(raw, "<f4").reshape(rows, cols))
+        return self.roots[bid, rows, cols]

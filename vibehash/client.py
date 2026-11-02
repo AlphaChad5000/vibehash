@@ -295,7 +295,8 @@ class WorkerClient:
         self.start_blob: dict[int, str] = {}
         self.uploaded: dict[int, set[str]] = {}  # checkpoints the node confirmed it has, by round
         self.attempt_of: dict[int, str | None] = {}  # the attempt at each round those confirmations were for
-        self.moved: set[tuple] = set()  # (round, dispute, move number) we've made our move for
+        self.moved: set[tuple] = set()  # (round, dispute, move number) the node took our move for
+        self.unsent: dict[tuple, dict] = {}  # moves worked out whose sending failed: sent again, not worked out again
         self.party: dict = {}  # this round's tracer.Party, for its disputes
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
@@ -659,14 +660,21 @@ class WorkerClient:
                 if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
                     continue  # tests only: a challenger that goes quiet
                 st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
-                if job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's (deepseek_client)
-                    prog, p = self.ds.prep_game(rnd, job, g, party.remote)
+                key = (rnd, g["id"], g["n"])
+                move = self.unsent.pop(key, None)
+                if move is None:
+                    if job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's (deepseek_client)
+                        prog, p = self.ds.prep_game(rnd, job, g, party.remote)
+                    else:
+                        prog, p = Program.of(job, int(g["seed"])), party
+                    move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g)}
+                            if g["turn"] == "split" else {"evidence": p.remote.put(p.evidence(prog, g))})
+                # Made only once the node takes it: a send that fails is tried again next time round, until the game's
+                # move count passes it (taken after all, or too late).
+                if self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move}) is None:
+                    self.unsent = {k: v for k, v in self.unsent.items() if k[0] == rnd} | {key: move}
                 else:
-                    prog, p = Program.of(job, int(g["seed"])), party
-                move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g)}
-                        if g["turn"] == "split" else {"evidence": p.remote.put(p.evidence(prog, g))})
-                self.moved.add((rnd, g["id"], g["n"]))
-                self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move})
+                    self.moved.add(key)
         finally:
             st.busy = False
 

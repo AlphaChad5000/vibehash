@@ -312,13 +312,14 @@ def op_ds_rope(op, x, r, c0, c1):
 # --- hyper-connections ------------------------------------------------------------------------------------------------
 
 def _sum(a: E, axis: int) -> E:
-    """A sum along one axis of a small array, in any order, kept broadcastable."""
-    k = a.v.shape[axis]
-    v = np.apply_along_axis(math_fsum, axis, a.v)
-    s_abs = np.apply_along_axis(math_fsum, axis, np.abs(a.v))
-    ae = np.apply_along_axis(math_fsum, axis, a.e)
-    v, ae, s_abs = (np.expand_dims(t, axis) for t in (v, ae, s_abs))
-    return E(v, ae + rf.gamma(k) * (s_abs + ae))
+    """A sum along one axis, in any honest order, kept broadcastable: referee.esum's bound (the statistical model, or the
+    worst case γ_K·Σ|terms| where that's tighter, as for a few terms)."""
+    t, et = np.moveaxis(a.v, axis, -1), np.moveaxis(a.e, axis, -1)
+    k = t.shape[-1]
+    v, s_abs = rf.fsum_rows(t), rf.fsum_rows(np.abs(t))
+    ae = rf.fsum_rows(et) if np.any(et) else np.zeros(v.shape)
+    e = ae * (1 + 2 * rf.U) + np.minimum(rf.gamma(k) * s_abs, rf.SPREAD_C * rf.U * rf.spread(t))
+    return E(np.expand_dims(v, axis), np.expand_dims(e, axis))
 
 
 def math_fsum(t) -> float:
@@ -684,18 +685,54 @@ def _acc(op, x, r, c0, c1, y: E, at: int) -> E:
     return rf.add(E(x.get(op.ins[at], r, r + 1, c0, c1)[0]), y) if len(op.ins) > at else y
 
 
+class _Spread:
+    """referee.spread of terms that arrive a chunk at a time along the sum (each chunk [n, cols], n a multiple of the
+    largest stride but for the last): the running sums at each stride carry over from one chunk to the next."""
+
+    def __init__(self, cols: int):
+        self.k, self.sq = 0, np.zeros(cols)
+        self.carry = {s: np.zeros((cols, s)) for s in rf.STRIDES}
+        self.hi = {s: np.zeros((cols, s)) for s in rf.STRIDES}
+        self.lo = {s: np.zeros((cols, s)) for s in rf.STRIDES}
+
+    def add(self, p: np.ndarray) -> None:
+        t = p.T  # [cols, n]
+        n = t.shape[1]
+        self.k += n
+        self.sq += np.einsum("ij,ij->i", t, t)
+        for s in rf.STRIDES:
+            pad = (-n) % s
+            tt = np.concatenate([t, np.zeros((t.shape[0], pad))], 1) if pad else t
+            c = np.cumsum(tt.reshape(t.shape[0], -1, s), axis=1) + self.carry[s][:, None, :]
+            self.carry[s] = c[:, -1, :]
+            self.hi[s] = np.maximum(self.hi[s], c.max(1))
+            self.lo[s] = np.minimum(self.lo[s], c.min(1))
+
+    def value(self) -> np.ndarray:
+        m = np.zeros(self.sq.shape)
+        for s in rf.STRIDES:
+            if s > self.k:
+                break
+            m = np.maximum(m, (self.hi[s] - self.lo[s]).max(1))
+        return np.sqrt(self.k) * m + np.sqrt(self.sq)
+
+
 def _contract_rows(dy: np.ndarray, rows_of, n_rows: int, chunk: int = 4096) -> E:
     """Σ_o dy[o] · W[o, cols] over every row o of W, read `chunk` rows at a time (rows_of(o0, o1) -> [o1-o0, cols]):
-    exact partial sums (fsum), and the bound of one K-term dot product of float32s in any order."""
-    parts, absparts = [], []
+    exact partial sums (fsum), and referee.contract's bound for one K-term dot product (the statistical model, or γ_K
+    where that's tighter), with the spread streamed across chunks (_Spread)."""
+    parts, absparts, spread = [], [], None
     for o0 in range(0, n_rows, chunk):
         o1 = min(n_rows, o0 + chunk)
         p = dy[o0:o1, None] * rows_of(o0, o1)
+        spread = spread or _Spread(p.shape[1])
+        spread.add(p)
         parts.append(rf.fsum_rows(p.T))
         absparts.append(rf.fsum_rows(np.abs(p).T))
     v = rf.fsum_rows(np.stack(parts, -1))
     s_abs = rf.fsum_rows(np.stack(absparts, -1))
-    return E(v, (rf.gamma(n_rows) + 2.0 ** -50) * s_abs)  # (and the float64 partial sums' own rounding)
+    e = np.minimum(rf.gamma(n_rows) * s_abs, rf.SPREAD_C * rf.U * spread.value())
+    return E(v, e + 2.0 ** -50 * s_abs)  # (and the float64 partial sums' own rounding)
 
 
 def op_ds_qlinear_bwd(op, x, r, c0, c1):
@@ -1270,8 +1307,9 @@ def choice_ds_candidates(op, x, r, row):
 
 class RecordSource:
     """A DeepSeek job's records as the referee reads them, through the weights' interface (dispute.Outside's source):
-    record.{seq}.{part} is a float32 tensor of that part's rows, so the rows a game's referee read are kept with the
-    weights in its record (dispute.Recorded), and a validator replays it without the bucket. `data` has the job's
+    record.{seq}.{part} is a float32 tensor of that part's rows. Records carry no weights (the second review's finding
+    2), so a validator replaying a game reads the rows the same way, each checked against the pinned root: it needs
+    the records' bucket (or a node's copy), as it needs the Hub for the weights. `data` has the job's
     token file (.tokens) and its records (.records: deepseek_unit.Records on a worker, deepseek_graph.RecordReader on
     the node, each checking a record against the pinned root as it reads it)."""
 

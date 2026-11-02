@@ -28,7 +28,8 @@ def baked(m: catalog.Model, f: catalog.Facts) -> dict:
             "experts": catalog.experts_text(f) if f.experts else "", "weights": catalog.size_text(f.weight_bytes),
             "estimated": f.estimated, "licence": f.licence or "not stated", "gated": f.gated,
             "team": [catalog.team(f, m)[gb] for gb in catalog.GPU_GB], "held": catalog.size_text(catalog.held_bytes(f, m)),
-            "left_out": [f"{what} ({catalog.size_text(b)}): {why}" for what, why, b in m.left_out]}
+            "left_out": [f"{what} ({catalog.size_text(b)}): {why}" for what, why, b in m.left_out],
+            "ready": catalog.ready(f, m)}  # fine-tunes today (an architecture finetune.py trains, on one gaming GPU)
 
 
 def script_json(value) -> str:

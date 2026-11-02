@@ -317,7 +317,7 @@ RUN = {name[2:]: fn for name, fn in globals().items() if name.startswith("r_")}
 # --- disputes: a worker's side (dispute.py has the rules) -------------------------------------------------------------
 
 HARD = 1e-2  # a child whose result is this far (relative) from a recompute is taken at once; else the furthest
-CANDIDATES = 8  # tiles of a picked op the challenger checks with the referee before naming one
+CANDIDATES = 32  # tiles of a picked op the challenger checks with the referee before naming one (or withdrawing)
 
 
 def node_at(prog, root, path) -> tuple[Node, tuple]:
@@ -479,10 +479,15 @@ class Party:
         atom = node.atoms[g0] if g1 - g0 == 1 else None
         move = {"pick": child}
         if isinstance(atom, Op) and atom.out:
-            move["tile"] = self.worst_tile(prog, atom, roots[child], roots[child + 1])
+            tile = self.worst_tile(prog, atom, roots[child], roots[child + 1])
+            if tile is None:  # nothing the referee would refuse: play on and lose, or withdraw
+                return {"concede": True}
+            move["tile"] = tile
         return move
 
-    def worst_tile(self, prog, op: Op, a: str, b: str) -> int:
+    def worst_tile(self, prog, op: Op, a: str, b: str) -> int | None:
+        """The tile of the defender's output of `op` the referee would refuse, among the CANDIDATES furthest from a
+        recompute, or None: then the challenger can only withdraw (dispute.play's concede), not win."""
         from . import merkle, referee
         from .dispute import Inputs, Outside
 
@@ -504,10 +509,13 @@ class Party:
         theirs = after[op.out].detach().cpu().numpy().reshape(-1)
         for tile in order:
             said = theirs[tile * merkle.LEAF:(tile + 1) * merkle.LEAF]
-            ok, _ = referee.judge(op, Inputs(full.shapes(), out, full=full), tile, said)
+            try:
+                ok, _ = referee.judge(op, Inputs(full.shapes(), out, full=full), tile, said)
+            except referee.Unresolved:  # the referee can't say: not a tile to win on
+                continue
             if not ok:
                 return tile
-        return order[0]
+        return None
 
 
 def _diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

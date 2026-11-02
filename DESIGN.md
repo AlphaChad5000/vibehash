@@ -628,23 +628,57 @@ Each step:
    - **evidence** (the defender), once the pick is one op: the two states' manifests, and with Merkle multiproofs, the
      numbers of the op's inputs the referee needs and the tile itself. The node checks the op changed exactly its
      output and dropped what it should, then `referee.judge` recomputes the tile.
-   - **Its length:** a game takes about 5 or 6 splits, as many picks and the evidence; `node.DISPUTE_MOVES` = 14 is the
-     most. Each move has `move_s` to be made, as long as the verify phase.
-   - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede. A checker that does
-     loses (it accused), but a replica that concedes, or never moves, before its first pick goes without blame: it
-     never chose to accuse.
+     - **Its size:** up to `dispute.MAX_EVIDENCE` (32 MB), or for a tile that reads more, `evidence_cap`: 32 MB plus
+       twice the bytes of the leaves the referee reads, found by running it on zeros (which leaves it reads depends
+       on shapes and tokens, never on the numbers). Attention's backward reads every query position of a group's
+       heads: on Qwen2.5-3B, 48 MB of leaves at 2048 tokens (96 MB at 4096). At launch a job's `seq_len` is at most
+       `finetune.MAX_SEQ_LEN` = 2048, and its base model at most `MAX_BASE_PARAMS` (4.5B: Qwen3-4B and smaller), which
+       also keeps the states a defender uploads in bounds (an attention tensor, heads × T² floats, is 512 MB at 32
+       heads and 2048 tokens). Longer sequences and bigger models can come later.
+   - **Its length:** a split and a pick for each 64-fold narrowing at each level from its root down to an op (one
+     at least, to descend), then the evidence. `program.dispute_size` counts the most from the job's spec: on Qwen3-4B,
+     15 moves at 4 steps a segment, 17 at 64, 21 for one segment of 10,000 steps (13 to 19 on Qwen3-0.6B). Each move
+     has `move_s` to be made: re-running a segment, plus the largest split's states uploaded and downloaded at the
+     reference speeds (also `dispute_size`), or the verify phase if that's longer.
+   - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede instead of picking.
+     - **A checker that concedes withdraws its rejection.** It isn't slashed, but it forfeits its pay for checking that
+       round and counts as having missed (reputation). Before naming a tile at an op, a checker runs the referee itself
+       on the defender's states (it has them all by then) and withdraws if no tile would fail. So an honest checker
+       never plays on to lose its stake.
+     - **A replica that concedes,** or never moves, before its first pick goes without blame: it never chose to
+       accuse.
+     - **When the phase ends** with a game unfinished, the party whose move it is loses only if that move's own
+       deadline has passed. If it hasn't, the game ends unchecked (`dispute.cut_short`), and nobody is slashed: the
+       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes.
 5. **The referee** works out, in float64, each output number's exact value given the defender's own inputs, and a bound
    on how far an honest float32 computation of it can land (`referee.E`, running error analysis). Each op is the
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
    - a correctly rounded operation (+ − × ÷ √), u = 2⁻²⁴ of its result;
    - exp, log or rsqrt, 4 ulps (CUDA's are 1 to 2, the CPU's at most 1);
-   - a dot product or sum of K terms, in any order, with or without fused multiply-adds, γ_K·Σ|terms| (Higham §3.1).
-   Errors of earlier steps of the op are carried through by each step's derivative. A number passes within twice its
-   bound (for kernels that order a step's operations differently), plus 2⁻³⁰ of its value, plus 2⁻¹²⁶ (for GPUs that
-   flush subnormals); the attention mask's −∞ must be exact. In tests, every honest tile of every op of a step passes
-   on all four families from both CPU and CUDA traces, and so does one tile of every op kind of Qwen3-0.6B. A single
-   number changed by 0.1% fails in 99.5% of tiles; the rest are numbers whose bound is wide because they come from
-   cancellation.
+   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), with M the largest partial sum any honest order
+     forms (`referee.spread`: the largest |sum| of a run of terms contiguous at a stride of 1 to 32, covering
+     sequential, blocked, split-K, pairwise and 32-lane strided accumulation).
+   Errors of earlier steps of the op are carried through by each step's derivative. A number passes within MARGIN
+   (1.25) times its bound, plus 2⁻³⁰ of its value, plus 2⁻¹²⁶ (for GPUs that flush subnormals); the attention mask's −∞
+   must be exact.
+   - **Overflow:** float32's e^x is ∞ above 88.72, so silu and its sigmoid for g below −88 may come out 0 in an honest
+     kernel (g/(1 + ∞)) where the value is under 2⁻¹²⁶: any number from the value to 0 passes there, and the value is
+     worked out as g·e^g/(1 + e^g), which doesn't overflow (`referee._silu`).
+   - **No bound:** a number whose bound comes out ∞ or NaN (a division by an interval around 0, say) leaves the
+     referee unable to say either way (`referee.Unresolved`): the game ends unchecked, nobody slashed, and a
+     challenger doesn't pick such a tile. (An ∞ bound used to pass any number: silu below −746 did.)
+   - **Why the sum bound is statistical.** The worst case, γ_K·Σ|terms| (Higham §3.1), allows K roundings all one way:
+     the second review measured 1.5% of an output at K = 2560 against 2.7e-7 of honest error. That is room for a worker
+     to compute every projection in TF32 or with bf16 activations, or to steer every op, and still pass, and for the
+     honest checker to lose. A real order's rounding errors are K draws of at most u times a partial sum, about as
+     likely up as down, so their total is about √K of them (Hoeffding: beyond SPREAD_C = 6 times the scale with
+     probability 2·exp(−54)).
+   - **Calibration** (`BoundTests`): float32 dot products by numpy, torch on the CPU, CUDA and a naive sequential loop,
+     on random, same-sign, alternating and heavy-tailed terms at K = 256 to 3072, land within 1.02 of the scale; the
+     referee allows 7.5. Honest CPU and CUDA traces of every op of a step pass on all four families.
+   - **What it catches:** TF32 and bf16-activation projections fail every tile at K = 1024, 2560 and 4096, where the
+     allowance is 3–6e-5 of a value. At width 2560, a TF32 worker 1.7% off loses its game at the projection it
+     changed (`test_a_tf32_worker_loses_at_full_width`).
    - **Determinism.** Products of two float32s are exact in float64, and `math.fsum` rounds a sum exactly, so a dot
      product's reference value is its exact value correctly rounded. Everything else uses only + − × ÷ √, which IEEE
      754 rounds correctly on every platform, element by element: no NumPy pairwise sums, whose order NumPy may change,
@@ -660,6 +694,15 @@ Each step:
      with the winning challenger as catcher.
    - **The challenger lost:** it's slashed for a false accusation, **with no catcher**: the slash is burned. Otherwise
      a worker could bait an honest checker into a dispute it can't win (the residual below) and collect.
+   - **The challenger withdrew:** no slash; it's unpaid for checking and marked as missing that round. The claim
+     stands on its other verdicts (accepted if another counted checker approved it, else unchecked).
+   - **Accusing again and again costs more:** every round a checker withdraws (or misses a deadline) costs it
+     reputation, its pay rate on everything, and `coordinator.games_allowed` gives it one dispute fewer a round for
+     each round's worth lost since it started (4 at a newcomer's 0.8, then 3, 2, 1; never fewer than one, so an honest
+     checker can always dispute). Within a round, 4 at most: a griefer makes a defender split and upload for at most
+     that many, and loses its round's pay for it.
+   - **One slash a round:** an offender pays only its first (`ledger._slash_txs`), so slashes with a catcher go first.
+     A cheater that also lost a dispute it started still pays its catcher (the second review's finding 9).
    - **The referee couldn't reach the weights:** the Hub was unreachable, so the claim ends unchecked and nobody is
      slashed.
    - **A checker that approved a claim found bad isn't slashed.** The referee finds an op a few ulps out of bounds,
@@ -673,9 +716,15 @@ Each step:
      (`verification.adam_impossible`; the test checker `knowing` uses it).
    - **Drawn from the round secret** (`test_canaries_pass_adams_invariants_and_rescaled_ones_dont`,
      `test_canaries_catch_a_checker_that_spots_rescaled_updates`). A checker rejecting a canary starts no dispute.
+   - **Residual: colluders can tell one apart** (the second review). A canary's openings are named by their blobs'
+     ids, which are their content's sha256: the donor claim's. A checker in league with the donor's worker, or with
+     its checkers, sees ids it knows under another unit's id. So canaries catch a lazy checker only on tasks whose
+     units' workers and checkers aren't its allies. Hiding the ids would mean serving each checkpoint under a
+     per-checker name that still proves its content, which isn't cheap; it's left as a known limit.
 8. **Bootstrapping.** A fine-tune's round assigns nothing until `FINETUNE_QUORUM` = 2 staked workers able to run it
-   have registered: one to train a unit and one to check it. With the node refereeing, one honest checker makes a
-   claim's verdict right (below), so that's enough to start, and with two workers each checks the other.
+   have registered: one to train a unit and one to check it. With the node refereeing, one honest checker is enough
+   for the security statement below (work outside the referee's bounds found bad, honest work never), so that's
+   enough to start, and with two workers each checks the other.
    - **From three workers,** each claim gets two checkers, so one going quiet leaves the other.
    - **Canaries** need a worker who neither holds nor checks either of two units, so they start from about five.
    - **Until the quorum,** the round says why (`waiting` in `/status`, on the worker dashboard and in the round
@@ -684,34 +733,48 @@ Each step:
 9. **Draws the leader can't steer.** Each claim's checkers are drawn from the round secret and the claim itself (unit
    and worker), the canaries and scorers from the secret and what they're for, and claims are taken in sorted order.
    The order a leader recorded the reveals in changes no other claim's draw.
-10. **Time.** A fine-tune's round length counts its dispute phase (`node.PhaseTimes.dispute_s` = `DISPUTE_MOVES` ×
-    `move_s`), so validators wait long enough for a disputed round. It's that long only for a party that makes every
-    move just in time: the phase ends when every dispute has. No phase is longer than `node.MAX_PHASE_S` (an hour),
-    whatever a spec asks for.
+10. **Time.** A fine-tune's round length counts its dispute phase (`node.PhaseTimes.dispute_s`: its most moves ×
+    `move_s`, from `program.dispute_size`), so validators wait long enough for a disputed round. It's that long only
+    for a party that makes every move just in time: the phase ends when every dispute has. No phase is longer than
+    `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
+    - **A limit:** a split can name gigabytes: K − 1 states of the adapters' B, m and v between steps (12.7 GB on
+      Qwen3-4B, all seven targets at rank 16, 64 steps a segment), or a layer's activations. At the reference upload
+      (2.5 MB/s) that's more than an hour, so such a job's moves get less time than they need (`MAX_PHASE_S` over the
+      moves), and a defender that slow loses. Jobs a node takes should keep a split to a few hundred MB: few steps a
+      segment (Qwen3-0.6B at 4 steps: 203 MB, 100 s).
 
-**The security statement:** a claim's verdict is right if at least one of its checkers is honest and online, with the
-node as referee.
-- **An honest worker can't lose a dispute:** every number it computed is within its bounds, which hold for any honest
-  float32 kernel (on whatever GPU or CPU, `test_a_cuda_defender_beats_a_cpu_checker`), and its states chain because
-  they're its training's own.
-- **An honest checker that rejected bad work wins,** as long as the work has an op outside its bounds. Work that
-  saves compute does: a faked or extrapolated segment can't be made of ops that each pass. So does any op changed by
-  more than float32 noise (`test_a_tampered_op_is_found`: one op of one step, deep in a layer's backward).
-- **The residual is steering within the bounds.** The bounds are rigorous, so they have room: γ_K·Σ|terms| allows K
-  roundings all one way, where an honest sum is off by about √K of them (`test_float32_bounds`: an actual order's
-  error is a tenth of the bound or less). A worker that does all the work and pushes every op to its limit might move
-  a segment past a checker's 1% rule without any op out of bounds; the honest checker who rejects it then loses its
-  dispute. Such a worker gains nothing (the slash is burned) and pays for the full work. How far steering can move a
-  segment hasn't been measured yet; if it's near the 1% rule, the checker's rule loosens (a cheat that saves work is
-  off by far more), or bounds tighten where kernels allow.
-- **The leader** can still drop a move and claim silence, as it can drop a verdict (receipts don't cover moves yet).
-  A plain replay trusts the record for a game's root states and the weights its referee used. A recheck rebuilds the
-  root states from the checkpoints; checking the recorded weights against the pinned commit is a follow-up.
+**The security statement:** with the node as referee, if at least one of a claim's checkers is honest and online, a
+claim whose float32 work deviates from honest float32 by more than the referee's bounds anywhere is found bad; an
+honest worker is never found bad; and an honest checker is never slashed. This rests on the calibrated sum model
+(an honest float32 sum, in any order a real kernel uses, lands within SPREAD_C · MARGIN = 7.5 of its scale; measured
+within 1.02).
+- **An honest worker can't lose a dispute:** every number it computes is within its bounds on any GPU or CPU tested
+  (CPU and CUDA traces of every op, and `test_a_cuda_defender_beats_a_cpu_checker`, where the CPU checker finds
+  nothing to win on and withdraws), and its states chain because they're its training's own. If the model failed for
+  some honest number (a probability the calibration puts far below any round's count of numbers), a dishonest
+  challenger hunting for it could win: that is the one assumption.
+- **An honest checker that rejected bad work wins** when the work has an op outside its bounds: work that saves
+  compute (TF32, bf16 activations, extrapolation) does, and so does any op changed by more than a few times float32
+  noise (`test_a_tampered_op_is_found`). When it finds no such op, it withdraws: unpaid for the round, never slashed.
+- **The residual is steering within the bounds:** a worker that does all the float32 work may still push each sum
+  by up to about 7 times the largest honest error measured (3–6e-5 of a value at K = 1024 to 4096), each in a
+  direction of its choosing, and pass. That's the room a dishonest worker keeps; it costs it the full work.
+- **What a validator doesn't take from the leader** (the second review's finding 2):
+  - **the base model's weights:** none are recorded; every referee reads whole tensors it checked itself against
+    the job's manifest;
+  - **a game's starting states:** a validator rebuilds them from the reveal's checkpoints, fetched from the block's
+    proposer (`node.LeaderBlobs`), and refuses a record whose states differ;
+  - **outcomes:** it re-runs every referee, so a game the leader marks unchecked, or any edited outcome, doesn't
+    replay to its record.
+- **What it still takes:** timing. The leader can drop a move and call it silence, or end the phase early, and a
+  replay can't see clocks. Moves now get signed receipts as verdicts do, so a party holding one for a move the record
+  lacks proves it was dropped (`receipts.audit`).
 
-**The weights the referee reads** come from the job's pinned commit on the Hub by byte range (`dispute.HubWeights`), or
-from the node's tensor cache when it has the whole tensor: never from either party. A tile needs at most a block of
-rows (a vocabulary block of the head: 8 MB at 1024 wide) or, for an op's backward, one projection (6 MB on Qwen3-0.6B,
-50 MB on 4B's MLP). Ranges fetched are kept in memory, up to 256 MB. **Why not have the parties supply weight
+**The weights the referee reads** come from the job's pinned commit on the Hub (`dispute.HubWeights`): each tensor it
+needs is fetched whole into the tensor cache and checked against the manifest's sha256 before any of it is read.
+Never from either party, nor from a record. A tile needs at most a block of rows (a vocabulary block of the head:
+8 MB at 1024 wide) or, for an op's backward, one projection (6 MB on Qwen3-0.6B, 50 MB on 4B's MLP). Rows read are kept
+in memory, up to 256 MB. **Why not have the parties supply weight
 slices with a proof:** the job's manifest pins each tensor's sha256 whole, so a slice has nothing to be proven against.
 A party would have to send the whole tensor, up to hundreds of MB, and the node would check it against the same
 manifest it can check the Hub's bytes with. Per-tensor Merkle roots in a future manifest version would make slices
@@ -734,12 +797,19 @@ once a round would be a ledger change.
   It's unreleased, so this redefines it.
   - **What the record adds:** scorers' verdicts carrying `score` beside the checkers' (`verdicts`), the median
     `score`, under `checks/redundancy` whether each replicated unit's replicas agreed, under `checks/game` each
-    dispute's root states, and `games`: each dispute's signed moves, its evidence, the weights its referee used, its
-    outcome and the referee's words.
+    dispute's root states, and `games`: each dispute's signed moves, its outcome and the referee's words. No weights (a
+    replay fetches and checks its own) and no evidence (the evidence move names its blob, which a validator fetches
+    from the proposer with the game's checkpoints): a record stays small whatever the model (the second review's
+    finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round, fewer once it has accused in
+    vain (`games_allowed`); its other rejections are ignored, and their claims stand on their other verdicts. That
+    trades a little of the guarantee for liveness: an honest checker that finds more bad claims in one round than it
+    may dispute leaves the rest to their other checkers.
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
-    the referee on the recorded evidence and weights, so it reaches the same verdicts without PyTorch, the GPU or the
-    Hub. It needs the job's dataset to rebuild the program (which sequences a step trains on); a plain replay of a
-    round without disputes still needs none.
+    the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
+    without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each
+    game's ends, and the job's dataset to rebuild the program; a plain replay of a round without disputes needs none.
+    A node that doesn't have the dataset fetches it from the block's proposer (or the peer that sent the block), then
+    any peer, checked on arrival (`node.PeerDatasets`), rather than refusing the block.
   - **Recheck:** besides version 2's, it rebuilds each dispute's root states from the checkpoints.
   - **MLP rounds** stay version 2, unchanged.
 - **What counts as a fine-tune:** a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`), a shape

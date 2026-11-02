@@ -15,17 +15,19 @@ op's output (merkle.LEAF numbers):
      it should), then referee.judge recomputes the tile. Inside the bounds, the defender wins; outside, it loses.
 A party silent past its move's deadline loses. A challenger may concede instead of picking: a checker that does
 loses (it accused), but a replica challenging the other replica that concedes (or never moves) before its first pick
-goes without blame: it never chose to accuse. Every move is a signed message and goes in the record with the evidence and
-the weights the referee used, so a validator replays the game and re-runs the referee and gets the same verdict.
+goes without blame: it never chose to accuse. Every move is a signed message and goes in the record with the evidence,
+so a validator replays the game and re-runs the referee, on weights it checked itself, and gets the same verdict.
 
-The base model's weights the referee needs come from the pinned commit on the Hub by byte range (HubWeights), or from
-the node's tensor cache: never from either party. The job's manifest pins each tensor's sha256, but only whole: a slice
+The base model's weights the referee needs come from the pinned commit on the Hub, each whole tensor checked against the
+job's manifest before any of it is read (HubWeights), or from the tensor cache that holds only checked tensors: never
+from either party, nor from a record. The job's manifest pins each tensor's sha256, but only whole: a slice
 of a tensor has nothing to be proven against, so a party offering one would have to send the whole tensor (up to
 hundreds of MB), and it would be checked against the same manifest the node can check the Hub's copy with. If the Hub
 can't be reached, the claim ends unchecked and nobody is slashed.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import types
@@ -36,18 +38,13 @@ import numpy as np
 from . import merkle, referee
 from .merkle import LEAF, MerkleError
 
-MAX_EVIDENCE = 32 * 2**20  # a tile's inputs: a few MB at most (an attention column over every query position)
+MAX_EVIDENCE = 32 * 2**20  # a tile's inputs, for most ops; a tile that reads more is allowed evidence_cap's
 MAX_WEIGHTS = 256 * 2**20  # base-model weights one tile can need (a whole projection, for its backward)
-MAX_RECORDED = 64 * 2**20  # weights a record keeps for one game (the column slices used, not whole tensors)
 MAX_MOVES = 40
 
 
 class WeightsUnavailable(Exception):
     """The base model's weights couldn't be fetched: the claim ends unchecked."""
-
-
-class RecordIncomplete(Exception):
-    """A replayed game's record lacks something its referee used."""
 
 
 # --- the base model's weights -----------------------------------------------------------------------------------------
@@ -90,9 +87,10 @@ _ITEM = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1, "I3
 
 
 class HubWeights:
-    """Rows of the job's pinned base model, as the node's referee reads them: from its tensor cache when it has the
-    whole tensor (hash-checked when it was fetched), else by byte range from the pinned commit on the Hub. Ranges
-    fetched are kept in memory, up to `keep` bytes."""
+    """Rows of the job's pinned base model, as a referee reads them: from the tensor cache, after fetching the whole
+    tensor from the pinned commit and checking it against the job's manifest if it isn't there yet. Rows read are
+    kept in memory, up to `keep` bytes. Validators replaying a game read the same way, so none trusts weights the
+    leader (or a record) supplies."""
 
     def __init__(self, manifest, hub=None, cache=None, keep: int = 256 * 2**20):
         from . import hub as hubmod
@@ -117,16 +115,16 @@ class HubWeights:
         e = self.manifest.tensors[name]
         path = self.cache.path(self.manifest.commit, e.sha256)
         try:
-            if path.exists() and path.stat().st_size == e.length:
-                with open(path, "rb") as f:
-                    f.seek(r0 * width)
-                    raw = f.read((r1 - r0) * width)
-            else:
-                size = self.manifest.files[e.file]["size"]
-                f = (self.hub or hubmod.Hub()).open(self.manifest.repo, self.manifest.commit, e.file, size)
-                raw = f.read(e.offset + r0 * width, (r1 - r0) * width)
-        except (hubmod.HubError, OSError) as ex:
-            raise WeightsUnavailable(f"couldn't fetch {name} from the Hub: {ex}") from None
+            if not (path.exists() and path.stat().st_size == e.length):
+                # The whole tensor, checked against the manifest's sha256 (TensorCache.fetch), before any of it is
+                # used: a slice has nothing of its own to be checked against, so every referee, the leader's and each
+                # validator's, reads only bytes it verified itself.
+                self.cache.fetch(self.manifest, [name], hub=self.hub or hubmod.Hub())
+            with open(path, "rb") as f:
+                f.seek(r0 * width)
+                raw = f.read((r1 - r0) * width)
+        except (hubmod.HubError, hubmod.IntegrityError, OSError) as ex:
+            raise WeightsUnavailable(f"couldn't fetch {name} from the Hub and check it: {ex}") from None
         if len(raw) != (r1 - r0) * width:
             raise WeightsUnavailable(f"{name}: the Hub sent {len(raw)} bytes, not {(r1 - r0) * width}")
         while self.kept and sum(map(len, self.kept.values())) + len(raw) > self.keep:
@@ -135,46 +133,12 @@ class HubWeights:
         return raw
 
 
-class Recorded:
-    """The weights a game's referee used, as the record keeps them (pack/unpack)."""
-
-    def __init__(self, blob: bytes | None = None):
-        self.items: dict[str, tuple[str, tuple, bytes]] = {}
-        if blob is not None:
-            header, chunks = merkle.unpack(blob, MAX_RECORDED + 2**20)
-            for key, (dtype, shape) in header.items():
-                if key not in chunks or dtype not in _ITEM or not isinstance(shape, list):
-                    raise RecordIncomplete("the record's weights are malformed")
-                self.items[key] = (dtype, tuple(int(x) for x in shape), chunks[key])
-
-    @staticmethod
-    def key(name, r0, r1) -> str:
-        return f"{name}[{r0}:{r1}]"
-
-    def shape(self, name):
-        for k, (dtype, shape, _) in self.items.items():
-            if k.rsplit("[", 1)[0] == name:
-                return dtype, shape
-        raise RecordIncomplete(f"the record has none of {name}")
-
-    def read(self, name, r0, r1) -> bytes:
-        try:
-            return self.items[self.key(name, r0, r1)][2]
-        except KeyError:
-            raise RecordIncomplete(f"the record lacks rows {r0}-{r1} of {name}") from None
-
-    def pack(self) -> bytes:
-        return merkle.pack({k: [d, list(s)] for k, (d, s, _) in self.items.items()}, {k: raw for k, (_, _, raw) in self.items.items()})
-
-
 class Outside:
     """What the referee reads besides the evidence: base-model weights (`source`: something with .shape(name) and
-    .read(name, r0, r1)), the job's data, its LoRA A matrices and the rotary tables. With `keep`, every weight read is
-    kept (Recorded) for the record."""
+    .read(name, r0, r1)), the job's data, its LoRA A matrices and the rotary tables."""
 
-    def __init__(self, spec, data, source, keep: bool = True, limit: int = MAX_WEIGHTS):
+    def __init__(self, spec, data, source, keep: bool = False, limit: int = MAX_WEIGHTS):
         self.spec, self.data, self.source, self.limit, self.used = spec, data, source, limit, 0
-        self.kept = Recorded() if keep else None
         self._a: dict[int, np.ndarray] = {}
         self._rope: dict = {}
         self._got: dict[str, np.ndarray] = {}
@@ -183,7 +147,7 @@ class Outside:
         return _rows(self.source.shape(name)[1])
 
     def weight(self, name, r0, r1) -> np.ndarray:
-        key = Recorded.key(name, r0, r1)
+        key = f"{name}[{r0}:{r1}]"
         if key in self._got:
             return self._got[key]
         dtype, shape = self.source.shape(name)
@@ -193,8 +157,6 @@ class Outside:
         self.used += len(raw)
         if self.used > self.limit:
             raise WeightsUnavailable("the tile needs more of the base model than the referee fetches for one")
-        if self.kept is not None:
-            self.kept.items[key] = (dtype, shape, raw)
         self._got[key] = decode(dtype, raw, _cols(shape))
         return self._got[key]
 
@@ -338,6 +300,32 @@ def diff_problem(op, before: dict, after: dict) -> str | None:
     return None
 
 
+class _Blank:
+    """Zeros of a shape, read by slices, as Inputs reads a whole array."""
+
+    def __init__(self, shape):
+        self.shape = shape
+
+    def __getitem__(self, idx):
+        r, c = idx
+        return np.zeros((len(range(*r.indices(self.shape[0]))), len(range(*c.indices(self.shape[1])))), dtype=np.float32)
+
+
+def evidence_cap(op, tile, outside: Outside) -> int:
+    """The most evidence a defender may send for one tile of `op`: MAX_EVIDENCE, plus twice the bytes of the leaves the
+    referee reads for it (each leaf with its share of the proof's hashes, which is less than its own bytes for any
+    tensor the node holds). Attention's backward over a long sequence reads every query position of every head in a
+    group: about 50 MB at 2048 tokens. Which leaves the referee reads depends on the op's shapes and the job's tokens,
+    never on the numbers, so a run on zeros finds them (a second for the largest)."""
+    if not op.out:
+        return MAX_EVIDENCE
+    shapes = dict(zip(op.ins, op.ishapes))
+    x = Inputs(shapes, outside, full={n: _Blank(s) for n, s in shapes.items()})
+    with np.errstate(all="ignore"), contextlib.suppress(referee.Unresolved):  # (zeros may leave a bound loose)
+        referee.judge(op, x, tile, np.zeros(LEAF))
+    return MAX_EVIDENCE + 2 * 4 * LEAF * sum(len(v) for v in x.used.values())
+
+
 def _proof(arr: np.ndarray, idx) -> tuple[dict, bytes]:
     tree = merkle.levels(merkle.leaf_hashes(arr))
     idx = sorted(set(idx))
@@ -357,7 +345,10 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
         x = Inputs(shapes or {n: a.shape for n, a in before.items()}, outside, full=before)
         x.after = Inputs({op.out: tuple(after[op.out].shape)}, outside, full={op.out: after[op.out]})
         said = np.ascontiguousarray(after[op.out], dtype="<f4").reshape(-1)[tile * LEAF:(tile + 1) * LEAF]
-        ok, why = referee.judge(op, x, tile, said)
+        try:
+            ok, why = referee.judge(op, x, tile, said)
+        except referee.Unresolved as e:  # (the leaves it read are noted all the same)
+            ok, why = True, str(e)
         for name, idx in sorted(x.used.items()):
             header["tensors"][f"in:{name}"], chunks[f"in:{name}"] = _proof(before[name], idx)
         out_idx = {tile} | x.after.used.get(op.out, set())  # (whole rows, for a choice)
@@ -368,7 +359,8 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
 def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) -> tuple[str, str]:
     """The referee's verdict on a game's last move: ("defender" | "challenger" | "unchecked", why)."""
     try:
-        header, chunks = merkle.unpack(evidence, MAX_EVIDENCE)
+        limit = MAX_EVIDENCE if len(evidence) <= MAX_EVIDENCE else evidence_cap(op, tile, outside)
+        header, chunks = merkle.unpack(evidence, limit)
         before_m, after_m = chunks.get("manifest:in", b""), chunks.get("manifest:out", b"")
         if merkle.state_root(before_m) != a or merkle.state_root(after_m) != b:
             return "challenger", "the evidence is for other states than the ones the defender posted around the op"
@@ -416,6 +408,8 @@ def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) 
         return ("defender" if ok else "challenger"), why
     except referee.Missing as e:
         return "challenger", f"the evidence doesn't prove {e}"
+    except referee.Unresolved as e:
+        return "unchecked", str(e)
     except (MerkleError, ValueError, TypeError, KeyError) as e:
         return "challenger", f"the evidence is malformed: {e}"
     except WeightsUnavailable as e:
@@ -460,7 +454,6 @@ class Game:
     detail: str = ""
     deadline: float = 0.0
     evidence: bytes | None = None
-    weights: bytes | None = None
     leaf: object = None  # the op picked, once it is one
     seed: int = 0  # the unit's, which the parties' program.Program needs
 
@@ -496,8 +489,7 @@ class Game:
         """The game as the round's record keeps it."""
         return {"id": self.gid, "unit": self.unit, "defender": self.defender, "challenger": self.challenger,
                 "why": self.why, "root": list(self.root), "a": self.origin[0], "b": self.origin[1],
-                "moves": list(self.moves), "evidence": merkle.b64(self.evidence) if self.evidence is not None else None,
-                "weights": merkle.b64(self.weights) if self.weights is not None else None,
+                "moves": list(self.moves),  # (an evidence move names its blob, which validators fetch: not inlined)
                 "outcome": self.outcome, "detail": self.detail}
 
 
@@ -505,13 +497,9 @@ def _hex64(x) -> bool:
     return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
 
 
-def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence: bytes | None = None,
-         outside: Outside | None = None) -> None:
-    """Apply one move `who` made. Raises MoveRefused for one that isn't taken. `check_states(roots)` (a live node)
-    raises MoveRefused unless every state a split names is on the node; `evidence` is the evidence move's bytes
-    (whose sha256 the move names) and `outside` what the referee reads besides it."""
-    from .program import Op, groups
-
+def whose(game: Game, who: str, move) -> str:
+    """The kind of move `move` is, when it's `who`'s to make now; else MoveRefused. Cheap, so a node asks it before
+    reading anything a move names."""
     if game.turn == "done":
         raise MoveRefused("this game is over")
     if len(game.moves) >= MAX_MOVES or not isinstance(move, dict):
@@ -521,13 +509,28 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
         raise MoveRefused("a move is a split, a pick (with a tile, for an op), evidence, or conceding")
     party = game.defender if kind in ("split", "evidence") else game.challenger
     if who != party or game.turn != ("pick" if kind == "concede" else kind):
-        whose = "defender" if game.turn in ("split", "evidence") else "challenger"
-        raise MoveRefused(f"it's the {whose}'s turn to {game.turn}")
+        turn = "defender" if game.turn in ("split", "evidence") else "challenger"
+        raise MoveRefused(f"it's the {turn}'s turn to {game.turn}")
+    return kind
+
+
+def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence: bytes | None = None,
+         outside: Outside | None = None) -> None:
+    """Apply one move `who` made. Raises MoveRefused for one that isn't taken. `check_states(roots)` (a live node)
+    raises MoveRefused unless every state a split names is on the node; `evidence` is the evidence move's bytes
+    (whose sha256 the move names) and `outside` what the referee reads besides it."""
+    from .program import Op, groups
+
+    kind = whose(game, who, move)
     if kind == "concede":
         if move["concede"] is not True:
             raise MoveRefused("conceding is {\"concede\": true}")
+        # A replica that never picked concedes without blame; a checker withdraws its rejection: it isn't slashed, but
+        # it forfeits its pay for the round (coordinator._settle_finetune). Its challenge found no number the referee
+        # would refuse, so it couldn't have won: an honest checker never has to play on to lose.
         blameless = game.why == "replicas" and not game.played
-        game.end("conceded" if blameless else "defender", "the challenger conceded")
+        game.end("conceded" if blameless else "withdrawn", "the challenger conceded" if blameless else
+                 "the challenger withdrew: it found no number the referee would refuse")
     elif kind == "split":
         roots = move["split"]
         n = len(groups(game.lo, game.hi))
@@ -570,9 +573,21 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
             raise MoveRefused("evidence is the id of an uploaded blob")
         outcome, detail = judge_evidence(game.leaf, game.tile, game.a, game.b, evidence, outside)
         game.evidence = evidence
-        if outcome != "unchecked" and outside is not None and outside.kept is not None:
-            game.weights = outside.kept.pack()
         game.end(outcome, detail)
+
+
+PHASE_ENDED = "the dispute phase ended before the move was due"
+
+
+def cut_short(game: Game, now: float) -> None:
+    """The dispute phase ended with the game unfinished. A party past its move's deadline loses (silence); one whose
+    move wasn't due yet isn't blamed for the phase's length, and the game ends unchecked."""
+    if game.turn == "done":
+        return
+    if game.deadline and now > game.deadline:
+        silence(game)
+    else:
+        game.end("unchecked", PHASE_ENDED)
 
 
 def silence(game: Game) -> None:
