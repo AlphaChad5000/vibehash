@@ -1696,22 +1696,6 @@ class Coordinator:
             new_params = _mean(list(updates.values()), job) if updates else r.start
             return params_hash(new_params).hex()
         model_hash = self._claim("model", "params_hash", average)
-        if scores:        accepted = {k: r.reveals[k] for k, res in r.results.items() if res.verdict == Verdict.ACCEPTED}
-        offenders = {s[0] for s in r.slashes} | r.forfeit
-        worker_flops: dict[str, int] = defaultdict(int)
-        updates: dict[str, np.ndarray] = {}
-        for (uid, addr), rv in accepted.items():
-            if addr not in offenders:
-                worker_flops[addr] += r.units[uid].flops
-                updates.setdefault(uid, rv.final_params)
-        new_params = None
-
-        def average() -> str:
-            nonlocal new_params
-            self._weights(*(updates.values() if updates else [r.start]))
-            new_params = _mean(list(updates.values()), job) if updates else r.start
-            return params_hash(new_params).hex()
-        model_hash = self._claim("model", "params_hash", average)
         if scores:
             r.record["score"] = [_median([s[0] for _, s in scores]), _median([s[1] for _, s in scores])]
             # Paid only when SCORERS answered and this one agrees with their median: nothing checks a lone score.

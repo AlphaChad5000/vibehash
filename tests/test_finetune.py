@@ -1008,6 +1008,25 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertTrue(all(res.verdict.value == "accepted" for res in rep.results))
         self.replays([rep])
 
+    def test_the_new_model_is_averaged_and_claimed_once(self):
+        """Settling a round averages the accepted results once, live and on a recheck (a leftover copy of that code
+        once ran it twice, and counted the "model" claim twice on every recheck)."""
+        from unittest import mock
+
+        from vibehash.coordinator import Coordinator
+        self.network([("honest", "honest")] * 3, replication_rate=0.0, canaries_per_round=0)
+        real, claims = Coordinator._claim, []
+
+        def counted(coord, kind, key, compute):
+            claims.append((kind, coord.replaying is not None))
+            return real(coord, kind, key, compute)
+        with mock.patch.object(Coordinator, "_claim", autospec=True, side_effect=counted):
+            rep = self.round()
+            self.assertEqual(claims.count(("model", False)), 1)
+            self.replays([rep])
+        self.assertEqual(claims.count(("model", True)), 1)
+        self.assertGreater(rep.block.summary.accepted_units, 0)
+
     def test_scorers_are_paid_only_when_they_agree(self):
         """The median of three scorers goes on record; a scorer is paid only when three answered and it agrees with
         them. One that makes its score up (and here checks nothing either) gets nothing for it."""
