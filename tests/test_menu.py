@@ -74,6 +74,15 @@ class MenuTests(unittest.TestCase):
         self.assertIn("same as:  vibehash send --to ADDRESS --amount VIBE", page)
         self.assertIn("q back", page)
 
+    def test_check_this_computer_runs_the_selftest(self):
+        labels = [i.label for i in menu.items()]
+        item = menu.items()[labels.index("Check this computer")]
+        self.assertEqual(item.argv, ("selftest",))
+        self.assertIn("Mine", [title for title, group in menu.SECTIONS if item in group])
+        with no_wallet():
+            page = menu.frame(labels.index("Check this computer"), menu.Status(), "vibehash", 120, termui.ASCII)
+        self.assertIn("same as:  vibehash selftest", re.sub(r"\x1b\[[0-9;]*[mKJH]", "", page))
+
     def test_fine_tune_asks_for_the_chats_and_a_model(self):
         answers = iter(["my-chats.jsonl", "", ""])
         with mock.patch("builtins.input", lambda *a: next(answers)):

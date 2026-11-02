@@ -5,8 +5,10 @@
 #
 # Finds Python 3.10 or newer, installs or updates Vibe Hash from PyPI, then runs `vibehash setup`, which asks
 # the rest. A Python that doesn't take packages directly (Homebrew's, Debian's and Ubuntu's) gets Vibe Hash in
-# its own environment, ~/.vibehash/venv. Safe to run again. To join a network other than the public one, give
-# its node: curl -fsSL https://vibehash.org/install.sh | VIBEHASH_NODE=192.168.1.20 sh
+# its own environment, ~/.vibehash/venv. A PyTorch already installed (a rented GPU's template) is kept exactly as it
+# is, and on a RunPod pod the settings and wallet go to /workspace/.vibehash, which survives a restart. Safe to run
+# again. To join a network other than the public one, give its node:
+# curl -fsSL https://vibehash.org/install.sh | VIBEHASH_NODE=192.168.1.20 sh
 
 # Everything is in functions that run on the last line, so a truncated download runs nothing.
 
@@ -60,24 +62,56 @@ marked = os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-M
 sys.exit(marked and sys.prefix == sys.base_prefix)' 2>/dev/null
 }
 
-# Make Vibe Hash's own environment in $2 from Python $1. Ubuntu and Debian leave out the part of Python that puts
-# pip in new environments (python3-venv), so without it the environment starts bare and gets pip from PyPA.
+# Make Vibe Hash's own environment in $2 from Python $1 ($3: --system-site-packages, so it sees a PyTorch already
+# installed there). Ubuntu and Debian leave out the part of Python that puts pip in new environments (python3-venv),
+# so without it the environment starts bare and gets pip from PyPA.
 make_venv() {
     if [ -f "$2/pyvenv.cfg" ]; then
         rm -rf "$2"  # an environment without pip: what an earlier, interrupted attempt left
     fi
-    "$1" -m venv "$2" >/dev/null 2>&1 && return 0
+    "$1" -m venv $3 "$2" >/dev/null 2>&1 && return 0
     rm -rf "$2"
-    "$1" -m venv --without-pip "$2" && curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$2/bin/python" - --quiet
+    "$1" -m venv --without-pip $3 "$2" && curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$2/bin/python" - --quiet
+}
+
+# The PyTorch Python $1 already has (a rented GPU's template, say: RunPod's come with CUDA PyTorch), or nothing.
+torch_version() {
+    "$1" -c 'import torch; print(torch.__version__)' 2>/dev/null
+}
+
+# pip constraints that keep a PyTorch already installed exactly as it is: the same torch, and NumPy 1 if that's what
+# it was built against (a NumPy 2 upgrade breaks older builds). Written to file $2.
+keep_torch() {
+    echo "torch==$(torch_version "$1")" >"$2"
+    if "$1" -c 'import numpy, sys; sys.exit(int(numpy.__version__.split(".")[0]) >= 2)' 2>/dev/null; then
+        echo "numpy<2" >>"$2"
+    fi
+}
+
+# A RunPod pod keeps only /workspace across a restart, so that's where Vibe Hash's settings and wallet go (as
+# settings.home does), unless VIBEHASH_HOME says otherwise or an earlier setup is in ~/.vibehash.
+pod_home() {
+    if [ -z "${VIBEHASH_HOME:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] && [ -d /workspace ] && [ -w /workspace ] \
+            && [ ! -f "$HOME/.vibehash/config.json" ] && [ ! -f "$HOME/.vibehash/wallet.json" ]; then
+        VIBEHASH_HOME=/workspace/.vibehash
+        export VIBEHASH_HOME
+        echo "This is a RunPod pod: Vibe Hash keeps its settings and wallet in $VIBEHASH_HOME, on the volume that"
+        echo "survives a restart (the rest of the pod doesn't)."
+    fi
 }
 
 main() {
     banner
     py=$(find_python) || no_python
+    pod_home
     venv="${VIBEHASH_HOME:-$HOME/.vibehash}/venv"
+    torch=$(torch_version "$py")
+    if [ -n "$torch" ]; then
+        echo "$py already has PyTorch $torch; it stays as it is."
+    fi
     if ! takes_packages "$venv/bin/python" && ! takes_packages "$py"; then
         echo "This Python doesn't take packages directly, so Vibe Hash gets its own environment in $venv"
-        if ! make_venv "$py" "$venv"; then
+        if ! make_venv "$py" "$venv" ${torch:+--system-site-packages}; then
             echo "Couldn't make it; the message above says why. On Ubuntu or Debian, sudo apt install python3-venv"
             echo "fixes most causes. Then run this again."
             exit 1
@@ -86,9 +120,21 @@ main() {
     if takes_packages "$venv/bin/python"; then
         py="$venv/bin/python"  # its own environment, made by this script now or before
     fi
+    set --
+    torch=$(torch_version "$py")
+    if [ -n "$torch" ]; then  # never reinstalled or downgraded: pip may add Vibe Hash's packages around it, no more
+        constraints="${TMPDIR:-/tmp}/vibehash-keep-torch.$$.txt"
+        keep_torch "$py" "$constraints"
+        set -- --constraint "$constraints"
+    fi
 
     echo "Installing Vibe Hash with $py..."
-    if ! "$py" -m pip install --upgrade --quiet --disable-pip-version-check "vibehash[finetune]"; then
+    "$py" -m pip install --upgrade --quiet --disable-pip-version-check "$@" "vibehash[finetune]"
+    installed=$?
+    if [ -n "${constraints:-}" ]; then
+        rm -f "$constraints"
+    fi
+    if [ "$installed" -ne 0 ]; then
         echo
         echo "Installing didn't work; pip's message above says why. Check you're online, then run this again."
         exit 1

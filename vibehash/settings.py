@@ -1,6 +1,7 @@
 """Where Vibe Hash keeps its files, and the settings `vibehash setup` saves.
 
-Everything lives in one folder, ~/.vibehash (or $VIBEHASH_HOME): the default
+Everything lives in one folder, ~/.vibehash (or $VIBEHASH_HOME; on a RunPod
+pod, /workspace/.vibehash, which survives a restart): the default
 wallet, config.json, the worker cache and local testnets. Commands look up
 --node and --wallet in this order: the flag, $VIBEHASH_NODE / $VIBEHASH_WALLET,
 config.json, then the public network's node / the default wallet file. For https nodes, config.json also
@@ -17,7 +18,23 @@ PUBLIC_NODE = "https://node.vibehash.org"  # the public network: where commands 
 
 
 def home() -> Path:
-    return Path(os.environ.get("VIBEHASH_HOME") or Path.home() / ".vibehash")
+    """$VIBEHASH_HOME, else ~/.vibehash; on a RunPod pod, /workspace/.vibehash (pod_volume), unless ~/.vibehash already
+    holds a setup."""
+    if os.environ.get("VIBEHASH_HOME"):
+        return Path(os.environ["VIBEHASH_HOME"])
+    default = Path.home() / ".vibehash"
+    volume = pod_volume()
+    if volume is not None and not any((default / f).exists() for f in ("config.json", "wallet.json")):
+        return volume / ".vibehash"
+    return default
+
+
+def pod_volume() -> Path | None:
+    """A RunPod pod's volume, /workspace: the one place in a pod that survives a restart (its home folder doesn't, so a
+    wallet kept there would be lost). RunPod sets $RUNPOD_POD_ID in every pod."""
+    if os.environ.get("RUNPOD_POD_ID") and os.path.isdir("/workspace"):
+        return Path("/workspace")
+    return None
 
 
 def config_path() -> Path:

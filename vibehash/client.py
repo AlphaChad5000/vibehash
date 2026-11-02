@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import finetune, hardware, receipts, settings, tls
+from . import advice, finetune, hardware, receipts, settings, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
@@ -308,6 +308,8 @@ class WorkerClient:
         # reveals the secret when the round is sealed; a leader that swapped it (and so picked the beacon after seeing
         # the commitments) would have to change the commitment in the record too, and this is where that shows.
         self.secret_commits: dict[tuple[int, str], str] = {}
+        self._told: dict[str, str] = {}  # the waiting message last explained for each job
+        self._last_said = ("", 0.0)  # the last problem logged, and when (_say)
 
     @property
     def keys(self) -> KeyPair:
@@ -510,6 +512,9 @@ class WorkerClient:
             if not units:
                 why = (s.get("waiting") or {}).get(job.job_id)
                 st.activity = why or ("no units for us this round" if st.rounds else "joining at the next round")
+                if why and self._told.get(job.job_id) != why:  # once a job, what the wait means for this worker
+                    self._told[job.job_id] = why
+                    log.info("%s", self._waiting(job, why, s))
             if units and given.get("prep"):  # a DeepSeek prep round: units of the work graph, through the bucket
                 st.busy = True
                 try:
@@ -688,13 +693,28 @@ class WorkerClient:
             self.start_blob[rnd] = p["blob"]
         return self.blobs.load(self.start_blob[rnd], job.wire_dtype, job.spec.n_params)
 
-    @staticmethod
-    def _try(fn, *args):
+    def _waiting(self, job: TrainingJob, why: str, s: dict) -> str:
+        """advice.waiting for this worker: its stake, and its memory against the job's."""
+        try:
+            stake = self.home.account(self.keys.address)["stake"]
+        except (NodeError, KeyError, TypeError):
+            stake = None
+        return advice.waiting(job.job_id, why, stake, s.get("min_stake", 0), self.memory_for(job), job.memory_mb,
+                              earn_in=bool(s.get("earn_in")))
+
+    def _say(self, level: int, text: str) -> None:
+        """Log a problem, but the same one at most once a minute: an unreachable node is tried every few seconds."""
+        if self._last_said[0] == text and time.monotonic() - self._last_said[1] < 60:
+            return log.debug("%s", text)
+        self._last_said = (text, time.monotonic())
+        log.log(level, "%s", text)
+
+    def _try(self, fn, *args):
         """One failed message (e.g. a phase that just closed) mustn't stop the rest being sent."""
         try:
             return fn(*args)
         except NodeError as e:
-            log.warning("%s", e)
+            self._say(logging.WARNING, advice.explain(e, self.home.url) or str(e))
             return None
 
     def run(self, stop=None) -> None:
@@ -705,10 +725,17 @@ class WorkerClient:
             try:
                 self.step()
             except NodeError as e:
-                log.warning("%s", e)
+                self._say(logging.WARNING, advice.explain(e, self.home.url) or str(e))
                 time.sleep(2)
-            except Exception:  # one bad round (corrupt download, full disk...) mustn't stop the worker for good
-                log.exception("unexpected error; skipping to the next phase")
+            except Exception as e:  # one bad round (corrupt download, full disk...) mustn't stop the worker for good
+                hint = advice.explain(e)  # out of GPU memory, a full disk: what to do, not a traceback
+                if hint and "ran out of memory" in hint:
+                    hint = advice.out_of_memory(self.backend.describe(), getattr(self.stats.job, "memory_mb", None),
+                                                self.backend.memory_mb() if self.backend.name != "cpu" else None)
+                if hint:
+                    self._say(logging.ERROR, f"{hint} (skipping to the next phase)")
+                else:
+                    log.exception("unexpected error; skipping to the next phase")
                 time.sleep(2)
             time.sleep(self.poll_s)
 

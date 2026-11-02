@@ -151,9 +151,16 @@ class Store:
 
     def _save(self) -> None:
         self.folder.mkdir(parents=True, exist_ok=True)
-        tmp = self.folder / (INDEX + ".tmp")
+        tmp = self.folder / f"{INDEX}.{os.getpid()}.tmp"  # (two workers on one computer may save at once)
         tmp.write_text(json.dumps({"files": self.files}, indent=1))
         os.replace(tmp, self.folder / INDEX)
+
+    def _reload(self) -> None:
+        """Read the index again: another worker on this computer (one per GPU) may have fetched files since."""
+        try:
+            self.files = json.loads((self.folder / INDEX).read_text())["files"]
+        except (OSError, ValueError, KeyError):
+            pass
 
     def path(self, name: str) -> Path:
         if Path(name).is_absolute() or ".." in Path(name).parts:
@@ -285,6 +292,21 @@ class Store:
         the job's files, marked used now."""
         if not plan.fits:
             raise RuntimeError(plan.why_not)
+        import hashlib
+        import tempfile
+
+        from .filelock import hold
+        # One worker on this computer fetches at a time; the next finds what it fetched instead of writing the same
+        # files at once. The lock is in the temp folder, so the store's own holds only what its index names.
+        tag = hashlib.sha256(str(self.folder.resolve()).encode()).hexdigest()[:16]
+        with hold(Path(tempfile.gettempdir()) / f"vibehash-models-{tag}.lock", wait_s=6 * 3600):
+            self._reload()
+            done = [n for n in plan.need if n in self.files and not self.files[n].get("partial") and self.path(n).exists()]
+            plan = Plan(plan.job, plan.what, {n: s for n, s in plan.need.items() if n not in done}, plan.have + done,
+                        [n for n in plan.evict if n in self.files], plan.fits, plan.why_not)
+            return self._acquire(plan, fetch)
+
+    def _acquire(self, plan: Plan, fetch) -> dict[str, Path]:
         for n in plan.evict:
             self._delete(n)
         now = self.clock()

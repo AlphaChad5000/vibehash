@@ -132,6 +132,7 @@ SECTIONS = [
         Item("Start mining", "earn VIBE with this computer", ("worker",)),
         Item("My balance", "what you've earned and staked", ("balance",)),
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
+        Item("Check this computer", "a real training test: is it ready, what can it take", ("selftest",)),
         Item("Mine the DeepSeek job", "think shorter's pilot: ~30 GB, asked first", ask=_deepseek,
              usage="worker --deepseek yes"),
     ]),

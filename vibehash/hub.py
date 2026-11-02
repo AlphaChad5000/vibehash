@@ -1309,8 +1309,14 @@ class TensorCache:
             if not p.exists():
                 missing.append(e)
         if missing:
-            self._download(manifest, missing, folder, hub or Hub(), progress,
-                           label or f"fetching {len(missing)} tensor{'s' * (len(missing) != 1)} of {manifest.repo}")
+            from .filelock import hold
+            # Workers on one computer (one per GPU) share this cache: one fetches a model while the others wait, then
+            # find it here, rather than all writing the same .part files at once.
+            with hold(self.root / f"{manifest.commit}.fetching", wait_s=6 * 3600):
+                missing = [e for e in missing if not (folder / e.sha256).exists()]
+                if missing:
+                    self._download(manifest, missing, folder, hub or Hub(), progress,
+                                   label or f"fetching {len(missing)} tensor{'s' * (len(missing) != 1)} of {manifest.repo}")
         return {name: folder / manifest.tensors[name].sha256 for name in names}
 
     def _part(self, folder: Path, e: TensorEntry) -> int:

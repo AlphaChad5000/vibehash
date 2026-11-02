@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import crypto, hardware, mnemonic, modelstore, settings, tls
+from . import advice, crypto, hardware, mnemonic, modelstore, settings, tls, unattended
 from . import economics as econ
 from . import fees
 from . import wallet as wallets
@@ -65,7 +65,7 @@ def fmt(syn: int) -> str:
 def password(prompt: str, confirm: bool = False) -> str | None:
     if "VIBEHASH_PASSWORD" in os.environ:
         return os.environ["VIBEHASH_PASSWORD"]
-    if not sys.stdin.isatty():
+    if not unattended.interactive():  # (Windows calls NUL a terminal, and getpass would wait on the console for ever)
         return None
     pw = getpass.getpass(prompt)
     if confirm and pw != getpass.getpass("Repeat password: "):
@@ -75,6 +75,9 @@ def password(prompt: str, confirm: bool = False) -> str | None:
 
 def load_wallet(path: str) -> KeyPair:
     pw = password(f"Password for {path}: ") if wallets.is_encrypted(path) else None
+    if pw is None and wallets.is_encrypted(path):
+        raise unattended.need(f"the password of {path}", "set VIBEHASH_PASSWORD to it (`export VIBEHASH_PASSWORD=...`; "
+                              "in PowerShell, `$env:VIBEHASH_PASSWORD = \"...\"`)")
     return wallets.load(path, pw)
 
 
@@ -88,7 +91,7 @@ def prog() -> str:
 def ask(question: str, assume_yes: bool = False) -> bool:
     if assume_yes:
         return True
-    if not sys.stdin.isatty():
+    if not unattended.interactive():
         return False
     try:
         return input(f"{question} [Y/n] ").strip().lower() in ("", "y", "yes")
@@ -98,8 +101,9 @@ def ask(question: str, assume_yes: bool = False) -> bool:
 
 
 def node_of(a) -> str:
-    """--node, the node setup saved, or the public network's."""
-    return settings.node_url(a.node)
+    """--node, the node setup saved, or the public network's. An address typed without http:// (`--node
+    192.168.1.20`, or $VIBEHASH_NODE as the installer passes it on) gets it, as setup gives it."""
+    return normalise_url(settings.node_url(a.node))
 
 
 def wallet_of(a) -> str:
@@ -156,10 +160,18 @@ def show_words(words: str, indent: str = "") -> None:
     print()
 
 
+def give_words(words: str, address: str, wallet: Path, indent: str = "") -> None:
+    """A new wallet's words: on the screen when this is a terminal; otherwise (nohup, Docker, a pod's log) never in
+    the output, which may be a log others can read, but in a file only this user can read, with a loud note."""
+    if sys.stdout.isatty():
+        return show_words(words, indent)
+    print(unattended.words_note(unattended.save_words(words, address, wallet), indent))
+
+
 def _read_words() -> str:
     if "VIBEHASH_MNEMONIC" in os.environ:
         return os.environ["VIBEHASH_MNEMONIC"]
-    if sys.stdin.isatty():
+    if unattended.interactive():
         return getpass.getpass("Recovery words, separated by spaces (they aren't shown as you type): ")
     return sys.stdin.readline()
 
@@ -170,7 +182,7 @@ def _passphrase(a, confirm: bool) -> str:
         return ""
     if "VIBEHASH_MNEMONIC_PASSPHRASE" in os.environ:
         return os.environ["VIBEHASH_MNEMONIC_PASSPHRASE"]
-    if not sys.stdin.isatty():
+    if not unattended.interactive():
         sys.exit("--passphrase needs a terminal, or set $VIBEHASH_MNEMONIC_PASSPHRASE")
     phrase = getpass.getpass("Recovery passphrase: ")
     if confirm and phrase != getpass.getpass("Repeat passphrase: "):
@@ -180,6 +192,9 @@ def _passphrase(a, confirm: bool) -> str:
 
 def _new_wallet_password(a) -> str | None:
     pw = None if a.no_password else password("New wallet password: ", confirm=True)
+    if not a.no_password and pw is None:
+        raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want (or pass --no-password "
+                              "for a throwaway test key)")
     if not a.no_password and not pw:
         sys.exit("a password is required (or pass --no-password for a throwaway test key)")
     return pw
@@ -194,7 +209,7 @@ def cmd_wallet_create(a):
     pw = _new_wallet_password(a)
     wallets.save(keys, out, pw, mnemonic.PATH)
     print(f"created {out}\naddress: {keys.address}")
-    show_words(words)
+    give_words(words, keys.address, out)
     if not pw:
         print("warning: stored unencrypted", file=sys.stderr)
 
@@ -307,18 +322,35 @@ def cmd_tls_fingerprint(a):
 
 
 def cmd_worker(a, keys: KeyPair | None = None):
-    from . import minerui
+    from .client import default_cache_dir
+
+    keys = keys or load_wallet(wallet_of(a))
+    # One worker per wallet: a second would prune the first's checkpoints and take the same units (unattended.py).
+    lock = unattended.WorkerLock(Path(a.cache_dir) if a.cache_dir else default_cache_dir() / keys.address)
+    if not lock.held:
+        sys.exit(lock.why_not(keys.address, prog()))
+    try:
+        _mine(a, keys)
+    finally:
+        lock.release()
+
+
+def _mine(a, keys: KeyPair):
+    from . import minerui, selftest
+    from .wire import MAX_CLOCK_SKEW_S
 
     url = node_of(a)
     if getattr(a, "deepseek", None):
         settings.save(deepseek=a.deepseek)  # remembered: the next `vibehash worker` does the same
     deepseek = (getattr(a, "deepseek", None) or settings.load().get("deepseek", "ask")) == "yes"
     try:
-        w = WorkerClient(url, keys or load_wallet(wallet_of(a)), a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir,
-                         deepseek=deepseek)
+        w = WorkerClient(url, keys, a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir, deepseek=deepseek)
     except RuntimeError as e:
         sys.exit(f"error: {e}")
     status = w.node.status()
+    skew = selftest.clock_skew(w.node)  # every message is signed with this clock, and refused if it's too far off
+    if skew is not None and abs(skew) > MAX_CLOCK_SKEW_S - 2:
+        sys.exit(f"error: {advice.clock(skew)}")
     acct, need = w.node.account(w.keys.address), status["min_stake"]
     low = earning = None
     if acct["stake"] < need and status.get("earn_in"):
@@ -375,6 +407,7 @@ def _setup_gpu(assume_yes: bool) -> None:
     if any(d["ready"] for d in listed):
         for d in listed:
             print(f"   {d['label']}: {'ready' if d['ready'] else 'not usable: ' + str(d['problem'])[:120]}")
+        print(f"   PyTorch {gpusetup.installed_torch()} already trains on it, so nothing is installed")
         return
     if listed:  # PyTorch sees the card but can't run on it: the driver, not the build, is the problem
         for d in listed:
@@ -409,11 +442,18 @@ def cmd_install_gpu(a):
 
 def cmd_setup(a):
     """Everything a new worker needs, in order. Safe to re-run: finished steps are kept."""
-    print(f"Vibe Hash setup. Your settings and wallet are kept in {settings.home()}\n\n1. Node")
+    home, pod = settings.home(), settings.pod_volume()
+    kept = (" (the pod's volume, so they survive a restart)" if pod and home.is_relative_to(pod) else
+            f"\nwarning: a pod restart wipes {home}; move it to {pod} (mv {home} {pod}/) so the wallet survives" if pod
+            else "")
+    print(f"Vibe Hash setup. Your settings and wallet are kept in {home}{kept}\n\n1. Node")
     url = settings.chosen_node(a.node)
-    if not url and sys.stdin.isatty():
-        url = input(f"   Press Enter to join the public network ({urlsplit(settings.PUBLIC_NODE).hostname}),\n"
-                    "   or type the address of another network's node (like 192.168.1.20): ").strip()
+    if not url and unattended.interactive():
+        try:
+            url = input(f"   Press Enter to join the public network ({urlsplit(settings.PUBLIC_NODE).hostname}),\n"
+                        "   or type the address of another network's node (like 192.168.1.20): ").strip()
+        except EOFError:
+            print()
     url = url or settings.PUBLIC_NODE
     status = None
     if url:
@@ -424,10 +464,11 @@ def cmd_setup(a):
                                     a.tls_fingerprint and tls.normalize_fingerprint(a.tls_fingerprint))
             print(f"   trusting the node's certificate by its {'fingerprint' if a.tls_fingerprint else 'CA'}")
         try:
-            status = NodeClient(url).status()
+            status = NodeClient(url, timeout=30).status()
             print(f"   connected to {url}: network {status['chain_id']}, block {status['height']}")
         except NodeError as e:
-            print(f"   saved {url}, but couldn't reach it ({e}). Check the address, or run setup again later.")
+            hint = (advice.explain(e, url) or str(e)).replace("\n", "\n   ")
+            print(f"   saved {url}, but {hint}\n   Run setup again once it answers (`{prog()} selftest` checks it).")
     else:
         print(f"   skipped. Add one later with: {prog()} setup --node ADDRESS")
 
@@ -439,6 +480,9 @@ def cmd_setup(a):
         print(f"   using {path}\n   address {address}")
     else:
         pw = password("   Choose a wallet password: ", confirm=True)
+        if pw is None:
+            raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
+                                  "too, to unlock the wallet unattended")
         if not pw:
             sys.exit("a wallet password is required (set VIBEHASH_PASSWORD for unattended setups)")
         words = mnemonic.generate()
@@ -446,8 +490,10 @@ def cmd_setup(a):
         wallets.save(keys, path, pw, mnemonic.PATH)
         address = keys.address
         print(f"   created {path}\n   address {address}")
-        show_words(words, "   ")
+        give_words(words, address, path, "   ")
     settings.save(wallet=str(path))
+    if a.deepseek:
+        settings.save(deepseek=a.deepseek)  # what `worker` does with DeepSeek jobs, until `worker --deepseek` changes it
 
     print("\n3. Graphics card")
     if a.gpu == "skip":
@@ -479,7 +525,7 @@ def cmd_setup(a):
                   f"   VIBE to {address}, then run setup again (or: {prog()} stake --amount {need // SYN_PER_VIBE})")
         else:
             amount = a.stake or min(acct["balance"] - fee, max(short, 10 * SYN_PER_VIBE))
-            if (a.stake or sys.stdin.isatty()) and ask(f"   Stake {fmt(amount)} now? Only cheating can cost you it.", bool(a.stake)):
+            if (a.stake or unattended.interactive()) and ask(f"   Stake {fmt(amount)} now? Only cheating can cost you it.", bool(a.stake)):
                 keys = keys or load_wallet(str(path))
                 node.send_tx(keys, "stake", "system", amount)
                 staked = True
@@ -508,13 +554,13 @@ def _setup_models(a) -> None:
             return ""
     if a.models_dir:
         store.folder = modelstore.dedicated(Path(a.models_dir).expanduser().resolve())
-    elif not saved and sys.stdin.isatty() and not a.yes:
+    elif not saved and unattended.interactive() and not a.yes:
         print("   Big models (like DeepSeek's, ~30 GB) are downloaded only when you take their work, and deleted when the\n"
               "   job ends or after a week without mining it. Where should they go?")
         store.choose(ask=reply, say=lambda m: print("   " + m))
     if a.models_gb:
         store.cap = int(a.models_gb * modelstore.GB)
-    elif not saved and sys.stdin.isatty() and not a.yes:
+    elif not saved and unattended.interactive() and not a.yes:
         answer = reply(f"How much space may they use, in GB? (Enter: {store.cap / modelstore.GB:.0f}) ")
         if answer:
             try:
@@ -523,7 +569,7 @@ def _setup_models(a) -> None:
                 print(f"   kept {store.cap / modelstore.GB:.0f} GB")
     if a.keep_models is not None:
         store.keep = a.keep_models == "yes"
-    elif not saved and sys.stdin.isatty() and not a.yes:
+    elif not saved and unattended.interactive() and not a.yes:
         store.keep = reply("Keep them after a job ends, to save downloading them again on a slow link? They'd\n"
                            "   stay until you run `vibehash cache clear`. [y/N] ").lower() in ("y", "yes")
     store.remember()
@@ -1454,7 +1500,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet", help=f"wallet file to use or create (default {settings.default_wallet()})")
     p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="find the GPU and install PyTorch for it")
     p.add_argument("--stake", type=to_syn, help="stake this much VIBE without asking")
-    p.add_argument("--yes", action="store_true", help="install GPU support without asking")
+    p.add_argument("--yes", action="store_true", help="install GPU support without asking. With no terminal (nohup, "
+                   "Docker, a pod) nothing is asked: the wallet's password comes from $VIBEHASH_PASSWORD, its recovery "
+                   "words go to a file only you can read, and model files take the defaults")
+    p.add_argument("--deepseek", choices=["yes", "no"], help="whether `worker` takes DeepSeek work (its ~30 GB of model "
+                   "files) without asking; remembered")
     p.add_argument("--models-dir", help="where big model files go (default: the drive with the most room)")
     p.add_argument("--models-gb", type=float, help="the most space they may use, in GB (default 40)")
     p.add_argument("--keep-models", choices=["yes", "no"], help="keep them after a job ends (default no)")
@@ -1545,11 +1595,19 @@ def parser() -> argparse.ArgumentParser:
     p = t.add_parser("fingerprint", help="print a certificate's SHA-256 fingerprint, for setup --tls-fingerprint")
     p.add_argument("cert"); p.set_defaults(fn=cmd_tls_fingerprint)
 
-    p = sub.add_parser("worker", help="contribute compute and earn VIBE")
+    p = sub.add_parser("worker", help="contribute compute and earn VIBE", description="Mine: train and check other "
+                       "workers' units, and earn VIBE. One worker trains on one device. For several GPUs in one computer "
+                       "or pod, run one worker per GPU, each with its own wallet (two with one wallet would undo each "
+                       "other's work, so the second refuses to start): `vibehash wallet create --out gpu1.json`, then "
+                       "`vibehash worker --device cuda:1 --wallet gpu1.json`. Each wallet gets its own cache; the "
+                       "model files they download are shared. With no terminal (nohup, Docker, a pod), set "
+                       "$VIBEHASH_PASSWORD to unlock the wallet.")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--device", default="auto", help="auto (first GPU found, else CPU), cpu, cuda, cuda:1, xpu, mps")
+    p.add_argument("--device", default="auto", help="auto (first GPU found, else CPU), cpu, cuda, cuda:1, xpu, mps. "
+                   "One device a worker: a second GPU gets its own worker and wallet")
     p.add_argument("--memory-mb", type=int, help="override detected memory"); p.add_argument("--flops", type=float, help="override benchmark")
-    p.add_argument("--cache-dir", help="where checkpoints and datasets are kept (default ~/.vibehash/cache)")
+    p.add_argument("--cache-dir", help="where checkpoints, datasets and receipts are kept (default "
+                   "~/.vibehash/cache/WALLET-ADDRESS: one per wallet)")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
     p.add_argument("--deepseek", choices=["ask", "yes", "no"], default=None,
                    help="take DeepSeek work (its ~30 GB of model files): ask once (the default), yes without asking "
@@ -1563,6 +1621,8 @@ def parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("devices", help="list the CPUs and GPUs this computer can train on")
     p.add_argument("--json", action="store_true", help="machine-readable output"); p.set_defaults(fn=cmd_devices)
+    from . import selftest
+    selftest.add_parser(sub)  # `vibehash selftest`: is this computer ready to mine, and what can it take?
 
     p = sub.add_parser("balance"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
     p.add_argument("address", nargs="?"); p.set_defaults(fn=cmd_balance)
@@ -1679,4 +1739,4 @@ def main(argv=None):
     except FileNotFoundError as e:
         sys.exit(f"error: {e.filename} doesn't exist")
     except (NodeError, wallets.WalletError, ValueError, OSError) as e:
-        sys.exit(f"error: {e}")
+        sys.exit(f"error: {advice.explain(e, getattr(a, 'node', None)) or e}")
