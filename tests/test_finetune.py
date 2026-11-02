@@ -1035,6 +1035,41 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertIn((liar, "false accusation"), slashed)
         self.replays([rep])
 
+    def test_moves_are_checked_before_what_they_name_is_read(self):
+        """The second review's finding 7: the node read a move's evidence before checking whose turn it was, and read
+        and hashed a split's states before checking their sizes. Now a move out of turn is refused before anything it
+        names is read, as is evidence bigger than its tile can need, and a "manifest" bigger than any manifest."""
+        from unittest import mock
+
+        from vibehash import dispute as dg, merkle
+        from vibehash.coordinator import ProtocolError
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        c, tried = self.proto.coord, set()
+        big = c._put_trace(bytes(merkle.MAX_MANIFEST + 1))
+
+        def moves(g, who):
+            body = {"round": c.r.round_no, "game": g["id"], "n": g["n"]}
+            if g["turn"] == "split" and "split" not in tried:
+                tried.add("split")
+                with self.assertRaisesRegex(ProtocolError, "too big to be a manifest"):
+                    c.submit_move(who, body | {"move": {"split": [g["a"]] + [big] * (len(g["groups"]) - 1) + [g["b"]]}})
+            if g["turn"] == "evidence" and "evidence" not in tried:
+                tried.add("evidence")
+                read = mock.Mock(side_effect=AssertionError("read"))
+                with mock.patch.object(c, "_get_trace", read), mock.patch.object(dg, "MAX_EVIDENCE", 10),                         mock.patch.object(dg, "evidence_cap", return_value=100):
+                    with self.assertRaisesRegex(ProtocolError, "turn"):  # the challenger can't send evidence
+                        c.submit_move(g["challenger"], body | {"move": {"evidence": big}})
+                    with self.assertRaisesRegex(ProtocolError, "more than this tile can need"):
+                        c.submit_move(who, body | {"move": {"evidence": big}})
+                    with self.assertRaisesRegex(ProtocolError, "uploaded blob"):
+                        c.submit_move(who, body | {"move": {"evidence": "../x"}})
+            return "default"
+        rep = self.round(moves=moves)
+        self.assertEqual(tried, {"split", "evidence"})
+        self.assertTrue(all(g.outcome == "challenger" for g in self.games.values()))  # then played out as usual
+        self.replays([rep])
+
     def test_a_phase_cut_short_blames_only_a_party_past_its_deadline(self):
         """The second review's finding 6: a dispute phase that ends with games unfinished judged them all by silence,
         though a party's own move may not have been due yet. Now each game goes by its own deadline: past it, the party

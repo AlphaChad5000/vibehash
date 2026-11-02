@@ -1377,12 +1377,33 @@ class Coordinator:
     def _get_trace(self, blob_id: str) -> bytes | None:
         return None if self.trace_blobs is None else self.trace_blobs.get_bytes(blob_id)
 
+    def _trace_size(self, blob_id: str) -> int | None:
+        return None if self.trace_blobs is None else self.trace_blobs.size(blob_id)
+
+    def _check_evidence_size(self, g, blob_id: str, outside) -> None:
+        """Evidence no bigger than its tile can need (dispute.evidence_cap), checked before it's read."""
+        size = self._trace_size(blob_id) if dg._hex64(blob_id) else None
+        if size is None:
+            raise ProtocolError("evidence is the id of an uploaded blob")
+        if size > dg.MAX_EVIDENCE:
+            try:
+                cap = dg.evidence_cap(g.leaf, g.tile, outside)
+            except dg.WeightsUnavailable:  # the referee will say so (unchecked), on evidence it then doesn't read
+                return
+            if size > cap:
+                raise ProtocolError(f"evidence of {size} bytes is more than this tile can need ({cap})")
+
     def _check_states(self, roots: list[str]) -> None:
         """Every state a split names is on the node, with every tensor it names, each hashing as its manifest says:
-        the challenger can fetch them all."""
+        the challenger can fetch them all. Sizes are checked before anything is read or hashed."""
         from . import merkle
 
         for root in roots:
+            size = self._trace_size(root)
+            if size is None:
+                raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
+            if size > merkle.MAX_MANIFEST:
+                raise dg.MoveRefused(f"state {root[:12]}… is too big to be a manifest")
             m = self._get_trace(root)
             if m is None:
                 raise dg.MoveRefused(f"state {root[:12]}… hasn't been uploaded")
@@ -1420,15 +1441,22 @@ class Coordinator:
             raise ProtocolError("too late: that move's deadline has passed")
         job = self.job(r.job_id)
         move, outside = body.get("move"), None
-        if isinstance(move, dict) and "evidence" in move:
-            evidence = self._replay_bytes(str(move["evidence"])) if self.replaying else self._get_trace(str(move["evidence"]))
+        try:
+            kind = dg.whose(g, addr, move)  # before reading anything the move names
+        except dg.MoveRefused as e:
+            raise ProtocolError(str(e)) from None
+        if kind == "evidence":
+            outside = dg.Outside(job.spec, job.data, self._weight_source(job))
+            blob = str(move["evidence"])
+            if not self.replaying:
+                self._check_evidence_size(g, blob, outside)
+            evidence = self._replay_bytes(blob) if self.replaying else self._get_trace(blob)
             if self.replaying and evidence is None:  # gone with its round's window: the record's outcome, unchecked
                 entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
                 g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
                 self.unchecked += 1
                 g.moves.append(envelope if envelope is not None else {"from": addr, **body})
                 return g.view()
-            outside = dg.Outside(job.spec, job.data, self._weight_source(job))
         try:
             dg.play(g, self._program(job, g.unit), addr, move, evidence=evidence, outside=outside,
                     check_states=None if self.replaying else self._check_states)
@@ -1891,6 +1919,9 @@ class _MemoryBlobs:
 
     def get_bytes(self, bid: str) -> bytes | None:
         return self.data.get(bid)
+
+    def size(self, bid: str) -> int | None:
+        return len(self.data[bid]) if bid in self.data else None
 
     def tensor_root(self, bid: str, rows: int, cols: int) -> str | None:
         from . import merkle

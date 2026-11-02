@@ -466,13 +466,9 @@ def _hex64(x) -> bool:
     return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
 
 
-def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence: bytes | None = None,
-         outside: Outside | None = None) -> None:
-    """Apply one move `who` made. Raises MoveRefused for one that isn't taken. `check_states(roots)` (a live node)
-    raises MoveRefused unless every state a split names is on the node; `evidence` is the evidence move's bytes
-    (whose sha256 the move names) and `outside` what the referee reads besides it."""
-    from .program import Op, groups
-
+def whose(game: Game, who: str, move) -> str:
+    """The kind of move `move` is, when it's `who`'s to make now; else MoveRefused. Cheap, so a node asks it before
+    reading anything a move names."""
     if game.turn == "done":
         raise MoveRefused("this game is over")
     if len(game.moves) >= MAX_MOVES or not isinstance(move, dict):
@@ -482,8 +478,19 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
         raise MoveRefused("a move is a split, a pick (with a tile, for an op), evidence, or conceding")
     party = game.defender if kind in ("split", "evidence") else game.challenger
     if who != party or game.turn != ("pick" if kind == "concede" else kind):
-        whose = "defender" if game.turn in ("split", "evidence") else "challenger"
-        raise MoveRefused(f"it's the {whose}'s turn to {game.turn}")
+        turn = "defender" if game.turn in ("split", "evidence") else "challenger"
+        raise MoveRefused(f"it's the {turn}'s turn to {game.turn}")
+    return kind
+
+
+def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence: bytes | None = None,
+         outside: Outside | None = None) -> None:
+    """Apply one move `who` made. Raises MoveRefused for one that isn't taken. `check_states(roots)` (a live node)
+    raises MoveRefused unless every state a split names is on the node; `evidence` is the evidence move's bytes
+    (whose sha256 the move names) and `outside` what the referee reads besides it."""
+    from .program import Op, groups
+
+    kind = whose(game, who, move)
     if kind == "concede":
         if move["concede"] is not True:
             raise MoveRefused("conceding is {\"concede\": true}")

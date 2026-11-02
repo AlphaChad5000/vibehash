@@ -1028,6 +1028,9 @@ class TraceBlobs:
     def get_bytes(self, blob_id: str) -> bytes | None:
         return self.store.path(blob_id).read_bytes() if self.store.has(blob_id) else None
 
+    def size(self, blob_id: str) -> int | None:
+        return self.store.size(blob_id) if self.store.has(blob_id) else None
+
     def tensor_root(self, blob_id: str, rows: int, cols: int) -> str | None:
         """The root of a blob read as a [rows, cols] tensor, or None when it isn't on the node at that size. Checked on
         every call, though the root is cached: a blob pruned since isn't on the node for a challenger to fetch. And
