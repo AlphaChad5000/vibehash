@@ -12,6 +12,7 @@ No SDK on purpose, so nothing hides what goes over the wire.
 """
 import json
 import os
+import urllib.error
 import urllib.request
 
 
@@ -29,8 +30,11 @@ def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 
         data=json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {os.environ['LLM_API_KEY']}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        reply = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            reply = json.load(r)
+    except urllib.error.HTTPError as e:  # the provider's error body says why (no credits, bad model name, ...)
+        raise SystemExit(f"{base} answered {e.code} {e.reason}: {e.read().decode(errors='replace')[:500]}")
     return reply["choices"][0]["message"]["content"]
 
 
