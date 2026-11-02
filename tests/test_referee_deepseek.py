@@ -25,8 +25,9 @@ def mk(kind, out, ins, attrs, shape, ishapes):
     return Op(kind, out, tuple(ins), attrs, (), tuple(shape), tuple(tuple(s) for s in ishapes))
 
 
-@unittest.skipIf(torch is None, "needs PyTorch")
-class ForwardOpTests(unittest.TestCase):
+class _OpCase(unittest.TestCase):
+    """The tiny config's weights, and judging an op's every tile against them."""
+
     @classmethod
     def setUpClass(cls):
         cls.cfg = tiny_config()
@@ -50,12 +51,26 @@ class ForwardOpTests(unittest.TestCase):
                 t = said.copy()
                 loose = op.attrs.get("num", "ref") == "f32" or op.kind in ("ds_hc_mixes", "ds_hc_split") or op.attrs.get("hi")
                 # (attention's output is a weighted sum of values that mostly cancel: its float32 bound is ~0.5%)
-                t[j] *= 1.5 if op.kind in rf.EXACT else 1.03 if not loose else 1.01 if op.kind == "ds_attn" else 1.001
+                t[j] *= 1.5 if op.kind in rf.EXACT else 1.03 if not loose else 1.01 if op.kind.startswith("ds_attn") else 1.001
                 tampered += 1
                 caught += not rf.judge(op, x, leaf, t)[0]
         # (a sum with heavy cancellation can hide a 0.1% change in its bound: hc_mixes' 256-term dot products)
         self.assertGreaterEqual(caught, tampered - (1 if op.kind == "ds_hc_mixes" else 0), label)
 
+
+    def verdict(self, op, before, after, tile):
+        """What the node decides from a defender's evidence for one tile (dispute.make_evidence and judge_evidence)."""
+        before = {k: np.asarray(v, dtype=np.float32) for k, v in before.items()}
+        after = {**before, **{k: np.asarray(v, dtype=np.float32) for k, v in after.items()}}
+        mb, _ = dispute.state_manifest(before)
+        ma, _ = dispute.state_manifest(after)
+        ev, _, _ = dispute.make_evidence(op, tile, before, after, (mb, ma), dispute.Outside(None, None, self.src, keep=False))
+        return dispute.judge_evidence(op, tile, merkle.state_root(mb), merkle.state_root(ma), ev,
+                                      dispute.Outside(None, None, self.src, keep=False))
+
+
+@unittest.skipIf(torch is None, "needs PyTorch")
+class ForwardOpTests(_OpCase):
     def test_every_forward_op(self):
         cfg, state = self.cfg, self.state
         REF, F32N = ds.Numerics(), ds.Numerics(torch.float32, quantize=False)
@@ -197,16 +212,6 @@ class ForwardOpTests(unittest.TestCase):
             self.judge(mk("ds_gates", "g", ["s", "c"], {"norm": cfg.norm_topk_prob, "route_scale": cfg.route_scale},
                           gates.shape, [sc.shape, chosen.shape]), {"s": sc, "c": chosen.float()}, gates, "gates")
 
-    def verdict(self, op, before, after, tile):
-        """What the node decides from a defender's evidence for one tile (dispute.make_evidence and judge_evidence)."""
-        before = {k: np.asarray(v, dtype=np.float32) for k, v in before.items()}
-        after = {**before, **{k: np.asarray(v, dtype=np.float32) for k, v in after.items()}}
-        mb, _ = dispute.state_manifest(before)
-        ma, _ = dispute.state_manifest(after)
-        ev, _, _ = dispute.make_evidence(op, tile, before, after, (mb, ma), dispute.Outside(None, None, self.src, keep=False))
-        return dispute.judge_evidence(op, tile, merkle.state_root(mb), merkle.state_root(ma), ev,
-                                      dispute.Outside(None, None, self.src, keep=False))
-
     def test_choices_are_judged_by_whole_rows(self):
         g = torch.Generator().manual_seed(7)
         # Experts: a top-k of the biased scores, distinct, any order.
@@ -305,6 +310,195 @@ class ForwardOpTests(unittest.TestCase):
                            {"r": routed.flatten(1), "c": chosen.float(), "sh": shared}, y, f"moe sum {numname}")
         finally:
             self.src = old
+
+
+@unittest.skipIf(torch is None, "needs PyTorch")
+class BackwardOpTests(_OpCase):
+    """The backward ops of float32 training units: each formula agrees with autograd (float64), and the referee
+    passes every tile of it computed in float32, as a tracer computes it, and refuses one changed by 0.1% (1% for
+    attention's sums, which cancel)."""
+
+    def setUp(self):
+        self.g = torch.Generator().manual_seed(11)
+
+    def rnd(self, *shape, s=1.0):
+        return torch.randn(*shape, generator=self.g, dtype=torch.float64) * s
+
+    def close(self, a, b, label):
+        a, b = a.detach().double(), b.detach().double()
+        self.assertLess(float((a - b).abs().max() / b.abs().max().clamp_min(1e-30)), 1e-5, label)
+
+    def check(self, kind, ins, attrs, before, f32, f64, label):
+        """f32: the formula in float32 (the tracer's); f64: autograd's gradient in float64."""
+        self.close(f32, f64, label)
+        attrs = {"num": "f32", **attrs}
+        self.judge(mk(kind, "y", ins, attrs, f32.shape, [before[n].shape for n in ins]), before, f32, label)
+
+    def test_matmuls_hyper_connections_and_experts(self):
+        cfg, st = self.cfg, self.state
+        T = 6
+        w = ds.dequant(st["layers.1.attn.wq_b.weight"], st["layers.1.attn.wq_b.scale"], torch.float64)
+        dy = self.rnd(T, w.shape[0])
+        self.check("ds_qlinear_bwd", ["dy"], {"weight": "layers.1.attn.wq_b"}, {"dy": dy}, (dy.float() @ w.float()), dy @ w,
+                   "qlinear_bwd")
+        wo = ds.dequant(st["layers.1.attn.wo_a.weight"], st["layers.1.attn.wo_a.scale"], torch.float64)
+        G = cfg.o_groups
+        dyo = self.rnd(T, wo.shape[0])
+        ref = torch.einsum("tgr,grd->tgd", dyo.view(T, G, -1), wo.view(G, -1, wo.shape[1])).flatten(1)
+        acc = self.rnd(T, ref.shape[1])
+        got = torch.einsum("tgr,grd->tgd", dyo.float().view(T, G, -1), wo.float().view(G, -1, wo.shape[1])).flatten(1) + acc.float()
+        self.check("ds_qlinear_bwd", ["dy", "acc"], {"weight": "layers.1.attn.wo_a", "groups": G}, {"dy": dyo, "acc": acc},
+                   got, ref + acc, "qlinear_bwd grouped")
+        wg = st["layers.1.ffn.gate.weight"].double()
+        dl = self.rnd(T, wg.shape[0])
+        self.check("ds_dense_bwd", ["dy"], {"weight": "layers.1.ffn.gate.weight"}, {"dy": dl}, dl.float() @ wg.float(), dl @ wg,
+                   "dense_bwd")
+        # hc_pre and hc_post
+        hc, dim = cfg.hc_mult, cfg.dim
+        xs = self.rnd(1, T, hc, dim).requires_grad_()
+        pre = torch.rand(1, T, hc, generator=self.g, dtype=torch.float64).requires_grad_()
+        dout = self.rnd(1, T, dim)
+        out = ds.hc_pre(xs, pre, torch.float64)
+        gx, gp = torch.autograd.grad(out, (xs, pre), dout)
+        mix = torch.cat([pre.detach()[0], torch.zeros(T, 24 - hc, dtype=torch.float64)], 1)
+        self.check("ds_hc_pre_dx", ["d", "m"], {"col": 0}, {"d": dout[0], "m": mix},
+                   (pre.detach()[0].float()[:, :, None] * dout[0].float()[:, None, :]).flatten(1), gx[0].flatten(1), "hc_pre_dx")
+        self.check("ds_hc_pre_dpre", ["d", "s"], {}, {"d": dout[0], "s": xs.detach()[0].flatten(1)},
+                   (dout[0].float()[:, None, :] * xs.detach()[0].float()).sum(-1), gp[0], "hc_pre_dpre")
+        y = self.rnd(1, T, dim).requires_grad_()
+        res = self.rnd(1, T, hc, dim).requires_grad_()
+        post = torch.rand(1, T, hc, generator=self.g, dtype=torch.float64).requires_grad_()
+        comb = torch.rand(1, T, hc, hc, generator=self.g, dtype=torch.float64).requires_grad_()
+        do = self.rnd(1, T, hc, dim)
+        o = ds.hc_post(y, res, post, comb, torch.float64)
+        gy, gr, gpo, gc = torch.autograd.grad(o, (y, res, post, comb), do)
+        split = torch.cat([torch.zeros(T, hc, dtype=torch.float64), post.detach()[0], comb.detach()[0].flatten(1)], 1)
+        dof = do[0].float()
+        self.check("ds_hc_post_dy", ["d", "s"], {"post": hc}, {"d": do[0].flatten(1), "s": split},
+                   (post.detach()[0].float()[:, :, None] * dof).sum(1), gy[0], "hc_post_dy")
+        self.check("ds_hc_post_dres", ["d", "s"], {"comb": 2 * hc, "hc": hc}, {"d": do[0].flatten(1), "s": split},
+                   torch.einsum("tjk,tkc->tjc", comb.detach()[0].float(), dof).flatten(1), gr[0].flatten(1), "hc_post_dres")
+        dsplit = torch.cat([torch.zeros(T, hc), (dof * y.detach()[0].float()[:, None, :]).sum(-1),
+                            torch.einsum("tkc,tjc->tjk", dof, res.detach()[0].float()).flatten(1)], 1)
+        self.check("ds_hc_post_dsplit", ["d", "y", "r"], {"hc": hc}, {"d": do[0].flatten(1), "y": y.detach()[0],
+                                                                     "r": res.detach()[0].flatten(1)},
+                   dsplit, torch.cat([torch.zeros(T, hc, dtype=torch.float64), gpo[0], gc[0].flatten(1)], 1), "hc_post_dsplit")
+        # hc_mixes
+        fn = st["layers.1.hc_attn_fn"].double()
+        h = self.rnd(T, hc * dim).requires_grad_()
+        mixes = F.linear(h, fn) * torch.rsqrt(h.square().mean(-1, keepdim=True) + cfg.norm_eps)
+        dm = self.rnd(T, mixes.shape[1])
+        gh, = torch.autograd.grad(mixes, h, dm)
+        hf, dmf, fnf = h.detach().float(), dm.float(), fn.float()
+        rs = torch.rsqrt(hf.square().mean(-1, keepdim=True) + cfg.norm_eps)
+        lin = F.linear(hf, fnf)
+        got = (dmf * rs) @ fnf + hf * (((dmf * lin).sum(-1, keepdim=True) * (rs * rs * rs)) * (-1.0 / hf.shape[1]))
+        self.check("ds_hc_mixes_bwd", ["d", "h"], {"fn": "layers.1.hc_attn_fn", "eps": cfg.norm_eps},
+                   {"d": dm, "h": h.detach()}, got, gh, "hc_mixes_bwd")
+        # SwiGLU with clamps and its gate
+        L = cfg.swiglu_limit
+        g_ = self.rnd(T, cfg.moe_inter_dim, s=1.5).requires_grad_()
+        u_ = self.rnd(T, cfg.moe_inter_dim, s=1.5).requires_grad_()
+        gate = torch.rand(T, 1, generator=self.g, dtype=torch.float64).requires_grad_()
+        hh = gate * (F.silu(g_.clamp(max=L)) * u_.clamp(-L, L))
+        dh = self.rnd(T, cfg.moe_inter_dim)
+        dgg, duu, dga = torch.autograd.grad(hh, (g_, u_, gate), dh)
+        gf, uf, gtf, dhf = g_.detach().float(), u_.detach().float(), gate.detach().float(), dh.float()
+        gc_, uc_ = gf.clamp(max=L), uf.clamp(-L, L)
+        sig = torch.sigmoid(gc_)
+        before = {"dh": dh, "g": g_.detach(), "u": u_.detach(), "gate": gate.detach()}
+        self.check("ds_swiglu_bwd", ["dh", "g", "u", "gate"], {"limit": L, "part": "g"}, before,
+                   torch.where(gf <= L, ((dhf * gtf) * uc_) * (sig * (1 + gc_ * (1 - sig))), 0.0), dgg, "swiglu dg")
+        self.check("ds_swiglu_bwd", ["dh", "g", "u", "gate"], {"limit": L, "part": "u"}, before,
+                   torch.where(uf.abs() <= L, (dhf * gtf) * F.silu(gc_), 0.0), duu, "swiglu du")
+        self.check("ds_swiglu_dgate", ["dh", "g", "u"], {"limit": L}, before, (dhf * (F.silu(gc_) * uc_)).sum(-1, keepdim=True),
+                   dga, "swiglu dgate")
+        # the router: gates, then sqrt(softplus)
+        E_, k = cfg.n_routed_experts, cfg.n_activated_experts
+        lg = self.rnd(T, E_, s=2).requires_grad_()
+        sc = F.softplus(lg / cfg.gate_temp).sqrt()
+        chosen = (sc.detach() + st["layers.1.ffn.gate.bias"].double()).topk(k, -1).indices
+        gs = sc.gather(1, chosen)
+        gts = gs / (gs.sum(-1, keepdim=True) + 1e-20) * cfg.route_scale
+        dgt = self.rnd(T, k)
+        dsc, = torch.autograd.grad(gts, sc, dgt, retain_graph=True)
+        dlg, = torch.autograd.grad(sc, lg, dsc)
+        scf, dgf = sc.detach().float(), dgt.float()
+        s_ch = scf.gather(1, chosen)
+        S = s_ch.sum(-1, keepdim=True) + 1e-20
+        d = (dgf / S - (dgf * s_ch).sum(-1, keepdim=True) / (S * S)) * cfg.route_scale
+        dscf = torch.zeros(T, E_).scatter(1, chosen, d)
+        self.check("ds_gates_bwd", ["s", "c", "dg"], {"norm": True, "route_scale": cfg.route_scale},
+                   {"s": sc.detach(), "c": chosen.double(), "dg": dgt}, dscf, dsc, "gates_bwd")
+        z = lg.detach().float() / cfg.gate_temp
+        dlf = dscf / (2 * F.softplus(z).sqrt()) * torch.sigmoid(z) / cfg.gate_temp
+        self.check("ds_moe_scores_bwd", ["l", "ds"], {"temp": cfg.gate_temp}, {"l": lg.detach(), "ds": dscf},
+                   dlf, dlg, "moe_scores_bwd")
+
+    def test_attention(self):
+        cfg, st = self.cfg, self.state
+        T, H, hd, n, k, W = 90, cfg.n_heads, cfg.head_dim, 30, 3, 40
+        S = min(T, W) + k
+        q = self.rnd(1, T, H, hd).requires_grad_()
+        kv = self.rnd(1, T, hd).requires_grad_()
+        comp = self.rnd(1, n, hd)
+        vis = (torch.arange(1, T + 1) // 3).clamp(max=n)
+        picks = torch.full((1, T, k), -1, dtype=torch.long)
+        for i in range(T):
+            c = sorted(torch.randperm(int(vis[i]), generator=self.g)[:k].tolist()) if vis[i] else []
+            picks[0, i, :len(c)] = torch.tensor(c, dtype=torch.long)
+        sink = st["layers.1.attn.attn_sink"].double()
+        scale = hd ** -0.5
+        o = ds.sparse_attention(q, kv, comp, picks, sink, scale, W, ds.Numerics(torch.float64, quantize=False))
+        do = self.rnd(1, T, H, hd)
+        gq, gkv = torch.autograd.grad(o, (q, kv), do)
+        # The formulas in float32, slot by slot, as a tracer computes them.
+        qf, kvf, cf, dof, sinkf = q.detach()[0].float(), kv.detach()[0].float(), comp[0].float(), do[0].float(), sink.float()
+        P, dP = torch.zeros(T, H, S), torch.zeros(T, H, S)
+        for t in range(T):
+            lo = max(0, t - W + 1)
+            keys = [kvf[j] for j in range(lo, t + 1)]
+            slots = list(range(len(keys)))
+            for j, p in enumerate(picks[0, t].tolist()):
+                if p >= 0:
+                    keys.append(cf[p])
+                    slots.append(min(T, W) + j)
+            K = torch.stack(keys)
+            s = (qf[t] @ K.T) * scale  # [H, keys]
+            m = s.max(-1, keepdim=True).values
+            ex = torch.exp(s - m)
+            pr = ex / (ex.sum(-1, keepdim=True) + torch.exp(sinkf[:, None] - m))
+            P[t][:, slots] = pr
+            dP[t][:, slots] = dof[t] @ K.T
+        dS = P * (dP - (P * dP).sum(-1, keepdim=True))
+        before = {"q": q.detach()[0].flatten(1), "kv": kv.detach()[0], "c": comp[0], "p": picks[0].double(),
+                  "do": do[0].flatten(1), "P": P.flatten(1), "dP": dP.flatten(1), "dS": dS.flatten(1)}
+        attrs = {"heads": H, "window": W, "scale": scale, "sink": "layers.1.attn.attn_sink", "n_window": min(T, W),
+                 "slots": S, "num": "f32"}
+        self.judge(mk("ds_attn_probs", "y", ["q", "kv", "c", "p"], attrs, (T, H * S),
+                      [before[x].shape for x in ("q", "kv", "c", "p")]), before, P.flatten(1), "attn_probs")
+        self.judge(mk("ds_attn_dp", "y", ["do", "kv", "c", "p"], attrs, (T, H * S),
+                      [before[x].shape for x in ("do", "kv", "c", "p")]), before, dP.flatten(1), "attn_dp")
+        self.judge(mk("ds_attn_ds", "y", ["P", "dP"], attrs, (T, H * S), [(T, H * S)] * 2), before, dS.flatten(1), "attn_ds")
+        dq = torch.zeros(T, H, hd)
+        dkv = torch.zeros(T, hd)
+        for t in range(T):
+            lo = max(0, t - W + 1)
+            keys = [kvf[j] for j in range(lo, t + 1)]
+            slots = list(range(len(keys)))
+            for j, p in enumerate(picks[0, t].tolist()):
+                if p >= 0:
+                    keys.append(cf[p])
+                    slots.append(min(T, W) + j)
+            dq[t] = (dS[t][:, slots] @ torch.stack(keys)) * scale
+            for jj, key in enumerate(range(lo, t + 1)):
+                dkv[key] += ((scale * dS[t][:, jj])[:, None] * qf[t] + P[t][:, jj][:, None] * dof[t]).sum(0)
+        self.close(dq, gq[0], "attn dq vs autograd")
+        self.close(dkv, gkv[0], "attn dkv vs autograd")
+        self.judge(mk("ds_attn_dq", "y", ["dS", "kv", "c", "p"], attrs, (T, H * hd),
+                      [before[x].shape for x in ("dS", "kv", "c", "p")]), before, dq.flatten(1), "attn_dq")
+        self.judge(mk("ds_attn_dkv", "y", ["dS", "P", "q", "do"], attrs, (T, hd),
+                      [before[x].shape for x in ("dS", "P", "q", "do")]), before, dkv, "attn_dkv")
 
 
 def np32(t):

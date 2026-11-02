@@ -670,6 +670,313 @@ def op_ds_moe_sum(op, x, r, c0, c1):
         y = o if y is None else rf.add(y, o)
     return cast(rf.add(y, E(x.get(op.ins[2], r, r + 1, c0, c1)[0])), _num(op))
 
+# --- the backward, for training units (float32: "f32") -----------------------------------------------------------------
+# Training units compute float32 throughout (deepseek_top.TRAIN), and their backward is written out op by op, each the
+# formula its docstring gives in that order: the tracer computes exactly these, and the referee bounds them. Ops that
+# add into an existing gradient take it as an optional last input (the accumulator), added last.
+
+def _acc(op, x, r, c0, c1, y: E, at: int) -> E:
+    return rf.add(E(x.get(op.ins[at], r, r + 1, c0, c1)[0]), y) if len(op.ins) > at else y
+
+
+def _contract_rows(dy: np.ndarray, rows_of, n_rows: int, chunk: int = 4096) -> E:
+    """Σ_o dy[o] · W[o, cols] over every row o of W, read `chunk` rows at a time (rows_of(o0, o1) -> [o1-o0, cols]):
+    exact partial sums (fsum), and the bound of one K-term dot product of float32s in any order."""
+    parts, absparts = [], []
+    for o0 in range(0, n_rows, chunk):
+        o1 = min(n_rows, o0 + chunk)
+        p = dy[o0:o1, None] * rows_of(o0, o1)
+        parts.append(rf.fsum_rows(p.T))
+        absparts.append(rf.fsum_rows(np.abs(p).T))
+    v = rf.fsum_rows(np.stack(parts, -1))
+    s_abs = rf.fsum_rows(np.stack(absparts, -1))
+    return E(v, (rf.gamma(n_rows) + 2.0 ** -50) * s_abs)  # (and the float64 partial sums' own rounding)
+
+
+def op_ds_qlinear_bwd(op, x, r, c0, c1):
+    """QLinear's backward to its input: dx = dy · W (W dequantised), group by group for wo_a, then + acc. ins (dy[,
+    acc]); attrs weight, groups."""
+    a = op.attrs
+    groups = a.get("groups", 1)
+    out_g, in_g = op.ishapes[0][1] // groups, op.shape[1] // groups
+    dy = x.row(op.ins[0], r)
+    parts = []
+    for g, j0, j1 in _segments(c0, c1, in_g):
+        def rows(o0, o1, g=g, j0=j0, j1=j1):
+            return qrows(x, a["weight"], g * out_g + o0, g * out_g + o1)[:, j0:j1]
+        parts.append(_contract_rows(dy[g * out_g:(g + 1) * out_g], rows, out_g))
+    return _acc(op, x, r, c0, c1, rf._cat(*parts), 1)
+
+
+def op_ds_dense_bwd(op, x, r, c0, c1):
+    """A plain matrix's backward to its input: dx = dy · W, then + acc. ins (dy[, acc]); attrs weight."""
+    dy = x.row(op.ins[0], r)
+    y = _contract_rows(dy, lambda o0, o1: x.weight(op.attrs["weight"], o0, o1)[:, c0:c1], op.ishapes[0][1])
+    return _acc(op, x, r, c0, c1, y, 1)
+
+
+def op_ds_hc_pre_dx(op, x, r, c0, c1):
+    """hc_pre's backward to the stream: dx_k = pre_k · dout, then + acc. ins (dout [T, dim], mix[, acc]); attrs col."""
+    dim, col = op.ishapes[0][1], op.attrs.get("col", 0)
+    parts = []
+    for k, j0, j1 in _segments(c0, c1, dim):
+        pre = x.get(op.ins[1], r, r + 1, col + k, col + k + 1)[0, 0]
+        parts.append(rf.mul(E(pre), E(x.get(op.ins[0], r, r + 1, j0, j1)[0])))
+    return _acc(op, x, r, c0, c1, rf._cat(*parts), 2)
+
+
+def op_ds_hc_pre_dpre(op, x, r, c0, c1):
+    """hc_pre's backward to pre: dpre_k = dout · x_k (over dim). ins (dout [T, dim], stream [T, hc·dim])."""
+    dim = op.ishapes[0][1]
+    dout = x.row(op.ins[0], r)
+    xs = np.stack([x.get(op.ins[1], r, r + 1, k * dim, (k + 1) * dim)[0] for k in range(c0, c1)])
+    return rf.contract(E(dout[None]), xs)[0]
+
+
+def op_ds_hc_post_dy(op, x, r, c0, c1):
+    """hc_post's backward to y: dy = Σ_k post_k · dout_k. ins (dout [T, hc·dim], split); attrs post."""
+    dim = op.shape[1]
+    hc = op.ishapes[0][1] // dim
+    post = x.get(op.ins[1], r, r + 1, op.attrs["post"], op.attrs["post"] + hc)[0]
+    d = np.stack([x.get(op.ins[0], r, r + 1, k * dim + c0, k * dim + c1)[0] for k in range(hc)], -1)
+    return rf.esum(rf.mul(E(post[None, :]), E(d)))
+
+
+def op_ds_hc_post_dres(op, x, r, c0, c1):
+    """hc_post's backward to the residual stream: dres_j = Σ_k comb_jk · dout_k, then + acc. ins (dout, split[,
+    acc]); attrs comb."""
+    hc = op.attrs["hc"]
+    dim = op.shape[1] // hc
+    comb = x.get(op.ins[1], r, r + 1, op.attrs["comb"], op.attrs["comb"] + hc * hc)[0].reshape(hc, hc)
+    parts = []
+    for j, j0, j1 in _segments(c0, c1, dim):
+        d = np.stack([x.get(op.ins[0], r, r + 1, k * dim + j0, k * dim + j1)[0] for k in range(hc)], -1)
+        parts.append(rf.esum(rf.mul(E(comb[j][None, :]), E(d))))
+    return _acc(op, x, r, c0, c1, rf._cat(*parts), 2)
+
+
+def op_ds_hc_post_dsplit(op, x, r, c0, c1):
+    """hc_post's backward to its split row: zero for pre, dpost_k = dout_k · y, dcomb_jk = dout_k · res_j (dots over
+    dim). ins (dout [T, hc·dim], y [T, dim], residual [T, hc·dim]); attrs hc."""
+    hc = op.attrs["hc"]
+    dim = op.ishapes[1][1]
+    dout = x.row(op.ins[0], r).reshape(hc, dim)
+    y, res = x.row(op.ins[1], r), x.row(op.ins[2], r).reshape(hc, dim)
+    dpost = rf.contract(E(dout), y[None])[:, 0]
+    dcomb = rf.contract(E(res), dout)  # [j, k]
+    out = rf._cat(E(np.zeros(hc)), E(dpost.v, dpost.e), E(dcomb.v.reshape(-1), dcomb.e.reshape(-1)))
+    return out[c0:c1]
+
+
+def op_ds_hc_mixes_bwd(op, x, r, c0, c1):
+    """hc_mixes' backward to the stream h: with lin = h·fnᵀ and rs = rsqrt(mean(h²) + eps) recomputed,
+    dh = (dmix · rs)·fn + h · ((Σ_m dmix_m · lin_m) · rs³ · (-1/n)), then + acc. ins (dmix [T, 24], stream[, acc]);
+    attrs fn, eps."""
+    a = op.attrs
+    h = x.row(op.ins[1], r)
+    n = h.size
+    dmix = x.row(op.ins[0], r)
+    fn = x.weight(a["fn"], 0, x.weight_rows(a["fn"]))
+    lin = rf.contract(E(h[None]), fn)[0]
+    rs = rf._norm(x, h[None], n, a["eps"])
+    g = rf.mul(E(dmix), E(np.full(dmix.shape, rs.v[0]), np.full(dmix.shape, rs.e[0])))
+    d1 = rf.contract(E(g.v[None], g.e[None]), fn[:, c0:c1].T)[0]
+    q = rf.esum(rf.mul(E(dmix), lin)[None])
+    coef = rf.scale(rf.mul(q, rf.mul(rf.mul(rs, rs), rs)), rf.f32(-1.0 / n))
+    d2 = rf.mul(E(h[c0:c1]), E(np.full(c1 - c0, coef.v[0]), np.full(c1 - c0, coef.e[0])))
+    return _acc(op, x, r, c0, c1, rf.add(d1, d2), 2)
+
+
+def op_ds_swiglu_bwd(op, x, r, c0, c1):
+    """ds_swiglu's backward (h = gate · silu(g') · u', g' = min(g, L), u' = clamp(u, ±L)), to g or u by attrs part:
+    dg = ((dh · gate) · u') · silu'(g') where g ≤ L, silu'(z) = σ(z) · (1 + z · (1 - σ(z))); du = ((dh · gate) ·
+    silu(g')) where |u| ≤ L. ins (dh, g, u, gate [n, 1]); attrs limit, part ("g" or "u")."""
+    a = op.attrs
+    lim = a.get("limit", 0)
+    dh, g, u = (x.get(n, r, r + 1, c0, c1)[0] for n in op.ins[:3])
+    gate = x.get(op.ins[3], r, r + 1, 0, 1)[0, 0]
+    gc, uc = (np.minimum(g, lim), np.clip(u, -lim, lim)) if lim > 0 else (g, u)
+    dg_ = rf.mul(E(dh), E(gate))
+    if a["part"] == "u":
+        y = rf.mul(dg_, rf._silu(gc))
+        keep = (np.abs(u) <= lim) if lim > 0 else np.ones_like(u, dtype=bool)
+    else:
+        sig = sigmoid(E(gc))
+        dsil = rf.mul(sig, rf.add(E(1.0), rf.mul(E(gc), rf.sub(E(1.0), sig))))
+        y = rf.mul(rf.mul(dg_, E(uc)), dsil)
+        keep = (g <= lim) if lim > 0 else np.ones_like(g, dtype=bool)
+    return E(np.where(keep, y.v, 0.0), np.where(keep, y.e, 0.0))
+
+
+def op_ds_swiglu_dgate(op, x, r, c0, c1):
+    """ds_swiglu's backward to the token's gate: Σ_c dh_c · (silu(g'_c) · u'_c). ins (dh, g, u); attrs limit."""
+    lim = op.attrs.get("limit", 0)
+    dh, g, u = (x.row(n, r) for n in op.ins[:3])
+    gc, uc = (np.minimum(g, lim), np.clip(u, -lim, lim)) if lim > 0 else (g, u)
+    return rf.esum(rf.mul(E(dh), rf.mul(rf._silu(gc), E(uc)))[None])[0:1]
+
+
+def op_ds_gates_bwd(op, x, r, c0, c1):
+    """ds_gates' backward to the scores [T, E]: zero but for the chosen; with S = Σ_chosen s + 1e-20 (norm) and
+    G = Σ_i dg_i · s_i, ds_j = route_scale · (dg_j / S - G / (S · S)); without norm, route_scale · dg_j.
+    ins (scores, chosen, dgates [T, k]); attrs norm, route_scale."""
+    a = op.attrs
+    chosen = x.row(op.ins[1], r).astype(np.int64)
+    dg = E(x.row(op.ins[2], r))
+    s = E(np.array([x.get(op.ins[0], r, r + 1, int(c), int(c) + 1)[0, 0] for c in chosen]))
+    rs = rf.f32(a.get("route_scale", 1.0))
+    if a.get("norm", True) and len(chosen) > 1:
+        S = rf.add(rf.esum(s[None])[0:1], E(np.array([rf.f32(1e-20)])))
+        G = rf.esum(rf.mul(dg, s)[None])[0:1]
+        full = lambda t: E(np.full(len(chosen), t.v[0]), np.full(len(chosen), t.e[0]))  # noqa: E731
+        d = rf.sub(rf.div(dg, full(S)), full(rf.div(G, rf.mul(S, S))))
+    else:
+        d = dg
+    d = rf.scale(d, rs)
+    v, e = np.zeros(c1 - c0), np.zeros(c1 - c0)
+    for j, c in enumerate(chosen):
+        if c0 <= c < c1:
+            v[c - c0], e[c - c0] = d.v[j], d.e[j]
+    return E(v, e)
+
+
+def op_ds_moe_scores_bwd(op, x, r, c0, c1):
+    """MoE.scores' backward to its logits (sqrt(softplus(l / temp))): ds · (1 / (2 · score)) · σ(l / temp) / temp
+    (σ: softplus' derivative; 1 beyond 20). ins (logits, dscores); attrs temp."""
+    t = rf.f32(op.attrs.get("temp", 1.0))
+    lg = x.get(op.ins[0], r, r + 1, c0, c1)[0]
+    ds_ = E(x.get(op.ins[1], r, r + 1, c0, c1)[0])
+    z = rf._r(lg / t, np.zeros_like(lg)) if t != 1.0 else E(lg)
+    sp = rf.log(rf.add(E(1.0), rf.exp(z)))
+    big = z.v > 20
+    sp = E(np.where(big, z.v, sp.v), np.where(big, z.e, sp.e))
+    score = rf.sqrt(sp)
+    dsp = sigmoid(z)
+    dsp = E(np.where(big, 1.0, dsp.v), np.where(big, 0.0, dsp.e))
+    y = rf.mul(rf.div(ds_, rf.scale(score, 2.0)), dsp)
+    return rf._r(y.v / t, y.e / t) if t != 1.0 else y
+
+
+# --- attention's backward ---------------------------------------------------------------------------------------------
+# In float32 the forward's rounding of the probabilities is the identity and its running maxima cancel, so the backward
+# is a plain softmax's (with the sink in the denominator), over each query's key slots: its window, oldest first, then
+# its picks (slots n_window ...). Probabilities are recomputed (ds_attn_probs), then dP = do · v, dS = P · (dP - δ),
+# dq = scale · Σ dS · k, and each window key's gradient sums every query and head that saw it.
+
+def _keys(op, x, r):
+    """Query r's keys: (window rows [w, hd], picked rows [k', hd] (valid ones), their slots)."""
+    a = op.attrs
+    hd = op.ishapes[1][1]
+    win = x.get(op.ins[1], max(0, r - a["window"] + 1), r + 1)
+    sel, slots = np.zeros((0, hd)), list(range(len(win)))
+    if len(op.ins) > 2 and op.ins[2]:
+        picks = x.row(op.ins[3], r)
+        valid = [(j, int(p)) for j, p in enumerate(picks) if p >= 0]
+        if valid:
+            sel = np.concatenate([x.get(op.ins[2], i, i + 1) for _, i in valid])
+            slots += [a["n_window"] + j for j, _ in valid]
+    return win, sel, slots
+
+
+def probs(qh, keys, sink, scale_) -> E:
+    """P_j = exp(s_j - m) / (Σ exp(s - m) + exp(sink - m)), s = (q · k) · scale, m = max s (one query, one head)."""
+    if len(keys) == 0:
+        return E(np.zeros(0))
+    s = rf.scale(rf.contract(E(qh[None]), keys)[0], rf.f32(scale_))
+    m = _emax(s)
+    ex = rf.exp(rf.sub(s, E(np.full(len(keys), m.v), np.full(len(keys), m.e))))
+    D = rf.add(rf.esum(ex[None])[0:1], rf.exp(rf.sub(E(np.array([sink])), E(np.array([m.v]), np.array([m.e])))))
+    return rf.div(ex, E(np.full(len(keys), D.v[0]), np.full(len(keys), D.e[0])))
+
+
+def _slots_row(op, values: dict, width: int) -> tuple[np.ndarray, np.ndarray]:
+    v, e = np.zeros(width), np.zeros(width)
+    for s, (vv, ee) in values.items():
+        v[s], e[s] = vv, ee
+    return v, e
+
+
+def op_ds_attn_probs(op, x, r, c0, c1):
+    """Query r's probabilities, [heads · slots]: slot j < n_window its j-th window key (oldest first), slot
+    n_window + i its i-th pick; zero where there's no key. ins and attrs as ds_attn's, plus slots (n_window + k)."""
+    a = op.attrs
+    hd, S = op.ishapes[1][1], a["slots"]
+    win, sel, slots = _keys(op, x, r)
+    keys = np.concatenate([win, sel]) if len(sel) else win
+    sinks = vec(x, a["sink"])
+    v, e = np.zeros(op.shape[1]), np.zeros(op.shape[1])
+    for h in range(c0 // S, (c1 - 1) // S + 1):
+        p = probs(x.get(op.ins[0], r, r + 1, h * hd, (h + 1) * hd)[0], keys, float(sinks[h]), a["scale"])
+        for j, s in enumerate(slots):
+            v[h * S + s], e[h * S + s] = p.v[j], p.e[j]
+    return E(v[c0:c1], e[c0:c1])
+
+
+def op_ds_attn_dp(op, x, r, c0, c1):
+    """dP_j = do · v_j for query r's key slots (the keys are the values), [heads · slots]. ins (do [T, heads·hd],
+    kv, comp, picks); attrs window, n_window, slots."""
+    a = op.attrs
+    hd, S = op.ishapes[1][1], a["slots"]
+    win, sel, slots = _keys(op, x, r)
+    keys = np.concatenate([win, sel]) if len(sel) else win
+    v, e = np.zeros(op.shape[1]), np.zeros(op.shape[1])
+    for h in range(c0 // S, (c1 - 1) // S + 1):
+        if len(keys):
+            d = rf.contract(E(x.get(op.ins[0], r, r + 1, h * hd, (h + 1) * hd)), keys)[0]
+            for j, s in enumerate(slots):
+                v[h * S + s], e[h * S + s] = d.v[j], d.e[j]
+    return E(v[c0:c1], e[c0:c1])
+
+
+def op_ds_attn_ds(op, x, r, c0, c1):
+    """dS = P · (dP - δ), δ = Σ_j P_j · dP_j per head. ins (P, dP) [T, heads · slots]; attrs slots."""
+    S = op.attrs["slots"]
+    out = []
+    for h, j0, j1 in _segments(c0, c1, S):
+        p, dp = (x.get(n, r, r + 1, h * S, (h + 1) * S)[0] for n in op.ins)
+        delta = rf.esum(rf.mul(E(p), E(dp))[None])
+        out.append(rf.mul(E(p[j0:j1]), rf.sub(E(dp[j0:j1]), E(np.full(j1 - j0, delta.v[0]), np.full(j1 - j0, delta.e[0])))))
+    return rf._cat(*out)
+
+
+def op_ds_attn_dq(op, x, r, c0, c1):
+    """dq = scale · Σ_j dS_j · k_j, [heads · hd]. ins (dS, kv, comp, picks); attrs window, n_window, slots, scale."""
+    a = op.attrs
+    hd, S = op.ishapes[1][1], a["slots"]
+    win, sel, slots = _keys(op, x, r)
+    keys = np.concatenate([win, sel]) if len(sel) else win
+    parts = []
+    for h, j0, j1 in _segments(c0, c1, hd):
+        ds_ = x.get(op.ins[0], r, r + 1, h * S, (h + 1) * S)[0][slots] if len(slots) else np.zeros(0)
+        d = rf.contract(E(ds_[None]), keys[:, j0:j1].T)[0] if len(slots) else E(np.zeros(j1 - j0))
+        parts.append(rf.scale(d, rf.f32(a["scale"])))
+    return rf._cat(*parts)
+
+
+def op_ds_attn_dkv(op, x, r, c0, c1):
+    """Window key r's gradient (as key and as value), [hd]: Σ over the queries t in [r, r + window) and every head h
+    of scale · dS[t, h, slot] · q[t, h] + P[t, h, slot] · do[t, h], slot = r - max(0, t - window + 1); then + acc.
+    ins (dS, P, q, do[, acc]); attrs heads, window, scale, slots."""
+    a = op.attrs
+    H, W, S = a["heads"], a["window"], a["slots"]
+    T = op.ishapes[0][0]
+    hd = op.shape[1]
+    c = rf.f32(a["scale"])
+    coef, rows = [], []
+    for t in range(r, min(T, r + W)):
+        slot = r - max(0, t - W + 1)
+        dsr, pr = x.row(op.ins[0], t), x.row(op.ins[1], t)
+        for h in range(H):
+            coef += [dsr[h * S + slot], pr[h * S + slot]]
+            rows += [x.get(op.ins[2], t, t + 1, h * hd + c0, h * hd + c1)[0], x.get(op.ins[3], t, t + 1, h * hd + c0, h * hd + c1)[0]]
+    if not rows:
+        return _acc(op, x, r, c0, c1, E(np.zeros(c1 - c0)), 4)
+    coef = np.array(coef)
+    ce = E(np.where(np.arange(len(coef)) % 2 == 0, coef * c, coef),
+           np.where(np.arange(len(coef)) % 2 == 0, rf.U * np.abs(coef * c), 0.0))  # scale · dS, rounded
+    y = rf.contract(E(ce.v[None], ce.e[None]), np.array(rows).T)[0]
+    return _acc(op, x, r, c0, c1, y, 4)
+
 # --- choices: judged by whole rows (referee.CHOICES), exactly, against the committed scores ----------------------------
 # A choice is a function of scores the state already holds, and those were judged in their own op (within their
 # bounds). So a worker may break near-ties either way, as its own scores fall, but may choose nothing its scores don't
