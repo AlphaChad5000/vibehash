@@ -379,12 +379,29 @@ def op_add(op, x, r, c0, c1):
     return add(E(x.get(a, r, r + 1, c0, c1)[0]), E(x.get(b, r, r + 1, c0, c1)[0]))
 
 
-def _silu(g: np.ndarray) -> E:
-    return div(E(g), add(E(1.0), exp(E(-g))))
+OVERFLOW = 88.0  # float32's e^x overflows to ∞ just above 88.72: kernels' e^−g may, for g below −88
 
 
 def _sigmoid(g: np.ndarray) -> E:
-    return div(E(1.0), add(E(1.0), exp(E(-g))))
+    """1/(1 + e^−g). Below −OVERFLOW, float32's e^−g may be ∞, so an honest kernel gets 0 where the value is under
+    2⁻¹²⁶ (or a subnormal, by e^g/(1 + e^g)): any number from the value to 0 passes, worked out as e^g/(1 + e^g),
+    which doesn't overflow (and is exactly 0 below −746, where the bound used to be ∞ and anything passed)."""
+    g = np.asarray(g, dtype=np.float64)
+    far = g < -OVERFLOW
+    s = div(E(1.0), add(E(1.0), exp(E(np.where(far, 0.0, -g)))))
+    t = dexp(np.where(far, g, 0.0))
+    t = t / (1.0 + t)
+    return E(np.where(far, t, s.v), np.where(far, t, s.e))
+
+
+def _silu(g: np.ndarray) -> E:
+    """g/(1 + e^−g), and below −OVERFLOW g·e^g/(1 + e^g), anything from it to 0 (see _sigmoid)."""
+    g = np.asarray(g, dtype=np.float64)
+    far = g < -OVERFLOW
+    s = div(E(g), add(E(1.0), exp(E(np.where(far, 0.0, -g)))))
+    t = dexp(np.where(far, g, 0.0))
+    t = g * (t / (1.0 + t))
+    return E(np.where(far, t, s.v), np.where(far, np.abs(t), s.e))
 
 
 def op_silu_mul(op, x, r, c0, c1):
@@ -588,6 +605,11 @@ class Missing(LookupError):
     """The referee asked for a number the evidence doesn't prove."""
 
 
+class Unresolved(ArithmeticError):
+    """A number of the tile has no finite bound (a division by an interval around 0, say): the referee can't say
+    either way, so the game ends unchecked. An infinite bound used to let any number pass."""
+
+
 def tile_rows(shape: tuple[int, int], leaf: int) -> list[tuple[int, int, int]]:
     """The output numbers a tile (one leaf of the output's Merkle tree) covers, as (row, first column, end)."""
     rows, cols = shape
@@ -611,6 +633,11 @@ def judge(op, x, leaf: int, said: np.ndarray) -> tuple[bool, str]:
     if said.shape != v.shape:
         return False, "the tile has the wrong size"
     masked = np.isinf(v)
+    loose = ~masked & ~(np.isfinite(e) & ~np.isnan(v))
+    if loose.any():
+        i = int(np.argmax(loose))
+        raise Unresolved(f"{op.kind} → {op.out}, number {leaf * LEAF + i}: the referee can't bound it "
+                         f"(exact {float(v[i])!r}, bound {float(e[i])!r})")
     allowed = MARGIN * e + REL * np.abs(v) + FLOOR
     with np.errstate(invalid="ignore"):
         off = np.where(masked, np.where(said == v, 0.0, np.inf), np.abs(said - v) / allowed)

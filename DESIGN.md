@@ -659,6 +659,12 @@ Each step:
    Errors of earlier steps of the op are carried through by each step's derivative. A number passes within MARGIN
    (1.25) times its bound, plus 2⁻³⁰ of its value, plus 2⁻¹²⁶ (for GPUs that flush subnormals); the attention mask's −∞
    must be exact.
+   - **Overflow:** float32's e^x is ∞ above 88.72, so silu and its sigmoid for g below −88 may come out 0 in an honest
+     kernel (g/(1 + ∞)) where the value is under 2⁻¹²⁶: any number from the value to 0 passes there, and the value is
+     worked out as g·e^g/(1 + e^g), which doesn't overflow (`referee._silu`).
+   - **No bound:** a number whose bound comes out ∞ or NaN (a division by an interval around 0, say) leaves the
+     referee unable to say either way (`referee.Unresolved`): the game ends unchecked, nobody slashed, and a
+     challenger doesn't pick such a tile. (An ∞ bound used to pass any number: silu below −746 did.)
    - **Why the sum bound is statistical.** The worst case, γ_K·Σ|terms| (Higham §3.1), allows K roundings all one way:
      the second review measured 1.5% of an output at K = 2560 against 2.7e-7 of honest error. That is room for a worker
      to compute every projection in TF32 or with bf16 activations, or to steer every op, and still pass, and for the

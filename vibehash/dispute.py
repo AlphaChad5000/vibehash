@@ -27,6 +27,7 @@ can't be reached, the claim ends unchecked and nobody is slashed.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import types
@@ -299,7 +300,7 @@ def evidence_cap(op, tile, outside: Outside) -> int:
         return MAX_EVIDENCE
     shapes = dict(zip(op.ins, op.ishapes))
     x = Inputs(shapes, outside, full={n: _Blank(s) for n, s in shapes.items()})
-    with np.errstate(all="ignore"):
+    with np.errstate(all="ignore"), contextlib.suppress(referee.Unresolved):  # (zeros may leave a bound loose)
         referee.judge(op, x, tile, np.zeros(LEAF))
     return MAX_EVIDENCE + 2 * 4 * LEAF * sum(len(v) for v in x.used.values())
 
@@ -322,7 +323,10 @@ def make_evidence(op, tile, before: dict, after: dict, manifests: tuple[bytes, b
     if op.out:
         x = Inputs(shapes or {n: a.shape for n, a in before.items()}, outside, full=before)
         said = np.ascontiguousarray(after[op.out], dtype="<f4").reshape(-1)[tile * LEAF:(tile + 1) * LEAF]
-        ok, why = referee.judge(op, x, tile, said)
+        try:
+            ok, why = referee.judge(op, x, tile, said)
+        except referee.Unresolved as e:  # (the leaves it read are noted all the same)
+            ok, why = True, str(e)
         for name, idx in sorted(x.used.items()):
             header["tensors"][f"in:{name}"], chunks[f"in:{name}"] = _proof(before[name], idx)
         header["tensors"][f"out:{op.out}"], chunks[f"out:{op.out}"] = _proof(after[op.out], [tile])
@@ -379,6 +383,8 @@ def judge_evidence(op, tile, a: str, b: str, evidence: bytes, outside: Outside) 
         return ("defender" if ok else "challenger"), why
     except referee.Missing as e:
         return "challenger", f"the evidence doesn't prove {e}"
+    except referee.Unresolved as e:
+        return "unchecked", str(e)
     except (MerkleError, ValueError, TypeError, KeyError) as e:
         return "challenger", f"the evidence is malformed: {e}"
     except WeightsUnavailable as e:

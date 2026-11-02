@@ -504,7 +504,10 @@ class Party:
         theirs = after[op.out].detach().cpu().numpy().reshape(-1)
         for tile in order:
             said = theirs[tile * merkle.LEAF:(tile + 1) * merkle.LEAF]
-            ok, _ = referee.judge(op, Inputs(full.shapes(), out, full=full), tile, said)
+            try:
+                ok, _ = referee.judge(op, Inputs(full.shapes(), out, full=full), tile, said)
+            except referee.Unresolved:  # the referee can't say: not a tile to win on
+                continue
             if not ok:
                 return tile
         return None

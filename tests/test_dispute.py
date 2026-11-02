@@ -441,6 +441,51 @@ class BoundTests(unittest.TestCase):
             allowed = referee.MARGIN * want.e + referee.REL * np.abs(want.v) + referee.FLOOR
             self.assertLess(np.median(allowed / np.abs(want.v)), 1e-4, K)  # (it was ~1.5% at K = 2560)
 
+    def test_silu_where_float32_exp_overflows(self):
+        """The second review's finding 8: for g between about −88.7 and −91.9, float32's e^−g is ∞ and torch's silu
+        gives −0 where the value is about −2e−37, which failed; below −746 the bound was ∞ and anything passed."""
+        from vibehash.program import Op
+
+        g = np.array([-50, -87, -88.5, -88.8, -89, -90, -91, -92, -104, -150, -700, -760, -1e4, 3, 88] * 18,
+                     dtype=np.float32)[:256]
+        u = np.random.default_rng(2).normal(0, 1, g.shape).astype(np.float32)
+        x = {"g": g[None], "u": u[None]}
+        op = Op("silu_mul", "m", ("g", "u"), {}, (), (1, 256), ((1, 256), (1, 256)))
+        out = dispute.Outside(None, None, None)
+        if torch is not None:
+            torch_said = (torch.nn.functional.silu(torch.from_numpy(g)) * torch.from_numpy(u)).numpy()
+            self.assertEqual(referee.judge(op, dispute.Inputs({"g": (1, 256), "u": (1, 256)}, out, full=x), 0,
+                                           torch_said)[0], True)
+        with np.errstate(over="ignore"):
+            said = (u * (g / (np.float32(1) + np.exp(-g)))).astype(np.float32)
+        self.assertTrue(referee.judge(op, dispute.Inputs({"g": (1, 256), "u": (1, 256)}, out, full=x), 0, said)[0])
+        for i in (12, 7):  # g = −1e4 (its bound was ∞), and −92
+            bad = said.copy()
+            bad[i] = 1e-3
+            self.assertFalse(referee.judge(op, dispute.Inputs({"g": (1, 256), "u": (1, 256)}, out, full=x), 0, bad)[0])
+
+    def test_a_number_the_referee_cant_bound_leaves_the_game_unchecked(self):
+        """The second review's finding 8: an infinite (or NaN) bound let any number pass. Now the referee says it
+        can't tell (referee.Unresolved): the game ends unchecked, and a challenger doesn't pick such a tile."""
+        from unittest import mock
+
+        from vibehash.program import Op
+
+        def loose(op, x, r, c0, c1):
+            v = x.get("x", r, r + 1, c0, c1)[0]
+            return referee.E(v, np.where(np.arange(c0, c1) == 5, np.inf, 0.0))
+        op = Op("loose", "y", ("x",), {}, (), (1, 256), ((1, 256),))
+        x = np.ones((1, 256), dtype=np.float32)
+        before, after, out = {"x": x}, {"x": x, "y": x + 7}, dispute.Outside(None, None, None)
+        ms = (dispute.state_manifest(before)[0], dispute.state_manifest(after)[0])
+        with mock.patch.dict(referee.OPS, {"loose": loose}):
+            with self.assertRaises(referee.Unresolved):
+                referee.judge(op, dispute.Inputs({"x": (1, 256)}, out, full=before), 0, after["y"][0])
+            evidence, _, _ = dispute.make_evidence(op, 0, before, after, ms, out)
+            verdict, why = dispute.judge_evidence(op, 0, *(merkle.state_root(m) for m in ms), evidence, out)
+        self.assertEqual(verdict, "unchecked", why)
+        self.assertIn("can't bound", why)
+
     def test_honest_sums_land_well_inside_the_model(self):
         """The calibration behind SPREAD_C: float32 dot products, by numpy, by torch on the CPU and CUDA, and by a
         naive sequential loop, on random, same-sign, alternating and heavy-tailed terms, land within 2 of the
