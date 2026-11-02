@@ -174,18 +174,21 @@ class LocalRunTests(unittest.TestCase):
         self.assertTrue(node.chain.state.balance(workers[0].address), "the honest worker was paid")
         self.assertLess(node.chain.state.escrow[JOB], 200 * VIBE)
 
-        # The disputes: refereed op by op, the cheat's down to the op it scaled, and slashed; the false accuser, finding
-        # no op the referee would refuse, withdraws its rejections (unpaid, not slashed).
+        # The disputes: refereed op by op, the cheat's down to the op it scaled, and slashed. The false accuser wins its
+        # games against the cheat and, finding no op the referee would refuse in the honest worker's, withdraws those
+        # (unpaid, not slashed). Its four games a round may all go on the cheat's claims (coordinator.MAX_GAMES).
         games = [g for r in training for g in r.get("games", [])]
         lost = [g for g in games if g["defender"] == workers[2].address and g["outcome"] == "challenger"]
         self.assertTrue(lost, [(g["defender"][:12], g["outcome"], g["detail"]) for g in games])
         self.assertTrue(any(g["detail"].startswith("ds_attn_dkv") for g in lost), [g["detail"] for g in lost])
-        self.assertTrue(any(g["challenger"] == workers[1].address and g["outcome"] == "withdrawn" for g in games),
-                        [(g["challenger"][:12], g["outcome"], g["detail"]) for g in games])
+        accused = [g for g in games if g["challenger"] == workers[1].address]
+        self.assertTrue(accused and not [g for g in accused if g["outcome"] == "defender" or
+                                         g["outcome"] == "challenger" and g["defender"] != workers[2].address],
+                        [(g["defender"][:12], g["outcome"], g["detail"]) for g in accused])
         slashes = [s for b in node.chain.blocks if b.summary and not by_height[b.height].get("prep")
                    for s in b.summary.slashes]
-        self.assertTrue(any(s[0] == workers[2].address and s[2] == "failed_replay" and s[1] == workers[0].address
-                            for s in slashes), slashes)  # caught by the honest checker, who gets the bounty
+        self.assertTrue(any(s[0] == workers[2].address and s[2] == "failed_replay" and s[1] in
+                            (workers[0].address, workers[1].address) for s in slashes), slashes)  # its catcher's bounty
         self.assertFalse([s for s in slashes if s[0] in (workers[0].address, workers[1].address)], slashes)
 
         # An outside auditor replays every round from its record, the prep's included, and referees every game again:
