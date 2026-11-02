@@ -510,9 +510,22 @@ forward.
 - **RAM and disk.** The top 4 layers and the head are 30.9 GB on disk (files
   39–43; 60.4 GB for the top 8), plus the miner's data shard.
   - Held in pinned RAM, they need a 48 GB PC.
-  - Streamed from an NVMe SSD instead: 7.2 GB per layer per direction per step,
-    about 19 s a step at 3 GB/s for K = 4. That's balanced against a step of
-    about 8K tokens at §7's 0.6 ms a token a layer, and needs 16 GB of RAM.
+  - Mapped from the disk instead, they need 16 GB of RAM
+    (`read_safetensors(..., mmap=True)` and `deepseek_top.build_trained`).
+    - Everything but the routed experts goes on the GPU.
+    - The experts stay the file's own bytes, read as each one's turn comes. The
+      OS keeps what RAM allows, so 32 GB is faster.
+    - Tested: the experts aren't copied, and a streamed step equals one from
+      RAM to the bit.
+    - On an NVMe SSD the reads are 7.2 GB per layer per direction per step:
+      about 19 s a step at 3 GB/s for K = 4. That's balanced against a step of
+      about 8K tokens at §7's 0.6 ms a token a layer. A SATA SSD is about 6×
+      slower.
+  - Disk for the pilot: 30.9 GB of model plus the miner's share of the 10.7 GB
+    of train records (and the 3.8 GB held back, for a scorer). That's under
+    40 GB for anyone sharing the records with others, and up to 45 GB for one
+    miner training on all of them. A prep piece's holder needs 29.6 GB plus
+    ~2 GB of hand-offs in flight.
 - **Data.** One step of 8 sequences of 512 tokens is 170 MB of records (90 MB
   with FP8). So a miner holds a shard of the dataset (say 10 GB, 240K tokens)
   that its units draw their batches from. Units can't draw from the whole
@@ -962,6 +975,71 @@ The wiring around it, once PR #5 merges:
    miner on a shard, for 3 passes. Each step reports `Meter`'s stats. The
    scorers' held-back loss on the 500 goes into `store.job_rounds`.
 5. **The result:** the adapter in PEFT's format, `layers_to_transform` 36–39.
+
+For launch day, the same wiring PR also needs:
+- **The worker's model files kept by `vibehash/modelstore.py`**, as "Model files
+  on a miner's PC" below has it. The worker asks before the ~30 GB download
+  (with an unattended yes), and `vibehash cache` and `vibehash cache clear`
+  come in, as do disk use on the dashboard and the location question in setup.
+- **The worker says clearly when a PC can't take DeepSeek work** (no NVIDIA GPU
+  with 8 GB, under 16 GB of RAM, or under ~40 GB free on an SSD). It keeps
+  earning on other jobs.
+- **A "Mining the DeepSeek job" section in `docs/guide.html`**, in the guide's
+  voice, keeping its ids and JS working, with main merged first. It covers:
+  - the job (the think-shorter pilot) and its requirements;
+  - what the worker downloads and when;
+  - prep pieces and training units, from a miner's point of view;
+  - where the data comes from: the bucket, through links from the node;
+  - how to follow it: the front page's featured panel and `job watch`;
+  - where the model files go, how much space they may take, and when they're
+    deleted (below).
+- **The front page's requirements** come from this section. They're "an NVIDIA
+  card with 8 GB or more (RTX 20-series or newer), 16 GB of memory (32 GB is
+  faster), about 40 GB free on an SSD, about 30 GB downloaded once". They hold
+  with the mapped experts above. A miner who trains alone on all the pilot's
+  records needs up to 45 GB.
+
+**Model files on a miner's PC** (`vibehash/modelstore.py`, built and tested in
+`tests/test_modelstore.py`). The owner's rule: the ~30 GB must never become
+permanent clutter on someone's C: drive.
+1. **Asked first.** Before any big download, the worker says what it is, how
+   big, and where it goes, and offers another place. The drives are listed with
+   their free space; the default is the one with the most room, and the choice
+   is remembered (config.json's "models"). An unattended flag says yes, and the
+   folder can be set outright.
+2. **A cap the user sets** ("use up to 40 GB").
+   - The store never goes over it. It evicts other jobs' least recently used
+     model files first.
+   - It refuses a job whose files won't fit, under the cap or on the disk (it
+     leaves 2 GB free), rather than overflowing. Other jobs carry on.
+3. **Not permanent by default.**
+   - A job's model files are deleted when the job ends, or after 7 days without
+     mining it, whichever comes first.
+   - A setting keeps them for next time, which saves re-downloading on a slow
+     link. Kept files still give way to the cap.
+   - A file two jobs use stays while either needs it.
+   - Hand-offs, data shards and checkpoints are temporary: deleted once used
+     and accepted.
+4. **Visible and removable.**
+   - `entries()` is what `vibehash cache` lists: what, where, how big and why.
+   - `clear()` removes everything, or one job's files.
+   - `usage()` is the dashboard's disk use.
+   - `choose()` is setup's one-time location question. Changing the place
+     deletes what the old one held instead of leaving it behind.
+5. **No partial download left behind.** Downloads resume from their `.part`
+   file (`deepseek.fetch_file`, which now takes the store's folder). The index
+   knows a download while it's under way, so `clear`, the job's end and the
+   weekly sweep remove any that won't be resumed.
+
+The front page says: "You choose where it goes and how much space it may use,
+and it's deleted when the job ends, unless you'd rather keep it for next time."
+What's left for the wiring PR, since these all live in PR #5's files:
+- the worker's prompt and its unattended flag;
+- `vibehash cache` and `vibehash cache clear [job]` in the CLI;
+- the dashboard's disk use;
+- the setup question.
+
+The fine-tune path can use the store the same way.
 
 **Build order for this route** (replacing §5's 3–7 for the first project):
 1. Done (§7): `deepseek.py`.

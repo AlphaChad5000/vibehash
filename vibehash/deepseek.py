@@ -1249,22 +1249,28 @@ SAFETENSORS_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8
                       "BF16": torch.bfloat16, "F32": torch.float32}
 
 
-def read_safetensors(path: str | Path, names=None, device="cpu") -> dict:
+def read_safetensors(path: str | Path, names=None, device="cpu", mmap: bool = False) -> dict:
     """Tensors of a local safetensors file (all, or those in `names`), as stored. The header is checked as
-    hub.parse_header checks any downloaded one."""
+    hub.parse_header checks any downloaded one. mmap=True maps the file instead of reading it (on the CPU): a
+    tensor's bytes come off the disk when it's used, and the OS can drop them again, so a PC with 16 GB of RAM can
+    train four layers of 7.4 GB, each expert read from the SSD as its turn comes (DEEPSEEK.md §8)."""
     from .hub import parse_header
     path = Path(path)
     with open(path, "rb") as f:
         n = int.from_bytes(f.read(8), "little")
         header = parse_header(f.read(n), path.stat().st_size, str(path))
+        mapped = np.memmap(path, np.uint8, "c") if mmap else None  # copy-on-write: writable, the file untouched
         out = {}
         for name, (dtype, shape, begin, end) in header.tensors.items():
             if names is not None and name not in names:
                 continue
             if dtype not in SAFETENSORS_DTYPES:
                 raise ValueError(f"{path.name}: tensor {name} is {dtype}, which DeepSeek-V4.1 doesn't use")
-            f.seek(header.data_start + begin)
-            raw = torch.frombuffer(bytearray(f.read(end - begin)), dtype=torch.uint8)
+            if mapped is not None:
+                raw = torch.from_numpy(mapped[header.data_start + begin:header.data_start + end])
+            else:
+                f.seek(header.data_start + begin)
+                raw = torch.frombuffer(bytearray(f.read(end - begin)), dtype=torch.uint8)
             out[name] = raw.view(SAFETENSORS_DTYPES[dtype]).reshape(shape).to(device)
     return out
 
@@ -1278,9 +1284,10 @@ PIECE = 64 * 2**20  # a weight file downloads in pieces this big, several at onc
 FETCHERS = 6
 
 
-def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=None, workers: int = FETCHERS) -> Path:
-    """One weight file of the pinned commit, downloaded whole into cache_dir() and checked against the sha256 the Hub
-    publishes for it. It comes in 64 MiB ranged reads over `workers` connections at once: the Hub's CDN slows a long
+def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=None, workers: int = FETCHERS,
+               folder: Path | None = None) -> Path:
+    """One weight file of the pinned commit, downloaded whole into `folder` (default cache_dir(); a miner's worker
+    lets modelstore choose it) and checked against the sha256 the Hub publishes for it. It comes in 64 MiB ranged reads over `workers` connections at once: the Hub's CDN slows a long
     single stream (measured: a fresh connection 30-37 MiB/s, one that had been running two minutes 1.5 MiB/s), and
     each piece is a fresh request. A dropped connection resumes within its piece, and a restart skips the pieces
     already written (listed in a .done file beside the .part). Refuses to start without room for it on the disk."""
@@ -1289,7 +1296,7 @@ def fetch_file(path: str, hub=None, repo: str = REPO, commit: str = COMMIT, log=
     from .hub import Hub, IntegrityError, _FileCheck
     hub = hub or Hub()
     info = hub.list_files(repo, commit)[path]
-    folder = cache_dir(commit)
+    folder = Path(folder) if folder is not None else cache_dir(commit)
     folder.mkdir(parents=True, exist_ok=True)
     dest, part, listed = folder / path, folder / (path + ".part"), folder / (path + ".done")
     if dest.exists() and dest.stat().st_size == info.size:
@@ -1345,7 +1352,7 @@ def layer_files(layer: int, hub=None, repo: str = REPO, commit: str = COMMIT) ->
     return out
 
 
-def load_layer(layer: int, device="cpu", hub=None, log=None) -> dict:
+def load_layer(layer: int, device="cpu", hub=None, log=None, mmap: bool = False) -> dict:
     """Layer `layer`'s tensors from DeepSeek's checkpoint, fetching the files that hold them (each is one whole layer,
     7.4 GB) unless cached. Layers 1 and 14 also have an engram table in a 101 GB file: not fetched here (per-job
     slices of it are DEEPSEEK.md's step 4)."""
@@ -1353,7 +1360,7 @@ def load_layer(layer: int, device="cpu", hub=None, log=None) -> dict:
     for file, names in layer_files(layer, hub).items():
         if any(".engram.embed." in n for n in names):
             raise ValueError(f"layer {layer}'s engram table is in {file} (101 GB); load_layer doesn't fetch tables")
-        out.update(read_safetensors(fetch_file(file, hub, log=log), set(names), device))
+        out.update(read_safetensors(fetch_file(file, hub, log=log), set(names), device, mmap=mmap))
     return out
 
 

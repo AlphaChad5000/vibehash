@@ -10,6 +10,7 @@ with its bottom frozen, to the bit.
 - PeftTests (needs PEFT): the adapter, saved in PEFT's format under the checkpoint's names, loads into PEFT with
   layers_to_transform and computes what deepseek.py's adapted projections compute.
 """
+import gc
 import json
 import tempfile
 import unittest
@@ -50,6 +51,20 @@ def models(cfg, state, first, num=None, device="cpu", train_num=None):
     low = top.freeze(Model(cfg, range(first), num, device=device, head=False).load_weights(bottom))
     high = top.freeze(Model(cfg, cut.trained, train_num, device=device, embed=False).load_weights(upper))
     return cut, whole, low, high
+
+
+def write_safetensors(path, tensors):
+    """A safetensors file, as DeepSeek's are laid out (the tests' own writer: no safetensors package needed)."""
+    names = {v: k for k, v in deepseek.SAFETENSORS_DTYPES.items()}
+    header, blobs, at = {}, [], 0
+    for name, t in tensors.items():
+        raw = t.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        header[name] = {"dtype": names[t.dtype], "shape": list(t.shape), "data_offsets": [at, at + len(raw)]}
+        blobs.append(raw)
+        at += len(raw)
+    head = json.dumps(header).encode()
+    head += b" " * (-len(head) % 8)
+    Path(path).write_bytes(len(head).to_bytes(8, "little") + head + b"".join(blobs))
 
 
 def learned(tokens, seed):
@@ -161,6 +176,36 @@ class StreamedTests(unittest.TestCase):
         self.compare(Config(), 3, 160, "cpu")
         cfg = tiny_config()
         self.compare(cfg, 4, 24, "cpu", token_map_for(cfg))
+
+    def test_experts_mapped_from_the_disk(self):
+        """build_trained over read_safetensors(..., mmap=True), as a 16 GB PC holds four 7.4 GB layers: the experts
+        stay the file's mapped bytes, and a streamed step is the same as from RAM, to the bit."""
+        cfg, first = Config(), 3
+        state = deepseek.random_weights(cfg, 0)
+        tokens = tokens_for(cfg, 1, 96, seed=20)
+        cut, _, low, ram = models(cfg, state, first, train_num=top.TRAIN)
+        batches = [top.precompute(low, cut, tokens, learned(tokens, 30))[0]]
+        def run(high):
+            ad = Adapters.fresh(high, cut, seed=7)
+            ad.attach(high)
+            losses = [top.train_step_streamed(high, cut, ad, batches, s, 1e-3, device="cpu") for s in (1, 2)]
+            return losses, torch.cat([b.detach().reshape(-1) for b in ad.b])
+
+        def from_disk(path):
+            mapped = deepseek.read_safetensors(path, mmap=True)
+            disk = top.build_trained(cut, mapped)
+            self.assertEqual(disk.layers["3"].ffn.experts[0].w1.weight.data_ptr(),
+                             mapped["layers.3.ffn.experts.0.w1.weight"].data_ptr())  # the mapped bytes, not a copy
+            return run(disk)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "upper.safetensors"
+            write_safetensors(path, split(cfg, state, first)[1])
+            disk = from_disk(path)
+            gc.collect()  # the mapping goes with the model, before the folder does (Windows won't delete it before)
+        losses, b = run(ram)
+        self.assertEqual(losses, disk[0])
+        self.assertTrue(torch.equal(b, disk[1]))
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs a CUDA GPU")
     def test_cuda_with_experts_in_ram(self):

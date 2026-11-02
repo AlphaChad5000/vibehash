@@ -539,3 +539,29 @@ def freeze(model: Model) -> Model:
     for p in model.parameters():
         p.requires_grad_(False)
     return model
+
+
+def build_trained(cut: Cut, weights: dict, device="cpu", num: ds.Numerics = TRAIN) -> Model:
+    """The trained layers and the head as a miner holds them, frozen: everything on `device` (cast as `num` keeps
+    it) but the routed experts' quantised matrices, which stay the very tensors in `weights`. With weights from
+    read_safetensors(..., mmap=True), the experts (7.2 GB a layer) stay on the disk until train_step_streamed brings
+    each one over, and the OS keeps what RAM allows: that's how a PC with 16 GB of RAM trains four layers
+    (DEEPSEEK.md §8). With 48 GB they all stay in memory, and an NVMe SSD makes the difference small."""
+    model = Model(cut.cfg, cut.trained, num, device="meta", embed=False)
+    experts = {n for n, _ in model.named_buffers() if ".ffn.experts." in n}
+    for name, mod in model.named_modules():
+        if ".ffn.experts" not in name:
+            mod.to_empty(device=device, recurse=False)
+    rest = {k: v for k, v in weights.items() if k not in experts and not k.endswith(ds.IMAGE_ONLY)}
+    got = model.load_state_dict(rest, strict=False)
+    if got.unexpected_keys or set(got.missing_keys) - experts:
+        raise ValueError(f"the trained layers' weights don't fit: missing {sorted(set(got.missing_keys) - experts)[:5]}, "
+                         f"unexpected {got.unexpected_keys[:5]}")
+    for name in experts:
+        *parents, leaf = name.split(".")
+        mod, t = model.get_submodule(".".join(parents)), weights[name]
+        if t.shape != mod._buffers[leaf].shape or t.dtype != mod._buffers[leaf].dtype:
+            raise ValueError(f"{name}: {t.dtype} {list(t.shape)}, not {mod._buffers[leaf].dtype} "
+                             f"{list(mod._buffers[leaf].shape)}")
+        mod._buffers[leaf] = t
+    return freeze(model)
