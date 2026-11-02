@@ -266,11 +266,27 @@ main section > h2::before, main section > .head > h2::before { content: counter(
 .tag { border-radius: 2px; }
 .bar, .progress, .bars i, .layers i { border-radius: 0; }
 
+/* Gold is kept for the brand mark, the headline's accent, and data (the layer bars, charts, progress). Everything
+   structural (section numbers, rules, links, controls) is neutral. */
+main section > h2::before, main section > .head > h2::before { color: var(--ink-2); }
+.step b, .setup > li::before { color: var(--ink-2); }
+.pillar { border-top-color: var(--rule); }
+.callout, .callout.deepseek { border-left-color: var(--ink-2); }
+.bubble.a { border-left-color: var(--ink-2); }
+.feat-eyebrow { color: var(--ink-2); }
+.stages li.now { color: var(--ink) !important; }
+.copy { color: var(--band-ink); }
+.copy:hover { border-color: var(--band-ink-2); }
+.os button[aria-pressed="true"] { border-color: var(--band-ink); }
+main a, footer a, .faq a { color: var(--ink); text-decoration-color: var(--ink-2); }
+main a:hover, footer a:hover { text-decoration-color: var(--ink); }
+.install p a { color: var(--band-ink); }
+.faq summary::after { color: var(--ink-2); }
 /* The page's scrollbar, in the brand's colours. */
-html { scrollbar-width: thin; scrollbar-color: #8a6a2c var(--paper); }
+html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: var(--paper); }
-::-webkit-scrollbar-thumb { background: #8a6a2c; border: 2px solid var(--paper); }
+::-webkit-scrollbar-thumb { background: #5a544c; border: 2px solid var(--paper); }
 ::-webkit-scrollbar-thumb:hover { background: #f1b23c; }
 
 </style>
