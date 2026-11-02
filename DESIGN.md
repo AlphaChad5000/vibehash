@@ -649,13 +649,16 @@ Each step:
        accuse.
      - **When the phase ends** with a game unfinished, the party whose move it is loses only if that move's own
        deadline has passed. If it hasn't, the game ends unchecked (`dispute.cut_short`), and nobody is slashed: the
-       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes.
+       phase's length isn't a party's fault. Like every deadline, that's the leader's clock, which a validator takes,
+       but only where it can be true: the phase has room for the game's most moves, so a game can be cut short in
+       time only once it has made all but one of them. Before that, some move overran, and the party whose move it
+       is loses (the third review).
 5. **The referee** works out, in float64, each output number's exact value given the defender's own inputs, and a bound
    on how far an honest float32 computation of it can land (`referee.E`, running error analysis). Each op is the
    sequence of float32 operations `tracer.py` runs, and each step of it adds what a rounding can:
    - a correctly rounded operation (+ − × ÷ √), u = 2⁻²⁴ of its result;
    - exp, log or rsqrt, 4 ulps (CUDA's are 1 to 2, the CPU's at most 1);
-   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), with M the largest partial sum any honest order
+   - a dot product or sum of K terms: SPREAD_C·u·(√K·M + ‖terms‖₂), or γ_K·Σ|terms| where tighter (a few terms), with M the largest partial sum any honest order
      forms (`referee.spread`: the largest |sum| of a run of terms contiguous at a stride of 1 to 32, covering
      sequential, blocked, split-K, pairwise and 32-lane strided accumulation).
    Errors of earlier steps of the op are carried through by each step's derivative. A number passes within MARGIN
@@ -737,11 +740,14 @@ Each step:
     `move_s`, from `program.dispute_size`), so validators wait long enough for a disputed round. It's that long only
     for a party that makes every move just in time: the phase ends when every dispute has. No phase is longer than
     `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
-    - **A limit:** a split can name gigabytes: K − 1 states of the adapters' B, m and v between steps (12.7 GB on
-      Qwen3-4B, all seven targets at rank 16, 64 steps a segment), or a layer's activations. At the reference upload
-      (2.5 MB/s) that's more than an hour, so such a job's moves get less time than they need (`MAX_PHASE_S` over the
-      moves), and a defender that slow loses. Jobs a node takes should keep a split to a few hundred MB: few steps a
-      segment (Qwen3-0.6B at 4 steps: 203 MB, 100 s).
+    - **Jobs whose disputes can't be played from home are refused** (the third review's finding B). A split can name
+      gigabytes: K − 1 states of the adapters' B, m and v between steps, or a layer's activations. At the reference
+      upload (REF_UPLOAD, 20 Mbit/s) a defender that slow would lose to a false accuser. So `post_job` refuses a job
+      whose largest split is over `tasks.MAX_SPLIT_BYTES` (512 MB), or whose moves need more than `MAX_PHASE_S` (an
+      hour) at the reference speeds. With the default unit (16 steps, 4 a segment) that admits Qwen3-0.6B up to about
+      960 tokens (203 MB and 31 minutes at 512), and no Qwen3-4B job: its B, m and v alone are 212 MB a step.
+      Per-move deadlines sized to each level's own split would admit it (only one or two levels have big splits);
+      that's the follow-up.
 
 **The security statement:** with the node as referee, if at least one of a claim's checkers is honest and online, a
 claim whose float32 work deviates from honest float32 by more than the referee's bounds anywhere is found bad; an
@@ -765,7 +771,10 @@ within 1.02).
   - **a game's starting states:** a validator rebuilds them from the reveal's checkpoints, fetched from the block's
     proposer (`node.LeaderBlobs`), and refuses a record whose states differ;
   - **outcomes:** it re-runs every referee, so a game the leader marks unchecked, or any edited outcome, doesn't
-    replay to its record.
+    replay to its record. It fetches each game's evidence from the proposer, which keeps it with the round's
+    checkpoints (`storage.record_blobs`); a block whose evidence it can't fetch, it refuses, rather than take the
+    record's word (the third review's finding A). Only a plain replay with nothing to fetch from (an old round, past
+    the window) counts such a game unchecked.
 - **What it still takes:** timing. The leader can drop a move and call it silence, or end the phase early, and a
   replay can't see clocks. Moves now get signed receipts as verdicts do, so a party holding one for a move the record
   lacks proves it was dropped (`receipts.audit`).
@@ -803,7 +812,9 @@ once a round would be a ledger change.
     finding 3). A checker opens at most `coordinator.MAX_GAMES` (4) disputes a round, fewer once it has accused in
     vain (`games_allowed`); its other rejections are ignored, and their claims stand on their other verdicts. That
     trades a little of the guarantee for liveness: an honest checker that finds more bad claims in one round than it
-    may dispute leaves the rest to their other checkers.
+    may dispute leaves the rest to their other checkers. So a cheat whose fifth bad claim is checked by the same
+    honest checker and by a colluder who approves it gets that claim accepted (it is still slashed for the four
+    disputed ones, and loses its stake on the first).
   - **Replay:** `replay.py` re-runs the round, plays each dispute's moves again (`Coordinator.submit_move`) and re-runs
     the referee on the recorded evidence, with weights it checked against the manifest, so it reaches the same verdicts
     without PyTorch or a GPU. It needs the Hub (or its tensor cache) for those weights, the checkpoints at each

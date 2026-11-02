@@ -1601,8 +1601,8 @@ def parser() -> argparse.ArgumentParser:
                    "huggingface.co address. Without a data file, shows what the model would take")
     p.add_argument("--rank", type=int, default=16, help="fine-tunes: LoRA rank (default 16)")
     p.add_argument("--lr", type=float, help="fine-tunes: Adam's learning rate (default: by model size)")
-    p.add_argument("--max-len", type=int, default=1024, help="fine-tunes: longest sequence in tokens; longer chats are "
-                   "cut (default 1024, at most 2048)")
+    p.add_argument("--max-len", type=int, default=512, help="fine-tunes: longest sequence in tokens; longer chats are "
+                   "cut (default 512, at most 2048; longer sequences make disputes too big to play from home)")
     p.add_argument("--units", type=int, default=8, help="fine-tunes: units of training a round (default 8)")
     p.add_argument("--yes", "-y", action="store_true", help="fine-tunes: don't ask before checking weights or posting")
     p.add_argument("--label", help="the column to predict (default: the last one)")

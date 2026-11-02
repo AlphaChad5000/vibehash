@@ -21,6 +21,21 @@ from .ledger import Block, Chain, canonical
 from .tasks import InvalidJob, TrainingJob, load_dataset
 
 
+def record_blobs(record: dict) -> set[str]:
+    """Blob ids a round's record points to: its reveals' opened checkpoints and finals, and its disputes' evidence (an
+    evidence move names its blob). A validator fetches them all from the proposer to replay the round, so the proposer
+    keeps them (the third review's finding A: evidence pruned at the round's end left validators nothing to referee)."""
+    keep: set[str] = set()
+    for rv in record.get("reveals", []):
+        keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+    for g in record.get("games", []):
+        for env in g.get("moves", []):
+            move = (env.get("body") or env).get("move") if isinstance(env, dict) else None
+            if isinstance(move, dict) and isinstance(move.get("evidence"), str):
+                keep.add(move["evidence"])
+    return keep
+
+
 class Store:
     def __init__(self, data_dir: str | Path):
         self.dir = Path(data_dir)
@@ -118,14 +133,13 @@ class Store:
         return None if row is None else json.loads(row[0])
 
     def evidence(self, tip: int, rounds: int) -> set[str]:
-        """Blob ids of the checkpoints the last `rounds` records point to: the opened checkpoints and finals
-        anyone re-checking those rounds needs (replay.py). Everything else can go."""
+        """Blob ids the last `rounds` records point to (record_blobs): what anyone re-checking those rounds needs
+        (replay.py). Everything else can go."""
         keep: set[str] = set()
         with self.lock:
             rows = self.db.execute("SELECT record FROM round_records WHERE height > ?", (tip - rounds,)).fetchall()
         for (text,) in rows:
-            for rv in json.loads(text).get("reveals", []):
-                keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+            keep |= record_blobs(json.loads(text))
         return keep
 
     def save_round(self, job_id: str, height: int, accepted: int, val_loss: float, val_acc: float) -> None:

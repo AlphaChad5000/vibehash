@@ -1540,7 +1540,8 @@ class Coordinator:
 
     def _replay_bytes(self, blob_id: str) -> bytes | None:
         """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
-        None when it can't be had (an old round past its window): the game then can't be refereed again."""
+        None when it can't be had: a validator then refuses the block (submit_move), a plain replay counts it
+        unchecked."""
         get = getattr(self.roots, "bytes", None)
         if get is None:
             return None
@@ -1674,7 +1675,11 @@ class Coordinator:
             if not self.replaying:
                 self._check_evidence_size(g, blob, outside)
             evidence = self._replay_bytes(blob) if self.replaying else self._get_trace(blob)
-            if self.replaying and evidence is None:  # gone with its round's window: the record's outcome, unchecked
+            if self.replaying and evidence is None:
+                if getattr(self.roots, "bytes", None) is not None:  # a validator never takes an outcome on trust
+                    raise ProtocolError(f"dispute {g.gid}'s evidence {blob[:12]}… can't be fetched to referee it again")
+                # A plain replay with no blobs to fetch from (an old round, past its window): the record's outcome,
+                # counted unchecked.
                 entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
                 g.end(str(entry.get("outcome", "unchecked")), str(entry.get("detail", "")))
                 self.unchecked += 1
@@ -1706,8 +1711,9 @@ class Coordinator:
         """The dispute phase is over: each unfinished game is judged by its own move's deadline (dispute.cut_short)."""
         r = self.r
         if r is not None and self.phase == Phase.DISPUTE:
+            most = self.job(r.job_id).phase_lengths().get("moves", 0)
             for g in r.games.values():
-                dg.cut_short(g, now)
+                dg.cut_short(g, now, most)
 
     def disputes_done(self) -> bool:
         r = self.r
@@ -1941,8 +1947,10 @@ class Coordinator:
         median goes into the record, for people: nothing is paid by it."""
         r = self.r
         job = self.job(r.job_id)
+        most = job.phase_lengths().get("moves", 0)
         for g in r.games.values():
-            if g.turn != "done" and self.replaying:  # the leader's clock: its phase ended before the move was due
+            # The leader's clock: its phase ended before the move was due, which it can be only near the game's end.
+            if g.turn != "done" and self.replaying and len(g.moves) >= most - 1:
                 entry = next((e for e in self.replaying.get("games", []) if e.get("id") == g.gid), {})
                 if (entry.get("outcome"), entry.get("detail")) == ("unchecked", dg.PHASE_ENDED):
                     g.end("unchecked", dg.PHASE_ENDED)

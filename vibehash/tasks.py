@@ -21,12 +21,18 @@ MAX_CHECKPOINT_BYTES = 2**30  # 1 GiB of weights (~268M float32); sent as chunke
 # an old laptop's CPU running the reference model (about 2 GFLOP/s), and 20 Mbit/s up, 100 Mbit/s down.
 REF_FLOPS = 2e9
 # Fine-tunes run on GPUs (finetune.py), so their reference is a gaming card: what this code sustains on a mid-range one,
-# in float32 with TF32 off (an RTX 4070 SUPER sustains 9-15 TFLOP/s of a job's nominal FLOPs; an RTX 3060 about a third).
-REF_GPU_FLOPS = 5e12
+# in float32 with TF32 off. Training runs program.py's ops one by one (tracer.py), so an RTX 4070 SUPER sustains about
+# 3.2 TFLOP/s of a job's nominal FLOPs (Qwen3-0.6B, batch 8, 192 tokens: 1.62 s a step), an RTX 3060 about a third.
+# (It was 5e12, measured on batched autograd before training went op by op: phases were 3x too short for that card.)
+REF_GPU_FLOPS = 1.5e12
 REF_UPLOAD = 2.5e6  # bytes/s
 REF_DOWNLOAD = 12.5e6  # bytes/s
 CHECKED_SEGMENTS = 3  # segments of a unit the beacon challenges (CoordinatorConfig.challenge_segments)
 MAX_COMPUTE_S = 3600.0
+MAX_PHASE_S = 3600.0  # no phase of a round is longer (node.times_for), whatever a spec asks for
+# A dispute's split, in bytes of states the defender uploads in one move: a home connection (REF_UPLOAD, 20 Mbit/s)
+# moves 512 MB in about 3.5 minutes, the time a move has when a game's 15 moves share an hour.
+MAX_SPLIT_BYTES = 512 * 2**20
 
 
 class InvalidJob(ValueError):
@@ -193,6 +199,19 @@ class TrainingJob:
         need(self.data_source.get("kind") == "tokens" and set(self.data_source) == {"kind", "sha256"}
              and re.fullmatch(r"[0-9a-f]{64}", str(self.data_source.get("sha256", ""))),
              'a fine-tune\'s data is {"kind": "tokens", "sha256": ...}')
+        # Its disputes must be playable from a home connection, or a slow honest defender loses to a false accuser
+        # (the third review's finding B). (A DeepSeek job's program will count its own: deepseek_program.)
+        if not getattr(self, "deepseek", False):
+            from .program import dispute_size
+
+            moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
+            need(split <= MAX_SPLIT_BYTES,
+                 f"a dispute over one of its units would upload {split / 2**20:.0f} MB of states in one move, more than "
+                 f"{MAX_SPLIT_BYTES // 2**20} MB: use fewer steps a segment, shorter sequences or fewer LoRA targets")
+            took = moves * self.phase_lengths()["move"]
+            need(took <= MAX_PHASE_S,
+                 f"a dispute over one of its units would take {took / 60:.0f} minutes at home upload speeds, more than "
+                 f"the {MAX_PHASE_S / 60:.0f} a dispute phase has: use fewer steps a segment or shorter sequences")
 
     def _validate_deepseek_data(self, need) -> None:
         """A DeepSeek job's data: its text as token ids (deepseek_prep's .npz), and which sequences train and which

@@ -579,12 +579,15 @@ def play(game: Game, prog, who: str, move: dict, *, check_states=None, evidence:
 PHASE_ENDED = "the dispute phase ended before the move was due"
 
 
-def cut_short(game: Game, now: float) -> None:
+def cut_short(game: Game, now: float, most: int) -> None:
     """The dispute phase ended with the game unfinished. A party past its move's deadline loses (silence); one whose
-    move wasn't due yet isn't blamed for the phase's length, and the game ends unchecked."""
+    move wasn't due yet isn't blamed for the phase's length, and the game ends unchecked. The phase has room for `most`
+    moves (program.dispute_size), so a game can be cut short in time only once it has made most − 1 of them; before
+    that, some move overran, and whoever's move it is loses. (So a validator, which takes the leader's clock, takes its
+    word for an unchecked end only then.)"""
     if game.turn == "done":
         return
-    if game.deadline and now > game.deadline:
+    if game.deadline and now > game.deadline or len(game.moves) < most - 1:
         silence(game)
     else:
         game.end("unchecked", PHASE_ENDED)
