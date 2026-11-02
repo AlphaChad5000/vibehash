@@ -1268,8 +1268,9 @@ def choice_ds_candidates(op, x, r, row):
 
 class RecordSource:
     """A DeepSeek job's records as the referee reads them, through the weights' interface (dispute.Outside's source):
-    record.{seq}.{part} is a float32 tensor of that part's rows, so the rows a game's referee read are kept with the
-    weights in its record (dispute.Recorded), and a validator replays it without the bucket. `data` has the job's
+    record.{seq}.{part} is a float32 tensor of that part's rows. Records carry no weights (the second review's finding
+    2), so a validator replaying a game reads the rows the same way, each checked against the pinned root: it needs
+    the records' bucket (or a node's copy), as it needs the Hub for the weights. `data` has the job's
     token file (.tokens) and its records (.records: deepseek_unit.Records on a worker, deepseek_graph.RecordReader on
     the node, each checking a record against the pinned root as it reads it)."""
 

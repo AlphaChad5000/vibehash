@@ -283,7 +283,14 @@ class TrainingJob:
         b, ref = self.checkpoint_bytes, REF_GPU_FLOPS if self.finetune else REF_FLOPS
         unit = b / REF_DOWNLOAD + self.unit_flops / ref + self.n_segments * b / REF_UPLOAD
         check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / ref
-        return {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
+        out = {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
+        if self.finetune:  # its disputes: as many moves as its program's tree is deep, the dearest re-running a segment
+            from .program import dispute_size  # and moving a split's states (the defender up, the challenger down)
+
+            moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
+            out |= {"moves": moves,
+                    "move": self.unit_flops / self.n_segments / ref + split / REF_UPLOAD + split / REF_DOWNLOAD}
+        return out
 
 
 def is_finetune_spec(d) -> bool:

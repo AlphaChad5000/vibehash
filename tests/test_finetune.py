@@ -23,7 +23,7 @@ from vibehash import finetune as ft
 from vibehash.blobs import file_sha256
 from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair
-from vibehash.ledger import Chain
+from vibehash.ledger import Chain, canonical
 from vibehash.model import Dataset, ModelSpec
 from vibehash.tasks import MAX_SPEC_BYTES, InvalidJob, TrainingJob, load_dataset
 from vibehash.verification import adam_impossible, rescale_update, reproduces
@@ -116,16 +116,46 @@ class SpecTests(unittest.TestCase):
         for every move of a dispute made just in time. And no phase is longer than an hour, whatever a spec asks for."""
         from types import SimpleNamespace
 
-        from vibehash.node import DISPUTE_MOVES, MAX_PHASE_S, Node, PhaseTimes
+        from vibehash.node import MAX_PHASE_S, Node, PhaseTimes
         node = SimpleNamespace(times=PhaseTimes())
-        t = Node.times_for(node, job_of())
-        self.assertEqual((t.move_s, t.dispute_s), (t.verify_s, DISPUTE_MOVES * t.verify_s))
+        t, need = Node.times_for(node, job_of()), job_of().phase_lengths()
+        self.assertEqual((need["moves"], t.move_s), (13, max(t.verify_s, need["move"])))  # the tree's depth
+        self.assertEqual(t.dispute_s, need["moves"] * t.move_s)
         self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + t.verify_s + t.dispute_s)
         self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).dispute_s, 0)
         huge = TrainingJob("big", "", 1, 1, spec=ModelSpec(4096, (8192,) * 3, 1000, "float32"), batch_size=4096,
                            steps_per_unit=100_000, checkpoint_every=100_000)
         self.assertTrue(all(x <= MAX_PHASE_S for x in (Node.times_for(node, huge).compute_s,
                                                        Node.times_for(node, huge).verify_s)))
+        long = job_of(batch_size=1024, steps_per_unit=10_000, checkpoint_every=10_000)
+        self.assertEqual(long.phase_lengths()["moves"], 19)
+        self.assertLessEqual(Node.times_for(node, long).dispute_s, MAX_PHASE_S + 1e-6)
+
+    def test_the_tree_is_as_deep_as_the_reviewer_measured(self):
+        """The second review's finding 6 (t_depth): Qwen3-4B's games take 15 to 21 moves with its settings, Qwen3-0.6B's
+        13 to 19; a unit of one segment adds a level, which the reviewer's count left out."""
+        from vibehash.program import dispute_size
+
+        dims = dict(spec_of().dims) | {"hidden": 2560, "layers": 36, "heads": 32, "ffn": 9728}
+        for d, want in ((dims, (15, 17, 21)), (dict(spec_of().dims), (13, 15, 19))):
+            for targets in (("q", "k", "v", "o"), ft.TARGETS):
+                spec = spec_of(targets=targets, rank=16) if d["layers"] == 28 else                     ft.LoraSpec(base=spec_of().base, manifest="a" * 64, dims=d, targets=targets, rank=16)
+                got = tuple(dispute_size(spec, b, s, per)[0] for b, per, s in ((4, 4, 4), (64, 64, 2), (1024, 10_000, 1)))
+                self.assertEqual(got, want, (d["layers"], targets))
+
+    def test_adams_constants_are_the_same_bits_everywhere(self):
+        """The second review: Python's ** calls the C library's pow, which isn't correctly rounded on every platform,
+        and Adam's bias corrections are the program's constants (and the reveal check's bound). finetune.ipow uses
+        multiplications alone; the float32 constants it gives are those of the exact powers."""
+        from fractions import Fraction
+
+        from vibehash.program import f32
+        b1, b2, _ = ft.OPTIMIZERS["adam"]
+        for b in (f32(b1), f32(b2)):
+            for n in range(0, 2000, 7):
+                exact = Fraction(b) ** n
+                self.assertLess(abs(Fraction(ft.ipow(b, n)) - exact), exact * Fraction(1, 2 ** 40))
+                self.assertEqual(f32(1 - ft.ipow(b, n)), f32(float(1 - exact)))
 
     def test_mlp_specs_are_unchanged(self):
         """Fine-tunes have a spec of their own; MLP jobs' specs keep exactly the fields they had."""
@@ -147,6 +177,9 @@ class SpecTests(unittest.TestCase):
             "targets": lambda d: d["lora"].update(targets=["q", "lm_head"]),
             "no targets": lambda d: d["lora"].update(targets=[]),
             "seq_len": lambda d: d.update(seq_len=8),
+            "seq_len past the launch limit": lambda d: d.update(seq_len=ft.MAX_SEQ_LEN + ft.SEQ_STEP),
+            "a base model past 4B": lambda d: d["model"].update(hidden=4096, ffn=12288, heads=32, head_dim=128,
+                                                                  layers=36),  # Qwen3-8B's shape
             "optimizer": lambda d: d.update(optimizer="sgd"),
             "precision": lambda d: d.update(precision="float64"),
             "data kind": lambda d: d.update(data={"kind": "npz", "sha256": "b" * 64}),
@@ -633,6 +666,9 @@ class ProtocolTests(unittest.TestCase):
             def array(self, bid, job):
                 return proto.checkpoints.array(bid, job)
 
+            def bytes(self, bid):
+                return proto.coord._get_trace(bid)
+
             def attach(self, j):
                 j.attach_data(load_dataset(path), sha)
         chain, stats = copy.deepcopy(before), {}
@@ -744,11 +780,12 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.proto.post_job(req, self.job)
         self.before = copy.deepcopy(self.proto.chain)
 
-    def round(self, answer=None, moves=None):
+    def round(self, answer=None, moves=None, cut=None):
         """One round: everyone trains and reveals honestly as their behaviour says; verify-phase tasks are answered by
         `answer(task, worker) -> (ok, bad) | None` (None: silent; default: as the worker would); disputes are played
         by their parties (tracer.Party) unless `moves(game, who) -> move | None | "default"` says otherwise (None: it
-        never moves). Returns the report."""
+        never moves). `cut(games) -> time` ends the dispute phase then (Coordinator.end_disputes), after setting the
+        games' deadlines. Returns the report."""
         p, c = self.proto, self.proto.coord
         c.open_round()
         r = c.r
@@ -772,6 +809,8 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.disputed = c.start_disputes()
         if self.disputed:
             self._play(moves)
+            if cut is not None:
+                c.end_disputes(cut(r.games))
         self.games = dict(r.games)
         return c.finalize(proposer_keys=p._proposer(beacon), timestamp=p.chain.tip.height + 1)
 
@@ -833,6 +872,9 @@ class NodeFreeRoundTests(unittest.TestCase):
             def array(self, bid, job):
                 return p.checkpoints.array(bid, job)
 
+            def bytes(self, bid):
+                return p.coord._get_trace(bid)
+
             def attach(self_, j):
                 j.attach_data(load_dataset(self.path), self.sha)
         chain, stats = copy.deepcopy(self.before), {}
@@ -879,8 +921,10 @@ class NodeFreeRoundTests(unittest.TestCase):
     def test_disputes_catch_a_tampered_op_and_false_accusations(self):
         """A worker that scaled one op's output deep in one step of each segment, checked by honest checkers, and a
         checker that rejects everything. Every rejection becomes a dispute the node referees: the tampering worker
-        loses on that very op (and is slashed, its accuser the catcher), the false accuser loses each of its own (and
-        is slashed, with no catcher), and every honest claim is accepted and paid. Then the round replays."""
+        loses on that very op (and is slashed, its accuser the catcher); the false accuser, finding nothing the referee
+        would refuse in the honest work it disputes, withdraws each of its own (unpaid for checking and marked missed,
+        but not slashed: an honest checker mistaken the same way mustn't be); and every honest claim is accepted and
+        paid. Then the round replays."""
         self.network([("honest", "honest")] * 5 + [("tamper", "honest"), ("honest", "false_accuser")],
                      replication_rate=0.0, canaries_per_round=0)
         cheat, liar = self.workers[-2].address, self.workers[-1].address
@@ -894,18 +938,20 @@ class NodeFreeRoundTests(unittest.TestCase):
             if k[1] != cheat:
                 self.assertEqual(v.verdict.value, "accepted", v.detail)
         self.assertTrue(any(s[0] == cheat and s[1] not in (None, cheat) for s in slashes))
-        false = [s for s in slashes if s[0] == liar]
-        self.assertTrue(false and all(s[1:] == [None, "false accusation"] for s in false), false)
-        self.assertEqual({s[0] for s in slashes}, {cheat, liar})
-        won = [g for g in self.games.values() if g.challenger == liar]
-        self.assertTrue(won and all(g.outcome in ("defender", "challenger") for g in won))
+        self.assertEqual({s[0] for s in slashes}, {cheat})
+        mine = [g for g in self.games.values() if g.challenger == liar]
+        self.assertTrue(mine and all(g.outcome in ("withdrawn", "challenger") for g in mine), [g.outcome for g in mine])
+        self.assertTrue(any(g.outcome == "withdrawn" for g in mine))
+        self.assertNotIn(liar, rep.block.summary.verifier_flops)  # unpaid for checking
+        self.assertIn(liar, rep.block.summary.missed)
         self.assertTrue(all(g.outcome == "challenger" for g in self.games.values() if g.defender == cheat))
         paid = rep.block.summary.worker_flops
         self.assertNotIn(cheat, paid)
         self.assertTrue(set(paid) >= {w.address for w in self.workers[:5]} & {k[1] for k in res})
         games = rep.record["games"]
         self.assertTrue(all(e["moves"] and len(e["moves"]) <= 14 for e in games))
-        self.assertTrue(all(e["evidence"] for e in games if e["outcome"] != "unchecked"))
+        refereed = [e for e in games if e["outcome"] in ("challenger", "defender")]
+        self.assertTrue(all("evidence" in e["moves"][-1]["body"]["move"] and "evidence" not in e for e in refereed))
         self.replays([rep])
         # What a validator votes by: a plain replay. Its referee needs the job's data (which sequences a step trains
         # on), which a node passes as its store.
@@ -918,6 +964,147 @@ class NodeFreeRoundTests(unittest.TestCase):
                 j.attach_data(load_dataset(self.path), self.sha)
         self.assertEqual(replay_block(copy.deepcopy(self.before), rep.block, copy.deepcopy(rep.record),
                                       datasets=Store()), [])
+
+    def test_validators_dont_take_the_leaders_word_on_disputes(self):
+        """The second review's finding 2. A record carries no weights (every referee, the leader's and each
+        validator's, reads only tensors it checked against the job's manifest); a validator rebuilds each dispute's
+        starting states from the reveal's checkpoints and refuses a record whose states differ; and an outcome the
+        leader edits (say, to unchecked) doesn't replay to the record it's in."""
+        from vibehash.crypto import h256
+        from vibehash.ledger import canonical
+        from vibehash.replay import replay_block
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        rep = self.round()
+        games = rep.record["games"]
+        self.assertTrue(games and all("weights" not in e for e in games))
+        p = self.proto
+
+        class Blobs:
+            def array(self_, bid, job):
+                return p.checkpoints.array(bid, job)
+
+            def bytes(self_, bid):
+                return p.coord._get_trace(bid)
+
+            def attach(self_, j):
+                j.attach_data(load_dataset(self.path), self.sha)
+
+        def replay(record):
+            block = copy.deepcopy(rep.block)
+            block.summary.record_hash = h256(canonical(record)).hex()  # as a leader would seal its own record
+            return replay_block(copy.deepcopy(self.before), block, record, datasets=Blobs(), roots=Blobs())
+        self.assertEqual(replay(copy.deepcopy(rep.record)), [])
+        forged = copy.deepcopy(rep.record)
+        gid = games[0]["id"]
+        forged["checks"]["game"][gid] = forged["checks"]["game"][gid][::-1]  # other starting states
+        self.assertIn("starting states", " ".join(replay(forged)))
+        forged = copy.deepcopy(rep.record)
+        forged["games"][0]["outcome"] = "unchecked"
+        self.assertTrue(replay(forged), "an edited outcome doesn't replay to its record")
+        # Moves get receipts, which the audit finds in the record's games.
+        from vibehash import receipts
+        keys = next(w.keys for w in self.workers if w.keys.public == rep.block.proposer_pubkey)  # the round's leader
+        env = games[0]["moves"][0]
+        r = receipts.make(keys, p.chain.chain_id, rep.block.height, rep.record["attempt"], "move", env)
+        self.assertEqual(receipts.audit(r, rep.block, rep.record)[0], "recorded")
+
+    def test_one_checker_opens_few_disputes(self):
+        """The second review's finding 3: a checker that rejects everything opens at most coordinator.MAX_GAMES
+        disputes a round (here patched to 1); its other rejections are ignored. Records hold no weights and no
+        evidence (the evidence move names its blob), so a round with disputes stays small whatever the model."""
+        from unittest import mock
+
+        with mock.patch("vibehash.coordinator.MAX_GAMES", 1):
+            self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                         canaries_per_round=0)
+            liar = self.workers[-1].address
+            rep = self.round()
+            rejected = [t for t in self.tasks.values() if t.verifier == liar and t.verdict is not None and not t.verdict[0]]
+            self.assertGreater(len(rejected), 1)
+            self.assertEqual(sum(g.challenger == liar for g in self.games.values()), 1)
+            self.replays([rep])
+        self.assertLess(len(canonical(rep.record)), 200_000)
+
+    def test_accusing_in_vain_again_and_again_costs_disputes(self):
+        """The second review's finding 9: withdrawing costs a checker that round's pay and reputation, and the
+        reputation it has lost since it started takes disputes away (coordinator.games_allowed), down to one a round."""
+        from vibehash.coordinator import MAX_GAMES, games_allowed
+
+        self.assertEqual([games_allowed(r) for r in (1.0, 0.8, 0.75, 0.7, 0.65, 0.6, 0.5)], [MAX_GAMES, 4, 3, 2, 1, 1, 1])
+        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        liar = self.workers[-1].address
+        for chain in (self.proto.chain, self.before):  # (the replay starts from the same reputation)
+            chain.state.reputation[liar] = 0.65  # three rounds' worth lost: one dispute
+        rep = self.round()
+        rejected = [t for t in self.tasks.values() if t.verifier == liar and t.verdict is not None and not t.verdict[0]]
+        self.assertGreater(len(rejected), 1)
+        self.assertEqual(sum(g.challenger == liar for g in self.games.values()), 1)
+        self.assertIn(liar, rep.block.summary.missed)  # it withdrew them: less reputation, fewer disputes next round
+        self.replays([rep])
+
+    def test_a_cheat_that_also_accused_falsely_still_pays_its_catcher(self):
+        """The second review's finding 9: an offender pays one slash a round, its first, and false accusations were
+        listed before fraud, so a cheater that also lost a dispute it started had its catcher's bounty burned."""
+        from vibehash.program import Op, Program
+        from vibehash.tracer import node_at
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        cheat, job = self.workers[-1].address, self.job
+
+        def moves(g, who):  # the cheater plays its accusations to the end (the first child, the first tile)
+            if who != cheat or g["turn"] != "pick":
+                return "default"
+            node, _ = node_at(Program.of(job, int(g["seed"])), g["root"], g["path"])
+            g0, g1 = g["groups"][0]
+            atom = node.atoms[g0] if g1 - g0 == 1 else None
+            return {"pick": 0, **({"tile": 0} if isinstance(atom, Op) and atom.out else {})}
+        rep = self.round(moves=moves)
+        mine = [s for s in rep.slashes if s[0] == cheat]
+        reasons = {s[2] for s in mine}
+        self.assertIn("false accusation", reasons)
+        self.assertIn("failed_replay", reasons)
+        self.assertIsNotNone(mine[0][1])  # its first slash, the one the ledger takes, has its catcher
+        self.replays([rep])
+
+    def test_a_replay_fetches_the_dataset_its_disputes_need(self):
+        """The second review's finding 10: a validator without a job's dataset refused every block with a dispute over
+        it (rebuilding a game's program needs the data), and a node syncing stopped at one whose job had ended. A
+        replay's datasets now come from node.PeerDatasets: the node's own, else fetched from the proposer (or the peer
+        that sent the block), then any peer, and checked on arrival."""
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from vibehash.client import NodeError
+        from vibehash.node import PeerDatasets
+        from vibehash.storage import Store
+
+        self.network([("honest", "honest")] * 3)
+        raw, asked = Path(self.path).read_bytes(), []
+
+        class Peer:
+            def __init__(self, url):
+                self.url = url
+
+            def download(self, kind, sha, store, check=None):
+                asked.append(self.url)
+                if self.url != "http://has-it":
+                    raise NodeError("node doesn't have it")
+                store.write_chunk(sha, 0, raw, len(raw), check=check)
+        store = Store(tmpdir(self))
+        self.addCleanup(store.db.close)
+        node = SimpleNamespace(store=store, peers=SimpleNamespace(urls=lambda: ["http://proposer", "http://has-it"],
+                                                                   client=lambda url, timeout: Peer(url)))
+        job = job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": self.sha})
+        PeerDatasets(node, "http://proposer").attach(job)
+        self.assertEqual(asked, ["http://proposer", "http://has-it"])
+        self.assertEqual(job.data.n_train, self.job.data.n_train)
+        PeerDatasets(node, "http://proposer").attach(job_of(self.tiny.spec(), data_source=job.data_source))
+        self.assertEqual(len(asked), 2)  # kept: not fetched again
+        with self.assertRaises(InvalidJob):  # nobody has it
+            PeerDatasets(node).attach(job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": "d" * 64}))
 
     def test_silent_parties_lose(self):
         """A dispute whose defender never moves is lost by the defender; one whose challenger stops picking, by the
@@ -943,6 +1130,68 @@ class NodeFreeRoundTests(unittest.TestCase):
         slashed = {(s[0], s[2]) for s in rep.slashes}
         self.assertIn((silent_defence.defender, "failed_replay"), slashed)
         self.assertIn((liar, "false accusation"), slashed)
+        self.replays([rep])
+
+    def test_moves_are_checked_before_what_they_name_is_read(self):
+        """The second review's finding 7: the node read a move's evidence before checking whose turn it was, and read
+        and hashed a split's states before checking their sizes. Now a move out of turn is refused before anything it
+        names is read, as is evidence bigger than its tile can need, and a "manifest" bigger than any manifest."""
+        from unittest import mock
+
+        from vibehash import dispute as dg, merkle
+        from vibehash.coordinator import ProtocolError
+
+        self.network([("honest", "honest")] * 5 + [("tamper", "honest")], replication_rate=0.0, canaries_per_round=0)
+        c, tried = self.proto.coord, set()
+        big = c._put_trace(bytes(merkle.MAX_MANIFEST + 1))
+
+        def moves(g, who):
+            body = {"round": c.r.round_no, "game": g["id"], "n": g["n"]}
+            if g["turn"] == "split" and "split" not in tried:
+                tried.add("split")
+                with self.assertRaisesRegex(ProtocolError, "too big to be a manifest"):
+                    c.submit_move(who, body | {"move": {"split": [g["a"]] + [big] * (len(g["groups"]) - 1) + [g["b"]]}})
+            if g["turn"] == "evidence" and "evidence" not in tried:
+                tried.add("evidence")
+                read = mock.Mock(side_effect=AssertionError("read"))
+                with mock.patch.object(c, "_get_trace", read), mock.patch.object(dg, "MAX_EVIDENCE", 10),                         mock.patch.object(dg, "evidence_cap", return_value=100):
+                    with self.assertRaisesRegex(ProtocolError, "turn"):  # the challenger can't send evidence
+                        c.submit_move(g["challenger"], body | {"move": {"evidence": big}})
+                    with self.assertRaisesRegex(ProtocolError, "more than this tile can need"):
+                        c.submit_move(who, body | {"move": {"evidence": big}})
+                    with self.assertRaisesRegex(ProtocolError, "uploaded blob"):
+                        c.submit_move(who, body | {"move": {"evidence": "../x"}})
+            return "default"
+        rep = self.round(moves=moves)
+        self.assertEqual(tried, {"split", "evidence"})
+        self.assertTrue(all(g.outcome == "challenger" for g in self.games.values()))  # then played out as usual
+        self.replays([rep])
+
+    def test_a_phase_cut_short_blames_only_a_party_past_its_deadline(self):
+        """The second review's finding 6: a dispute phase that ends with games unfinished judged them all by silence,
+        though a party's own move may not have been due yet. Now each game goes by its own deadline: past it, the party
+        loses; before it, the game ends unchecked and nobody is slashed. A validator replays both."""
+        from vibehash import dispute as dg
+
+        self.network([("honest", "honest")] * 5 + [("honest", "false_accuser")], replication_rate=0.0,
+                     canaries_per_round=0)
+        order = []
+
+        def moves(g, who):
+            if g["id"] not in order:
+                order.append(g["id"])
+            return None if g["id"] in order[:2] and who == g["defender"] else "default"  # two never split
+
+        def cut(games):
+            games[order[0]].deadline, games[order[1]].deadline = 100.0, 10.0
+            return 50.0
+        rep = self.round(moves=moves, cut=cut)
+        waiting, late = self.games[order[0]], self.games[order[1]]
+        self.assertEqual((waiting.outcome, waiting.detail), ("unchecked", dg.PHASE_ENDED))
+        self.assertEqual((late.outcome, late.detail), ("challenger", "the defender didn't split in time"))
+        slashed = {s[0] for s in rep.slashes}
+        self.assertIn(late.defender, slashed)
+        self.assertNotIn(waiting.defender, slashed - {late.defender})
         self.replays([rep])
 
     def test_replicas_that_disagree_dispute_each_other(self):
@@ -1007,6 +1256,25 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertGreater(rep.block.summary.accepted_units, 0)
         self.assertTrue(all(res.verdict.value == "accepted" for res in rep.results))
         self.replays([rep])
+
+    def test_the_new_model_is_averaged_and_claimed_once(self):
+        """Settling a round averages the accepted results once, live and on a recheck (a leftover copy of that code
+        once ran it twice, and counted the "model" claim twice on every recheck)."""
+        from unittest import mock
+
+        from vibehash.coordinator import Coordinator
+        self.network([("honest", "honest")] * 3, replication_rate=0.0, canaries_per_round=0)
+        real, claims = Coordinator._claim, []
+
+        def counted(coord, kind, key, compute):
+            claims.append((kind, coord.replaying is not None))
+            return real(coord, kind, key, compute)
+        with mock.patch.object(Coordinator, "_claim", autospec=True, side_effect=counted):
+            rep = self.round()
+            self.assertEqual(claims.count(("model", False)), 1)
+            self.replays([rep])
+        self.assertEqual(claims.count(("model", True)), 1)
+        self.assertGreater(rep.block.summary.accepted_units, 0)
 
     def test_scorers_are_paid_only_when_they_agree(self):
         """The median of three scorers goes on record; a scorer is paid only when three answered and it agrees with
@@ -1077,8 +1345,10 @@ class NodeFreeRoundTests(unittest.TestCase):
             for bid in [x["final"], *(v[0] for v in x["openings"].values())]:
                 arrays[bid] = self.proto.checkpoints.array(bid, self.job)
         with open(d / "round.pkl", "wb") as f:
+            evidence = {m["body"]["move"]["evidence"]: self.proto.coord._get_trace(m["body"]["move"]["evidence"])
+                        for e in rep.record["games"] for m in e["moves"] if "evidence" in m["body"]["move"]}
             pickle.dump({"before": self.before, "block": rep.block, "record": rep.record, "arrays": arrays,
-                         "path": str(self.path), "sha": self.sha}, f)
+                         "path": str(self.path), "sha": self.sha, "evidence": evidence}, f)
         script = BLOCK_TORCH + """
 import copy, hashlib, pickle
 from vibehash import node, coordinator, replay, storage, finetune, dispute, referee  # noqa: F401
@@ -1089,6 +1359,7 @@ from vibehash.ledger import canonical
 d = pickle.load(open(sys.argv[1], "rb"))
 class Recheck:
     def array(self, bid, job): return d["arrays"][bid]
+    def bytes(self, bid): return d["evidence"][bid]
     def attach(self, j): j.attach_data(load_dataset(d["path"]), d["sha"])
 stats = {}
 problems = replay_block(copy.deepcopy(d["before"]), d["block"], copy.deepcopy(d["record"]), Recheck(), stats)
@@ -1137,6 +1408,41 @@ def word_tokenizer(vocab: int) -> bytes:
 
 
 @unittest.skipUnless(torch is not None and HAVE_TOKENIZERS, "needs PyTorch, tokenizers and jinja2")
+class ClientMoveTests(unittest.TestCase):
+    def test_a_move_that_doesnt_get_through_is_sent_again(self):
+        """The second review's finding 6: the worker marked a move made before sending it, so one lost on the way was
+        never sent again and its party lost by silence. It's made only once the node takes it, and a failed one is sent
+        again as it was, not worked out again, until the game's move count passes it."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from vibehash.client import NodeError, WorkerClient, WorkerStats
+
+        game = {"id": "g1", "turn": "split", "defender": "me", "challenger": "them", "n": 3, "seed": 1}
+        node = SimpleNamespace(get=lambda path: [dict(game)])
+        party = SimpleNamespace(split=mock.Mock(return_value=["a" * 64, "b" * 64]))
+        w = WorkerClient.__new__(WorkerClient)
+        w.node, w.stats, w.moved, w.unsent = node, WorkerStats(), set(), {}
+        w.party, w.worker = {5: party}, SimpleNamespace(verifier_behavior="honest", keys=SimpleNamespace(address="me"))
+        sent = []
+
+        def signed(kind, body):
+            sent.append(body)
+            if len(sent) == 1:
+                raise NodeError("connection reset")
+            return {"id": "g1"}
+        w._signed = signed
+        with mock.patch("vibehash.program.Program.of"):
+            w._disputes(5, None)
+            self.assertEqual((w.moved, len(sent)), (set(), 1))
+            w._disputes(5, None)  # sent again, the same move
+            self.assertEqual(sent[1], sent[0])
+            self.assertEqual(party.split.call_count, 1)
+            self.assertEqual(w.moved, {(5, "g1", 3)})
+            w._disputes(5, None)  # taken: not sent a third time
+            self.assertEqual(len(sent), 2)
+
+
 class LiveNetworkTests(unittest.TestCase):
     """The whole thing over HTTP, offline: a fake Hugging Face (tests/test_hub.py) serving a tiny model and its
     tokenizer, a node and three workers, `vibehash train chats.jsonl --base`, rounds, and `vibehash job download`."""
@@ -1211,8 +1517,8 @@ class LiveNetworkTests(unittest.TestCase):
         slashes = [s for b in node.chain.blocks if b.summary for s in b.summary.slashes]
         games = [(e["outcome"], e["detail"], len(e["moves"])) for b in node.chain.blocks if b.summary
                  for e in api.get(f"/round/{b.height}/record").get("games", [])]
-        self.assertTrue(any(s[0] == workers[-1].address and s[2] == "false accusation" for s in slashes), (slashes, games))
-        self.assertFalse([s for s in slashes if s[0] != workers[-1].address], ("only the false accuser was slashed", games))
+        self.assertTrue(any(o == "withdrawn" for o, _, _ in games), games)  # the false accuser withdraws its rejections
+        self.assertFalse(slashes, ("nobody is slashed: the accuser withdrew", games))
         self.assertTrue(all(r["version"] == 4 for r in (api.get(f"/round/{b.height}/record") for b in node.chain.blocks
                                                         if b.summary)))
 

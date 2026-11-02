@@ -50,10 +50,27 @@ MODULE_OF = {"q": "self_attn.q_proj", "k": "self_attn.k_proj", "v": "self_attn.v
 DEFAULT_TARGETS = ("q", "k", "v", "o")  # FINETUNING.md: the attention projections, unless flags say otherwise
 OPTIMIZERS = {"adam": (0.9, 0.999, 1e-8)}  # name -> (beta1, beta2, eps); the name in a spec fixes all three
 DIMS = ("family", "vocab", "hidden", "layers", "heads", "kv_heads", "head_dim", "ffn", "tied")
+
+
+def ipow(x: float, n: int) -> float:
+    """x to a whole power n ≥ 0, by squaring: IEEE multiplications only, so every platform gets the same bits. Python's
+    ** calls the C library's pow, which isn't correctly rounded everywhere, and what's computed from Adam's betas (the
+    program's constants, the reveal check's bound) must be the same on every node."""
+    out = 1.0
+    while n:
+        if n & 1:
+            out *= x
+        x *= x
+        n >>= 1
+    return out
 EVAL_BATCH = 8  # validation sequences scored at once
 HEAD_TOKENS = 512  # llm.HEAD_CHUNK: tokens whose logits are made at once
 MAX_VAL = 128  # sequences held back at most: the node scores them every round
 SEQ_STEP = 64  # sequence lengths are rounded up to a multiple of this
+# Launch limits: a dispute's evidence for an attention tile, and the states a defender uploads, grow with the sequence
+# (dispute.evidence_cap: ~50 MB at 2048 tokens; an attention tensor is heads x T^2 floats) and with the model.
+MAX_SEQ_LEN = 2048
+MAX_BASE_PARAMS = 4_500_000_000  # Qwen3-4B (4.02B) and smaller
 # How far a replay may be from a claim, relative to the claim's own size, for each of B, m and v (verification.
 # reproduces adds: within 1% of what the segment changed). Measured CPU against CUDA on Qwen3-0.6B: DESIGN.md §8.
 TOLERANCE = 1e-4
@@ -119,14 +136,17 @@ class LoraSpec:
             out.append(f"model must give {', '.join(DIMS)} (family one of {', '.join(FAMILIES)})")
         elif m["heads"] % m["kv_heads"] or m["head_dim"] % 2:
             out.append("query heads must be a multiple of key/value heads, and head_dim even")
+        elif self.base_params > MAX_BASE_PARAMS:
+            out.append(f"base models are at most {MAX_BASE_PARAMS / 1e9:g}B parameters for now; "
+                       f"this one is {self.base_params / 1e9:.1f}B")
         if type(self.rank) is not int or not 1 <= self.rank <= 256:
             out.append("LoRA rank must be 1-256")
         if not 0 < self.alpha <= 4096:
             out.append("LoRA alpha must be in (0, 4096]")
         if not self.targets or not set(self.targets) <= set(TARGETS):
             out.append(f"LoRA targets must be some of {', '.join(TARGETS)}")
-        if type(self.seq_len) is not int or not 16 <= self.seq_len <= 32768:
-            out.append("seq_len must be 16-32768")
+        if type(self.seq_len) is not int or not 16 <= self.seq_len <= MAX_SEQ_LEN:
+            out.append(f"seq_len must be 16-{MAX_SEQ_LEN}")
         if self.optimizer not in OPTIMIZERS:
             out.append(f"optimizer must be one of {', '.join(OPTIMIZERS)}")
         if self.precision != "float32":
@@ -160,6 +180,13 @@ class LoraSpec:
     def n_adapter(self) -> int:
         """Trained weights: every B, [out, rank]."""
         return sum(out for _, out, _ in self.modules()) * self.rank
+
+    @property
+    def base_params(self) -> int:
+        """The base model's weights in all, the embedding and head included (arch.Arch.n_weights)."""
+        m = self.model
+        layer = sum(math.prod(self.shape(t)) for t in TARGETS) + 2 * m["hidden"]
+        return m["layers"] * layer + m["vocab"] * m["hidden"] * (1 if m["tied"] else 2) + m["hidden"]
 
     @property
     def n_params(self) -> int:
@@ -205,10 +232,10 @@ class LoraSpec:
         (1-β1)/√(1-β2) · √(Σ_{k<t} (β1²/β2)^k) · √(1-β2^t) / (1-β1^t), which is 1 at t = 1 and grows slowly
         (16.6 in all for 16 steps; Kingma & Ba's 3.16 a step is its limit). eps only makes steps shorter."""
         b1, b2, _ = OPTIMIZERS[self.optimizer]
-        total, geometric = 0.0, 0.0
+        total, geometric, ratio = 0.0, 0.0, b1 * b1 / b2
         for t in range(1, steps + 1):
-            geometric += (b1 * b1 / b2) ** (t - 1)
-            total += (1 - b1) / math.sqrt(1 - b2) * math.sqrt(geometric) * math.sqrt(1 - b2 ** t) / (1 - b1 ** t)
+            geometric += ipow(ratio, t - 1)
+            total += (1 - b1) / math.sqrt(1 - b2) * math.sqrt(geometric) * math.sqrt(1 - ipow(b2, t)) / (1 - ipow(b1, t))
         return lr * total
 
     def sane(self, start: np.ndarray, final: np.ndarray, lr: float, steps: int, ratio: float) -> bool:
@@ -909,7 +936,7 @@ def plan(data_path: str | Path, ref: str, *, hub=None, job_id: str = "fine-tune"
         raise DataError(f"{repo} has no tokenizer.json, which turning text into training data needs")
     template = files["chat_template.jinja"].decode("utf-8") if "chat_template.jinja" in files else None
     tokenizer = ChatTokenizer(files["tokenizer.json"], json.loads(files.get("tokenizer_config.json", b"{}")), template)
-    limit = min(max_len, int(config.get("max_position_embeddings") or max_len))
+    limit = min(max_len, MAX_SEQ_LEN, int(config.get("max_position_embeddings") or max_len))
     prepared = prepare(data_path, tokenizer, mbytes, config_bytes, max_len=limit)
     defaults = settings_for(dims)
     spec = LoraSpec(base=f"hf:{repo}@{commit}", manifest=hashlib.sha256(mbytes).hexdigest(), dims=dims, rank=rank,

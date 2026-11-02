@@ -87,7 +87,6 @@ MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
 # What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
 # a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
 MAX_TRACE_BLOB, MAX_TRACE_UPLOADS = 2 * 2**30, 16 * 2**30
-DISPUTE_MOVES = 14  # the most moves a dispute takes: unit, segment, step, sequence, layer and ops, two levels each
 # The biggest model this node relays a post_job for (--max-job-mb), as one checkpoint at the job's precision. Measured:
 # a float32 model's starting weights take ~7 times its checkpoint size to build (float64 copies), ~460 MB at 64 MB, and
 # a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
@@ -249,6 +248,7 @@ class Node:
         with self.coord.lock:
             self.start_blob, self.uploads, self._blob_of, self.trace_uploads = None, {}, {}, {}
         self.blobs.prune(self._evidence())
+        self.coord.trace_blobs.forget()
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
 
     def _rounds(self) -> None:
@@ -295,14 +295,16 @@ class Node:
         if job.deepseek:  # a prep unit's transfers at the slowest link the network takes (deepseek_graph.deadline)
             need = need | {"compute": max(need["compute"], job.spec.prep_seconds())}
         verify = min(MAX_PHASE_S, max(t.verify_s, need["verify"]))
-        # A dispute's dearest move re-runs a segment (a challenger checking each step of one), which takes no longer
-        # than checking a claim's segments: as long as verify. Most moves take a second or two, and the phase ends as
-        # soon as every dispute has; it's this long only for a party that makes every move just in time (a DeepSeek
-        # job's prep rounds have no games yet: their dispute phase ends at once).
-        move = min(verify, MAX_PHASE_S / DISPUTE_MOVES) if job.finetune else 0.0
+        # A dispute has as many moves as the job's program is deep (need["moves"], program.dispute_size), and each as
+        # long as its dearest takes (need["move"]: re-running a segment, and a split's states up and down), or verify
+        # if that's longer. Most moves take a second or two, and the phase ends as soon as every dispute has; it's this
+        # long only for a party that makes every move just in time (a DeepSeek job's prep rounds have no games yet:
+        # their dispute phase ends at once). A job whose moves need more than MAX_PHASE_S in all gets less for each: a
+        # defender too slow for it loses (DESIGN, "Time").
+        moves = need.get("moves", 0)
+        move = min(max(verify, need["move"]), MAX_PHASE_S / moves) if moves else 0.0
         return PhaseTimes(t.register_s, min(MAX_PHASE_S, max(t.compute_s, need["compute"])),
-                          min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s,
-                          DISPUTE_MOVES * move, move)
+                          min(MAX_PHASE_S, max(t.reveal_s, need["reveal"])), verify, t.idle_s, moves * move, move)
 
     def _propose_wait(self) -> float:
         """How long validators wait for a proposal: the configured wait, plus however much longer than the node's
@@ -339,6 +341,7 @@ class Node:
                 if self.stopping.wait(0.2) or (still is not None and not still()):
                     return False
                 c.expire_moves(time.time())
+            c.end_disputes(time.time())
             for g in sorted(c.r.games.values(), key=lambda g: g.gid):
                 log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, g.challenger[:10], g.defender[:10],
                          g.outcome or "unfinished")
@@ -414,7 +417,10 @@ class Node:
                 if block.summary is not None:
                     record = value.get("record")
                     problems = (["no round record"] if not isinstance(record, dict)
-                                else replay_block(self.chain, block, record, datasets=self.store))
+                                else replay_block(self.chain, block, record,
+                                                  datasets=PeerDatasets(self, self.chain.state.validators.get(
+                                                      address_of(block.proposer_pubkey))),
+                                                  roots=LeaderBlobs(self, address_of(block.proposer_pubkey))))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -510,7 +516,8 @@ class Node:
                 problem = check_certificate(d.get("certificate"), block.height, block.hash.hex(),
                                             self.chain.state.validator_set(), self.chain.chain_id)
             if problem is None and record is not None:
-                problem = "; ".join(replay_block(self.chain, block, record, datasets=self.store)) or None
+                problem = "; ".join(replay_block(self.chain, block, record,
+                                                 datasets=PeerDatasets(self, peer.url))) or None
         if problem:
             log.error("refusing block %d from %s: %s", block.height, peer.url, problem)
             return False
@@ -847,7 +854,8 @@ class Node:
                                  score=body.get("score"))
                 return {"ok": True, "receipt": self._receipt(kind, env)}
             if kind == "move":
-                return c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())
+                view = c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())
+                return {**view, "receipt": self._receipt(kind, env)}
         raise ProtocolError(f"unknown message {kind}")
 
     def _receipt(self, kind: str, entry: dict) -> dict:
@@ -1097,11 +1105,72 @@ class TraceBlobs:
     def get_bytes(self, blob_id: str) -> bytes | None:
         return self.store.path(blob_id).read_bytes() if self.store.has(blob_id) else None
 
+    def size(self, blob_id: str) -> int | None:
+        return self.store.size(blob_id) if self.store.has(blob_id) else None
+
     def tensor_root(self, blob_id: str, rows: int, cols: int) -> str | None:
+        """The root of a blob read as a [rows, cols] tensor, or None when it isn't on the node at that size. Checked on
+        every call, though the root is cached: a blob pruned since isn't on the node for a challenger to fetch. And
+        cached by shape, since the same bytes (zeros, say) make another root in another shape."""
         from .merkle import root_of
 
-        if blob_id not in self.roots:
-            if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
-                return None
-            self.roots[blob_id] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
-        return self.roots[blob_id]
+        if not self.store.has(blob_id) or self.store.size(blob_id) != rows * cols * 4:
+            return None
+        key = (blob_id, rows, cols)
+        if key not in self.roots:
+            self.roots[key] = root_of(np.fromfile(self.store.path(blob_id), dtype="<f4").reshape(rows, cols))
+        return self.roots[key]
+
+    def forget(self) -> None:
+        """At a round's end: its roots go with its blobs."""
+        self.roots = {}
+
+
+class PeerDatasets:
+    """A job's dataset for a replay whose disputes need it (which sequences a step trains on): this node's own, else
+    fetched (from `first`, the block's proposer or the peer that sent it, then any peer) and checked on arrival as an
+    upload is. Without it a validator would refuse every block with a dispute over a job whose data it hadn't fetched
+    yet, and a node syncing would stop at one whose job has since ended."""
+
+    def __init__(self, node: Node, first: str | None = None):
+        self.node, self.first = node, first
+
+    def attach(self, job) -> None:
+        store, sha = self.node.store, job.data_source.get("sha256", "")
+        if not store.datasets.has(sha):
+            urls = [self.first] if self.first else []
+            for url in urls + [u for u in self.node.peers.urls() if u != self.first]:
+                try:
+                    self.node.peers.client(url, timeout=120).download("dataset", sha, store.datasets,
+                                                                      check=store.check_dataset)
+                    break
+                except (NodeError, InvalidJob, BlobError, KeyError, TypeError, ValueError) as e:
+                    log.debug("dataset %s from %s: %s", sha[:12], url, e)
+        store.attach_dataset(job)
+
+
+class LeaderBlobs:
+    """A round's checkpoints, for a validator checking its disputes' starting states (replay_block's `roots`): this
+    node's own when it has them, else fetched from the block's proposer and checked by their id."""
+
+    def __init__(self, node: Node, proposer: str):
+        self.node, self.proposer = node, proposer
+
+    def array(self, blob_id: str, job) -> np.ndarray:
+        store = self.node.blobs
+        if not store.has(blob_id):
+            url = self.node.chain.state.validators.get(self.proposer)
+            if not url:
+                raise ProtocolError("the proposer has no address to fetch its checkpoints from")
+            self.node.peers.client(url, timeout=120).download("blob", blob_id, store, size=job.checkpoint_bytes)
+        return np.asarray(store.load(blob_id, job.wire_dtype, job.spec.n_params), dtype=np.float64)
+
+    def bytes(self, blob_id: str) -> bytes:
+        """A dispute's evidence, by its id (checked on arrival)."""
+        store = self.node.blobs
+        if not store.has(blob_id):
+            url = self.node.chain.state.validators.get(self.proposer)
+            if not url:
+                raise ProtocolError("the proposer has no address to fetch the evidence from")
+            self.node.peers.client(url, timeout=120).download("blob", blob_id, store)
+        return store.path(blob_id).read_bytes()
