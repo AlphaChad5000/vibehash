@@ -218,7 +218,8 @@ class SelfTestTests(Home):
 
     def test_the_fruit_demo_job_is_the_public_ones(self):
         job = selftest.fruit_job()
-        self.assertEqual(job.data_source["sha256"], selftest.FRUIT_SHA)  # the packaged fruit.csv, byte for byte
+        # The packaged fruit.csv makes the public job's arrays (its file's bytes depend on the system that saves it)
+        self.assertEqual(selftest.arrays_sha(job.data), selftest.FRUIT_ARRAYS)
         self.assertEqual(json.loads(job.spec_json())["model"], {"n_in": 5, "n_out": 4, "n_hidden": [128, 128]})
 
     def test_fine_tune_memory_matches_the_measured_table(self):
