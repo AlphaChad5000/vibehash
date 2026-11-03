@@ -42,10 +42,12 @@ class Rig:
     balance: int = 0
     stake: int = 0
     reputation: float = 0.0
+    nonce: int | None = None  # transactions the wallet has sent: a drop with no new one is a slash
+    sent: int = 0  # what the wallet's own transactions took out this session, which isn't lost earnings
 
     @property
     def earned(self) -> int:
-        return 0 if self.start is None or self.total is None else self.total - self.start
+        return 0 if self.start is None or self.total is None else self.total - self.start + self.sent
 
 
 class MinerDashboard:
@@ -79,15 +81,20 @@ class MinerDashboard:
                     acct = self.api.account(rig.client.keys.address)
                 except NodeError:
                     continue
-                total = acct["balance"] + acct["stake"]
+                total, nonce = acct["balance"] + acct["stake"], acct.get("nonce")
                 if rig.start is None:
                     rig.start = total
                 elif rig.total is not None and total != rig.total:
                     if total > rig.total:
                         paid += total - rig.total
+                    elif nonce is not None and rig.nonce is not None and nonce > rig.nonce:
+                        # The wallet sent something itself (a transfer, a job's budget, unstaking): a slash sends nothing
+                        rig.sent += rig.total - total
+                        self.note(f"{rig.name} sent {_vibe(rig.total - total)} in its own transaction (not a slash)")
                     else:
                         self.note(f"{rig.name} lost {_vibe(rig.total - total)}: slashed", logging.ERROR)
                 rig.total, rig.balance, rig.stake, rig.reputation = total, acct["balance"], acct["stake"], acct["reputation"]
+                rig.nonce = nonce
             if paid:
                 self.popup = (time.time(), paid)
                 height = self.rigs[0].client.stats.height

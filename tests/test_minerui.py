@@ -52,6 +52,28 @@ class DashboardTests(unittest.TestCase):
                                 for line in lines:
                                     self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
 
+    def test_a_send_from_the_wallet_is_not_a_slash(self):
+        """Sending a friend VIBE drops the balance too: it showed as "lost 97.42 VIBE: slashed" on test night. A
+        wallet's own transactions raise its nonce, and a slash doesn't."""
+        dash, v = self.dashboard(), SYN_PER_VIBE
+        r = dash.rigs[0]
+        r.start = r.total = None
+        accounts = iter([{"balance": 100 * v, "stake": 10 * v, "reputation": 1.0, "nonce": 3},
+                         {"balance": 3 * v, "stake": 10 * v, "reputation": 1.0, "nonce": 4},  # sent 100, paid 3
+                         {"balance": 1 * v, "stake": 10 * v, "reputation": 1.0, "nonce": 4}])  # slashed 2
+        dash.api = SimpleNamespace(status=lambda: {"chain_id": "c"}, account=lambda addr: next(accounts))
+        polls = []
+        stop = SimpleNamespace(is_set=lambda: len(polls) >= 3, wait=polls.append)
+        dash.feed.clear()
+        dash._poll(stop)
+        sent, slashed = [(lvl, t) for _, lvl, t in dash.feed]
+        self.assertEqual(sent[0], logging.INFO)
+        self.assertIn("sent 97", sent[1])
+        self.assertIn("not a slash", sent[1])
+        self.assertEqual(slashed[0], logging.ERROR)
+        self.assertIn("lost 2", slashed[1])
+        self.assertEqual((r.sent, r.earned), (97 * v, -2 * v))  # the send isn't counted against the session
+
     def test_shows_the_work_and_the_money(self):
         text = ESCAPE.sub("", self.frames(self.dashboard(), (120, 50))[-1])
         for want in ("ROUND 42", "COMPUTE", "training unit 3 of 7", "RTX 4070 SUPER", "290.00 GFLOP/s", "37 units",
