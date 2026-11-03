@@ -86,6 +86,10 @@ def find(model: str = MODEL, download: bool = True, config_only: bool = False) -
             raise ValueError(f"{folder} has no config.json: give a Hugging Face model's folder")
         name = re.sub(r"[^\w.-]+", "-", folder.resolve().name).strip("-.") or "model"
         return Base(folder.resolve(), f"hf:local/{name}@{hashlib.sha1(str(folder.resolve()).encode()).hexdigest()}")
+    if "/" not in model:  # a short name from the model picker (catalog.py), as `train --base` takes them
+        from .catalog import find as catalog_find
+        known = catalog_find(model)
+        model = known.repo if known is not None else model
     repo, rev = parse_ref(model)
     try:
         from huggingface_hub import snapshot_download
