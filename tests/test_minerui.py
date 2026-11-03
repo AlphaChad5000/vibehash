@@ -52,6 +52,33 @@ class DashboardTests(unittest.TestCase):
                                 for line in lines:
                                     self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
 
+    def test_a_phase_waiting_for_work_shows_how_much_is_in(self):
+        """A phase ends as soon as its work is in (0.5.7), so while some is out its end is only the latest it can be:
+        the bar says "3/4 in, up to …" and fills with what's in, and every frame still fits."""
+        for size in ((40, 20), (66, 34), (120, 50)):
+            for glyphs in (minerui.GLYPHS, minerui.ASCII):
+                dash = self.dashboard(glyphs=glyphs)
+                dash.rigs[0].client.stats.phase_ends = time.time() + 598
+                dash.rigs[0].client.stats.progress = (3, 4)
+                for frame in self.frames(dash, size):
+                    for line in frame.split("\n"):
+                        self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
+        text = ESCAPE.sub("", self.frames(self.dashboard(), (120, 50))[-1])
+        self.assertIn("s left", text, "no progress from the node (before 0.5.9): the countdown as before")
+        dash = self.dashboard()
+        dash.rigs[0].client.stats.phase_ends, dash.rigs[0].client.stats.progress = time.time() + 598, (3, 4)
+        text = ESCAPE.sub("", self.frames(dash, (120, 50))[-1])
+        self.assertIn("3/4 in, up to 59", text)
+        self.assertNotIn("s left", text)
+        dash.rigs[0].client.stats.progress = (4, 4)  # all in: phase_ends is the real end now
+        self.assertIn("s left", ESCAPE.sub("", self.frames(dash, (120, 50))[-1]))
+
+    def test_progress_from_the_node_is_only_two_small_whole_numbers(self):
+        from vibehash.termui import parse_progress
+        self.assertEqual(parse_progress([3, 4]), (3, 4))
+        for bad in (None, [4, 3], [1], [1, 2, 3], ["1", "2"], [1.0, 2], [True, 2], [-1, 2], [0, 10**7], "3/4", {}):
+            self.assertIsNone(parse_progress(bad), bad)
+
     def test_a_send_from_the_wallet_is_not_a_slash(self):
         """Sending a friend VIBE drops the balance too: it showed as "lost 97.42 VIBE: slashed" on test night. A
         wallet's own transactions raise its nonce, and a slash doesn't."""

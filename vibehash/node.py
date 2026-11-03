@@ -662,6 +662,14 @@ class Node:
 
     # --- read-only views ---------------------------------------------------------------
 
+    def _progress(self) -> list[int] | None:
+        """/status's "progress" (Coordinator.progress), or None: every worker polls /status, so nothing in it may fail."""
+        try:
+            p = self.coord.progress()
+        except Exception:  # noqa: BLE001 - (the round's job is loaded when it opens, so this shouldn't happen)
+            return None
+        return list(p) if p is not None else None
+
     def status(self) -> dict:
         c = self.coord
         consensus = self.engine.status() if self.bft else None  # before taking the round lock: the engine's comes first
@@ -673,7 +681,7 @@ class Node:
                 "phase": c.phase.value, "phase_ends": self.phase_ends,
                 # [in, of] of what the phase waits for (Coordinator.progress): while some is out, phase_ends is only
                 # the latest it can end, since it ends as soon as the rest is in.
-                "progress": list(p) if (p := c.progress()) is not None else None,
+                "progress": self._progress(),
                 "round": r.round_no if r else None, "job_id": r.job_id if r else None,
                 "attempt": r.record.get("attempt") if r else None,
                 "beacon": r.beacon.hex() if r and r.beacon else None,
