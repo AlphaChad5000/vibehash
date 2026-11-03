@@ -53,6 +53,12 @@ class Site:
     def answer_chat(self, cid: str, **reply) -> None:
         self.post(f"dispatch/chat/{cid}", reply)
 
+    def claim_talk(self) -> dict | None:
+        return self.post("dispatch/talk", {"machine": MACHINE})
+
+    def answer_talk(self, tid: str, **reply) -> None:
+        self.post(f"dispatch/talk/{tid}", reply)
+
     def claim(self) -> dict | None:
         return self.post("dispatch/claim", {"machine": MACHINE})  # also tells the site this machine is online
 
@@ -72,37 +78,49 @@ class Site:
 
 
 class Chatter:
-    """Answers the site's chat messages: the base model and a finished fine-tune, one reply each. The base model
-    stays loaded between messages (a reply then takes seconds) and is freed before a request needs the GPU."""
+    """Answers the site's chats with a finished fine-tune or with the base model as it comes. The base model stays
+    loaded between messages, with each fine-tune's adapter (a few megabytes) beside it once used, so a reply takes
+    seconds; all of it is freed before a request needs the GPU."""
 
     def __init__(self, jobs: Path):
         self.jobs, self.base, self.tok, self.model, self.adapters = jobs, None, None, None, set()
 
-    def reply(self, job: str, message: str) -> tuple[str, str]:
-        import torch
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        plan = self.jobs / f"{job}.plan.json"
-        adapter = self.jobs / "adapters" / job
-        if not plan.exists() or not adapter.exists():
-            raise FileNotFoundError(f"this machine doesn't have the model {job} (it was trained elsewhere)")
-        base = json.loads(plan.read_text())["base"]
-        if base != self.base:
-            self.free()
-            repo = models.BASES[base]
-            self.tok = AutoTokenizer.from_pretrained(repo)
-            loaded = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, device_map="auto")
-            self.model, self.base = PeftModel.from_pretrained(loaded, str(adapter), adapter_name=job), base
-            self.adapters = {job}
+    def say(self, job: str | None, conversation: str | list[dict], base: str = "qwen3-0.6b") -> str:
+        """One reply to a message or a conversation: from the fine-tune `job`, or with no job from the base model."""
+        if job:
+            plan = self.jobs / f"{job}.plan.json"
+            if not plan.exists() or not (self.jobs / "adapters" / job).exists():
+                raise FileNotFoundError(f"this machine doesn't have the model {job} (it was trained elsewhere)")
+            base = json.loads(plan.read_text())["base"]
+        self.load(base)
+        if not job:
+            if not self.adapters:
+                return judge.reply(self.tok, self.model, conversation)
+            with self.model.disable_adapter():
+                return judge.reply(self.tok, self.model, conversation)
+        if not self.adapters:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, str(self.jobs / "adapters" / job), adapter_name=job)
         elif job not in self.adapters:
-            self.model.load_adapter(str(adapter), adapter_name=job)  # a few megabytes next to the same base
-            self.adapters.add(job)
+            self.model.load_adapter(str(self.jobs / "adapters" / job), adapter_name=job)
+        self.adapters.add(job)
         self.model.set_adapter(job)
-        tuned = judge.reply(self.tok, self.model, message)
-        with self.model.disable_adapter():
-            base_reply = judge.reply(self.tok, self.model, message)
-        return base_reply, tuned
+        return judge.reply(self.tok, self.model, conversation)
+
+    def reply(self, job: str, message: str) -> tuple[str, str]:
+        """The base model's reply and the fine-tune's, to the same message."""
+        tuned = self.say(job, message)
+        return self.say(None, message, self.base), tuned
+
+    def load(self, base: str) -> None:
+        if base == self.base:
+            return
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.free()
+        self.tok = AutoTokenizer.from_pretrained(models.BASES[base])
+        self.model = AutoModelForCausalLM.from_pretrained(models.BASES[base], dtype=torch.bfloat16, device_map="auto")
+        self.base = base
 
     def free(self) -> None:
         if self.model is not None:
@@ -266,7 +284,24 @@ CHAT_EVERY = 2  # seconds between checks for chat messages while idle
 
 
 def chat(site, chatter: Chatter) -> bool:
-    """Answer one waiting chat message, if there is one."""
+    """Answer one waiting chat message, if there is one: a demo-chat turn, or a message to a request's model."""
+    try:
+        turn = site.claim_talk()
+    except OSError:
+        turn = None
+    if turn:
+        try:
+            base = turn["model"] if turn["model"] in models.BASES else "qwen3-0.6b"
+            reply = chatter.say(turn["job"], turn["messages"], base)
+            print(f"talk {turn['id'][:8]} ({turn['model']}): {turn['messages'][-1]['content'][:60]!r}", flush=True)
+            site.answer_talk(turn["id"], reply=reply)
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                site.answer_talk(turn["id"], error=f"{type(e).__name__}: {e}"[:300])
+            except OSError:
+                pass
+        return True
     try:
         msg = site.claim_chat()
     except OSError:

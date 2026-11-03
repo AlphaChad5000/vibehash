@@ -9,8 +9,9 @@ BASES = {
 }
 
 
-def chat_prompt(tok, user: str) -> str:
-    """The text a model sees before it replies to `user`, in its own chat format. Thinking is switched off (Qwen3
-    would otherwise spend its reply budget on a <think> block); templates without that switch ignore it."""
-    return tok.apply_chat_template([{"role": "user", "content": user}], add_generation_prompt=True, tokenize=False,
-                                   enable_thinking=False)
+def chat_prompt(tok, user: str | list[dict]) -> str:
+    """The text a model sees before it replies to `user` (one message, or a conversation of {role, content}
+    messages ending with the user's), in its own chat format. Thinking is switched off (Qwen3 would otherwise spend
+    its reply budget on a <think> block); templates without that switch ignore it."""
+    messages = [{"role": "user", "content": user}] if isinstance(user, str) else user
+    return tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=False)
