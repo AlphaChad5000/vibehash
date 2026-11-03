@@ -44,12 +44,24 @@ class NetstatsTests(unittest.TestCase):
 
     def test_fine_tunes_report_loss_and_jobs_without_work(self):
         spec = {"base": "Qwen/Qwen3-4B", "lora": {"rank": 16}}
-        rounds = [{"height": 5, "accepted_units": 0, "val_loss": 2.53, "val_acc": float("nan")},
-                  {"height": 6, "accepted_units": 3, "val_loss": 1.17, "val_acc": float("nan")}]
+        nan = float("nan")
+        # A fine-tune's round scores the model it started from, so a round's training shows in the next scored round:
+        # test night's job trained one unit at 7277 (scored 5.13 before it) and 7280 scored 3.65. It said 5.13.
+        rounds = [{"height": 7277, "accepted_units": 1, "val_loss": 5.13, "val_acc": nan},
+                  {"height": 7280, "accepted_units": 0, "val_loss": 3.65, "val_acc": nan},
+                  {"height": 7286, "accepted_units": 0, "val_loss": 3.65, "val_acc": nan}]
         j = netstats.job_summary("ft", spec, 0, rounds, None, lambda h: None)
         self.assertEqual((j["model"], j["metric"], j["status"]), ("fine-tune of Qwen/Qwen3-4B", "loss", "finished"))
-        self.assertEqual((j["start"], j["now"]), (2.53, 1.17))
+        self.assertEqual((j["start"], j["now"], j["history"], j["rounds_trained"]),
+                         (5.13, 3.65, [[7277, 5.13], [7280, 3.65]], 1))
         json.dumps(j, allow_nan=False)  # no NaN reaches the page
+        # Rounds that worked one after another, a round nobody scored, and a last round whose result isn't scored yet.
+        rounds = [{"height": 10, "accepted_units": 2, "val_loss": 3.0}, {"height": 11, "accepted_units": 2, "val_loss": 2.5},
+                  {"height": 12, "accepted_units": 0, "val_loss": nan}, {"height": 13, "accepted_units": 4, "val_loss": 2.1},
+                  {"height": 14, "accepted_units": 3, "val_loss": 1.9}]
+        j = netstats.job_summary("ft", spec, 0, rounds, None, lambda h: None)
+        self.assertEqual(j["history"], [[10, 3.0], [11, 2.5], [13, 2.1], [14, 1.9]])
+        self.assertEqual((j["start"], j["now"], j["rounds_trained"]), (3.0, 1.9, 4))
         empty = netstats.job_summary("new", {"model": {}}, 10, [], None, lambda h: None)
         self.assertEqual((empty["status"], empty["history"], empty["now"], empty["last_trained"], empty["examples"]),
                          ("open", [], None, None, None))

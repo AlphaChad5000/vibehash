@@ -118,14 +118,31 @@ class PhaseEndTests(unittest.TestCase):
         node = SimpleNamespace(stopping=threading.Event(), phase_ends=0.0)
         began = time.monotonic()
         self.assertTrue(Node._wait(node, 600, done=lambda: True))
+        wall = time.time()
         self.assertTrue(Node._wait(node, 600, done=lambda: True, least=0.4))
         self.assertGreaterEqual(time.monotonic() - began, 0.4, "no sooner than `least`")
         self.assertLess(time.monotonic() - began, 3)
-        self.assertGreater(node.phase_ends, time.time() + 590, "/status says the latest it could have ended")
+        self.assertLess(abs(node.phase_ends - (wall + 0.4)), 0.3, "/status says when it really ends, not ten minutes")
         self.assertFalse(Node._wait(node, 600, still=lambda: False, done=lambda: False), "the round's no longer wanted")
         node.stopping.set()
         self.assertFalse(Node._wait(node, 600, done=lambda: False))
         self.assertFalse(Node._wait(node, 600, done=lambda: True, least=0.1), "stopping, even with the work in")
+
+    def test_status_says_the_latest_a_phase_can_end_then_when_it_will(self):
+        """On test night the dashboard counted down a DeepSeek round's ten minutes, then the round ended twenty seconds
+        in: /status's phase_ends was always the latest. While work is out it still is (nobody waiting is cut short);
+        once the work is in, it's when the phase really ends."""
+        node, seen, arrived = SimpleNamespace(stopping=threading.Event(), phase_ends=0.0), [], threading.Event()
+
+        def done():
+            seen.append(node.phase_ends)
+            return arrived.is_set()
+        threading.Timer(0.5, arrived.set).start()
+        wall = time.time()
+        self.assertTrue(Node._wait(node, 600, done=done, least=0.1))
+        self.assertGreater(seen[0], wall + 590, "work still out: the latest it can end")
+        self.assertLess(node.phase_ends, wall + 2, "then: when it really ended")
+        self.assertLess(time.time() - wall, 3)
 
 
 class AllInTests(unittest.TestCase):
@@ -149,17 +166,21 @@ class AllInTests(unittest.TestCase):
         c.open_round()
         r, job = c.r, c.job(c.r.job_id)
         self.assertFalse(c.all_in(), "nobody can tell who else will register")
+        self.assertIsNone(c.progress(), "registration counts nothing (/status's progress)")
         self.register(proto)
         c.start_compute()
         held = sorted((uid, a) for a, uids in r.assignments.items() for uid in uids)
         self.assertGreater(len(held), 1)
-        for uid, a in held:
+        for i, (uid, a) in enumerate(held):
             self.assertFalse(c.all_in(), f"{uid} isn't committed yet")
+            self.assertEqual(c.progress(), (i, len(held)))
             c.commit(proto.workers[a].compute(r.units[uid], job, r.start))
         self.assertTrue(c.all_in())
+        self.assertEqual(c.progress(), (len(held), len(held)))
         beacon = c.start_reveal()
-        for uid, a in held:
+        for i, (uid, a) in enumerate(held):
             self.assertFalse(c.all_in(), f"{uid} isn't revealed yet")
+            self.assertEqual(c.progress(), (i, len(held)))
             rv = proto.workers[a].reveal(r.units[uid], job, beacon, c.config.challenge_segments)
             c.reveal(rv, wire=proto._wire(rv, job))
         self.assertTrue(c.all_in())
@@ -167,8 +188,9 @@ class AllInTests(unittest.TestCase):
         asked = [t for t in r.tasks.values() if t.verifier]
         self.assertGreater(len(asked), 1)
         self.assertTrue(any(t.canary for t in asked))
-        for t in asked:
+        for i, t in enumerate(asked):
             self.assertFalse(c.all_in(), "a task isn't answered yet")
+            self.assertEqual(c.progress(), (i, len(asked)))
             w = proto.workers[t.verifier]
             ok, bad = w.verify(job, t.unit, t.openings, t.segments)
             body = {"round": r.round_no, "task_id": t.task_id, "ok": bool(ok), "bad_segment": bad}

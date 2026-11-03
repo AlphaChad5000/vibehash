@@ -340,13 +340,18 @@ def _mine(a, keys: KeyPair):
     from .wire import MAX_CLOCK_SKEW_S
 
     url = node_of(a)
+    job = None if getattr(a, "job", None) in (None, "auto") else a.job
+    if job:  # before the GPU's self-test: a mistyped job is said at once
+        _chosen_job(NodeClient(url), job, url)
     if getattr(a, "deepseek", None):
         settings.save(deepseek=a.deepseek)  # remembered: the next `vibehash worker` does the same
     deepseek = (getattr(a, "deepseek", None) or settings.load().get("deepseek", "ask")) == "yes"
     try:
-        w = WorkerClient(url, keys, a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir, deepseek=deepseek)
+        w = WorkerClient(url, keys, a.memory_mb, a.flops, device=a.device, cache_dir=a.cache_dir, deepseek=deepseek,
+                         job=job)
     except RuntimeError as e:
         sys.exit(f"error: {e}")
+    mining = f"mining {job} only (--job): other jobs' rounds are sat out" if job else None
     status = w.node.status()
     skew = selftest.clock_skew(w.node)  # every message is signed with this clock, and refused if it's too far off
     if skew is not None and abs(skew) > MAX_CLOCK_SKEW_S - 2:
@@ -363,6 +368,8 @@ def _mine(a, keys: KeyPair):
         print(f"worker {w.keys.address} training on {w.backend.describe()} ({hardware.describe()})")
         if session:
             print(session.where())
+        if mining:
+            print(mining)
         if earning:
             print(earning)
         if low:
@@ -377,6 +384,8 @@ def _mine(a, keys: KeyPair):
     dash = minerui.MinerDashboard([("you", w)], url)
     if session:
         dash.note(session.where())
+    if mining:
+        dash.note(mining)
     if earning:
         dash.note(earning, logging.INFO + 1)
     if low:
@@ -390,6 +399,27 @@ def _mine(a, keys: KeyPair):
         stop.set()
     print(dash.summary())
     _record_end(session)
+
+
+def _chosen_job(api: NodeClient, job: str, url: str) -> None:
+    """`worker --job JOB`: the node must list JOB among its jobs with budget left, or the worker stops here naming
+    the ones it does. A node from before /network is asked about JOB alone."""
+    try:
+        listed = api.open_jobs()
+    except NodeError as e:
+        if e.status != 404:
+            raise
+        try:
+            listed = [job] if api.get(f"/job/{job}").get("escrow", 0) > 0 else []
+        except NodeError as e:
+            if e.status != 404:
+                raise
+            listed = []
+    if job not in listed:
+        there = (f"its jobs with budget left are {', '.join(listed)}" if listed else
+                 "it has no jobs with budget left right now")
+        sys.exit(f"error: {url} has no job {job} with budget left: {there}. Leave out --job (or --job auto) to mine "
+                 "every job")
 
 
 def cmd_devices(a):
@@ -1723,6 +1753,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--deepseek", choices=["ask", "yes", "no"], default=None,
                    help="take DeepSeek work (its ~30 GB of model files): ask once (the default), yes without asking "
                         "(unattended), or no. Remembered")
+    p.add_argument("--job", default="auto", metavar="JOB", help="mine only this job's rounds and sit the other jobs' out "
+                   "(default auto: every job this worker can do). The dashboard's job line changes it while it runs: "
+                   "Tab or 0-9")
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")

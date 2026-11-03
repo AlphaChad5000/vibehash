@@ -334,6 +334,15 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(stop.is_set())  # and the polling thread is told to stop
 
 
+class StatusTests(unittest.TestCase):
+    def test_status_progress_reaches_the_phase_bar_only_if_its_two_small_numbers(self):
+        """/status's "progress" (0.5.9 nodes): [in, of] of what the phase waits for. Older nodes don't send it."""
+        net = trainui.parse_status({"phase": "compute", "round": 7, "phase_ends": 1.0, "progress": [2, 8]})
+        self.assertEqual(net.progress, (2, 8))
+        self.assertIsNone(trainui.parse_status({"phase": "compute", "progress": ["[2J", 8]}).progress)
+        self.assertIsNone(trainui.parse_status({"phase": "compute"}).progress)
+
+
 class EmblemTests(unittest.TestCase):
     def test_every_catalog_model_has_its_makers_emblem(self):
         for m in catalog.CATALOG:

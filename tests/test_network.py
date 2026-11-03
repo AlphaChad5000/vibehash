@@ -373,6 +373,30 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(round(sum(x["earned_vibe"] for x in sealed) * VIBE),
                          s.balance(workers[0].address) + s.stake(workers[0].address) - 10 * VIBE)
 
+    def test_worker_job_must_be_one_the_node_lists(self):
+        """`worker --job JOB` (for pods and --plain): a job the node doesn't list with budget left stops it at once,
+        naming the jobs it does; a listed one is the worker's choice from the start."""
+        node, api, req, workers, *_, tmp = start_network(self, 1)
+        job = TrainingJob("listed-job", req.address, budget=60 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        wait_for(lambda: "listed-job" in node.chain.state.jobs)
+        wallets.save(workers[0], tmp / "w.json", None)
+        args = ["worker", "--plain", "--node", node.url, "--wallet", str(tmp / "w.json"), "--device", "cpu", "--flops",
+                "1e9", "--memory-mb", "8192"]
+        code, out = self.run_cli_status(*args, "--job", "nosuch")
+        self.assertEqual(code, f"error: {node.url} has no job nosuch with budget left: its jobs with budget left are "
+                               "listed-job. Leave out --job (or --job auto) to mine every job")
+        chosen = []
+
+        def run(client, stop=None):
+            chosen.append(client.choice.job_id)
+            raise KeyboardInterrupt
+        with mock.patch.object(WorkerClient, "run", run):
+            out = self.run_cli(*args, "--job", "listed-job")
+            self.run_cli(*args)  # and auto, by default
+        self.assertEqual(chosen, ["listed-job", None])
+        self.assertIn("mining listed-job only (--job)", out)
+
     def test_testnet_runs_and_resumes(self):
         # The small job: this tests resuming, not how much a busy CPU can train in 3 seconds.
         fast = ["--dir", str(self.home / "tn"), "--port", "0", "--device", "cpu", "--job", "small",
@@ -442,6 +466,149 @@ class DistantWorkerTest(unittest.TestCase):
         self.assertEqual([s.missed for s in worked], [[]] * len(worked))
         self.assertIn(12, [s.accepted_units for s in worked])
         self.assertEqual(drops, [])
+
+    def test_a_far_checker_gets_its_verdicts_in_before_the_verify_phase_ends(self):
+        """A RunPod pod checking fruit-demo on test night (2026-11-02): "the verify phase ended with 7 tasks left
+        unchecked", every round. It fetched each task's checkpoints one at a time and then sent its verdict, a round
+        trip after another, and 9 tasks didn't fit the 10 s phase. They now come down together, and verdicts go while
+        the next task is checked."""
+        node, api, req, workers, clients, stop, *_ = start_network(
+            self, 3, times=PhaseTimes(register_s=1.0, compute_s=5.0, reveal_s=1.5, verify_s=4.0, idle_s=0.3),
+            config=CoordinatorConfig(canaries_per_round=0, newcomer_units=12))
+        far = clients[0]
+
+        def far_open(request, near=far.node._open):
+            time.sleep(0.1)
+            return near(request)
+        far.node._open = far_open
+        given, answer = [], far._answer
+        far._answer = lambda rnd, job, tasks: (given.append(len(tasks)), answer(rnd, job, tasks))[1]
+        late = []
+
+        class Late(logging.Handler):
+            def emit(self, record):
+                if "left unchecked" in record.getMessage():
+                    late.append(record.getMessage())
+        handler = Late()
+        logging.getLogger("vibehash.worker").addHandler(handler)
+        self.addCleanup(logging.getLogger("vibehash.worker").removeHandler, handler)
+        job = TrainingJob("far-checks", req.address, budget=60 * SYN_PER_VIBE, fee_per_round=10 * SYN_PER_VIBE,
+                          units_per_round=12, steps_per_unit=40, checkpoint_every=5)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        run_until(node, clients, stop, node.chain.tip.height + 3)
+        self.assertGreaterEqual(sum(given), 4, "the far worker was given too few checks to tell")
+        self.assertEqual(late, [])
+
+
+class JobPickerTest(unittest.TestCase):
+    def test_a_worker_set_to_one_job_sits_the_other_out(self):
+        """Two jobs take turns a round each. A worker set to one of them (the dashboard's selector, `worker --job`)
+        registers only in that job's rounds, saying why in its activity line and not in its log; put back on auto
+        while it runs, it takes both."""
+        node, api, req, workers, clients, stop, *_ = start_network(
+            self, 2, times=PhaseTimes(register_s=1.0, compute_s=3.0, reveal_s=1.5, verify_s=2.0, idle_s=0.3),
+            config=CoordinatorConfig(canaries_per_round=0, newcomer_units=6))
+        for name in ("pick-a", "pick-b"):  # one after the other: a second tx sent at once would reuse the first's nonce
+            job = TrainingJob(name, req.address, budget=100 * VIBE, fee_per_round=5 * VIBE, units_per_round=4)
+            api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+            wait_for(lambda: name in node.chain.state.jobs)
+        picker, me = clients[0], workers[0].address
+        picker.choose("pick-a")
+        said = []
+
+        class Said(logging.Handler):
+            def emit(self, record):
+                said.append(record.getMessage())
+        handler = Said()
+        logging.getLogger("vibehash.worker").addHandler(handler)
+        self.addCleanup(logging.getLogger("vibehash.worker").removeHandler, handler)
+        threads = [threading.Thread(target=c.run, args=(stop,), daemon=True) for c in clients]
+        start, activities = node.chain.tip.height, set()
+        for t in threads:
+            t.start()
+
+        def rounds(job_id, after):
+            return [b for b in node.chain.blocks[after + 1:] if b.summary and b.summary.job_id == job_id]
+
+        def until(done, seconds=120):
+            deadline = time.time() + seconds
+            while not done() and time.time() < deadline:
+                activities.add(picker.stats.activity)
+                time.sleep(0.05)
+            self.assertTrue(done(), "the rounds didn't come in time")
+        until(lambda: len(rounds("pick-a", start)) >= 2 and len(rounds("pick-b", start)) >= 2)
+        picker.choose(None)  # from another thread, as the dashboard does, while a round is under way
+        switched = node.chain.tip.height  # the round now running may already be past registering: skip it
+        until(lambda: rounds("pick-a", switched + 1) and rounds("pick-b", switched + 1))
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+
+        def registered(block):
+            return picker.keys.public.hex() in {e["pubkey"] for e in api.get(f"/round/{block.height}/record")["registrations"]}
+        before_a, before_b = rounds("pick-a", start)[:2], rounds("pick-b", start)[:2]
+        self.assertTrue(all(registered(b) for b in before_a))
+        self.assertTrue(any(me in b.summary.worker_flops for b in before_a), [b.summary for b in before_a])
+        for b in before_b:  # the other worker trained them; this one wasn't there at all
+            self.assertFalse(registered(b), b.height)
+            self.assertNotIn(me, b.summary.worker_flops)
+            self.assertNotIn(me, b.summary.verifier_flops)
+            self.assertIn(workers[1].address, b.summary.worker_flops)
+        after_b = rounds("pick-b", switched + 1)
+        self.assertTrue(all(registered(b) for b in after_b))
+        self.assertTrue(any(me in b.summary.worker_flops for b in after_b), [b.summary for b in after_b])
+        self.assertIn("sitting out pick-b's round: mining pick-a only", activities)
+        self.assertEqual([m for m in said if "sitting out" in m or "mining" in m], [])
+
+    def test_a_chosen_job_that_runs_out_puts_the_worker_back_on_auto(self):
+        """Spent or cancelled, the job is no longer listed with budget left: the worker goes back to every job, with one
+        log line. It asks at most every OPEN_EVERY seconds, keeps the choice when it can't tell, and finishes a round it
+        registered in whatever the choice says by then."""
+        from vibehash import client as client_module
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        c = WorkerClient("http://127.0.0.1:9", KeyPair.generate(b"picker"), device="cpu", cache_dir=tmp.name, job="spent")
+        status = {"genesis_hash": "g", "height": 4, "round": 5, "attempt": "a", "phase": "register", "phase_ends": 0,
+                  "job_id": "other"}
+        c._follow_leader = lambda: dict(status)
+        c.jobs["other"], c.cannot["other"] = TrainingJob("other", "req", 0, 10), "this test's worker can't run it"
+        listed, asked = [["spent", "other"]], []
+
+        def open_jobs():
+            asked.append(1)
+            if isinstance(listed[0], Exception):
+                raise listed[0]
+            return listed[0]
+        c.home.open_jobs = open_jobs
+        with self.assertLogs("vibehash.worker", logging.INFO) as logs:
+            c.step()
+            c.step()  # within OPEN_EVERY: not asked again
+            self.assertEqual((c.choice.job_id, c.stats.activity, len(asked)),
+                             ("spent", "sitting out other's round: mining spent only", 1))
+            listed[0] = NodeError("the node is busy", 503)
+            c._open_asked -= client_module.OPEN_EVERY + 1
+            c.step()
+            self.assertEqual((c.choice.job_id, len(asked)), ("spent", 2))  # can't tell: kept
+            listed[0] = ["other"]
+            c._open_asked -= client_module.OPEN_EVERY + 1
+            c.step()
+            self.assertEqual((c.choice.job_id, c.stats.activity), (None, "this test's worker can't run it"))
+            c.done.clear()
+            c.step()
+            self.assertEqual(len(asked), 3)  # on auto: nothing more to ask
+        backs = [m for m in logs.output if "no budget left" in m]
+        self.assertEqual(backs, ["INFO:vibehash.worker:job spent has no budget left any more: mining every job (auto)"])
+
+        c.choose("another")  # a round it registered in is finished, whatever the choice says by then
+        c.done.clear()
+        c.done[(5, "a", "register")] = True
+        status["phase"] = "compute"
+        c.stats.activity = ""
+        c.step()
+        self.assertEqual(c.stats.activity, "this test's worker can't run it")
+        self.assertFalse(c.choose("another"))
+        self.assertTrue(c.choose(None))
 
 
 @unittest.skipIf(importlib.util.find_spec("torch") is None, "needs PyTorch")
