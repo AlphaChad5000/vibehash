@@ -46,7 +46,7 @@ class Site:
             return json.load(r)
 
     def claim(self) -> dict | None:
-        return self.post("dispatch/claim")
+        return self.post("dispatch/claim", {"machine": MACHINE})  # also tells the site this machine is online
 
     def report(self, rid: str, status: str, message: str | None = None, **extra) -> None:
         print(f"[{rid[:8]}] {status}: {message or ''}", flush=True)
