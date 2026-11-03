@@ -2,13 +2,14 @@
 
 A drill bores through rock while the worker trains, slows down while it checks other
 workers' results, fills its ore cart with every unit it commits, and throws gold sparks
-when VIBE lands. Below it: the round and phase, what the worker is doing, its speed, the
-work mined this session, earnings and stake, and the latest events.
+when VIBE lands. Below it: the round and phase, what the worker is doing, which jobs it
+mines (a selector: auto, or one of the jobs with budget left), its speed, the work mined
+this session, earnings and stake, and the latest events.
 
 Plain ANSI escape codes, nothing to install. Only used on a real terminal; `--plain` (or
-piping the output) keeps the classic log. NO_COLOR turns the colours off. What it shares
-with the training dashboard (trainui.py), from the palette and the rock to the screen
-handling, is in termui.py.
+piping the output) keeps the classic log, and `worker --job` picks the job there. NO_COLOR
+turns the colours off. What it shares with the training dashboard (trainui.py), from the
+palette and the rock to the screen and keys, is in termui.py.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import time
 from dataclasses import dataclass
 
 from . import termui
-from .client import NodeClient, NodeError, WorkerClient
+from .client import JobChoice, NodeClient, NodeError, WorkerClient
 from .economics import REP_MAX, REP_MIN
 from .termui import DIM, GOLD, GREEN, LAMP, PHASES, SPARKS, TEXT, TIMBER, WHITE, _cells, _fit, _line, _n, _noise, _si, _vibe, rgb
 from .termui import supported  # noqa: F401  (the commands ask minerui whether to show it)
@@ -31,6 +32,41 @@ DRILL, DRILL_DIM, TIP = rgb(80, 200, 255, True), rgb(60, 110, 140), rgb(225, 245
 GLYPHS = {**termui.GLYPHS, "rail": "═", "tie": "╪", "stripe": "▓", "cart": "▐▌"}
 ASCII = {**termui.ASCII, "rail": "=", "tie": "+", "stripe": "=", "cart": "[]"}
 BAND, TUNNEL, RAILS = 7, (2, 3, 4), 4  # rows in the mine picture; the drill bores rows 2-4
+JOBS_EVERY = 30.0  # seconds between asking the node which jobs have budget left, for the selector
+HINTS = ("  tab or 0-9 to pick", "  tab/0-9")  # the selector's keys, at the end of its line when there's room
+
+
+def selector(g: dict, options: list[str], sel: int, width: int, keys: bool = True) -> list:
+    """The job selector's line, at most `width` wide: "job:", then each option ("auto" first, then the jobs) with
+    its number key, the chosen one (`options[sel]`) in brackets, and the keys at the end if they fit (`keys`: only
+    when they work). When it doesn't all fit, the names not chosen get shorter (to 16, then 12 characters), the keys
+    go, the names go down to 8, and then the last options give way to "+N more", auto too. The chosen one always
+    shows, and is cut only when it alone is too wide for the line."""
+    more, n = g["more"], len(options)
+    hints = HINTS if keys else ()
+
+    def line(hint: str, cap: int | None, keep: int, own: int | None = None) -> list:
+        segs = [("job:", DIM)]
+        shown = [i for i in range(n) if i < keep or i == sel]
+        for i in shown:
+            on, name, limit = i == sel, options[i], own if i == sel else cap
+            if limit is not None and len(name) > limit:
+                name = name[:max(1, limit - len(more))] + more
+            segs += [(" [" if on else "  ", GOLD), (f"{i} " if i < 10 else "", DIM), (name, GOLD if on else TEXT),
+                     ("]" if on else " ", GOLD)]
+        if len(shown) < n:
+            segs.append((f" +{n - len(shown)} more", DIM))
+        return segs + [(hint, DIM)]
+
+    tries = ([(h, None, n) for h in hints] + [(h, c, n) for c in (16, 12) for h in hints[1:]]
+             + [("", c, n) for c in (None, 16, 12)] + [(h, 8, n) for h in (*hints[1:], "")]
+             + [(h, 8, k) for k in range(n - 1, -1, -1) for h in (*hints[1:], "")])
+    for t in tries:
+        segs = line(*t)
+        if sum(len(s) for s, _ in segs) <= width:
+            return segs
+    over = sum(len(s) for s, _ in line("", 8, 0)) - width  # the chosen one alone is too wide: cut it to fit
+    return line("", 8, 0, max(1, len(options[sel]) - over))
 
 
 @dataclass
@@ -63,9 +99,57 @@ class MinerDashboard:
         self.phase_seen: dict[tuple, float] = {}
         self.chain_id = ""
         self.started = time.time()
+        # One selector for every rig: they share the first one's choice (a worker's --job, or auto).
+        self.choice = getattr(self.rigs[0].client, "choice", None) or JobChoice()
+        for r in self.rigs:
+            r.client.choice = self.choice
+        self.jobs: list[str] = []  # jobs with budget left, as the node lists them (_poll_jobs)
+        self.keyed = False  # keys are being read (run), so the selector shows them
 
     def note(self, text: str, level: int = logging.INFO) -> None:
         self.feed.append((time.time(), level, text))
+
+    # --- the job selector ------------------------------------------------------------------------------------
+
+    def options(self) -> list[str | None]:
+        """What the selector offers: auto (None), then the jobs with budget left, and the chosen one if the node no
+        longer lists it (the worker puts itself back on auto once it notices)."""
+        chosen = self.choice.job_id
+        return [None, *self.jobs, *([chosen] if chosen and chosen not in self.jobs else [])]
+
+    def pick(self, job_id: str | None) -> None:
+        """Mine `job_id` only (None: every job), on every rig, and say so in the feed if that's a change."""
+        if self.choice.set(job_id):
+            self.note(f"mining {job_id} only" if job_id else "mining every job (auto)")
+
+    def press(self, key: str) -> None:
+        """One key, as termui.keypresses names it: Tab, j or the right arrow picks the next option, k or the left
+        arrow the one before (Shift+Tab too, where the terminal tells it from Tab: a Windows console doesn't); a or 0
+        auto, and 1-9 the job with that number."""
+        opts = self.options()
+        at = opts.index(self.choice.job_id) if self.choice.job_id in opts else 0
+        if key in ("tab", "j", "right"):
+            self.pick(opts[(at + 1) % len(opts)])
+        elif key in ("shift-tab", "k", "left"):
+            self.pick(opts[(at - 1) % len(opts)])
+        elif key in ("a", "A", "0"):
+            self.pick(None)
+        elif len(key) == 1 and key in "123456789" and int(key) < len(opts):
+            self.pick(opts[int(key)])
+
+    def _selector(self, width: int):
+        opts = self.options()
+        sel = opts.index(self.choice.job_id) if self.choice.job_id in opts else 0
+        return selector(self.g, ["auto", *opts[1:]], sel, width, self.keyed)
+
+    def _poll_jobs(self, stop: threading.Event) -> None:
+        """The selector's jobs, from the node's /network, every JOBS_EVERY seconds: off the drawing thread."""
+        while not stop.is_set():
+            try:
+                self.jobs = self.api.open_jobs()
+            except NodeError:
+                pass  # keep the last list: the node is busy, or from before /network
+            stop.wait(JOBS_EVERY)
 
     # --- background polling: balances arrive over HTTP, which mustn't stall the animation ------------
 
@@ -193,6 +277,7 @@ class MinerDashboard:
         mark = (self.g["tips"][self.frame_no % 3] if lead.busy else self.g["tips"][0]) + " "
         add((mark, PHASES.get(lead.phase, DIM)), (lead.activity if len(self.rigs) == 1 else
              f"{sum(s.busy for s in stats)} of {len(stats)} workers busy · {lead.activity}", TEXT))
+        add(*self._selector(w - 1))
         lines.append("")
         job = lead.job
         what = f"{job.job_id} ({job.spec.n_params:,} {job.spec.precision} weights)" if job else "no job yet"
@@ -235,18 +320,27 @@ class MinerDashboard:
 
     def run(self, stop: threading.Event, tick=None, on_start=None) -> None:
         """Draw until `stop` is set or Ctrl+C, calling `tick()` every frame. Worker and node log lines go to the
-        event feed meanwhile; start the workers in `on_start()` so their first lines land there too."""
+        event feed meanwhile; start the workers in `on_start()` so their first lines land there too. Keys pressed
+        move the job selector (press), read between frames, never waiting (termui.keypresses)."""
         loggers = [logging.getLogger(n) for n in ("vibehash.worker", "vibehash.node")]
         handler, saved = termui.Feed(self), [(lg, lg.propagate) for lg in loggers]
         for lg in loggers:
             lg.addHandler(handler)
             lg.propagate = False
         threading.Thread(target=self._poll, args=(stop,), daemon=True, name="dashboard-poll").start()
+        threading.Thread(target=self._poll_jobs, args=(stop,), daemon=True, name="dashboard-jobs").start()
         try:
-            with termui.alternate_screen() as out:
+            with termui.alternate_screen() as out, termui.keypresses() as read:
+                self.keyed = read is not None
+
+                def every_frame():
+                    for key in read() if read else ():
+                        self.press(key)
+                    if tick:
+                        tick()
                 if on_start:
                     on_start()
-                termui.animate(out, self.frame, lambda: not stop.is_set(), tick)
+                termui.animate(out, self.frame, lambda: not stop.is_set(), every_frame)
         finally:
             for lg, propagate in saved:
                 lg.removeHandler(handler)
