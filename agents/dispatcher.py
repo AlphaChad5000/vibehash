@@ -193,12 +193,18 @@ def run(site, req: dict, a) -> None:
         site.report(rid, "planning", f"Heads up: {plan['caveat']}")
     site.report(rid, "training", f"{len(plan['examples'])} examples on {plan['base']}, rank {plan['rank']}, "
                                  f"{plan['epochs']} epochs: {plan['reasoning']}", job_id=job)
+    rigor = req.get("rigor") if req.get("rigor") in RIGOR else "standard"  # a request queued before there was a choice
     results = [round_(site, rid, plan, chats, evals, out, title, 1)]
 
-    # Repair rounds: while the judge isn't convinced, the Job Architect writes chats aimed at what went wrong and
-    # fresh test prompts. Not for goals it warned need facts: more chats of the same size won't teach those.
-    while len(results) <= REPAIRS and not usable(results[-1]) and not plan.get("caveat"):
+    # Repair rounds: while the run isn't up to the bar the requester chose, the Job Architect writes chats aimed at
+    # what went wrong and fresh test prompts. They stop when a round doesn't improve on the one before (more of the
+    # same won't get it there), and for goals it warned need facts: more chats of the same size won't teach those.
+    while len(results) <= RIGOR[rigor]["repairs"] and not good_enough(results[-1], rigor) and not plan.get("caveat"):
         n = len(results) + 1
+        if n > 2 and progress(results[-1], rigor) <= progress(results[-2], rigor):
+            site.report(rid, "training", f"round {n - 1} did no better than round {n - 2}, so no more repairs: "
+                                         f"more of the same chats won't get it to the bar")
+            break
         site.report(rid, "training", f"round {n}: the Job Architect is writing chats aimed at the prompts it lost")
         graded = json.loads((out / f"{plan['job_id']}.eval.answers.graded.json").read_text())
         fix = architect.repair(plan, graded)
@@ -214,25 +220,48 @@ def run(site, req: dict, a) -> None:
     result = results[-1]
     result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")},
                          "vs_prompted": r["judge"].get("vs_prompted", {}).get("tuned_wins")}
+                        | {s: wins(r["judge"][s]) for s in judge.SETS if r["judge"].get(s)}
                         for i, r in enumerate(results)]
+    result["rigor"] = {"level": rigor, "met": good_enough(result, rigor) if RIGOR[rigor]["repairs"] else None}
     j = result["judge"]
     told = f"; over the base model told the goal, {j['vs_prompted']['tuned_wins']} of {j['prompts']}" \
         if j.get("vs_prompted") else ""
+    hard = f"; on the hard prompts, {wins(j['hard'])} of {j['hard']['prompts']}" if j.get("hard") else ""
+    met = result["rigor"]["met"]
+    bar = f" ({rigor}{'' if met is None else ': up to the bar' if met else ': short of the bar'})"
     site.report(rid, "done", " → ".join(f"{r['tuned_wins']}/{r['prompts']}" for r in result["rounds"]) +
-                f": fine-tune preferred over the untrained model on {j['tuned_wins']} of {j['prompts']} prompts{told}",
-                run=result)
+                f": fine-tune preferred over the untrained model on {j['tuned_wins']} of {j['prompts']} prompts"
+                f"{told}{hard}{bar}", run=result)
 
 
-REPAIRS = 2     # at most this many repair rounds after the first, so a request finishes in minutes
-USABLE = 0.8    # the judge preferring the fine-tune on this share of prompts ends the repairs
+# How hard a request tries before it's published, chosen on the form. Every level answers and reports every score;
+# a stricter one sets a higher bar and allows more repair rounds to reach it, so it takes longer.
+RIGOR = {
+    "quick":    {"repairs": 0, "check": False},  # one round, published as it is
+    "standard": {"repairs": 2, "check": False},  # repairs until it beats the base model told the goal
+    "strict":   {"repairs": 4, "check": True},   # ...and holds its style on the long, demanding check prompts
+}
+BAR = 0.8          # share of its test prompts the fine-tune must win against the base model told the goal
+CHECK_BAR = 2 / 3  # share of the check prompts (judge.SETS) it must win, the same way, for a strict request
 
 
-def score(result: dict) -> float:
-    return result["judge"]["tuned_wins"] / result["judge"]["prompts"]
+def wins(summary: dict) -> int:
+    """Wins against the base model told the goal (the honest rival), or against the untrained model if it wasn't."""
+    return (summary.get("vs_prompted") or summary)["tuned_wins"]
 
 
-def usable(result: dict) -> bool:
-    return score(result) >= USABLE
+def good_enough(result: dict, rigor: str) -> bool:
+    j = result["judge"]
+    if wins(j) / j["prompts"] < BAR:
+        return False
+    return not RIGOR[rigor]["check"] or not j.get("check") or wins(j["check"]) / j["check"]["prompts"] >= CHECK_BAR
+
+
+def progress(result: dict, rigor: str) -> float:
+    """How close a round got to the bar, to tell whether a repair helped."""
+    j = result["judge"]
+    check = wins(j["check"]) / j["check"]["prompts"] if RIGOR[rigor]["check"] and j.get("check") else 0
+    return wins(j) / j["prompts"] + check
 
 
 def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
@@ -252,6 +281,8 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
         detail = {"kind": "verdict", "round": round_no, "i": i, "prompts": n, "winner": v["winner"],
                   "flagged": v["flagged"] or bool(told and told["flagged"]), "prompt": pair["prompt"][:300],
                   "base": pair["base"][:550], "tuned": pair["tuned"][:550], "reason": v["reason"][:400]}
+        if pair.get("set"):
+            detail["set"] = pair["set"]
         if told:
             detail |= {"vs_prompted": told["winner"], "prompted": pair["prompted"][:550],
                        "prompted_reason": told["reason"][:400]}
@@ -270,9 +301,10 @@ def main():
     p.add_argument("--out", default="agent-jobs")
     p.add_argument("--every", type=int, default=20, help="seconds between checks for new requests")
     p.add_argument("--once", action="store_true", help="run one request, then stop")
+    p.add_argument("--rigor", choices=list(RIGOR), default="strict", help="with --goal: how hard it tries (RIGOR)")
     a = p.parse_args()
     if a.goal:
-        run(Terminal(), {"id": os.urandom(4).hex(), "goal": a.goal}, a)
+        run(Terminal(), {"id": os.urandom(4).hex(), "goal": a.goal, "rigor": a.rigor}, a)
         return
 
     token = os.environ.get("DISPATCH_TOKEN") or sys.exit("set DISPATCH_TOKEN to the site's dispatch secret first")

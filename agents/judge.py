@@ -29,10 +29,17 @@ from models import chat_prompt, source
 
 
 PROMPTED = "Follow this instruction in every reply: {goal}"
-# Prompts people wrote, the long and demanding kind: every run answers them besides its own test prompts, and they're
-# scored apart, so a style that only holds on short questions shows. No run trains or repairs on them.
-HARD = [p.strip() for p in (Path(__file__).with_name("hard_prompts.txt").read_text(encoding="utf-8")
-                            .split("\n=====\n")[1:])]
+
+
+def fixed(name: str) -> list[str]:
+    """A file of prompts: a paragraph on what they're for, then the prompts, each after a line of ====="""
+    return [p.strip() for p in Path(__file__).with_name(name).read_text(encoding="utf-8").split("\n=====\n")[1:]]
+
+
+# Two fixed sets of long, demanding prompts, answered by every run besides its own test prompts and scored apart, so
+# a style that only holds on short questions shows. No run trains or repairs on either. A strict request's repair
+# loop stops on the check prompts; the hard prompts decide nothing, so theirs is the honest score.
+SETS = {"check": fixed("check_prompts.txt"), "hard": fixed("hard_prompts.txt")}
 LONG = 300  # characters: a prompt this long asks for more than 200 tokens can say (architect.LONG too)
 
 
@@ -58,7 +65,8 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     tok = AutoTokenizer.from_pretrained(**source(spec["base"]))
     model = AutoModelForCausalLM.from_pretrained(**source(spec["base"]), dtype=torch.bfloat16, device_map="auto")
 
-    prompts = spec["prompts"] + HARD
+    sets = [(p, None) for p in spec["prompts"]] + [(p, name) for name, ps in SETS.items() for p in ps]
+    prompts = [p for p, _ in sets]
     base = [reply(tok, model, p, room(p)) for p in prompts]
     told = {"role": "system", "content": PROMPTED.format(goal=spec["goal"])}
     prompted = [reply(tok, model, [told, {"role": "user", "content": p}], room(p)) for p in prompts]
@@ -67,8 +75,8 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
 
     out = eval_file.with_suffix(".answers.json")
     out.write_text(json.dumps({"goal": spec["goal"], "pairs": [
-        {"prompt": p, "base": b, "prompted": pr, "tuned": t} | ({"hard": True} if i >= len(spec["prompts"]) else {})
-        for i, (p, b, pr, t) in enumerate(zip(prompts, base, prompted, tuned))]}, indent=2))
+        {"prompt": p, "base": b, "prompted": pr, "tuned": t} | ({"set": s} if s else {})
+        for (p, s), b, pr, t in zip(sets, base, prompted, tuned)]}, indent=2))
     print(f"wrote {out}")
     return out
 
@@ -151,11 +159,12 @@ def grade(answers_file: Path, on_verdict=None) -> None:
             if on_verdict:
                 on_verdict(i, pair)
     data["model"] = model_name()
-    data["summary"] = summary([p for p in data["pairs"] if not p.get("hard")])
-    if hard := [p for p in data["pairs"] if p.get("hard")]:
-        data["summary"]["hard"] = summary(hard)
+    data["summary"] = summary([p for p in data["pairs"] if not p.get("set")])
+    for name in SETS:
+        if some := [p for p in data["pairs"] if p.get("set") == name]:
+            data["summary"][name] = summary(some)
     answers_file.with_suffix(".graded.json").write_text(json.dumps(data, indent=2))
-    for name, s in [("", data["summary"]), ("hard prompts: ", data["summary"].get("hard"))]:
+    for name, s in [("", data["summary"])] + [(f"{n} prompts: ", data["summary"].get(n)) for n in SETS]:
         if s:
             print(f"\n{name}fine-tune preferred on {s['tuned_wins']} of {s['prompts']} prompts ({s['ties']} ties)")
             if v := s.get("vs_prompted"):

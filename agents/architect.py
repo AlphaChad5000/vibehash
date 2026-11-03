@@ -165,8 +165,8 @@ prompts below. Reply with ONE JSON object:
 def repair(plan: dict, graded: dict) -> dict:
     """Round 2+: more chats aimed at the prompts the fine-tune lost or tied, and fresh test prompts, so the repaired
     model is judged on prompts it wasn't repaired against."""
-    # Not the hard prompts (judge.HARD): they test every run, so no run may be repaired against them
-    misses = [p for p in graded["pairs"] if not p["verdict"]["tuned_won"] and not p.get("hard")]
+    # Not the fixed check and hard prompts (judge.SETS): they test every run, so no run may be repaired against them
+    misses = [p for p in graded["pairs"] if not p["verdict"]["tuned_won"] and not p.get("set")]
     report = "\n\n".join(f"Prompt: {p['prompt']}\nFine-tune replied: {p['tuned']}\nJudge: {p['verdict'].get('reason')}"
                          for p in misses)
     seen = set(plan["eval_prompts"]) | {e["user"] for e in plan["examples"]}

@@ -1,7 +1,8 @@
 Hard prompts: every fine-tune answers these as well as the Job Architect's test prompts, and they're scored on
-their own (judge.py). People wrote them, not the agents, and no run is trained or repaired on them, so they show
-whether a style survives the long, demanding requests people actually send: a role to play, numbered parts, a
-required format. A line of five = signs separates prompts; this paragraph is not one.
+their own (judge.py). People wrote them, not the agents, and no run is trained or repaired on them, or chosen by
+them (the repair loop stops on check_prompts.txt instead), so their score is the honest one: whether a style survives
+the long, demanding requests people actually send, with a role to play, numbered parts, a required format. A line of
+five = signs separates prompts; this paragraph is not one.
 =====
 Act as a Principal Systems Analyst and Senior Technical Writer. I need you to analyze the concept of "local-first software architecture" and break it down for a mixed audience of software engineers and product managers.
 
