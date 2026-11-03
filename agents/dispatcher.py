@@ -33,6 +33,7 @@ import models
 import publish
 
 MACHINE = platform.node()
+CHAT_TOKENS = 1024  # longest chat reply: room for a table or a few sections (judged answers stop at 200)
 
 
 class Site:
@@ -111,9 +112,9 @@ class Chatter:
         self.load(base)
         if not job:
             if not self.adapters:
-                return judge.reply(self.tok, self.model, conversation)
+                return judge.reply(self.tok, self.model, conversation, CHAT_TOKENS)
             with self.model.disable_adapter():
-                return judge.reply(self.tok, self.model, conversation)
+                return judge.reply(self.tok, self.model, conversation, CHAT_TOKENS)
         if not self.adapters:
             from peft import PeftModel
             self.model = PeftModel.from_pretrained(self.model, str(self.jobs / "adapters" / job), adapter_name=job)
@@ -121,7 +122,7 @@ class Chatter:
             self.model.load_adapter(str(self.jobs / "adapters" / job), adapter_name=job)
         self.adapters.add(job)
         self.model.set_adapter(job)
-        return judge.reply(self.tok, self.model, conversation)
+        return judge.reply(self.tok, self.model, conversation, CHAT_TOKENS)
 
     def reply(self, job: str, message: str) -> tuple[str, str]:
         """The base model's reply and the fine-tune's, to the same message."""

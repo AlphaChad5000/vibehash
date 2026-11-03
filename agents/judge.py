@@ -29,13 +29,24 @@ from models import chat_prompt, source
 
 
 PROMPTED = "Follow this instruction in every reply: {goal}"
+# Prompts people wrote, the long and demanding kind: every run answers them besides its own test prompts, and they're
+# scored apart, so a style that only holds on short questions shows. No run trains or repairs on them.
+HARD = [p.strip() for p in (Path(__file__).with_name("hard_prompts.txt").read_text(encoding="utf-8")
+                            .split("\n=====\n")[1:])]
+LONG = 300  # characters: a prompt this long asks for more than 200 tokens can say (architect.LONG too)
 
 
-def reply(tok, model, prompt: str | list[dict]) -> str:
-    """One reply, greedy so the same prompt always gets the same answer (the site's chat answers this way too)."""
+def reply(tok, model, prompt: str | list[dict], tokens: int = 200) -> str:
+    """One reply, greedy so the same prompt always gets the same answer (the site's chat answers this way too).
+    Judged answers to short prompts stop at 200 tokens, the length the first published scores were measured at."""
     ids = tok(chat_prompt(tok, prompt), add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)
-    out = model.generate(ids, max_new_tokens=200, do_sample=False)
+    out = model.generate(ids, max_new_tokens=tokens, do_sample=False)
     return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+def room(prompt: str) -> int:
+    """Tokens a judged reply may take: a five-part request cut off at part two would lose on length, not style."""
+    return 800 if len(prompt) >= LONG else 200
 
 
 def answer(eval_file: Path, adapter_dir: Path) -> Path:
@@ -47,16 +58,17 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     tok = AutoTokenizer.from_pretrained(**source(spec["base"]))
     model = AutoModelForCausalLM.from_pretrained(**source(spec["base"]), dtype=torch.bfloat16, device_map="auto")
 
-    base = [reply(tok, model, p) for p in spec["prompts"]]
+    prompts = spec["prompts"] + HARD
+    base = [reply(tok, model, p, room(p)) for p in prompts]
     told = {"role": "system", "content": PROMPTED.format(goal=spec["goal"])}
-    prompted = [reply(tok, model, [told, {"role": "user", "content": p}]) for p in spec["prompts"]]
+    prompted = [reply(tok, model, [told, {"role": "user", "content": p}], room(p)) for p in prompts]
     tuned_model = PeftModel.from_pretrained(model, str(adapter_dir))  # the same weights plus the LoRA adapter
-    tuned = [reply(tok, tuned_model, p) for p in spec["prompts"]]
+    tuned = [reply(tok, tuned_model, p, room(p)) for p in prompts]
 
     out = eval_file.with_suffix(".answers.json")
     out.write_text(json.dumps({"goal": spec["goal"], "pairs": [
-        {"prompt": p, "base": b, "prompted": pr, "tuned": t}
-        for p, b, pr, t in zip(spec["prompts"], base, prompted, tuned)]}, indent=2))
+        {"prompt": p, "base": b, "prompted": pr, "tuned": t} | ({"hard": True} if i >= len(spec["prompts"]) else {})
+        for i, (p, b, pr, t) in enumerate(zip(prompts, base, prompted, tuned))]}, indent=2))
     print(f"wrote {out}")
     return out
 
@@ -138,23 +150,30 @@ def grade(answers_file: Path, on_verdict=None) -> None:
             print(f"{pair['verdict']['winner']:>5}  {pair['verdict']['reason']}")
             if on_verdict:
                 on_verdict(i, pair)
-    pairs, n = data["pairs"], len(data["pairs"])
+    data["model"] = model_name()
+    data["summary"] = summary([p for p in data["pairs"] if not p.get("hard")])
+    if hard := [p for p in data["pairs"] if p.get("hard")]:
+        data["summary"]["hard"] = summary(hard)
+    answers_file.with_suffix(".graded.json").write_text(json.dumps(data, indent=2))
+    for name, s in [("", data["summary"]), ("hard prompts: ", data["summary"].get("hard"))]:
+        if s:
+            print(f"\n{name}fine-tune preferred on {s['tuned_wins']} of {s['prompts']} prompts ({s['ties']} ties)")
+            if v := s.get("vs_prompted"):
+                print(f"{name}over the base model told the goal: {v['tuned_wins']} of {s['prompts']} ({v['ties']} ties)")
+
+
+def summary(pairs: list[dict]) -> dict:
+    """The score over some of the pairs: the Job Architect's test prompts, or the hard prompts on their own."""
+    n = len(pairs)
     wins = sum(p["verdict"]["winner"] == "tuned" for p in pairs)
     ties = sum(p["verdict"]["winner"] == "tie" for p in pairs)
-    data["model"] = model_name()
-    data["summary"] = {"prompts": n, "tuned_wins": wins, "ties": ties, "base_wins": n - wins - ties,
-                       "interval": interval(wins, n),
-                       "flagged": sum(p["verdict"]["flagged"] or p.get("vs_prompted", {}).get("flagged", False)
-                                      for p in pairs)}
+    out = {"prompts": n, "tuned_wins": wins, "ties": ties, "base_wins": n - wins - ties, "interval": interval(wins, n),
+           "flagged": sum(p["verdict"]["flagged"] or p.get("vs_prompted", {}).get("flagged", False) for p in pairs)}
     if all("vs_prompted" in p for p in pairs):
         pw = sum(p["vs_prompted"]["winner"] == "tuned" for p in pairs)
         pt = sum(p["vs_prompted"]["winner"] == "tie" for p in pairs)
-        data["summary"]["vs_prompted"] = {"tuned_wins": pw, "ties": pt, "prompted_wins": n - pw - pt,
-                                          "interval": interval(pw, n)}
-    answers_file.with_suffix(".graded.json").write_text(json.dumps(data, indent=2))
-    print(f"\nfine-tune preferred on {wins} of {n} prompts ({ties} ties)")
-    if v := data["summary"].get("vs_prompted"):
-        print(f"over the base model told the goal: {v['tuned_wins']} of {n} ({v['ties']} ties)")
+        out["vs_prompted"] = {"tuned_wins": pw, "ties": pt, "prompted_wins": n - pw - pt, "interval": interval(pw, n)}
+    return out
 
 
 if __name__ == "__main__":

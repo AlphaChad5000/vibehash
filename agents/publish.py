@@ -33,6 +33,7 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
               "flagged": p["verdict"].get("flagged", False) or p.get("vs_prompted", {}).get("flagged", False)}
              | ({"prompted": p["prompted"], "vs_prompted": p["vs_prompted"]["winner"],
                  "prompted_reason": p["vs_prompted"]["reason"]} if "vs_prompted" in p else {})
+             | ({"hard": True} if p.get("hard") else {})
              for p in graded["pairs"]]
     return {"title": title or job.replace("-", " ").capitalize(), "job": job, "goal": plan["goal"],
             "base_title": TITLES.get(base, base), "base_repo": BASES[base],

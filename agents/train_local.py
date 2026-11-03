@@ -70,7 +70,7 @@ def tensors(model, ex: dict) -> dict:
 
 
 def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: float = 2e-4, accumulate: int = 4,
-          max_len: int = 512, seed: int = 0) -> Path:
+          max_len: int = 1536, seed: int = 0) -> Path:
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
