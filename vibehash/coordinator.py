@@ -56,6 +56,7 @@ from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
 from .verification import (
+    FINETUNE_CHECK,
     challenge_segments,
     check_commitment_signature,
     check_openings,
@@ -66,6 +67,7 @@ from .verification import (
     replay_cost,
     replay_openings,
     replay_segment,
+    replicas_agree,
     reproduces,
     required_openings,
 )
@@ -140,6 +142,9 @@ class CoordinatorConfig:
     max_newcomers: int = 64  # workers without stake (earning it in) admitted per round, so they can't crowd the round
     max_mempool: int = 10_000
     min_fee: int = 0  # syn a tx must pay to be relayed; `vibehash node` sets fees.DEFAULT_MIN_FEE
+    # How a fine-tune's replicas are compared (verification.FINETUNE_CHECK). Only fine-tunes' rounds record it
+    # (open_round), so other jobs' rules, and their records' hashes, stay as they were.
+    finetune_check: int = FINETUNE_CHECK
 
     def rules(self) -> dict:
         """The settings a round's outcome depends on, recorded with it so a replay uses the same ones."""
@@ -686,6 +691,10 @@ class Coordinator:
         if job.finetune:  # its disputes (start_disputes): signed moves, evidence and the weights the referee used
             self.r.record |= {"version": FINETUNE_RECORD_VERSION, "games": []}
             self.r.record["checks"]["game"] = {}  # each dispute's root states, from the checkpoints
+            # How its replicas are compared (verification.FINETUNE_CHECK). A replay takes the recorded rules instead
+            # (below), and a record from before this has none: rule 1, which is recorded as it was, without one.
+            if self.config.finetune_check != 1:
+                self.r.record["rules"]["finetune_check"] = self.config.finetune_check
         if prep_units:  # a DeepSeek prep round: which unit of the work graph each of its units is
             self.r.record["prep"] = {"units": dict(prep_units)}
             self.r.record["checks"]["handoff"] = {}  # whether a rejected unit's outputs are its last state
@@ -1596,7 +1605,24 @@ class Coordinator:
         else:
             a, b = self._claim("game", gid, ends)
         g = dg.Game(gid, uid, defender, challenger, why, list(root), a, b, seed=r.units[uid].seed)
+        if root == ["unit"] and not self.replaying:
+            g.ready = self._checkpoint_states(job, r.reveals[key])
         r.games[gid] = g.start(self._program(job, uid))
+
+    def _checkpoint_states(self, job: TrainingJob, rv) -> list[str]:
+        """The states at a unit's segment boundaries that its reveal opened, put with the dispute's states: a split at
+        the unit names exactly these (its children are the segments), so the defender needn't send again what it
+        uploaded as checkpoints during compute. Round 7280 on the public network: a defender sending a unit's split
+        tensor by tensor from home missed its move. Live rounds only: a replay rebuilds no states but the game's ends."""
+        out = []
+        for i in sorted(rv.openings):
+            if 0 < i < job.n_segments:
+                state, manifest, blobs = dg.checkpoint_state(job.spec, rv.openings[i][0])
+                for raw in blobs.values():
+                    self._put_trace(raw)
+                self._put_trace(manifest)
+                out.append(state)
+        return out
 
     def _replay_bytes(self, blob_id: str) -> bytes | None:
         """A dispute's evidence, which the record names by id: from self.roots (the leader's blobs, for a validator).
@@ -1782,11 +1808,15 @@ class Coordinator:
         return r is None or all(g.turn == "done" for g in r.games.values())
 
     def _replicas_agree(self, job: TrainingJob, keys: list) -> bool:
-        """Whether replicas of a unit ended at the same weights (by the agreement rule, loosened to what a whole unit on
-        other hardware measured, finetune.WHOLE_TOLERANCE; no training)."""
-        r, tol = self.r, max(self.config.agreement_tolerance, WHOLE_TOLERANCE)
+        """Whether replicas of a unit ended at the same weights, by the round's own rule (verification.FINETUNE_CHECK):
+        rule 2's replicas_agree, or rule 1's agreement rule loosened to what a whole unit on other hardware measured
+        (finetune.WHOLE_TOLERANCE). No training."""
+        r = self.r
         finals = [r.reveals[k].final_params for k in keys]
         self._weights(r.start, *finals)
+        if r.record["rules"].get("finetune_check", 1) >= 2:
+            return all(replicas_agree(f, finals[0], r.start, job.spec, job.lr, job.steps_per_unit) for f in finals[1:])
+        tol = max(self.config.agreement_tolerance, WHOLE_TOLERANCE)
         return all(reproduces(f, finals[0], r.start, tol, job.spec) for f in finals[1:])
 
     # --- 5. finalize ------------------------------------------------------------------------

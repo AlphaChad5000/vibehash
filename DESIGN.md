@@ -551,6 +551,53 @@ Checkpoints are three times B's size (27.5 MB for Qwen3-0.6B at rank 16).
   step, close to the bound.
 - **Canaries** rescale one segment's whole update, so all three parts are off
   by 15–25% and every honest replay rejects them.
+- **Rule 2: the comparison knows Adam (2026-11-02).** On the public network, honest workers on two machines
+  rejected each other's units and replicas of a unit disagreed (round 7280, below), because two things the rule
+  above didn't allow for happen on any two devices:
+  - **Adam's first step flips signs.** Each unit starts from zero moments, so its first step moves every weight of
+    B by lr times the sign of its gradient (m̂/√v̂ = g/|g|). Where a gradient is nearer zero than the two devices'
+    rounding apart, the sign comes out differently and that weight lands up to 2·lr away, for good: the steps after
+    take it the same way on both. In round 7280's unit, 45 of 2.29M weights, whose step-1 gradients were 6e-10 to
+    4e-7 against noise up to 1e-5. Enough on their own to fail 1e-4 of B's size.
+  - **A gradient's noise depends on the data.** Most batches' gradients were 7e-6 apart, but one sequence's 3.5e-4
+    (its batch's 1.3e-4), worst in the first layers, so a unit's moments came out 2.8e-4 apart, over the job's 1e-4.
+
+  So a fine-tune's comparison is versioned (`verification.FINETUNE_CHECK`): a round records the rule it compared its
+  replicas by in `rules["finetune_check"]`, a record without one is rule 1 (above), and every round replays and
+  rechecks by its own. Validators refuse a new round that isn't rule 2. Checkers, whose verdicts are their own word,
+  use the newest. Rule 2 (`adam_reproduces`, `replicas_agree`):
+  - **m and v** within `MOMENT_TOLERANCE` (1e-3) of their size, or the job's tolerance if larger, and 1% of their
+    change.
+  - **B, in a segment from zero moments** (a unit's first): the `FLIP_SHARE` (1e-4) of its weights furthest from the
+    replay are set aside, each still no further than two runs of Adam can put it (2·`max_step`), and the rest within
+    `FRESH_TOLERANCE` (1e-3) of the segment's change. Its size is no yardstick there: in a job's first round B's size
+    is its change.
+  - **B, from moments built up:** rule 1's, the job's tolerance of its size and 1% of its change. Adam's steps are
+    smooth there, and nothing honest flips.
+  - **Replicas** (whole units, compared by the node): B alone, flips set aside as above, the rest within 1% of the
+    unit's change. Their moments are zeroed once the round is averaged, and each replica's checkers check them
+    segment by segment; over a whole unit the flips' effect on later gradients builds up (m 2e-2 apart after 16 steps).
+
+  Measured on round 7280's own unit (its start and dataset, from the node), an RTX 4070 SUPER against the CPU, and the
+  same unit trained with TF32 on (a cheaper, less precise worker):
+
+  | | Honest, CUDA vs CPU | TF32 vs CPU |
+  |---|---|---|
+  | Segment 0 (zero moments): B, flips set aside, of its change / m / v | 2.1e-4 / 2.8e-4 / 1.9e-4 (45 flips, 1.97·lr at most) | 3.4e-2 / 3.2e-2 / 3.0e-2 (3,927 flips, 3.8·lr) |
+  | Segments 1–3: B of its size / m | 1e-6 / 6e-6 to 1.6e-5 | 4.5e-4 to 6.6e-4 / 3e-3 to 6e-3 |
+  | Whole unit (replicas): B, flips set aside, of its change | 1.6e-3 | |
+  | Rule 1 / rule 2 | segment 0 and replicas fail / all pass | all fail / all fail |
+
+  The same on synthetic 64-token data from fresh adapters (`RealModelTests.test_round_7280s_segment_replays_on_the_
+  cpu_by_rule_2`, opt-in): B 7.5e-4 of its size apart with 5 weights a step apart, m 5.7e-5, v 6.4e-5; rule 1 fails
+  it, rule 2 passes it either way round and fails the TF32 run.
+
+  Freezers, canaries, a sign flipped across much of B, a step past Adam's reach, moments 1% off and a flip from moments
+  built up all still fail (`test_another_devices_training_passes_rule_2_and_cheats_dont`; a worker training as
+  another device would, `worker.elsewhere`, is accepted in a round: `test_a_worker_on_other_hardware_is_accepted_and_
+  old_rounds_keep_rule_1`). **Its limit:** a flip's knock-on through the steps after it grows with the step it took,
+  so the tolerances hold at the learning rates `settings_for` gives (5e-4 at most; the tiny test model at 5e-4 matches
+  Qwen3-0.6B), not at any a poster might choose: on the tiny model at 1e-2 one flip moves m 6e-3.
 - Lazy, freezer, shortcut and poisoner workers are all caught, and rounds
   replay and recheck from their records with no disputes
   (`test_finetune.ProtocolTests`).
@@ -580,7 +627,8 @@ same step.
 | Held-back loss on 2,379 everyday chats, Adam at 3e-4 / 1e-3 / 3e-3, after 5 simulated rounds of 4 units | 1.127 / 1.132 / 1.202 (from 2.461) |
 
 So a replay on other hardware sits 4,000 times inside the 1% rule, and
-fine-tunes use a `tolerance` of 1e-4, as float32 MLPs do. The default learning
+fine-tunes use a `tolerance` of 1e-4, as float32 MLPs do. Those runs started from adapters already trained a little
+on random tokens; round 7280's real one, from zero moments on short chats, didn't fit it (rule 2, above). The default learning
 rate is 5e-4 below 1B weights, 3e-4 up to about 3B and 2e-4 above.
 
 **Who needs what.** Workers need PyTorch and a GPU with the job's `memory_mb`
@@ -645,8 +693,7 @@ Each step:
    - **Its length:** a split and a pick for each 64-fold narrowing at each level from its root down to an op (one
      at least, to descend), then the evidence. `program.dispute_size` counts the most from the job's spec: on Qwen3-4B,
      15 moves at 4 steps a segment, 17 at 64, 21 for one segment of 10,000 steps (13 to 19 on Qwen3-0.6B). Each move
-     has `move_s` to be made: re-running a segment, plus the largest split's states uploaded and downloaded at the
-     reference speeds (also `dispute_size`), or the verify phase if that's longer.
+     has `move_s` to be made (`TrainingJob.move_seconds`, item 10), or the verify phase if that's longer.
    - **Silence and conceding:** a party silent past its deadline loses. A challenger may concede instead of picking.
      - **A checker that concedes withdraws its rejection.** It isn't slashed, but it forfeits its pay for checking that
        round and counts as having missed (reputation). Before naming a tile at an op, a checker runs the referee itself
@@ -747,6 +794,23 @@ Each step:
     `move_s`, from `program.dispute_size`), so validators wait long enough for a disputed round. It's that long only
     for a party that makes every move just in time: the phase ends when every dispute has. No phase is longer than
     `node.MAX_PHASE_S` (an hour), whatever a spec asks for.
+    - **A move's time is sized for a home computer** (`TrainingJob.move_seconds`, since 2026-11-02). Round 7280 on the
+      public network gave each move 53.8 s, and an honest defender's first split came a minute late: it lost its game
+      and its stake. A late unit costs a worker part of the next round's work; a late move, the stake. So moves are
+      timed for a slower computer and link than the phases (`tasks.MOVE_*`): half the reference GPU, 10 Mbit/s up, a
+      quarter second a request with 8 at a time, 15 s to see the move is due, and another segment's compute for a
+      check the worker had started. A move is the longer of a split (re-running a segment at most, then sending its
+      states up) and a pick (fetching them, then re-running every segment of a unit). Round 7280's job now gets 131 s
+      a move. A job whose moves then need more than the hour gets less each, as before; post_job still judges a job at
+      the reference speeds, so every job it took before it takes now.
+    - **The worker does disputes first** (`client.WorkerClient`). Its verify phase's checks run beside its loop and
+      stop, at the next segment, once the phase is over, so it sees the dispute phase open and moves at once. Each
+      game's move is worked out in a thread of its own. A state it holds (the round's start, its checkpoints) it
+      takes as its own rather than fetching (`tracer.Party.adopt`), and a state's tensors go up and down eight at a
+      time, a request each (`client.TRACE_REQUESTS`). A split at a unit names the defender's checkpoints, so it re-runs
+      nothing, and the node builds the states its reveal opened when the game starts (`Coordinator._checkpoint_states`,
+      `Game.ready`, in `GET /round/games`), so it sends nothing it uploaded during compute. Before, it fetched and sent
+      every tensor one at a time, two round trips each: a Qwen3-0.6B split was about 2,700 of them.
     - **Jobs whose disputes can't be played from home are refused** (the third review's finding B). A split can name
       gigabytes: K − 1 states of the adapters' B, m and v between steps, or a layer's activations. At the reference
       upload (REF_UPLOAD, 20 Mbit/s) a defender that slow would lose to a false accuser. So `post_job` refuses a job
@@ -829,6 +893,9 @@ once a round would be a ledger change.
     A node that doesn't have the dataset fetches it from the block's proposer (or the peer that sent the block), then
     any peer, checked on arrival (`node.PeerDatasets`), rather than refusing the block.
   - **Recheck:** besides version 2's, it rebuilds each dispute's root states from the checkpoints.
+  - **Its rules** say how its replicas were compared (`finetune_check`, rule 2 above, since 2026-11-02); a record
+    without it is rule 1. A node from before refuses a record with it (its `CoordinatorConfig` has no such field), so
+    every validator upgrades before the first such round, as with a version.
   - **MLP rounds** stay version 2, unchanged.
 - **What counts as a fine-tune:** a spec with `lora` and a model without `n_in` (`tasks.is_finetune_spec`), a shape
   every earlier node refused. An MLP spec that happens to carry a field named `base` stays an MLP spec, as it was.

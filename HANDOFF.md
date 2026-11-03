@@ -33,7 +33,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 |---|---|
 | `coordinator.py` | **The core.** Round state machine (register → compute/commit → beacon/reveal → verify → finalize). Shared by the real node and the simulator. |
 | `ledger.py` | Accounts, signed txs, blocks. Rewards and slashes are **re-derived from each block's `RoundSummary`**, never trusted from the proposer. Unbonding, chain id, job specs on chain. |
-| `verification.py` | Commit–reveal, Merkle openings, sanity checks, replay spot-checks, full replay for arbitration. |
+| `verification.py` | Commit–reveal, Merkle openings, sanity checks, replay spot-checks, full replay for arbitration. A fine-tune's comparison is versioned (`FINETUNE_CHECK`, a round's `rules["finetune_check"]`, absent = 1): rule 2's `adam_reproduces` (checkers) and `replicas_agree` (the node) allow for Adam's first step flipping signs across devices (DESIGN §8). |
 | `economics.py` | Subsidy and halving, 80/15/5 split, reputation (per round), slashing. |
 | `model.py` | Reference MLP (multi-layer, tanh, softmax), deterministic SGD, float32 or float64. Batch indices come from `(unit_seed, step)`, so any segment can be replayed alone. |
 | `compute.py` | Backends: `NumpyBackend` (CPU reference) and `TorchBackend` (cuda / xpu / mps), with identical maths. `self_test()` catches broken GPU drivers; `get_backend("auto")` falls back to the CPU. |
@@ -41,7 +41,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `node.py` | HTTP node. JSON for small messages; `/blob/<sha>` and `/dataset/<sha>` for chunked binary transfer (GET status, GET `?offset=`, signed PUT). On a validator chain: `_lead` runs the round when it's our turn and proposes it, `_validate` (apply + replay) decides our vote, `_commit` adopts final blocks, `_sync` catches up from peers, `_ensure_params` / `_fetch_missing_data` pull trained weights and datasets from peers. |
 | `consensus.py` | Tendermint Algorithm 1 (`Engine`: proposals, prevote/precommit, locking, timeouts, round skipping), stake-weighted `proposer_order`, `check_certificate`. Transport-agnostic: node.py feeds it messages and ticks. |
 | `p2p.py` | `Peers`: `--peer` addresses plus validators' on-chain addresses; background POST fan-out with a back-off for unreachable peers. |
-| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only) and `WorkerClient` (worker loop). The loop notes each round into `record` (a `records.RoundLog` when the command keeps one, else nothing) and writes its line once the round's block is final. |
+| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only; `put_blob`/`get_blob`, a small blob in one request) and `WorkerClient` (worker loop). The loop notes each round into `record` (a `records.RoundLog` when the command keeps one, else nothing) and writes its line once the round's block is final. Disputes come first: a round's checks run in a thread beside the loop (`_check`, stopping once the verify phase is over), each dispute's move is worked out in a thread of its own (`_move`), a round's checkpoints are kept until its disputes end (`_tidy`), and `_Remote` moves a state's tensors `TRACE_REQUESTS` at a time. |
 | `records.py` | What's kept on disk so a night of mining can be read afterwards (README, "Logs and records"). Workers: `Session` (made by `worker` and `testnet`) attaches `LogFile` to the dashboard feed's loggers (`logs/worker-DATE.log`, 10 MB then `.1`, 14 days kept, control characters written out by `clean`) and gives each client a `RoundLog` (`logs/rounds.jsonl`: a line per round, pay read from the round's block by `settle`: its reward and slash txs and its summary; units accepted are the worker's FLOPs over a unit's). Posters: `history_rows` from `/job` plus each round's block (time, its `fee_release`), budget left worked back from the escrow; `JobHistory` keeps `jobs/JOB/history.csv`/`.jsonl` current for `trainui.JobWatch`; `fetch_history` for `job history`; `write_report` puts the history and a `TRAINING.md` beside a downloaded model. `testnet` logs its nodes to `node.log` too. Tested: `tests/test_records.py`, and end to end in `test_network.CommandLineTests`. |
 | `worker.py` | Training, commit, reveal, verify. Cheat behaviours exist **for tests only**. `blobs=` spills checkpoints to disk. |
 | `storage.py` | SQLite chain and weights; datasets and blobs directories. The chain is re-validated on start-up. |
@@ -121,6 +121,43 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Unreleased (2026-11-02, branch `claude/trusting-germain-1fbaf8`): why honest fine-tune workers slashed each other on
+test night, fixed.** Job `pokemon-pun-starter-2d950a` (Qwen3-0.6B LoRA, 64 tokens, batch 8, 16 steps in 4 segments)
+was trained by the owner's RTX 4070 SUPER and a friend's PC. In rounds 7277 and 7280 each rejected the other's units at
+segment 0, replicas disagreed, and every dispute ended "the defender didn't split in time", so honest defenders were
+slashed. Two bugs:
+- **Honest results didn't reproduce across devices within the check's tolerance.** Measured on round 7280's own unit
+  (its start and dataset from the node; its checkpoints were already pruned, so CUDA against the CPU stood in for the
+  two machines), DESIGN §8 "Rule 2" has the table. Each unit's Adam starts from zero moments, so its first step moves
+  each weight by ±lr by the sign of its gradient alone; 45 of 2.29M weights had gradients (1e-9 or so) nearer zero than
+  the devices' rounding and landed 2·lr apart. A gradient's noise also depends on the data: one sequence's was 3.5e-4,
+  so the moments came out 2.8e-4 apart, over the job's 1e-4. Segments after the first replayed to about 1e-6. Earlier
+  fine-tune runs passed because every worker shared one GPU. **Fix:** check rule 2 (`verification.FINETUNE_CHECK`),
+  recorded per round as `rules["finetune_check"]` (none = rule 1, so old records replay and recheck as they were);
+  validators refuse a new fine-tune round without it. A TF32 worker, a freezer and canaries still fail. Re-run on the
+  real model: honest CUDA↔CPU passes every segment both ways and as replicas, TF32 fails every segment
+  (`RealModelTests.test_round_7280s_segment_replays_on_the_cpu_by_rule_2`, opt-in). Test workers can play another
+  device (`worker.elsewhere`).
+- **A disputed honest worker couldn't make its first move in time.** A move had 53.8 s (the verify phase); the
+  defender was still checking when the dispute opened, then fetched the state it defended and sent its split's states
+  one tensor at a time, two round trips to New York each (about 2,700 for a Qwen3-0.6B split); its upload came ~60 s
+  after its check finished and was refused. **Fix:** the worker does disputes first and in parallel (`client.py` above),
+  takes its own checkpoints as states rather than fetching them (`tracer.Party.adopt`), sends a split at a unit as the
+  checkpoints the node already has (`Coordinator._checkpoint_states`, `Game.ready`), and moves tensors eight at a
+  time in one request each; moves are timed for a home computer, 10 Mbit/s up and half the reference GPU
+  (`tasks.MOVE_*`, `TrainingJob.move_seconds`): 131 s a move for that job. post_job still judges jobs at the
+  reference speeds, so the blocks that posted jobs still apply. `tests.test_network.DistantDefenderTest` (0.3 s a
+  request, a check outlasting the verify phase) failed as round 7280 did and passes now.
+- **Rolling it out:** release, then upgrade the node (`deploy/setup-node.sh`). Its first fine-tune round under rule 2
+  writes a record a 0.5.7 node can't replay (`CoordinatorConfig` has no `finetune_check`), so every validator upgrades
+  first; on `vibehash-public-1` the node is the only one. Workers should upgrade too: a 0.5.7 checker still compares by
+  rule 1 (it rejects honest work from other hardware, and then has to withdraw), and a 0.5.7 defender is still slow,
+  though the node's longer moves help it. Notes for the main session: `side-session-notes/.../round-7280-fixes.md`.
+- **Not done:** moves are one length for every level of a game, so a job whose split is big (Qwen3-0.6B at 512 tokens:
+  212 MB) needs more than the hour at the MOVE_* speeds and gets less a move, as before; deadlines sized to each
+  level's own split are the follow-up. Rule 2's tolerances are measured at `settings_for`'s learning rates (5e-4 at
+  most): a flip's knock-on grows with lr. Two different GPUs weren't measured against each other (CUDA vs CPU only).
 
 **Release 0.5.7 (2026-11-02): for test night (PR #17, TONIGHT.md).** The three parts below, and the Muse agents (`agents/`,
 calebluh's `Meta-AI-Agents` with fixes; agents/README.md). The faster rounds are the node's: they take effect when
@@ -275,7 +312,8 @@ Done and tested (as of the last full runs):
      - **Scorers** are paid only when three agree.
      - **Draws** are seeded per claim.
      - **Timing:** no phase is over an hour (`node.MAX_PHASE_S`).
-     - **Tolerance:** comparing replicas uses `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA).
+     - **Tolerance:** comparing replicas uses `finetune.WHOLE_TOLERANCE` (1e-3; measured 5e-5 CPU vs CUDA). That was
+       rule 1; since 2026-11-02 rounds compare by rule 2 (the top of "Current state").
    - **Disputes in place of juries (DESIGN §8, `dispute.py`):** a checker's rejection, or two replicas that disagree,
      is a bisection game in a `dispute` phase of the same round. The worker posts the states between its training's
      ops (unit → segment → step → sequence → layer → op, up to 64 children a split), the challenger picks where they

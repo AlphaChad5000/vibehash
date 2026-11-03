@@ -418,3 +418,24 @@ class ProposalVersionTests(unittest.TestCase):
         with self.assertLogs("vibehash.node", "WARNING") as logs:
             self.assertFalse(self.node._validate(self.proposal(VERSION, summary(V), {"version": 1})))
         self.assertIn(f"record must be version {RECORD_VERSION}", logs.output[0])
+
+    def test_a_new_fine_tune_round_compares_replicas_by_todays_rule(self):
+        """verification.FINETUNE_CHECK: a fine-tune round's record says how its replicas were compared, and a new one
+        must say today's rule, as its version must be today's: a leader can't run a round by the rule honest workers on
+        different hardware failed (round 7280). Older records, without it, still replay by rule 1."""
+        import json
+
+        from tests.test_finetune import job_of
+        from vibehash.verification import FINETUNE_CHECK
+
+        st = self.node.chain.state
+        st.jobs[JOB.job_id] = json.dumps(json.loads(job_of().spec_json()) | {"id": JOB.job_id})
+        st.job_owner[JOB.job_id] = REQ.address
+        for rules in ({}, {"finetune_check": 1}):
+            with self.assertLogs("vibehash.node", "WARNING") as logs:
+                self.assertFalse(self.node._validate(self.proposal(VERSION, summary(V), {"version": 4, "rules": rules})))
+            self.assertIn(f"compares its replicas by rule {FINETUNE_CHECK}, not 1", logs.output[0])
+        with self.assertLogs("vibehash.node", "WARNING") as logs:  # past that: refused for what this record lacks
+            self.assertFalse(self.node._validate(self.proposal(VERSION, summary(V), {"version": 4, "rules": {
+                "finetune_check": FINETUNE_CHECK}})))
+        self.assertNotIn("compares its replicas", logs.output[0])

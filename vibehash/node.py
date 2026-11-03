@@ -61,6 +61,7 @@ from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
 from .storage import Store, record_blobs
 from .tasks import SYN_PER_VIBE, InvalidJob, Reveal, TrainingJob
+from .verification import FINETUNE_CHECK
 from .wire import MAX_CLOCK_SKEW_S, WireError, blob_openings_in, blob_openings_out, commitment_in, commitment_out, open_envelope
 
 log = logging.getLogger("vibehash.node")
@@ -451,6 +452,10 @@ class Node:
                         else RECORD_VERSION)
                 if record.get("version") != want:
                     raise InvalidBlock(f"a new round's record must be version {want}, not {record.get('version')!r}")
+                rules = record.get("rules")
+                if want == FINETUNE_RECORD_VERSION and isinstance(rules, dict) and rules.get("finetune_check") != FINETUNE_CHECK:
+                    raise InvalidBlock(f"a new fine-tune round compares its replicas by rule {FINETUNE_CHECK}, not "
+                                       f"{rules.get('finetune_check', 1)!r}")
             with self.coord.lock:
                 tip = self.chain.tip
                 if block.height != tip.height + 1 or block.prev_hash != tip.hash:

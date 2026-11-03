@@ -237,7 +237,8 @@ working on the jobs they fit.
 | `train DATA --base`: pre-flight, checking the weights once, one question, posting | done (manifests are cached by the poster, not yet shared on the network) |
 | PEFT export in `job download` | done, loads in PEFT (tested on tiny models of each family, and with Qwen3-0.6B) |
 | Workers fetch the base once (parallel ranged requests), keep it on the GPU, skip fine-tunes without PyTorch | done; no cache limit or download progress on the dashboard yet |
-| Measured CPU ↔ CUDA tolerances | done on NVIDIA; Intel, AMD and Apple unmeasured |
+| Measured CPU ↔ CUDA tolerances | done on NVIDIA, and again on a real job's data after the public network's round 7280 (2026-11-02), where honest workers on two machines failed each other: Adam's first step flips signs where a gradient is nearer zero than the devices' rounding, so checks follow rule 2 (DESIGN §8, `verification.FINETUNE_CHECK`); Intel, AMD and Apple unmeasured |
+| Disputes an honest worker can play from home | done after round 7280, where a defender's first split came a minute late and it lost its stake: moves timed for 10 Mbit/s up (`tasks.MOVE_*`), the worker moving first and in parallel, tensors eight at a time, checkpoints it uploaded reused (DESIGN §8, "Time") |
 | Text documents (`{"text": ...}`) and `.txt`/`.md` files | done, lightly tested |
 | Scoring, unanswered checks and disputes done by workers, so the node never runs the model (record version 4) | done (DESIGN §8); on the public network after a release and a node update |
 | `vibehash hub login`, gated models end to end | next: hub.py reads `HF_TOKEN`, but nothing sets it |

@@ -370,7 +370,9 @@ class _AsNumpy(dict):
 
 class Party:
     """One worker's side of its disputes: states it has made or fetched (by root), and how to run them.
-    `remote` has put(bytes) -> blob id and get(blob id) -> bytes (the node's blob store)."""
+    `remote` has put(bytes) -> blob id and get(blob id) -> bytes (the node's blob store), and may have put_many and
+    get_many, which move a state's tensors several at a time (client._Remote): one at a time, a state of Qwen3-0.6B's
+    336 tensors took two round trips to a distant node each, and a defender missed its move (round 7280)."""
 
     def __init__(self, rt, spec, data, remote, tamper=None):
         from . import merkle
@@ -379,68 +381,128 @@ class Party:
         self.states: dict[str, tuple[dict, bytes]] = {}
         self.tensors: dict[tuple, torch.Tensor] = {}  # by (blob id, rows, cols): a reshape has the same bytes
         self.hashes: dict[int, tuple] = {}  # id(tensor) -> (tensor, root, blob): every op makes a new tensor
+        self.on_node: set[str] = set()  # blobs the node holds: fetched from it, or sent to it
 
     def executor(self, prog, honest: bool) -> Executor:
         return Executor(self.rt, self.spec, prog, None if honest else self.tamper)
 
+    def gpu(self):
+        """The device's lock (finetune._Runtime.busy) around a re-run, so a dispute's and a check's never hold two
+        steps' activations at once; nothing to wait for on the CPU, or for a runtime without one."""
+        import contextlib
+        return getattr(self.rt, "busy", None) or contextlib.nullcontext()
+
     def source(self):
         """The base model's weights as this worker holds them, for running the referee itself (dispute.Outside)."""
         return TorchWeights(self.rt.model)
+
+    def adopt(self, theta) -> str:
+        """One of this worker's own checkpoints as a state, loaded without fetching anything: a game's ends are
+        checkpoints its defender committed to, and so are a unit's segment ends. Returns its root."""
+        from .dispute import state_manifest
+        from .program import split_theta
+
+        arrays = split_theta(self.spec, theta)
+        m, _ = state_manifest(arrays)
+        root = self.merkle.state_root(m)
+        if root not in self.states:
+            st = {}
+            for name, (troot, blob, rows, cols) in self.merkle.parse_manifest(m).items():
+                k = (blob, rows, cols)
+                if k not in self.tensors:  # (a copy: a checkpoint may be a read-only memory map)
+                    self.tensors[k] = torch.tensor(arrays[name], device=self.rt.device)
+                    self.hashes[id(self.tensors[k])] = (self.tensors[k], troot, blob)
+                st[name] = self.tensors[k]
+            self.states[root] = (st, m)
+        return root
 
     def load(self, root: str) -> tuple[dict, bytes]:
         if root not in self.states:
             m = self.remote.get(root)
             if self.merkle.state_root(m) != root:
                 raise ValueError("the node sent another state than the one asked for")
+            entries = self.merkle.parse_manifest(m)
+            want = list(dict.fromkeys(b for _, b, rows, cols in entries.values() if (b, rows, cols) not in self.tensors))
+            get_many = getattr(self.remote, "get_many", None)
+            got = dict(zip(want, get_many(want) if get_many else [self.remote.get(b) for b in want]))
             st = {}
-            for name, (troot, blob, rows, cols) in self.merkle.parse_manifest(m).items():
+            for name, (troot, blob, rows, cols) in entries.items():
                 k = (blob, rows, cols)
                 if k not in self.tensors:
-                    raw = self.remote.get(blob)
-                    a = torch.frombuffer(bytearray(raw), dtype=_F32).reshape(rows, cols)
+                    a = torch.frombuffer(bytearray(got[blob]), dtype=_F32).reshape(rows, cols)
                     self.tensors[k] = a.to(self.rt.device)
                     self.hashes[id(self.tensors[k])] = (self.tensors[k], troot, blob)
                 st[name] = self.tensors[k]
+            self.on_node.update([root, *(b for _, b, _, _ in entries.values())])  # (all of them: it served this state)
             self.states[root] = (st, m)
         st, m = self.states[root]
         return dict(st), m
 
-    def publish(self, st: dict) -> str:
-        entries, new = {}, {}
-        for name, t in st.items():
-            hit = self.hashes.get(id(t))
-            if hit is None or hit[0] is not t:
-                a = t.detach().cpu().numpy()
-                hit = (t, self.merkle.root_of(a), self.merkle.blob_of(a))
-                self.hashes[id(t)] = hit
-                new[hit[2]] = a
-            entries[name] = (hit[1], hit[2], t.shape[0], t.shape[1])
-            self.tensors.setdefault((hit[2], t.shape[0], t.shape[1]), t)
-        m = self.merkle.manifest_bytes(entries)
-        for blob, a in new.items():
-            self.remote.put(a.astype("<f4").tobytes())
-        root = self.remote.put(m)
-        self.states[root] = (dict(st), m)
-        return root
+    def publish(self, st: dict, ready=()) -> str:
+        return self.publish_all([st], ready)[0]
+
+    def publish_all(self, states: list[dict], ready=()) -> list[str]:
+        """Put states on the node, every tensor of theirs it doesn't hold yet (several at a time, with the remote's
+        put_many) and their manifests, and return their roots. `ready`: states the node holds whole already
+        (dispute.Game.ready), which send nothing."""
+        roots, send = [], {}
+        for st in states:
+            entries, new = {}, {}
+            for name, t in st.items():
+                hit = self.hashes.get(id(t))
+                if hit is None or hit[0] is not t:
+                    a = t.detach().cpu().numpy()
+                    hit = (t, self.merkle.root_of(a), self.merkle.blob_of(a))
+                    self.hashes[id(t)] = hit
+                entries[name] = (hit[1], hit[2], t.shape[0], t.shape[1])
+                self.tensors.setdefault((hit[2], t.shape[0], t.shape[1]), t)
+                if hit[2] not in self.on_node:
+                    new[hit[2]] = t
+            m = self.merkle.manifest_bytes(entries)
+            root = self.merkle.state_root(m)
+            if root in ready:
+                self.on_node.update([root, *new])
+            else:
+                send |= new
+                send[root] = m
+            roots.append(root)
+            self.states[root] = (dict(st), m)
+        raws = [v if isinstance(v, bytes) else v.detach().cpu().numpy().astype("<f4").tobytes() for v in send.values()]
+        put_many = getattr(self.remote, "put_many", None)
+        if put_many is not None:
+            put_many(raws)
+        else:
+            for raw in raws:
+                self.remote.put(raw)
+        self.on_node.update(send)
+        return roots
 
     def forget(self) -> None:
         self.states.clear()
         self.tensors.clear()
         self.hashes.clear()
+        self.on_node.clear()
 
     # --- the defender ---
 
-    def split(self, prog, view: dict) -> list[str]:
-        """The state roots at the boundaries of the current range's children, as its training went."""
+    def split(self, prog, view: dict, checkpoints=None) -> list[str]:
+        """The state roots at the boundaries of the current range's children, as its training went. At a unit's top
+        level the boundaries are segment ends, so with `checkpoints` (this worker's own for the unit, by index) they're
+        those, not re-run, and the node already holds the ones the unit's reveal opened (view["ready"])."""
         from .program import groups
 
-        node, where = node_at(prog, view["root"], view["path"])
-        st, _ = self.load(view["a"])
-        ex, roots = self.executor(prog, honest=False), [view["a"]]
-        for g0, g1 in groups(view["lo"], view["hi"])[:-1]:
-            ex.run_atoms(node, g0, g1, st, where)
-            roots.append(self.publish(st))
-        return roots + [view["b"]]
+        ready, bounds = set(view.get("ready") or ()), groups(view["lo"], view["hi"])[:-1]
+        if checkpoints is not None and view["root"] == ["unit"] and not view["path"]:
+            states = [self.states[self.adopt(checkpoints[g1])][0] for _, g1 in bounds]
+        else:
+            node, where = node_at(prog, view["root"], view["path"])
+            st, _ = self.load(view["a"])
+            ex, states = self.executor(prog, honest=False), []
+            for g0, g1 in bounds:
+                with self.gpu():
+                    ex.run_atoms(node, g0, g1, st, where)
+                states.append(dict(st))
+        return [view["a"]] + self.publish_all(states, ready) + [view["b"]]
 
     def evidence(self, prog, view: dict) -> bytes:
         from .dispute import Outside, make_evidence
@@ -467,7 +529,8 @@ class Party:
         for c, (g0, g1) in enumerate(groups(view["lo"], view["hi"])):
             mine, _ = self.load(roots[c])
             theirs, _ = self.load(roots[c + 1])
-            ex.run_atoms(node, g0, g1, mine, where)
+            with self.gpu():
+                ex.run_atoms(node, g0, g1, mine, where)
             dev = deviation(mine, theirs)
             best = max(best, (dev, -c))
             if dev >= HARD:

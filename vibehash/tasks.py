@@ -33,6 +33,14 @@ MAX_PHASE_S = 3600.0  # no phase of a round is longer (node.times_for), whatever
 # A dispute's split, in bytes of states the defender uploads in one move: a home connection (REF_UPLOAD, 20 Mbit/s)
 # moves 512 MB in about 3.5 minutes, the time a move has when a game's 15 moves share an hour.
 MAX_SPLIT_BYTES = 512 * 2**20
+# A dispute's moves are timed for a slower computer and link than a round's phases are: a unit that comes in late costs
+# its worker part of the next round's work, but a move that comes in late loses the game, and the stake with it
+# (round 7280 on the public network: an honest defender's first split came a minute late).
+MOVE_GPU_FLOPS = REF_GPU_FLOPS / 2  # an older card than the reference's, or one finishing a check it had started
+MOVE_UPLOAD = 1.25e6  # bytes/s: 10 Mbit/s up, the slow end of home connections
+MOVE_REQUEST_S = 0.25  # a request to a distant node, a new TLS connection included; MOVE_PARALLEL of them at once
+MOVE_PARALLEL = 8  # client.TRACE_REQUESTS: a state's tensors go up and down this many at a time, one blob each
+MOVE_SLACK_S = 15.0  # seeing the move is due (workers poll the node), and the node checking the states it names
 
 
 class InvalidJob(ValueError):
@@ -208,7 +216,9 @@ class TrainingJob:
             need(split <= MAX_SPLIT_BYTES,
                  f"a dispute over one of its units would upload {split / 2**20:.0f} MB of states in one move, more than "
                  f"{MAX_SPLIT_BYTES // 2**20} MB: use fewer steps a segment, shorter sequences or fewer LoRA targets")
-            took = moves * self.phase_lengths()["move"]
+            # (At the reference speeds, as when this rule was made, rather than move_seconds' slower ones: a job that
+            # was valid stays valid, so the blocks that posted one still apply.)
+            took = moves * (self.unit_flops / self.n_segments / REF_GPU_FLOPS + split / REF_UPLOAD + split / REF_DOWNLOAD)
             need(took <= MAX_PHASE_S,
                  f"a dispute over one of its units would take {took / 60:.0f} minutes at home upload speeds, more than "
                  f"the {MAX_PHASE_S / 60:.0f} a dispute phase has: use fewer steps a segment or shorter sequences")
@@ -303,13 +313,26 @@ class TrainingJob:
         unit = b / REF_DOWNLOAD + self.unit_flops / ref + self.n_segments * b / REF_UPLOAD
         check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / ref
         out = {"compute": max(self.compute_s, 1.25 * unit), "reveal": 2 * b / REF_UPLOAD, "verify": 2 * check}
-        if self.finetune:  # its disputes: as many moves as its program's tree is deep, the dearest re-running a segment
-            from .program import dispute_size  # and moving a split's states (the defender up, the challenger down)
+        if self.finetune:  # its disputes: as many moves as its program's tree is deep, each timed by move_seconds
+            from .program import dispute_size
 
             moves, split = dispute_size(self.spec, self.batch_size, self.n_segments, self.checkpoint_every)
-            out |= {"moves": moves,
-                    "move": self.unit_flops / self.n_segments / ref + split / REF_UPLOAD + split / REF_DOWNLOAD}
+            out |= {"moves": moves, "move": self.move_seconds(split)}
         return out
+
+    def move_seconds(self, split: int) -> float:
+        """How long each move of a dispute over one of this job's units has (Node.times_for), on the MOVE_* computer:
+        the larger of the defender's split (re-running at most a segment's steps, then sending the split's `split`
+        bytes of states up; a split at a unit re-runs nothing, since its states are the defender's checkpoints) and the
+        challenger's pick (fetching them, then re-running every segment of a unit to find where they go wrong); a
+        request for each tensor in them, MOVE_PARALLEL at a time; and another segment's compute, for a check the
+        worker had started when the move came due. A job too big for this to fit MAX_PHASE_S gets less (times_for)."""
+        seg = self.unit_flops / self.n_segments / MOVE_GPU_FLOPS
+        tensor = 4 * self.spec.n_adapter / max(1, len(self.spec.modules()))  # B, m or v of a module, on average
+        requests = split / tensor / MOVE_PARALLEL * MOVE_REQUEST_S
+        defender = seg + split / MOVE_UPLOAD
+        challenger = self.n_segments * seg + split / REF_DOWNLOAD
+        return MOVE_SLACK_S + seg + requests + max(defender, challenger)
 
 
 def is_finetune_spec(d) -> bool:
