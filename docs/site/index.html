@@ -24,7 +24,7 @@
    node every 30 seconds), then three steps and what's next. Everything else lives in the guide. */
 :root {
   --paper: #ffffff; --stone: #f4f3f0; --ink: #1d1b19; --ink-2: #5b554e; --rule: #e3dfd9;
-  --gold: #995a05; --gold-wash: #f6ead5; --good: #2c7836; --good-wash: #e2f0e3;
+  --gold: #995a05; --gold-wash: #f6ead5; --good: #2c7836; --good-wash: #e2f0e3; --bad: #b3261e;
   --band: #151311; --band-ink: #eeebe6; --band-ink-2: #a39c93; --band-rule: #2b2824; --term: #0c0b0a;
   --signal: #f1b23c; --on-signal: #1d1406;
   --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
@@ -34,13 +34,13 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
-    --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a;
+    --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a; --bad: #f28b7d;
     --band: #0b0a09; --band-rule: #25221f; --term: #070606; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --paper: #121110; --stone: #1b1917; --ink: #ebe7e1; --ink-2: #a9a299; --rule: #2d2a26;
-  --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a;
+  --gold: #efb041; --gold-wash: #322510; --good: #80cf88; --good-wash: #15301a; --bad: #f28b7d;
   --band: #0b0a09; --band-rule: #25221f; --term: #070606; color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -297,6 +297,73 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
 ::-webkit-scrollbar-thumb { background: #5a544c; border: 2px solid var(--paper); }
 ::-webkit-scrollbar-thumb:hover { background: #f1b23c; }
 
+/* The jobs after the featured one, grouped by state: training now, waiting, queued, finished. Each card says how its
+   held-back score moved, and opens a report in place: the curve, the rounds that changed the model, its settings. */
+.job { grid-template-columns: minmax(0, 1fr) minmax(0, 300px); }
+@media (max-width: 760px) { .job { grid-template-columns: minmax(0, 1fr); } }
+.jobs { gap: 48px; margin-top: 48px; }
+.jobs:empty { display: none; }
+.jobs-list { display: grid; gap: 28px; margin-top: 18px; }
+.group-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.group-head h3 { font-size: 1.15rem; }
+.group-head h3::before { content: "\25CF\00A0"; font-size: 0.7em; vertical-align: 0.12em; color: var(--ink-2); }
+.group.training .group-head h3::before { color: var(--good); }
+.group.waiting .group-head h3::before { color: var(--gold); }
+.count { font: 600 0.74rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-2); }
+.group-note { margin-top: 4px; font-size: 0.92rem; color: var(--ink-2); max-width: 46rem; }
+details.group > summary { cursor: pointer; list-style: none; }
+details.group > summary::-webkit-details-marker { display: none; }
+details.group > summary::after { content: "+"; margin-left: auto; font-weight: 700; color: var(--ink-2); }
+details.group[open] > summary::after { content: "–"; }
+summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; border-radius: 3px; }
+.kind { font: 600 0.74rem var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-2); margin-bottom: 4px; }
+.job-title { margin: 0; font: 600 1.05rem var(--font-mono); overflow-wrap: anywhere; }
+.metric .delta { font: 700 1rem var(--font-body); color: var(--ink-2); white-space: nowrap; }
+@media (max-width: 480px) { .metric { font-size: 1.6rem; } }
+.delta.good, .rounds .good { color: var(--good); }
+.delta.bad, .rounds .bad { color: var(--bad); }
+.metric-note { margin-top: 2px; font-size: 0.88rem; color: var(--ink-2); }
+.headline > .metric-note:only-child { margin-top: 10px; font-size: 1rem; }
+.why { margin-top: 10px; font-size: 0.95rem; }
+.why-full { margin-top: 4px; font-size: 0.88rem; color: var(--ink-2); max-width: 46rem; overflow-wrap: anywhere; }
+.job-actions { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { font: 600 0.8rem var(--font-mono); letter-spacing: 0.04em; color: var(--ink); background: none; border: 1px solid var(--rule); border-radius: 2px; padding: 6px 12px; cursor: pointer; }
+.btn:hover { border-color: var(--ink-2); }
+.btn[aria-expanded="true"] { border-color: var(--ink); }
+.linkbtn { font: inherit; color: var(--ink); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-decoration-color: var(--ink-2); text-underline-offset: 3px; }
+.linkbtn:hover { text-decoration-color: var(--ink); }
+.report { grid-column: 1 / -1; border-top: 1px solid var(--rule); padding-top: 20px; display: grid; gap: 28px; min-width: 0; }
+.report-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px 48px; align-items: start; }
+@media (max-width: 860px) { .report-grid { grid-template-columns: minmax(0, 1fr); } }
+.r-col { display: grid; gap: 28px; align-content: start; min-width: 0; }
+.r-sec { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.r-head { margin: 0; font: 600 0.9rem var(--font-body); color: var(--ink-2); }
+.report-note { font-size: 0.88rem; color: var(--ink-2); }
+.chart { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 10px; }
+.chart-y { display: flex; flex-direction: column; justify-content: space-between; height: 200px; padding-block: 3px; text-align: right; font: 0.75rem/14px var(--font-mono); color: var(--ink-2); }
+.chart-plot { position: relative; height: 200px; touch-action: pan-y; }
+.chart-plot svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.chart-x { grid-column: 2; display: flex; justify-content: space-between; gap: 12px; padding-top: 6px; font: 0.75rem var(--font-mono); color: var(--ink-2); }
+.chart-cross { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink-2); pointer-events: none; }
+.chart-ring { position: absolute; width: 12px; height: 12px; border: 2px solid var(--ink); border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; }
+.chart-tip { position: absolute; z-index: 1; white-space: nowrap; background: var(--paper); border: 1px solid var(--rule); padding: 3px 8px; font-size: 0.85rem; color: var(--ink-2); pointer-events: none; }
+.chart-tip b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; }
+.rounds { width: 100%; border-collapse: collapse; font-size: 0.92rem; font-variant-numeric: tabular-nums; }
+.rounds th { font-weight: 600; font-size: 0.82rem; color: var(--ink-2); text-align: right; padding: 0 0 6px 12px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.rounds td { text-align: right; padding: 5px 0 5px 12px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.rounds th:first-child, .rounds td:first-child { text-align: left; padding-left: 0; }
+.settings { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; font-size: 0.95rem; }
+.settings dt { color: var(--ink-2); }
+.settings dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 480px) { .settings { grid-template-columns: minmax(0, 1fr); gap: 0; } .settings dd { margin-bottom: 8px; } }
+.cmds { display: grid; gap: 6px; }
+.cmd { display: flex; align-items: center; gap: 10px; border: 1px solid var(--rule); border-radius: 2px; padding: 4px 4px 4px 12px; }
+.cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; background: none; border: 0; padding: 0; font-size: 0.82rem; }
+.cmd code span { display: inline-block; max-width: 100%; }
+.cmd .btn { flex: none; padding: 4px 10px; }
+.report, .r-col, .r-sec, .cmds { grid-template-columns: minmax(0, 1fr); }
+.feat > .job-actions { margin-top: 0; }
 </style>
 </head>
 <body>
@@ -466,11 +533,15 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
   })();
 
   // ---- install line ----
+  var OS = "win";
+  function vhText(cmd) { return ((OS === "win" ? "python" : "python3") + " -m vibehash " + cmd).trim(); }
   function pick(os) {
+    OS = os;
     document.querySelectorAll(".os button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.os === os)); });
     $("cmd").textContent = CMDS[os][0];
     $("cmd-note").firstChild.textContent = CMDS[os][1] + " ";
-    document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = ((os === "win" ? "python" : "python3") + " -m vibehash " + c.dataset.cmd).trim(); });
+    document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = vhText(c.dataset.cmd); });
+    document.querySelectorAll("code.words").forEach(cmdWords);  // the job reports' commands
   }
   document.querySelectorAll(".os button").forEach(function (b) { b.addEventListener("click", function () { pick(b.dataset.os); }); });
   pick(/Win/i.test(navigator.userAgent) ? "win" : "unix");
@@ -522,40 +593,417 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     return svg;
   }
 
-  function jobCard(j, net) {
-    var card = el("article", "job"), left = el("div"), top = el("div", "job-top");
-    top.appendChild(el("h3", null, j.id));
-    var online = ((net.miners.online_by_job || {})[j.id] || 0) > 0;
-    var state = j.status === "training" ? (online ? ["training", "Training now"] : ["waiting", "Waiting for miners"])
-              : j.status === "open" ? ["waiting", "Queued"] : ["", "Finished"];
-    top.appendChild(el("span", "pill " + state[0], state[1]));
-    left.appendChild(top);
-    left.appendChild(el("p", "quiet", j.model));
-    if (j.now != null) {
-      var m = el("p", "metric");
-      if (j.metric === "accuracy") {
-        m.textContent = Math.round(j.now * 100) + "% ";
-        m.appendChild(el("span", null, "accuracy on held-back data" + (j.start != null && j.start < j.now ? ", up from " + Math.round(j.start * 100) + "%" : "")));
-      } else {
-        m.textContent = j.now.toFixed(3) + " ";
-        m.appendChild(el("span", null, "held-back loss" + (j.start != null && j.start > j.now ? ", down from " + j.start.toFixed(3) : "")));
-      }
-      left.appendChild(m);
+  // ---- jobs: grouped by state, how each one is improving, and a report on each that opens in place ----
+  // Job ids, models, reasons and settings come from the network and can carry anything. They only ever go in as text
+  // (el(), textContent) or through attribute setters, and become a link, an element id or a command only when plain.
+  var ID_OK = /^[a-z0-9][a-z0-9._-]{0,63}$/;  // the network's own rule for a job id (vibehash/tasks.py)
+  var HF_OK = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)@([0-9a-f]{7,64})$/;  // a fine-tune's base: org/name@commit
+  function byId() { return Object.create(null); }  // keyed by job id, so an id like "__proto__" is only a key
+  var OPEN = byId(), MORE = byId(), WHY = byId(), JOBS = byId(), UIDS = byId(), uids = 0;
+  var finishedOpen = false, last = null, wanted = null;
+  function own(o, k) { return o && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined; }
+  function num(x) { return typeof x === "number" && isFinite(x) ? x : null; }
+  function count(n, word) { return int(n) + " " + word + (n === 1 ? "" : "s"); }
+  function uid(id) { return UIDS[id] || (UIDS[id] = "j" + (++uids)); }  // a plain stand-in for an id in element ids and keys
+  function here(j, net) { return num(own(net.miners.online_by_job, String(j.id))) || 0; }
+
+  function score(v, metric) { return metric === "accuracy" ? (v * 100).toFixed(1).replace(/\.0$/, "") + "%" : v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3); }
+  // The change from a to b, in words, and whether it's better: loss going down, accuracy going up.
+  function change(a, b, metric) {
+    var acc = metric === "accuracy", d = acc ? (b - a) * 100 : a > 0 ? (b - a) / a * 100 : 0;
+    if (Math.abs(d) < 0.05) return ["no change", ""];
+    return [(d > 0 ? "+" : "−") + Math.abs(d).toFixed(acc || Math.abs(d) < 10 ? 1 : 0) + (acc ? " pts" : "%"), (acc ? d > 0 : d < 0) ? "good" : "bad"];
+  }
+  function bytes(n) { var u = ["bytes", "kB", "MB", "GB", "TB"], i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return (i ? n.toFixed(n >= 100 ? 0 : 1) : String(n)) + " " + u[i]; }
+  // At most n of points, evenly spread, always keeping the first and the last (as netstats.py thins a curve).
+  function thin(points, n) {
+    if (points.length <= n) return points;
+    var out = [], step = (points.length - 1) / (n - 1);
+    for (var i = 0; i < n; i++) out.push(points[Math.round(i * step)]);
+    return out;
+  }
+
+  // How a job's held-back score moved, from its rounds (GET /job): where it started, then each round that changed the
+  // model with the score that shows it. A model trained from scratch is scored after its round. A fine-tune's scorers
+  // score the model its round started from, so its round shows in the next scored round's loss (as netstats.py). A
+  // round nobody scored has no number and is skipped. Points are [round, score, what it is, is it the start].
+  function trainingOf(rounds, metric) {
+    var tune = metric === "loss", key = tune ? "val_loss" : "val_acc", next = [], at = null, worked = [], start = null, i;
+    for (i = rounds.length - 1; i >= 0; i--) { next[i] = at; if (num(rounds[i][key]) != null) at = i; }
+    for (i = 0; i < rounds.length; i++) if ((num(rounds[i].accepted_units) || 0) > 0) worked.push(i);
+    var first = worked.length ? worked[0] : rounds.length;
+    for (i = 0; i < Math.min(rounds.length, tune ? first + 1 : first); i++) if (num(rounds[i][key]) != null) { start = i; break; }
+    var steps = worked.map(function (w) {
+      var s = tune ? next[w] : num(rounds[w][key]) != null ? w : null;
+      return { height: rounds[w].height, units: rounds[w].accepted_units, at: s, value: s == null ? null : num(rounds[s][key]), change: null };
+    });
+    // Rounds that trained back to back before one score share it: it goes on the last of them.
+    for (i = 0; i + 1 < steps.length; i++) if (steps[i].at != null && steps[i].at === steps[i + 1].at) { steps[i].value = null; steps[i].shared = true; }
+    var points = start == null ? [] : [[rounds[start].height, num(rounds[start][key]), "start, round #" + int(rounds[start].height), true]];
+    var prev = start == null ? null : points[0][1];
+    steps.forEach(function (s) {
+      if (s.value == null) return;
+      if (prev != null) s.change = change(prev, s.value, metric);
+      prev = s.value;
+      points.push([rounds[s.at].height, s.value, "after round #" + int(s.height), false]);
+    });
+    var end = steps[steps.length - 1];
+    return { metric: metric, steps: steps, points: points, rounds: rounds.length, pending: !!end && end.value == null };
+  }
+  // A job's curve: from its rounds when the page has read them, else from the node's summary (GET /network).
+  function curveOf(j) {
+    var c = own(JOBS, String(j.id));
+    if (c && c.training) return c.training;
+    var pts = (Array.isArray(j.history) ? j.history : []).filter(function (p) { return Array.isArray(p) && num(p[1]) != null; })
+      .map(function (p, i) { return [p[0], p[1], (i ? "round #" : "start, round #") + int(p[0]), !i]; });
+    return { metric: j.metric === "accuracy" ? "accuracy" : "loss", steps: null, points: pts, pending: false };
+  }
+  // Until the public node runs 0d1a9ee, its summary ends a fine-tune's curve on the score from before the last round's
+  // work: the curve's last point is that round itself. Only then are the job's rounds read for its card as well.
+  function lagging(j) {
+    var h = Array.isArray(j.history) && j.history.length ? j.history[j.history.length - 1] : null;
+    return j.metric === "loss" && !!j.last_trained && !!h && h[0] === j.last_trained.height;
+  }
+
+  // A fine-tune's base model ("fine-tune of hf:org/name@commit", or a spec's "hf:org/name@commit"), named short, with a
+  // link to that exact commit only when every part of it is plain.
+  function baseOf(s) {
+    var m = /^(?:fine-tune of )?hf:(.+)$/.exec(String(s == null ? "" : s));
+    if (!m) return null;
+    var ok = HF_OK.exec(m[1]);
+    if (ok) return { full: ok[1] + "/" + ok[2], name: ok[2], commit: ok[3], url: "https://huggingface.co/" + ok[1] + "/" + ok[2] + "/tree/" + ok[3] };
+    return { full: m[1].slice(0, 80), name: (m[1].split("@")[0].split("/").pop() || "a model").slice(0, 40), commit: null, url: null };
+  }
+  function pretty(name) { return /^deepseek/i.test(name) ? name.replace(/-/g, " ") : name; }
+  function prepped(p) { return !p || !Array.isArray(p.done) || p.done.every(function (x) { return x >= 1; }); }
+  function kindOf(j) {
+    var b = baseOf(j.model);
+    if (j.prep && !prepped(j.prep)) return (b ? pretty(b.name) : "DeepSeek") + " · prep";
+    return /^fine-tune of /.test(String(j.model)) ? "Fine-tune" + (b ? " · " + pretty(b.name) : "") : "Classic model";
+  }
+
+  // Why a job can't train yet, from the node (GET /status), cut to one plain line; the node's own words open below it.
+  function whyShort(text, id) {
+    var t = String(text), q = /needs (\d+) staked workers? with ([\d.]+) (GB|MB) of GPU memory each[\s\S]*?and (\d+) registered/.exec(t);
+    if (q) {
+      var have = +q[4], more = Math.max(1, +q[1] - have), gb = Math.max(1, Math.ceil(q[3] === "GB" ? +q[2] : +q[2] / 1024));
+      return "Needs " + more + (have ? " more" : "") + " staked worker" +
+        (more === 1 ? " with " + (/^8|^1[18]$/.test(String(gb)) ? "an " : "a ") + gb + " GB GPU" : "s with " + gb + " GB GPUs");
     }
-    var facts = [];
-    if (j.rounds_trained) facts.push("trained in " + int(j.rounds_trained) + " round" + (j.rounds_trained === 1 ? "" : "s") + ", " + int(j.units) + " units of work");
-    else facts.push("no rounds trained yet");
-    if (j.last_trained && j.last_trained.time) facts.push("last trained " + ago(net.now - j.last_trained.time));
-    if (j.escrow > 0) facts.push(vibe(j.escrow) + " left to pay miners");
-    left.appendChild(el("p", "facts", facts.join(" · ")));
+    if (t.indexOf("job " + id + " ") === 0) t = t.slice(id.length + 5);
+    t = t.replace(/^waits: (it )?/, "").split(/; | \(|\. /)[0];
+    if (t.length > 90) t = t.slice(0, 88).replace(/\s+\S*$/, "") + "…";
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  }
+  function whyLines(parent, text, id, key) {
+    var p = el("p", "why"), full = el("p", "why-full", text), b = el("button", "linkbtn", "Why?");
+    full.id = "why-" + key; full.hidden = !WHY[id];
+    b.type = "button"; b.setAttribute("aria-expanded", String(!!WHY[id])); b.setAttribute("aria-controls", full.id); b.setAttribute("data-key", "why-" + key);
+    b.addEventListener("click", function () { WHY[id] = !WHY[id]; full.hidden = !WHY[id]; b.setAttribute("aria-expanded", String(!!WHY[id])); });
+    p.appendChild(document.createTextNode(whyShort(text, id) + " ")); p.appendChild(b);
+    parent.appendChild(p); parent.appendChild(full);
+  }
+
+  function factsOf(j, net) {
+    var f = [], n = num(j.rounds_trained) || 0, u = num(j.units) || 0, esc = num(j.escrow) || 0, fee = num(j.fee_per_round), on = here(j, net);
+    f.push(n ? count(n, "round") + " trained" : "no rounds trained yet");
+    if (u) f.push(count(u, "unit") + " accepted");
+    if (j.last_trained && num(j.last_trained.time) != null) f.push("last trained " + ago(net.now - j.last_trained.time));
+    if (j.status === "finished" || esc <= 0) f.push("budget spent");
+    else f.push(vibe(esc) + " left" + (fee > 0 ? ", about " + count(Math.floor(esc / fee), "round") + " of training" : ""));
+    if (j.status !== "finished") f.push(on ? count(on, "miner") + " on it now" : "no miners on it now");
+    return f.join(" · ");
+  }
+  // A fine-tune's last round shows in the next round's score, which a finished job never gets.
+  function unscored(j) { return j.status === "finished" ? "Its last round was never scored: the budget ran out first" : "Its latest round is scored the next time the job runs"; }
+  // "loss 5.13 → 3.65 (−29%)": where the held-back score started, where it is now, and whether that's better.
+  function headline(c, j) {
+    var box = el("div", "headline"), pts = c.points;
+    if (!pts.length) { box.appendChild(el("p", "metric-note", "No training scored yet")); return box; }
+    var a = pts[0][1], b = pts[pts.length - 1][1], m = el("p", "metric");
+    m.appendChild(el("span", null, (c.metric === "accuracy" ? "accuracy" : "loss") + " "));
+    m.appendChild(document.createTextNode(score(a, c.metric) + (pts.length > 1 ? " → " + score(b, c.metric) + " " : "")));
+    if (pts.length > 1) { var ch = change(a, b, c.metric); m.appendChild(el("b", "delta " + ch[1], "(" + ch[0] + ")")); }
+    box.appendChild(m);
+    box.appendChild(el("p", "metric-note", pts.length < 2 ? "Only one score so far, so no change to show yet" :
+      (c.metric === "accuracy" ? "Accuracy on held-back data: higher is better" : "Loss on held-back examples: lower is better") +
+      (c.pending ? ". " + unscored(j) : "")));
+    return box;
+  }
+
+  function jobCard(j, net, waiting) {
+    var id = String(j.id), key = uid(id), c = curveOf(j), card = el("article", "job"), left = el("div");
+    if (ID_OK.test(id)) card.id = "job-" + id;
+    card.setAttribute("data-anchor", key);
+    left.appendChild(el("p", "kind", kindOf(j)));
+    left.appendChild(el("h4", "job-title", id));
+    if (j.model != null && !/^fine-tune of /.test(String(j.model))) left.appendChild(el("p", "quiet", String(j.model)));
+    left.appendChild(headline(c, j));
+    left.appendChild(el("p", "facts", factsOf(j, net)));
+    var why = own(waiting, id);
+    if (typeof why === "string") whyLines(left, why, id, key);
+    var bar = el("div", "job-actions");
+    bar.appendChild(reportButton(card, j, net, key, false));
+    left.appendChild(bar);
     card.appendChild(left);
-    var s = spark(j.history || [], j.metric);
+    var s = spark(thin(c.points, 48), c.metric);
     if (s) {
       var right = el("div"); right.appendChild(s);
       var cap = el("p", "spark-cap"); cap.appendChild(el("span", null, "start")); cap.appendChild(el("span", null, "now"));
       right.appendChild(cap); card.appendChild(right);
     }
+    if (OPEN[id]) card.appendChild(report(j, net, key, false));
     return card;
+  }
+
+  function reportButton(card, j, net, key, feat) {
+    var id = String(j.id), b = el("button", "btn");
+    b.type = "button"; b.setAttribute("data-key", "rep-" + key);
+    function show() {
+      b.textContent = OPEN[id] ? "Hide report" : "Report";
+      b.setAttribute("aria-expanded", String(!!OPEN[id]));
+      if (OPEN[id]) b.setAttribute("aria-controls", "rep-" + key); else b.removeAttribute("aria-controls");
+    }
+    show();
+    b.addEventListener("click", function () {
+      OPEN[id] = !OPEN[id];
+      var old = card.querySelector(".report");
+      if (old) old.parentNode.removeChild(old);
+      if (OPEN[id]) {
+        card.appendChild(report(j, net, key, feat));
+        var c = own(JOBS, id);
+        if (!c || !c.data) fetchJob(id, j);
+      }
+      show();
+      if (ID_OK.test(id) && history.replaceState) {  // the address follows the open report, so it can be shared
+        if (OPEN[id]) history.replaceState(null, "", "#job-" + id);
+        else if (location.hash === "#job-" + id) history.replaceState(null, "", location.pathname + location.search);
+      }
+    });
+    return b;
+  }
+
+  // Reads a job's rounds, settings and model (GET /job/<id>), keeps them, and redraws the jobs when they're in.
+  function fetchJob(id, j) {
+    var c = own(JOBS, id);
+    if (!c) c = JOBS[id] = { data: null, error: false, busy: false };
+    if (c.busy) return;
+    c.busy = true;
+    fetch(NODE + "/job/" + encodeURIComponent(id), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        if (!d || typeof d !== "object" || !Array.isArray(d.rounds)) throw new Error("not a job");
+        var spec = d.spec && typeof d.spec === "object" ? d.spec : {};
+        var rounds = d.rounds.filter(function (r) { return r && typeof r === "object" && num(r.height) != null; });
+        c.data = d; c.spec = spec; c.error = false;
+        c.training = trainingOf(rounds, "base" in spec ? "loss" : "accuracy");
+        c.trainedAt = j && j.last_trained ? j.last_trained.height : null;
+      })
+      .catch(function () { c.error = true; })
+      .then(function () { c.busy = false; if (last) renderJobs(); });
+  }
+
+  // The report: the curve, the rounds that changed the model, its settings in plain words, and commands to follow it.
+  function report(j, net, key, feat) {
+    var id = String(j.id), c = own(JOBS, id), box = el("div", "report"), h = feat ? "h4" : "h5";
+    box.id = "rep-" + key;
+    if (!c || !c.data) {
+      box.appendChild(el("p", "report-note", c && c.error ? "Couldn't read this job's rounds from the network just now. Trying again with the next update." : "Reading this job's rounds from the network…"));
+      return box;
+    }
+    if (c.error) box.appendChild(el("p", "report-note", "Couldn't refresh this report just now, so it shows the rounds read before."));
+    var t = c.training, d = c.data, acc = t.metric === "accuracy";
+
+    var curve = el("div", "r-sec");
+    curve.setAttribute("data-anchor", key + "-chart");
+    curve.appendChild(el(h, "r-head", (acc ? "Accuracy on held-back data" : "Loss on held-back examples") + ", round by round"));
+    if (t.points.length > 1) {
+      curve.appendChild(bigChart(t.points, t.metric));
+      curve.appendChild(el("p", "report-note", "Each dot is a round that changed the model" +
+        (t.points.length > 200 ? " (200 of its " + int(t.points.length) + ", spread evenly)" : "") + ". " + (acc ? "Higher is better." : "Lower is better.") +
+        (t.pending ? " " + unscored(j) + "." : "")));
+    } else {
+      curve.appendChild(el("p", "report-note", t.points.length ? "One score so far, before any training, so there's no curve to draw yet." : "No training scored yet."));
+    }
+    box.appendChild(curve);
+
+    var grid = el("div", "report-grid"), rs = el("div", "r-sec");
+    rs.setAttribute("data-anchor", key + "-rounds");
+    rs.appendChild(el(h, "r-head", "Rounds that changed the model"));
+    if (t.steps.length) {
+      var holder = el("div", "table-wrap");
+      holder.appendChild(roundsTable(t, !!MORE[id], j));
+      rs.appendChild(holder);
+      if (t.steps.length > 20) {
+        var more = el("button", "linkbtn");
+        more.type = "button"; more.setAttribute("data-key", "more-" + key);
+        var sync = function () { more.textContent = MORE[id] ? "Show the latest 20" : "Show all " + int(t.steps.length); more.setAttribute("aria-expanded", String(!!MORE[id])); };
+        sync();
+        more.addEventListener("click", function () {
+          MORE[id] = !MORE[id];
+          holder.textContent = ""; holder.appendChild(roundsTable(t, MORE[id], j)); sync();
+          if (!MORE[id]) more.scrollIntoView({ block: "nearest" });
+        });
+        var p = el("p"); p.appendChild(more); rs.appendChild(p);
+      }
+      rs.appendChild(el("p", "report-note", int(t.steps.length) + " of its " + count(t.rounds, "round") + " changed the model; in the rest, no unit was accepted."));
+      grid.appendChild(rs);
+    } else {  // nothing to list: say so under the chart, and give the settings the left column
+      curve.appendChild(el("p", "report-note", t.rounds ? "None of its " + count(t.rounds, "round") + " so far has changed the model." : "It hasn't had a round yet."));
+    }
+
+    var col = el("div", "r-col"), about = el("div", "r-sec");
+    about.setAttribute("data-anchor", key + "-about");
+    about.appendChild(el(h, "r-head", "How it's set up"));
+    about.appendChild(settingsList(c.spec, d));
+    if (t.steps.length) col.appendChild(about); else grid.appendChild(about);
+    var prep = j.prep;
+    if (prep && Array.isArray(prep.done)) {
+      var ps = el("div", "r-sec"), ready = prep.done.filter(function (x) { return x >= 1; }).length;
+      ps.appendChild(el(h, "r-head", "Preparing the frozen layers"));
+      ps.appendChild(el("p", null, int(num(prep.pieces_done) || 0) + " of " + int(num(prep.pieces_total) || 0) + " pieces done · " +
+        ready + " of " + prep.done.length + " layers ready" + (num(prep.miners) ? " · " + count(prep.miners, "miner") + " on it lately" : "")));
+      if (!feat) ps.appendChild(layerBars(prep));  // the featured card draws them already
+      col.appendChild(ps);
+    }
+    var cmds = el("div", "r-sec");
+    cmds.appendChild(el(h, "r-head", "Follow it from your computer"));
+    cmds.appendChild(commands(id, key));
+    col.appendChild(cmds);
+    grid.appendChild(col);
+    box.appendChild(grid);
+    return box;
+  }
+
+  function roundsTable(t, all, j) {
+    var tbl = el("table", "rounds"), head = el("tr"), thead = el("thead"), body = el("tbody"), steps = t.steps.slice().reverse();
+    if (!all) steps = steps.slice(0, 20);
+    ["Round", "Units", (t.metric === "accuracy" ? "Accuracy" : "Loss") + " after", "Change"].forEach(function (name) {
+      var th = el("th", null, name); th.scope = "col"; head.appendChild(th);
+    });
+    thead.appendChild(head); tbl.appendChild(thead);
+    steps.forEach(function (s) {
+      var tr = el("tr");
+      tr.appendChild(el("td", null, "#" + int(s.height)));
+      tr.appendChild(el("td", null, int(s.units)));
+      tr.appendChild(el("td", null, s.value != null ? score(s.value, t.metric) : s.shared ? "with the next" : j.status === "finished" ? "never scored" : "scored next run"));
+      tr.appendChild(el("td", s.change ? s.change[1] : "quiet", s.change ? s.change[0] : "–"));
+      body.appendChild(tr);
+    });
+    tbl.appendChild(body);
+    return tbl;
+  }
+
+  function settingsList(spec, d) {
+    var dl = el("dl", "settings"), b = baseOf(spec.base), lora = spec.lora && typeof spec.lora === "object" ? spec.lora : null;
+    var m = spec.model && typeof spec.model === "object" ? spec.model : {}, mm = d.model && typeof d.model === "object" ? d.model : {};
+    function row(label, value) {
+      dl.appendChild(el("dt", null, label));
+      var dd = el("dd");
+      if (typeof value === "string") dd.textContent = value; else dd.appendChild(value);
+      dl.appendChild(dd);
+    }
+    function n(x) { return num(x) != null; }
+    if (b) {
+      if (b.url) {
+        var v = el("span"), a = el("a", null, b.full);
+        a.href = b.url; a.rel = "noopener";
+        v.appendChild(a); v.appendChild(document.createTextNode(" at " + b.commit.slice(0, 7)));
+        row("Base model", v);
+      } else row("Base model", b.full);
+    } else if (n(m.n_in) && n(m.n_out) && Array.isArray(m.n_hidden)) {
+      row("Layer sizes", int(m.n_in) + " inputs → " + m.n_hidden.filter(n).map(int).concat([int(m.n_out) + " classes"]).join(" → "));
+    }
+    if (lora) {
+      var targets = Array.isArray(lora.targets) ? lora.targets.filter(function (x) { return typeof x === "string"; }) : [];
+      row("Add-on", "LoRA" + (n(lora.rank) ? ", rank " + lora.rank : "") + (n(lora.alpha) ? ", alpha " + lora.alpha : "") + (targets.length ? ", on " + targets.join(", ") : ""));
+    }
+    if (n(spec.seq_len)) row("Sequence length", count(spec.seq_len, "token"));
+    if (n(spec.batch_size)) row("Batch", count(spec.batch_size, b ? "sequence" : "example"));
+    if (n(spec.steps_per_unit)) row("Steps a unit", int(spec.steps_per_unit));
+    if (n(spec.units_per_round)) row("Units a round", int(spec.units_per_round));
+    if (n(spec.lr)) row("Learning rate", String(spec.lr));
+    if (n(spec.fee_per_round)) row("Fee a round", vibe(spec.fee_per_round));
+    if (typeof d.owner === "string") { var o = el("code", null, short(d.owner)); o.title = d.owner; row("Owner", o); }
+    if (n(mm.bytes)) row("Trained model", bytes(mm.bytes) + (n(mm.height) ? ", as of block #" + int(mm.height) : ""));
+    if (typeof mm.sha256 === "string") { var s = el("code", null, mm.sha256.length > 20 ? mm.sha256.slice(0, 12) + "…" + mm.sha256.slice(-6) : mm.sha256); s.title = mm.sha256; row("Its sha256", s); }
+    return dl;
+  }
+
+  // A command a word at a time, so a long one wraps between words and never after the hyphen of "--csv".
+  function cmdWords(code) {
+    code.textContent = "";
+    vhText(code.dataset.cmd).split(" ").forEach(function (w, i) { if (i) code.appendChild(document.createTextNode(" ")); code.appendChild(el("span", null, w)); });
+  }
+  function commands(id, key) {
+    var box = el("div", "cmds");
+    if (!ID_OK.test(id)) { box.appendChild(el("p", "report-note", "This job's id isn't one a command line can take safely, so there's nothing to copy.")); return box; }
+    [["watch", "job watch " + id], ["history", "job history " + id + " --csv " + id + ".csv"], ["download", "job download " + id]].forEach(function (x, i) {
+      var row = el("div", "cmd"), code = el("code", "words"), b = el("button", "btn", "Copy");
+      code.dataset.cmd = x[1]; cmdWords(code);
+      b.type = "button"; b.setAttribute("aria-label", "Copy the " + x[0] + " command"); b.setAttribute("data-key", "copy-" + key + "-" + i);
+      b.addEventListener("click", function () {
+        if (navigator.clipboard) navigator.clipboard.writeText(code.textContent).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1600); }, function () {});
+      });
+      row.appendChild(code); row.appendChild(b); box.appendChild(row);
+    });
+    box.appendChild(el("p", "report-note", "watch follows it live, history saves every round to a CSV file, and download saves the trained model."));
+    return box;
+  }
+
+  // The prep's assembly line: one bar per frozen layer, filled as its pieces are accepted, then the trained top layers.
+  function layerBars(prep) {
+    var box = el("div", "r-sec"), layers = el("div", "layers");
+    layers.setAttribute("role", "img");
+    layers.setAttribute("aria-label", "Prepared: " + prep.done.filter(function (x) { return x >= 1; }).length + " of " + prep.done.length + " frozen layers");
+    prep.done.forEach(function (f) { var c = el("i"), b = el("b"); b.style.height = Math.round(100 * Math.min(1, num(f) || 0)) + "%"; c.appendChild(b); layers.appendChild(c); });
+    for (var k = prep.done.length; k < 40; k++) layers.appendChild(el("i", "top"));
+    box.appendChild(layers);
+    var lc = el("p", "layer-cap");
+    lc.appendChild(el("span", null, "Layer 1")); lc.appendChild(el("span", null, "the top " + Math.max(0, 40 - prep.done.length) + " are trained by miners"));
+    box.appendChild(lc);
+    return box;
+  }
+
+  // The report's chart: the score after each round that changed the model, one dot each (at most 200), with the range
+  // on the left and the first and last rounds below. Pointing at it reads a point out; the table has every value.
+  function bigChart(points, metric) {
+    var ns = "http://www.w3.org/2000/svg", W = 600, H = 200, P = 10, pts = thin(points, 200), n = pts.length;
+    var vals = pts.map(function (p) { return p[1]; }), lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    if (hi - lo < 1e-9) { var pad = Math.abs(hi) * 0.05 || 0.05; lo -= pad; hi += pad; }
+    var xy = pts.map(function (p, i) { return [P + i / (n - 1) * (W - 2 * P), P + (hi - p[1]) / (hi - lo) * (H - 2 * P)]; });
+    var fig = el("figure", "chart"), ys = el("div", "chart-y"), plot = el("div", "chart-plot"), xs = el("div", "chart-x");
+    ys.appendChild(el("span", null, score(hi, metric))); ys.appendChild(el("span", null, score(lo, metric)));
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("aria-hidden", "true");
+    function add(tag, attrs) { var e = document.createElementNS(ns, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; }
+    function dot(q) { return "M" + q[0].toFixed(1) + "," + q[1].toFixed(1) + "h0"; }  // a zero-length line with round caps: a dot that stays round
+    var line = xy.map(function (q) { return q[0].toFixed(1) + "," + q[1].toFixed(1); }).join(" ");
+    [P, H - P].forEach(function (y) { add("line", { x1: 0, x2: W, y1: y, y2: y, stroke: "var(--rule)", "vector-effect": "non-scaling-stroke" }); });
+    add("polygon", { points: xy[0][0] + "," + (H - P) + " " + line + " " + xy[n - 1][0] + "," + (H - P), fill: "var(--gold-wash)" });
+    add("polyline", { points: line, fill: "none", stroke: "var(--signal)", "stroke-width": 2, "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" });
+    var from = pts[0][3] ? 1 : 0, size = n > 60 ? 5 : 8;
+    if (from) add("path", { d: dot(xy[0]), fill: "none", stroke: "var(--ink-2)", "stroke-width": size, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" });
+    add("path", { d: xy.slice(from).map(dot).join(""), fill: "none", stroke: "var(--gold)", "stroke-width": size, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke" });
+    plot.appendChild(svg);
+    var cross = el("i", "chart-cross"), ring = el("i", "chart-ring"), tip = el("span", "chart-tip");
+    cross.hidden = ring.hidden = tip.hidden = true;
+    plot.appendChild(cross); plot.appendChild(ring); plot.appendChild(tip);
+    function point(e) {
+      var r = plot.getBoundingClientRect(), i = Math.round(((e.clientX - r.left) / r.width * W - P) / (W - 2 * P) * (n - 1));
+      i = Math.max(0, Math.min(n - 1, i));
+      var x = xy[i][0] / W * 100, y = xy[i][1] / H * 100;
+      cross.style.left = ring.style.left = tip.style.left = x + "%";
+      ring.style.top = tip.style.top = y + "%";
+      tip.style.transform = "translate(" + (x < 20 ? "0" : x > 80 ? "-100%" : "-50%") + ", " + (y > 45 ? "calc(-100% - 12px)" : "12px") + ")";
+      tip.textContent = ""; tip.appendChild(el("b", null, score(pts[i][1], metric))); tip.appendChild(document.createTextNode(" " + pts[i][2]));
+      cross.hidden = ring.hidden = tip.hidden = false;
+    }
+    plot.addEventListener("pointermove", point); plot.addEventListener("pointerdown", point);
+    plot.addEventListener("pointerleave", function () { cross.hidden = ring.hidden = tip.hidden = true; });
+    xs.appendChild(el("span", null, "round #" + int(pts[0][0]))); xs.appendChild(el("span", null, "round #" + int(pts[n - 1][0])));
+    fig.appendChild(ys); fig.appendChild(plot); fig.appendChild(xs);
+    return fig;
   }
 
   // ---- the featured job: what it's for is written here; how it's going comes from the node ----
@@ -580,15 +1028,17 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
   }
   function times(r) { return (r < 10 ? r.toFixed(2) : r.toFixed(1)) + "×"; }
 
-  function featuredCard(j, net) {
-    var info = infoFor(j), here = (net.miners.online_by_job || {})[j.id] || 0, prep = j.prep;
-    var prepDone = !prep || prep.done.every(function (x) { return x >= 1; });
-    var stage = j.status === "finished" ? "done" : !prepDone ? "prep" : "train";
+  function featuredCard(j, net, waiting) {
+    var id = String(j.id), key = uid(id), info = infoFor(j), on = here(j, net), prep = j.prep, base = baseOf(j.model);
+    var stage = j.status === "finished" ? "done" : !prepped(prep) ? "prep" : "train";
+    var c = curveOf(j), pts = c.points, start = pts.length ? pts[0][1] : null, now = pts.length ? pts[pts.length - 1][1] : null;
     var card = el("article", "feat"), head = el("div", "feat-head");
-    head.appendChild(el("p", "feat-eyebrow", "Featured job · " + j.model));
+    if (ID_OK.test(id)) card.id = "job-" + id;
+    card.setAttribute("data-anchor", key);
+    head.appendChild(el("p", "feat-eyebrow", "Featured job · " + kindOf(j)));
     var top = el("div", "job-top");
-    top.appendChild(el("h3", null, info ? info.title : "Fine-tuning " + j.model.replace(/^fine-tune of /, "")));
-    var pill = stage === "done" ? ["", "Finished"] : stage === "prep" ? ["waiting", "Preparing"] : here ? ["training", "Training now"] : ["waiting", "Waiting for miners"];
+    top.appendChild(el("h3", null, info ? info.title : "Fine-tuning " + (base ? base.full : String(j.model).replace(/^fine-tune of /, ""))));
+    var pill = stage === "done" ? ["", "Finished"] : stage === "prep" ? ["waiting", "Preparing"] : on ? ["training", "Training now"] : ["waiting", "Waiting for miners"];
     top.appendChild(el("span", "pill " + pill[0], pill[1]));
     head.appendChild(top);
     if (info) head.appendChild(el("p", "quiet", info.blurb));
@@ -602,20 +1052,20 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     // How it's improving: the held-back score, said plainly.
     var imp = el("div", "panel");
     imp.appendChild(el("h4", null, "How it's improving"));
-    if (j.metric === "loss" && j.start != null && j.now != null && j.start > j.now) {
-      var r = Math.exp(j.start - j.now);
+    if (j.metric === "loss" && pts.length > 1 && start > now) {
+      var r = Math.exp(start - now);
       imp.appendChild(el("p", "big", times(r)));
       imp.appendChild(el("p", null, (info ? "Short, correct worked solutions" : "Its target answers") + " are now " + times(r) +
         " as likely, token by token, as before training, on " + (info ? int(info.heldBack) + " " + info.unit : "held-back examples") +
         " it has never trained on."));
-      imp.appendChild(el("p", "quiet", "Held-back loss " + j.start.toFixed(3) + " → " + j.now.toFixed(3) + " (lower is better)"));
-    } else if (j.metric === "accuracy" && j.now != null) {
-      imp.appendChild(el("p", "big", Math.round(j.now * 100) + "%"));
-      imp.appendChild(el("p", null, "accuracy on held-back data" + (j.start != null && j.start < j.now ? ", up from " + Math.round(j.start * 100) + "%" : "")));
+      imp.appendChild(el("p", "quiet", "Held-back loss " + start.toFixed(3) + " → " + now.toFixed(3) + " (lower is better)"));
+    } else if (j.metric === "accuracy" && now != null) {
+      imp.appendChild(el("p", "big", Math.round(now * 100) + "%"));
+      imp.appendChild(el("p", null, "accuracy on held-back data" + (pts.length > 1 && start < now ? ", up from " + Math.round(start * 100) + "%" : "")));
     } else {
       imp.appendChild(el("p", "quiet", stage === "prep" ? "Training starts once the frozen layers are prepared. Scores show up here after its first rounds." : "Scores show up here after the first rounds."));
     }
-    var s = spark(j.history || [], j.metric);
+    var s = spark(thin(pts, 48), j.metric);
     if (s) {
       imp.appendChild(s);
       var cap = el("p", "spark-cap"); cap.appendChild(el("span", null, "start")); cap.appendChild(el("span", null, "now")); imp.appendChild(cap);
@@ -625,16 +1075,8 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     // Progress: the prep's assembly line, then training.
     var prog = el("div", "panel");
     prog.appendChild(el("h4", null, "Progress"));
-    if (prep) {
-      var layers = el("div", "layers");
-      layers.setAttribute("role", "img");
-      layers.setAttribute("aria-label", "Prepared: " + prep.done.filter(function (x) { return x >= 1; }).length + " of " + prep.layers + " frozen layers");
-      prep.done.forEach(function (f) { var c = el("i"), b = el("b"); b.style.height = Math.round(100 * Math.min(1, f)) + "%"; c.appendChild(b); layers.appendChild(c); });
-      for (var k = prep.done.length; k < 40; k++) layers.appendChild(el("i", "top"));
-      prog.appendChild(layers);
-      var lc = el("p", "layer-cap");
-      lc.appendChild(el("span", null, "Layer 1")); lc.appendChild(el("span", null, "the top " + (40 - prep.done.length) + " are trained by miners"));
-      prog.appendChild(lc);
+    if (prep && Array.isArray(prep.done)) {
+      prog.appendChild(layerBars(prep));
       prog.appendChild(el("p", null, int(prep.pieces_done) + " of " + int(prep.pieces_total) + " prep pieces done" +
         (prep.miners ? ", by " + int(prep.miners) + " miner" + (prep.miners === 1 ? "" : "s") : "")));
     }
@@ -644,11 +1086,13 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
       prog.appendChild(el("p", null, int(j.examples) + " " + (info ? info.unit : "examples") + " studied" +
         (passes != null ? ", " + passes.toFixed(2) + " passes through all " + int(total) : "")));
     }
-    var facts = [here ? int(here) + " miner" + (here === 1 ? "" : "s") + " on it now" : "no miners on it right now"];
+    var facts = [on ? int(on) + " miner" + (on === 1 ? "" : "s") + " on it now" : "no miners on it right now"];
     if (j.rounds_trained) facts.push(int(j.rounds_trained) + " rounds trained");
     if (j.last_trained && j.last_trained.time) facts.push("last trained " + ago(net.now - j.last_trained.time));
     if (j.escrow > 0) facts.push(vibe(j.escrow) + " left to pay miners");
     prog.appendChild(el("p", "quiet", facts.join(" · ")));
+    var why = own(waiting, id);
+    if (typeof why === "string") whyLines(prog, why, id, key);
     grid.appendChild(prog);
     card.appendChild(grid);
 
@@ -664,11 +1108,90 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
       chat.appendChild(el("p", "source", info.sample.source));
       card.appendChild(chat);
     }
+    var bar = el("div", "job-actions");
+    bar.appendChild(reportButton(card, j, net, key, true));
+    card.appendChild(bar);
+    if (OPEN[id]) card.appendChild(report(j, net, key, true));
     return card;
   }
 
-  function render(net) {
+  // The jobs after the featured one, by state. A job that miners worked on in the last 10 minutes is training now, even
+  // between its turns; one the node says can't train (GET /status) is waiting; the others take turns until finished.
+  var GROUPS = [
+    ["training", "Training now", "Miners are working on these, this round or in the last 10 minutes."],
+    ["waiting", "Waiting", "Funded, but they can't train until enough workers who fit them sign up."],
+    ["queued", "Queued", "Funded and taking turns with the other jobs: each trains when its turn comes and miners are on."],
+    ["finished", "Finished", "Their budget is spent and their models are trained."]
+  ];
+  function groupOf(j, net, waiting) {
+    if (j.status === "finished") return "finished";
+    if (here(j, net) > 0) return "training";
+    if (typeof own(waiting, String(j.id)) === "string") return "waiting";
+    return j.status === "training" ? "training" : "queued";
+  }
+
+  // Redrawing replaces the cards, so keep the reader's place and focus: the first card or report section that starts on
+  // screen (or else the first one showing) stays where it was, and a focused control is focused again.
+  function keep(draw) {
+    var anchor = null, top = 0, f = document.activeElement, fkey = f && f.getAttribute ? f.getAttribute("data-key") : null;
+    var all = document.querySelectorAll("[data-anchor]"), i, r;
+    for (i = 0; i < all.length && anchor == null; i++) { r = all[i].getBoundingClientRect(); if (r.top >= 0 && r.top < innerHeight) { anchor = all[i].getAttribute("data-anchor"); top = r.top; } }
+    for (i = 0; i < all.length && anchor == null; i++) { r = all[i].getBoundingClientRect(); if (r.bottom > 0 && r.top < innerHeight) { anchor = all[i].getAttribute("data-anchor"); top = r.top; } }
+    draw();
+    var n = anchor && document.querySelector('[data-anchor="' + anchor + '"]');  // anchors and keys are uid()s: plain
+    if (n) { var d = n.getBoundingClientRect().top - top; if (Math.abs(d) >= 1) window.scrollBy(0, d); }
+    var g = fkey && document.querySelector('[data-key="' + fkey + '"]');
+    if (g && g !== document.activeElement) g.focus({ preventScroll: true });
+  }
+
+  // #job-<id> opens that job's report once it's on the page.
+  function readHash() {
+    if (location.hash.indexOf("#job-") !== 0) return null;
+    try { return decodeURIComponent(location.hash.slice(5)); } catch (e) { return null; }
+  }
+  wanted = readHash();
+  window.addEventListener("hashchange", function () { wanted = readHash(); if (last && wanted != null) renderJobs(); });
+
+  function renderJobs() {
+    var net = last.net, waiting = last.waiting, feat = pickFeatured(net.jobs), target = null;
+    if (wanted != null) net.jobs.forEach(function (j) { if (String(j.id) === wanted) target = j; });
+    if (target) {
+      OPEN[wanted] = true;
+      if (target.status === "finished") finishedOpen = true;
+      if (!own(JOBS, wanted)) fetchJob(wanted, target);
+      wanted = null;
+    }
+    keep(function () {
+      var slot = $("featured"), box = $("jobs"), by = { training: [], waiting: [], queued: [], finished: [] };
+      slot.textContent = ""; box.textContent = "";
+      if (feat) slot.appendChild(featuredCard(feat, net, waiting));
+      net.jobs.forEach(function (j) { if (j !== feat && (j.status !== "finished" || num(j.rounds_trained))) by[groupOf(j, net, waiting)].push(j); });
+      GROUPS.forEach(function (g) {
+        var list = by[g[0]];
+        if (!list.length) return;
+        list.sort(function (a, b) { return here(b, net) - here(a, net) || ((b.last_trained || {}).height || 0) - ((a.last_trained || {}).height || 0); });
+        var fin = g[0] === "finished", sec = el(fin ? "details" : "div", "group " + g[0]), head = el(fin ? "summary" : "div", "group-head");
+        sec.setAttribute("data-anchor", "g-" + g[0]);
+        head.appendChild(el("h3", null, g[1])); head.appendChild(el("span", "count", count(list.length, "job")));
+        sec.appendChild(head);
+        sec.appendChild(el("p", "group-note", g[2]));
+        var cards = el("div", "jobs-list");
+        list.forEach(function (j) { cards.appendChild(jobCard(j, net, waiting)); });
+        sec.appendChild(cards);
+        if (fin) {
+          head.setAttribute("data-key", "g-finished");
+          sec.open = finishedOpen;
+          sec.addEventListener("toggle", function () { finishedOpen = sec.open; });
+        }
+        box.appendChild(sec);
+      });
+    });
+    if (target) { var n = ID_OK.test(String(target.id)) && $("job-" + target.id); if (n) n.scrollIntoView({ block: "start" }); }
+  }
+
+  function render(net, status) {
     var m = net.miners;
+    net.jobs = Array.isArray(net.jobs) ? net.jobs : [];
     $("s-online").textContent = int(m.online);
     $("s-day").textContent = int(m.day);
     var work = $("s-work"), fp = flopParts(m.flops_day);
@@ -678,15 +1201,16 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
     $("s-height").textContent = "#" + int(net.height);
     $("s-blocktime").textContent = (m.block_time ? "one every " + Math.round(m.block_time) + " s · " : "") + "last " + ago(net.now - net.time);
     $("empty").hidden = m.online > 0;
-    var feat = pickFeatured(net.jobs), slot = $("featured"), jobs = $("jobs");
-    slot.textContent = ""; jobs.textContent = "";
-    if (feat) slot.appendChild(featuredCard(feat, net));
-    var info = feat && infoFor(feat), now = $("now");
+    var feat = pickFeatured(net.jobs), info = feat && infoFor(feat), base = feat && baseOf(feat.model), now = $("now");
     now.hidden = !feat || feat.status === "finished";
-    if (feat) $("now-text").textContent = (feat.prep && !feat.prep.done.every(function (x) { return x >= 1; }) ? "Preparing: " : "Now training: ") +
-      (info ? info.short : feat.model.replace(/^fine-tune of /, ""));
-    net.jobs.filter(function (j) { return j !== feat && (j.status !== "finished" || j.rounds_trained); }).slice(0, 6)
-      .forEach(function (j) { jobs.appendChild(jobCard(j, net)); });
+    if (feat) $("now-text").textContent = (prepped(feat.prep) ? "Now training: " : "Preparing: ") + (info ? info.short : base ? base.full : String(feat.model));
+    last = { net: net, waiting: status && status.waiting && typeof status.waiting === "object" ? status.waiting : {} };
+    renderJobs();
+    // Open reports refresh with each update; a fine-tune's rounds are read for its card only while the node's summary lags.
+    net.jobs.forEach(function (j) {
+      var id = String(j.id), c = own(JOBS, id);
+      if (OPEN[id] || (lagging(j) && (!c || c.trainedAt !== j.last_trained.height || (c.training && c.training.pending)))) fetchJob(id, j);
+    });
     var list = $("miner-list"), top = m.top_miners || [], most = top.length ? top[0].flops : 0;
     list.textContent = "";
     top.forEach(function (t, i) {
@@ -702,9 +1226,11 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
   }
 
   function load() {
+    var status = fetch(NODE + "/status", { cache: "no-store" })  // only for why a job waits: the page works without it
+      .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
     fetch(NODE + "/network", { cache: "no-store" })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-      .then(render)
+      .then(function (net) { return status.then(function (s) { render(net, s); }); })
       .catch(function () {
         $("live").className = "live";
         $("live-text").textContent = "Can't reach the network right now; trying again shortly";
