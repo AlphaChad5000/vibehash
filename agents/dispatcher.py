@@ -238,7 +238,7 @@ def usable(result: dict) -> bool:
 def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
     """Train, have both models answer the test prompts, have Muse Spark judge them: one round's run."""
     job = plan["job_id"]
-    site.report(rid, "training", f"round {round_no}: training", detail={"kind": "round", "round": round_no})
+    site.report(rid, "training", f"round {round_no}: training", detail={"kind": "round", "round": round_no, "epochs": plan.get("epochs"), "rank": plan.get("rank")})
     train(site, rid, architect.train_command(plan, chats, out), round_no)
     site.report(rid, "judging", "the base and fine-tuned models are answering the held-back prompts")
     answers = judge.answer(evals, out / "adapters" / job)
