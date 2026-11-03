@@ -122,7 +122,11 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
-**Unreleased: a phase ends once its work is in, and a round nobody works in lasts the node's own 38 s.** On the
+**Release 0.5.7 (2026-11-02): for test night (PR #17, TONIGHT.md).** The three parts below, and the Muse agents (`agents/`,
+calebluh's `Meta-AI-Agents` with fixes; agents/README.md). The faster rounds are the node's: they take effect when
+the public node is upgraded with `deploy/setup-node.sh`.
+
+**In 0.5.7: a phase ends once its work is in, and a round nobody works in lasts the node's own 38 s.** On the
 public node the DeepSeek pilot, which nobody mines, took 1,521 s a round (its phases are a prep unit's deadline and
 its checks', never under 10 minutes), alternating with fruit-demo's 39 s ones: a newcomer earning its stake on
 fruit-demo got a paid round every 26 minutes. Now compute, reveal and verify each end as soon as everything they wait
@@ -138,7 +142,7 @@ as often); a qwen3-0.6b fine-tune's round (264 s at 192 tokens) ends once its 8 
 however fast that is. This folds in the commit before it, which ended a prep round's compute phase once every unit
 was committed (then Coordinator.prep_committed, with no floor).
 
-**Unreleased: `vibehash selftest`, and setup and the worker for tonight's machines (branch `selftest-setup`).** For
+**In 0.5.7: `vibehash selftest`, and setup and the worker for tonight's machines.** For
 the owner's mixed Windows laptops and desktops and RunPod pods:
 - `selftest` (code map), in the menu as "Check this computer". On the 4070 SUPER it takes about 10 s.
 - Unattended: on Windows, `setup < NUL` (and so any setup or worker with no console) waited for ever in getpass; now
@@ -156,7 +160,7 @@ the owner's mixed Windows laptops and desktops and RunPod pods:
   worker's stake and memory; selftest adds how long the stake should take at the network's recent pace).
 - The pilot's ~1,520 s empty rounds that held newcomers back are the node change above.
 
-**Unreleased: records of what happened (branch `record-training`).** For a night of mining on home PCs and rented
+**In 0.5.7: records of what happened.** For a night of mining on home PCs and rented
 pods with nobody watching a terminal: every `vibehash worker` and testnet worker keeps the dashboard feed's events in
 `~/.vibehash/logs/worker-DATE.log` and a JSON line per round in `logs/rounds.jsonl` (what it was given and did, the
 seconds it took, and what the round's block paid it or slashed, and why), says where at start and sums the session up
