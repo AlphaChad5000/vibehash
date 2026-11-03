@@ -55,10 +55,11 @@ def settings() -> dict:
     return s
 
 
-def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 0.2) -> str:
+def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 0.2, model: str | None = None) -> str:
+    """One reply from the configured model, or from `model` on the same provider (the second judge)."""
     s = settings()
     base = s["LLM_BASE_URL"].rstrip("/")
-    body = {"model": s["LLM_MODEL"], "messages": messages, "temperature": temperature}
+    body = {"model": model or s["LLM_MODEL"], "messages": messages, "temperature": temperature}
     if json_mode:  # ask for one JSON object back; providers that don't support this ignore it or error
         body["response_format"] = {"type": "json_object"}
     req = urllib.request.Request(
@@ -79,10 +80,10 @@ def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 
             raise SystemExit(f"{base} answered {e.code} {e.reason}: {e.read().decode(errors='replace')[:500]}")
 
 
-def chat_json(messages: list[dict]) -> dict:
+def chat_json(messages: list[dict], model: str | None = None) -> dict:
     """chat(), parsed. Models sometimes wrap the JSON in ``` fences or put a <think> block before it, so parse only
     the outermost {...}."""
-    text = chat(messages, json_mode=True).split("</think>")[-1]
+    text = chat(messages, json_mode=True, model=model).split("</think>")[-1]
     return json.loads(text[text.find("{"):text.rfind("}") + 1])
 
 

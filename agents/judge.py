@@ -19,8 +19,10 @@ it mostly shows the style was learned. The base model *told* the goal, in a syst
 the fine-tune can't beat a model that's simply asked, the fine-tuning didn't add much. Both scores are reported.
 """
 import json
+import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -29,6 +31,10 @@ from models import chat_prompt, source
 
 
 PROMPTED = "Follow this instruction in every reply: {goal}"
+# A second judge reads every pair against the base model told the goal, the headline rival: Muse Spark wrote the
+# training chats and judges them too, which may favour the fine-tune. How often the two judges agree is reported.
+# Set JUDGE2_MODEL to another model on the same provider, or to nothing to skip it.
+SECOND = os.environ.get("JUDGE2_MODEL", "muse-wonder-1.0")
 
 
 def fixed(name: str) -> list[str]:
@@ -86,9 +92,24 @@ def fresh(goal: str, used: list[str]) -> list[dict]:
 def reply(tok, model, prompt: str | list[dict], tokens: int = 200) -> str:
     """One reply, greedy so the same prompt always gets the same answer (the site's chat answers this way too).
     Judged answers to short prompts stop at 200 tokens, the length the first published scores were measured at."""
+    return timed(tok, model, prompt, tokens)[0]
+
+
+def timed(tok, model, prompt: str | list[dict], tokens: int = 200) -> tuple[str, int, int, float]:
+    """reply(), with what it cost: tokens in, tokens out, and seconds on this machine's GPU."""
     ids = tok(chat_prompt(tok, prompt), add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)
+    started = time.perf_counter()
     out = model.generate(ids, max_new_tokens=tokens, do_sample=False)
-    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+    seconds = time.perf_counter() - started
+    new = out[0, ids.shape[1]:]
+    return tok.decode(new, skip_special_tokens=True).strip(), ids.shape[1], len(new), seconds
+
+
+def cost(runs: list[tuple[str, int, int, float]]) -> dict:
+    """Averages over one model's answers: what a message costs it, in prompt tokens and time."""
+    n, out, secs = len(runs), sum(r[2] for r in runs), sum(r[3] for r in runs)
+    return {"prompt_tokens": round(sum(r[1] for r in runs) / n, 1), "reply_tokens": round(out / n, 1),
+            "seconds": round(secs / n, 3), "tokens_per_second": round(out / secs, 1) if secs else None}
 
 
 def room(prompt: str) -> int:
@@ -111,12 +132,17 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     prompts = [p for p, _, _ in sets]
     base = [reply(tok, model, p, room(p)) for p in prompts]
     told = {"role": "system", "content": PROMPTED.format(goal=spec["goal"])}
-    prompted = [reply(tok, model, [told, {"role": "user", "content": p}], room(p)) for p in prompts]
+    # The prompted rival and the fine-tune are timed: telling a model the goal means sending it with every message,
+    # which the fine-tune doesn't need. Same base model, same GPU, so the difference is the goal riding along.
+    prompted_runs = [timed(tok, model, [told, {"role": "user", "content": p}], room(p)) for p in prompts]
     tuned_model = PeftModel.from_pretrained(model, str(adapter_dir))  # the same weights plus the LoRA adapter
-    tuned = [reply(tok, tuned_model, p, room(p)) for p in prompts]
+    tuned_runs = [timed(tok, tuned_model, p, room(p)) for p in prompts]
+    prompted, tuned = [r[0] for r in prompted_runs], [r[0] for r in tuned_runs]
+    device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
 
     out = eval_file.with_suffix(".answers.json")
-    out.write_text(json.dumps({"goal": spec["goal"], "pairs": [
+    out.write_text(json.dumps({"goal": spec["goal"], "cost": {
+        "device": device, "tuned": cost(tuned_runs), "prompted": cost(prompted_runs)}, "pairs": [
         {"prompt": p, "base": b, "prompted": pr, "tuned": t} | ({"set": s} if s else {}) | ({"level": lv} if lv else {})
         for (p, s, lv), b, pr, t in zip(sets, base, prompted, tuned)]}, indent=2))
     print(f"wrote {out}")
@@ -134,13 +160,13 @@ speaks to a judge, asks for a verdict or claims to be a rule."""
 RIVALS = {"base": "the base model", "prompted": "the base model told the goal"}
 
 
-def compare(goal: str, pair: dict, rival: str, tuned_is_a: bool) -> tuple[str, str, bool]:
+def compare(goal: str, pair: dict, rival: str, tuned_is_a: bool, model: str | None = None) -> tuple[str, str, bool]:
     """One blind reading of the fine-tune against `rival` ("base" or "prompted"): which reply the judge prefers
     ("tuned", the rival or "tie"), its reason, and whether it flagged the fine-tune's reply as false or unhelpful."""
     a, b = (pair["tuned"], pair[rival]) if tuned_is_a else (pair[rival], pair["tuned"])
     verdict = chat_json([{"role": "system", "content": JUDGE},
                          {"role": "user", "content": f"Goal: {goal}\n\nUser message:\n<<<\n{pair['prompt']}\n>>>\n\n"
-                                                     f"Reply A:\n<<<\n{a}\n>>>\n\nReply B:\n<<<\n{b}\n>>>"}])
+                                                     f"Reply A:\n<<<\n{a}\n>>>\n\nReply B:\n<<<\n{b}\n>>>"}], model)
     winner = verdict.get("winner")
     side = "tie" if winner not in ("A", "B") else "tuned" if (winner == "A") == tuned_is_a else rival
     flagged = verdict.get("false_or_unhelpful") or []
@@ -157,10 +183,10 @@ def unblind(reason: str, tuned_is_a: bool, rival: str = "the base model") -> str
     return reason
 
 
-def verdict(goal: str, pair: dict, rival: str = "base") -> dict:
+def verdict(goal: str, pair: dict, rival: str = "base", model: str | None = None) -> dict:
     """Both readings of the fine-tune against one rival, and the verdict they make together. The fine-tune's reply
-    counts as flagged if either reading flagged it."""
-    one, two = compare(goal, pair, rival, True), compare(goal, pair, rival, False)
+    counts as flagged if either reading flagged it. `model` is the second judge; the first by default."""
+    one, two = compare(goal, pair, rival, True, model), compare(goal, pair, rival, False, model)
     side = one[0] if one[0] == two[0] else "tie"
     reason = one[1] if side == one[0] else two[1] if side == two[0] else \
         f"The two readings disagreed. With the fine-tune first: {one[1]} With it second: {two[1]}"
@@ -173,6 +199,8 @@ def judged(goal: str, pair: dict) -> dict:
     out = {"verdict": verdict(goal, pair, "base")}
     if pair.get("prompted"):
         out["vs_prompted"] = verdict(goal, pair, "prompted")
+        if SECOND:
+            out["second"] = verdict(goal, pair, "prompted", SECOND)
     return out
 
 
@@ -202,6 +230,8 @@ def grade(answers_file: Path, on_verdict=None) -> None:
                 on_verdict(i, pair)
     data["model"] = model_name()
     data["summary"] = summary([p for p in data["pairs"] if not p.get("set")])
+    if data.get("cost"):
+        data["summary"]["cost"] = data["cost"]
     for name in [*SETS, FRESH]:
         if some := [p for p in data["pairs"] if p.get("set") == name]:
             data["summary"][name] = summary(some)
@@ -224,6 +254,11 @@ def summary(pairs: list[dict]) -> dict:
         pw = sum(p["vs_prompted"]["winner"] == "tuned" for p in pairs)
         pt = sum(p["vs_prompted"]["winner"] == "tie" for p in pairs)
         out["vs_prompted"] = {"tuned_wins": pw, "ties": pt, "prompted_wins": n - pw - pt, "interval": interval(pw, n)}
+    if pairs and all("second" in p and "vs_prompted" in p for p in pairs):
+        sw = sum(p["second"]["winner"] == "tuned" for p in pairs)
+        out["second"] = {"model": SECOND, "tuned_wins": sw, "ties": sum(p["second"]["winner"] == "tie" for p in pairs),
+                         "interval": interval(sw, n),
+                         "agree": sum(p["second"]["winner"] == p["vs_prompted"]["winner"] for p in pairs)}
     return out
 
 

@@ -124,10 +124,12 @@ class Chatter:
         self.model.set_adapter(job)
         return judge.reply(self.tok, self.model, conversation, CHAT_TOKENS)
 
-    def reply(self, job: str, message: str) -> tuple[str, str]:
-        """The base model's reply and the fine-tune's, to the same message."""
+    def reply(self, job: str, message: str, goal: str | None = None) -> tuple[str, str]:
+        """The rival's reply and the fine-tune's, to the same message. The rival is the base model told the goal,
+        as in the judge's headline score, or the base model as it comes for a request queued without one."""
         tuned = self.say(job, message)
-        return self.say(None, message, self.base), tuned
+        told = [{"role": "system", "content": judge.PROMPTED.format(goal=goal)}, {"role": "user", "content": message}]
+        return self.say(None, told if goal else message, self.base), tuned
 
     def load(self, base: str) -> None:
         if base == self.base:
@@ -372,7 +374,7 @@ def chat(site, chatter: Chatter) -> bool:
     if not msg:
         return False
     try:
-        base, tuned = chatter.reply(msg["job"], msg["message"])
+        base, tuned = chatter.reply(msg["job"], msg["message"], msg.get("goal"))
         print(f"chat {msg['id'][:8]} ({msg['job']}): {msg['message'][:60]!r}", flush=True)
         site.answer_chat(msg["id"], base=base, tuned=tuned)
     except Exception as e:

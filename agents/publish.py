@@ -34,6 +34,7 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
              | ({"prompted": p["prompted"], "vs_prompted": p["vs_prompted"]["winner"],
                  "prompted_reason": p["vs_prompted"]["reason"]} if "vs_prompted" in p else {})
              | {k: p[k] for k in ("set", "level") if p.get(k)}
+             | ({"second": p["second"]["winner"], "second_reason": p["second"]["reason"]} if "second" in p else {})
              for p in graded["pairs"]]
     return {"title": title or job.replace("-", " ").capitalize(), "job": job, "goal": plan["goal"],
             "base_title": TITLES.get(base, base), "base_repo": BASES[base],

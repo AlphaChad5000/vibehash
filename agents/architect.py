@@ -56,7 +56,9 @@ SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON obje
   "caveat": "" if a small fine-tune can do what the goal asks; otherwise one plain sentence for the requester on what
             it won't do. A fine-tune of a small model learns a style, format, tone or persona well, but it doesn't
             learn many new facts from a few dozen chats: for a goal that depends on facts (lore, a catalogue, prices,
-            dates), say it will copy the expert's voice and likely get facts wrong,
+            dates), say it will copy the expert's voice and likely get facts wrong. Nor can a model this small make
+            up real wordplay (puns, rhymes, new jokes), which takes knowing how words sound: for such a goal, say it
+            will copy the shape (a capital's name, then the answer) without the joke itself,
   "examples": [{{"user": "...", "assistant": "..."}}, ...]   (at least 40, varied, in exactly the style wanted; at
             least {LONG_EXAMPLES} of them long and {CASUAL_EXAMPLES} casual),
   "eval_prompts": ["...", ...]   (20 NEW user messages, not in examples, to test the result with; at least
