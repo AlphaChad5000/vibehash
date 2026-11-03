@@ -30,7 +30,35 @@ curl -fsSL https://vibehash.org/install.sh | sh
 ```
 
 The scripts are [install.ps1](install.ps1) and [install.sh](install.sh). Run
-them again any time to update.
+them again any time to update. A PyTorch that's already installed, such as a
+rented GPU's, is kept exactly as it is: the script never reinstalls or
+downgrades it, and setup's GPU step sees it works and installs nothing.
+
+**On a rented GPU (RunPod).** Use a template with PyTorch, open its terminal
+(SSH or Jupyter), and run the macOS/Linux line above. A pod keeps only its
+`/workspace` volume when it restarts, so on a pod Vibe Hash keeps its settings
+and wallet in `/workspace/.vibehash` by itself (RunPod sets `$RUNPOD_POD_ID`;
+an earlier setup in `~/.vibehash` is kept where it is). After a restart, run the
+installer again: Vibe Hash itself was on the part that's wiped, but the wallet
+is still there. Anywhere else, `VIBEHASH_HOME=/some/folder` puts everything in
+that folder instead.
+
+**With nobody at the keyboard** (`nohup`, a tmux session left running, a
+Docker `CMD`), nothing waits for an answer. The wallet password comes from
+`$VIBEHASH_PASSWORD`, for setup and for every `worker` start; without it, setup
+and the worker stop at once and say so. A new wallet's 24 recovery words are
+then not printed into the log, which other people may be able to read: they go
+to `recovery-words-ADDRESS.txt` in the settings folder, readable only by you,
+and the log says where. Copy them somewhere offline and delete the file.
+`setup --deepseek yes` (or `no`) answers the DeepSeek question in advance, and
+`--yes` installs GPU support without asking:
+
+```bash
+VIBEHASH_PASSWORD='choose-one' nohup vibehash setup --yes --deepseek no > setup.log 2>&1
+```
+```bash
+VIBEHASH_PASSWORD='choose-one' nohup vibehash worker --plain > worker.log 2>&1 &
+```
 
 Or install it yourself: Python 3.10+. Vibe Hash is on PyPI:
 
@@ -47,6 +75,63 @@ python -m pip install -e .
 
 Either adds a `vibehash` command (also available as `python -m vibehash`) and
 pulls in NumPy and `cryptography`.
+
+## Check a machine
+
+Before mining on a new computer, or when something seems off, run the self
+test. In a minute or so, with no wallet needed and nothing spent, it says
+whether this computer can mine and what it can take:
+
+```bash
+vibehash selftest
+```
+
+It checks, one line each:
+- **software**: Python, NumPy, `cryptography`, and whether a newer Vibe Hash
+  is out;
+- **devices**: every GPU's self-test, its memory and how much is free, and
+  whether PyTorch is built for what the graphics driver supports;
+- **training, for real**: a unit of the public network's fruit-demo job (its
+  exact settings and data) on the device the worker would use, checked the way
+  verifiers check it, with every segment replayed on the CPU within the job's
+  tolerance. A broken driver or a setup that doesn't repeat its results fails
+  here. With PyTorch and a GPU, also a fine-tune step (LoRA on a tiny model),
+  replayed on the CPU;
+- **network**: the node answers (and how fast), its network, block and round,
+  jobs that are waiting and what that means for you, this computer's clock
+  against the node's (signed messages more than 2 minutes off are refused),
+  download speed, and whether huggingface.co answers (fine-tunes fetch their
+  weights there);
+- **wallet**: whether setup has run, the saved node and wallet, its balance
+  and stake, and roughly how long earning the stake takes at the network's
+  recent pace;
+- **disk**: room for fine-tunes' weights and for DeepSeek's model files.
+
+It ends with what this computer can take tonight (CSV jobs on its GPU or CPU,
+Qwen3-0.6B and Qwen3-4B fine-tunes by GPU memory, the DeepSeek pilot) and the
+command to run next. It exits with status 0 only if the computer can mine.
+`--node ADDRESS` checks against another network, `--device cuda:1` a
+particular GPU, `--offline` skips the network, and `--json` is for scripts.
+`--model qwen3-0.6b` also trains one real unit of that model, timed, with its
+peak GPU memory; it downloads the weights first (1.5 GB, kept for its
+fine-tune jobs), so it asks, unless you add `--yes`. The menu has it as
+"Check this computer".
+
+**Several GPUs in one computer or pod.** One worker trains on one GPU. Run a
+worker for each, each with its own wallet, so each earns and stakes on its own
+(two workers with one wallet would take the same units and undo each other's
+work, so the second one refuses to start):
+
+```bash
+vibehash wallet create --out gpu1.json
+```
+```bash
+vibehash worker --device cuda:1 --wallet gpu1.json
+```
+
+Each wallet gets its own cache (`~/.vibehash/cache/ADDRESS`: checkpoints,
+datasets, receipts). Model weights are shared: when two workers need the same
+model, one downloads it while the other waits for it.
 
 ## Quick start
 
@@ -113,8 +198,9 @@ costs before posting. In a terminal it then follows the job live until the
 budget is spent: a forge where the model is a blade that grows with its
 accuracy, accuracy and loss charted round by round, the units accepted, the
 budget left, and whether it's the job's turn to train. Ctrl+C stops watching,
-not training; `job watch` picks it up again and `job status` prints a
-summary. `job download` saves the model as one file (`my-data-model.npz`),
+not training; `job watch` picks it up again, `job status` prints a
+summary and `job history` the rounds one by one. `job download` saves the
+model as one file (`my-data-model.npz`, with how it was trained beside it),
 and `predict` labels new rows (`--out predictions.csv` saves them all).
 `python -m vibehash example` writes a sample, `fruit.csv`, to try first. On
 your own testnet, pay with its requester wallet by adding
@@ -196,7 +282,49 @@ card and driver (NVIDIA through `nvidia-smi`, Intel Arc, Apple silicon, AMD
 with ROCm on Linux), checks which PyTorch builds are currently published for
 your driver and Python version, installs the newest one that fits, and
 self-tests it. `vibehash devices` shows what's usable. Workers use the first
-GPU they find; `--device cpu|cuda|xpu|mps` overrides it.
+GPU they find; `--device cpu|cuda|cuda:1|xpu|mps` overrides it. One worker uses
+one GPU: for more, see "Several GPUs" above.
+
+## Logs and records
+
+What a worker or a job poster does is also kept in files, so a night of
+mining can be looked at afterwards by someone who wasn't watching. They're in
+`~/.vibehash` (or `$VIBEHASH_HOME`), and they're written whether the dashboard
+is on or not: with `--plain`, piped, in tmux or over SSH.
+
+- `logs/worker-DATE.log` (DATE is the day the worker started): what the
+  mining dashboard's feed shows, one line each with the time. A file stops at
+  10 MB and starts again, keeping the one before as `worker-DATE.1.log`, and
+  only the last 14 days are kept.
+- `logs/rounds.jsonl`: a line for each round a worker took part in. It names
+  the computer (`host`), the wallet (`worker`), the node and chain, the round
+  and job and what kind of job it was. Then what happened: units given,
+  trained, committed, revealed and accepted, and why not when the node said;
+  checks done; seconds spent training and uploading; what the round's block
+  paid (`earned_vibe`, `paid`) or took (`slashed`); and the balance and stake
+  after it. `outcome` says it in words. Each line is one JSON object, so a
+  text editor shows it, and files from several computers can be put together.
+- `vibehash worker` prints where these go when it starts, and a summary when
+  you stop it: rounds, units accepted, VIBE earned. `vibehash testnet` also
+  keeps its node's log in `node.log` in the testnet's folder.
+- `jobs/JOB/history.csv` (and `history.jsonl`): a job's rounds one by one:
+  round (its block's height), time, units accepted, loss and accuracy on the
+  held-back data, VIBE paid and budget left. `train` and `job watch` keep it up
+  to date while they follow the job. `job history` fetches it from the node for
+  any job, including one posted from another computer, prints the latest
+  rounds and saves the rest; `--csv FILE` writes it where you want it, and
+  `--json` prints all of it for scripts:
+
+```bash
+python -m vibehash job history fruit-demo --csv fruit-demo.csv
+```
+
+`job download` writes the same history beside the model it saves
+(`my-data-model-training-history.csv`, or `training-history.csv` inside a
+fine-tune's adapter folder), with a short `TRAINING.md` saying how it was
+trained: the base model, the data, the rounds, accuracy or loss from the first
+round to the last, the VIBE spent, the node and chain, and the dates. Every
+fact in it comes from the node or from the receipt `train` kept.
 
 ## Publishing a release
 
@@ -208,14 +336,14 @@ trusted publisher for `vibehash` names owner `AlphaChad5000`, repository
 `vibehash`, workflow `publish.yml` and environment `pypi`.
 
 1. Bump `version` in `pyproject.toml` (PyPI never accepts the same version
-   twice; 0.5.6 is out), commit it, and push.
+   twice; 0.5.7 is out), commit it, and push.
 2. Tag the commit with that version and push the tag. This publishes it:
 
 ```bash
-git tag v0.5.7
+git tag v0.5.8
 ```
 ```bash
-git push origin v0.5.7
+git push origin v0.5.8
 ```
 
 Follow the run under the repository's Actions tab. To try a build locally
@@ -408,7 +536,11 @@ clock. `tests/test_hardening.py` covers fees, issuance schedules, HTTPS
 nodes, rate limits and recovery words, including the official BIP39 and
 SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 `models` and `train --base` against a fake Hugging Face Hub, and that
-`train --base` never reaches the node or the wallet.
+`train --base` never reaches the node or the wallet. `tests/test_selftest.py`
+runs `selftest` against an in-process node with made-up GPUs (one whose
+results drift, one that fails its self-test), a clock five minutes off and a
+node out of reach, and checks the advice, one worker per wallet and the pod
+rule; `tests/test_setup.py` runs `setup` and `worker` with no terminal.
 
 ## Layout
 
@@ -432,6 +564,7 @@ SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 | `vibehash/ratelimit.py` | Per-client rate limits, connection caps and timeouts for the node's server |
 | `vibehash/tls.py` | HTTPS: server contexts, self-signed certificates, certificate pinning for clients |
 | `vibehash/client.py` | HTTP client and the worker loop, with live `WorkerStats` |
+| `vibehash/records.py` | What's kept on disk: workers' event logs and a line per round, a job's history, the page beside a downloaded model |
 | `vibehash/minerui.py` | The terminal mining dashboard (plain ANSI, ASCII fallback) |
 | `vibehash/trainui.py` | The terminal training dashboard: a job followed live from the node, politely, with a log-line mode |
 | `vibehash/emblems.py` | Pixel-art emblems of the model makers, which the training dashboard forges instead of a blade for a fine-tune (`scripts/preview_forge.py NAME` plays one) |
@@ -449,6 +582,10 @@ SLIP-0010 test vectors. `tests/test_catalog.py` checks the model catalog,
 | `vibehash/mnemonic.py` | Recovery words: BIP39 mnemonics and SLIP-0010 Ed25519 key derivation |
 | `vibehash/hardware.py` | RAM detection and a workload benchmark |
 | `vibehash/cli.py` | The `vibehash` command, including `setup` and `testnet` |
+| `vibehash/selftest.py` | `vibehash selftest`: whether this computer can mine (a real training unit checked as verifiers check it, the node, the clock, disk) and what it can take |
+| `vibehash/advice.py` | What went wrong, in a line or two a newcomer can act on: a node out of reach, a clock that's off, a GPU out of memory, a full disk, a job waiting for staked workers |
+| `vibehash/unattended.py` | Running with nobody at the keyboard: no questions that can't be answered, recovery words to a private file, one worker per wallet |
+| `vibehash/filelock.py` | Locks between processes on one computer, so workers sharing it don't fetch the same model into the same files |
 | `vibehash/settings.py` | `~/.vibehash`: the default wallet, and the node address and its TLS trust that `setup` saves |
 | `vibehash/gpusetup.py` | GPU detection before PyTorch is installed; picks and installs the PyTorch build for the card |
 | `vibehash/protocol.py` | In-process driver for simulations |

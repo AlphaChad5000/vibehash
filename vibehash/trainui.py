@@ -213,8 +213,10 @@ class JobWatch:
     for the dashboard. Events go to `events`, as (time, level, text), and to each of `listeners`."""
 
     def __init__(self, job_id: str, node_url: str, budget: int | None = None, posted: bool = False, api=None,
-                 base: str | None = None):
+                 base: str | None = None, history=None):
+        """`history`: a records.JobHistory, given each /job reply to keep the job's round-by-round files up to date."""
         self.job_id, self.url, self.posted = job_id, node_url.rstrip("/"), posted
+        self.history = history
         self.base_hint = safe_base(base)  # the model it fine-tunes, when the poster knows it before the node says
         self.api = api if api is not None else Reader(node_url)
         self.budget_hint = budget if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0 else None
@@ -362,6 +364,11 @@ class JobWatch:
                     before.append(r)
         self.job = job
         self._budget_news(job, now, first=prev is None)
+        if self.history is not None:
+            why = self.history.update(reply)
+            if why and "history" not in self._said:
+                self._said.add("history")
+                self.say(f"couldn't save the job's history: {why}", logging.WARNING)
 
     def _sealed(self, r: Round, before: list[Round], now: float) -> None:
         accs = [x.acc for x in before if x.acc is not None]

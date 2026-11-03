@@ -68,10 +68,17 @@ a small but **steady** income, with no need for a mining pool.
    - **verify:** fetch and replay the challenged segments of two units.
 
    A job file can also ask for a longer compute phase (`compute_s`, 5–3600 s),
-   for bigger units. Nodes run each round for the longer of their own phase
-   lengths and the job's. The compute phase a round actually had is written
-   into its record's rules, since capacity depends on it. Validators wait for
-   a proposal as long as the longest funded job's round needs. A small job
+   for bigger units. Nodes give each phase the longer of their own length for
+   it and the job's. That's the most it lasts: a phase ends sooner once
+   everything it waits for is in (every unit handed out committed, every
+   commitment revealed, every check answered: `Coordinator.all_in`), but never
+   sooner than the node's own length. So a round nobody was handed work in
+   lasts the node's own round, whatever the job's, and no round is shorter:
+   at the default phases a chain nobody mines seals a block every 38 s, the
+   block time the issuance schedule is timed by. The compute phase a round
+   was given is written into its record's rules, since capacity depends on it;
+   when a phase really ended isn't recorded. Validators wait for a proposal as
+   long as the longest funded job's round can take. A small job
    keeps the 38-second default; the GPU template (270k weights) still fits
    in it. A model of three 4096-wide layers (34M weights, 134 MB per
    checkpoint) gets about 17-minute rounds: 12 minutes of compute, most of
@@ -1014,7 +1021,9 @@ allocations under the 21M cap. The cap is enforced as well as designed in: a
 genesis that allocates more is invalid, and a subsidy never takes coins
 created past the cap. Halvings count block heights, and blocks that only
 carry transactions (when no job is running) mint nothing, so the 4 years
-assume the network is busy.
+assume the network is busy. No round is shorter than the node's own, however
+fast its work comes in (§3, "Round length follows the job"), so at the
+default phases blocks never come faster than the schedule assumes.
 
 **Commitment.** A schedule other than the testnet one adds one genesis
 transaction, `memo = "economics:" + canonical JSON of the numbers`, so it's

@@ -1505,13 +1505,15 @@ class ClientMoveTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
 
-        from vibehash.client import NodeError, WorkerClient, WorkerStats
+        from vibehash.client import NodeError, WorkerClient, WorkerStats, _NoLog
 
         game = {"id": "g1", "turn": "split", "defender": "me", "challenger": "them", "n": 3, "seed": 1}
         node = SimpleNamespace(get=lambda path: [dict(game)])
         party = SimpleNamespace(split=mock.Mock(return_value=["a" * 64, "b" * 64]))
         w = WorkerClient.__new__(WorkerClient)
         w.node, w.stats, w.moved, w.unsent = node, WorkerStats(), set(), {}
+        w.home, w._last_said = SimpleNamespace(url="http://node.test"), ("", 0.0)  # what _try's warning reads
+        w.record = _NoLog()
         w.party, w.worker = {5: party}, SimpleNamespace(verifier_behavior="honest", keys=SimpleNamespace(address="me"))
         sent = []
 

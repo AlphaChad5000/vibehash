@@ -41,18 +41,23 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `node.py` | HTTP node. JSON for small messages; `/blob/<sha>` and `/dataset/<sha>` for chunked binary transfer (GET status, GET `?offset=`, signed PUT). On a validator chain: `_lead` runs the round when it's our turn and proposes it, `_validate` (apply + replay) decides our vote, `_commit` adopts final blocks, `_sync` catches up from peers, `_ensure_params` / `_fetch_missing_data` pull trained weights and datasets from peers. |
 | `consensus.py` | Tendermint Algorithm 1 (`Engine`: proposals, prevote/precommit, locking, timeouts, round skipping), stake-weighted `proposer_order`, `check_certificate`. Transport-agnostic: node.py feeds it messages and ticks. |
 | `p2p.py` | `Peers`: `--peer` addresses plus validators' on-chain addresses; background POST fan-out with a back-off for unreachable peers. |
-| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only) and `WorkerClient` (worker loop). |
+| `client.py` | `NodeClient` (API, upload/download with retry on transport errors only) and `WorkerClient` (worker loop). The loop notes each round into `record` (a `records.RoundLog` when the command keeps one, else nothing) and writes its line once the round's block is final. |
+| `records.py` | What's kept on disk so a night of mining can be read afterwards (README, "Logs and records"). Workers: `Session` (made by `worker` and `testnet`) attaches `LogFile` to the dashboard feed's loggers (`logs/worker-DATE.log`, 10 MB then `.1`, 14 days kept, control characters written out by `clean`) and gives each client a `RoundLog` (`logs/rounds.jsonl`: a line per round, pay read from the round's block by `settle`: its reward and slash txs and its summary; units accepted are the worker's FLOPs over a unit's). Posters: `history_rows` from `/job` plus each round's block (time, its `fee_release`), budget left worked back from the escrow; `JobHistory` keeps `jobs/JOB/history.csv`/`.jsonl` current for `trainui.JobWatch`; `fetch_history` for `job history`; `write_report` puts the history and a `TRAINING.md` beside a downloaded model. `testnet` logs its nodes to `node.log` too. Tested: `tests/test_records.py`, and end to end in `test_network.CommandLineTests`. |
 | `worker.py` | Training, commit, reveal, verify. Cheat behaviours exist **for tests only**. `blobs=` spills checkpoints to disk. |
 | `storage.py` | SQLite chain and weights; datasets and blobs directories. The chain is re-validated on start-up. |
 | `wire.py` | Signed envelopes (chain id + timestamp), blob-reference openings. |
 | `wallet.py` | scrypt + AES-256-GCM key files. |
 | `hardware.py` | RAM detection, benchmark on the chosen backend. |
-| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`. `--node` / `--wallet` default to what setup saved. |
+| `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`, `selftest` (selftest.py), `job history [JOB] [--csv FILE] [--json]` (records.py). `--node` / `--wallet` default to what setup saved. |
 | `tabular.py` | `vibehash train` / `job download` / `predict`: CSV → standardised dataset (80/20 split), and self-contained model `.npz` files (weights, widths, scaling, column and class names; loaded without pickle). `train` keeps a receipt in `~/.vibehash/jobs/<job>/job.json`; `job download` merges it into the model file. Sample data in `vibehash/data/` (package data). |
 | `minerui.py` | Live terminal dashboard for `worker` / `testnet`: animated mine (drill speed follows `WorkerStats.busy`, cart fills with committed units, gold popup on payouts), round/phase bar, earnings, and an event feed that captures the `vibehash.worker` / `vibehash.node` loggers. Alternate screen, ANSI only, Unicode with a pure-ASCII fallback, `NO_COLOR`; off when stdout isn't a TTY or with `--plain`. `tests/test_minerui.py` checks every frame fits 40/66/120-column terminals. The Claude Code tool shell sets `NO_COLOR=1`, so previews from there come out colourless. |
 | `trainui.py` | Live dashboard for job posters: `train` shows it after posting, `job watch [JOB]` brings it back. A forge in the mine: the model is a blade that grows with accuracy, hammered when it's the job's turn; per-round accuracy and loss charts, budget left, an event feed. Polls `/status` every 1.5 s and `/job` on new blocks; `--plain` or a pipe gives log lines. A fine-tune (a job whose spec names a `base`, or `JobWatch(base=...)`) forges its model maker's emblem instead (`emblems.py`): the forge grows to 9 rows, and the emblem takes on its colours from left to right as accuracy climbs. |
 | `termui.py` | What the two dashboards share: colours, the rock, the banner, the phase bar, the feed, the alternate screen. |
-| `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. |
+| `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. On a RunPod pod (`$RUNPOD_POD_ID`, a `/workspace` folder) the home is `/workspace/.vibehash`, the only place a restart keeps (`pod_volume`), unless `~/.vibehash` already holds a setup. |
+| `selftest.py` | `vibehash selftest` (and the menu's "Check this computer"): Python and packages, PyPI's newest release, every device's self-test, PyTorch's CUDA build against the driver, GPU memory free; **a real fruit-demo unit** (the public job's spec, and its dataset: the packaged fruit.csv makes it byte for byte) on the worker's device, checked as verifiers check it with every segment replayed on the CPU, and whether it repeats bit for bit; a LoRA step on a tiny Qwen3 built in memory (put into `finetune._runtimes` directly, so nothing is fetched) replayed on the CPU; `--model NAME` for one real unit (asked first). The node's /status, round trip, clock skew from its HTTP `Date` header (`clock_skew`, which `worker` also checks before it starts), download speed, Hugging Face; the wallet read without its password; disk for the cache and model store; then what the computer can take (`finetune_need` sizes Qwen3-0.6B/4B from baked shapes with `finetune.memory_mb`; `deepseek_worker.can_take`) and the next command. Exit 0 only if it can mine. `--json`. Tests: `tests/test_selftest.py` (no GPU or internet). |
+| `advice.py` | Plain-language problems and what to do, a line or two each: a node out of reach (DNS, refused, timeout with the dorm-Wi-Fi hint, TLS/captive portal), the clock, a different network, out of GPU memory, a full disk, no stake on a network without earn-in, a job waiting for staked workers (by this worker's stake and memory). `explain(e)` maps exceptions to them; every command's error exit, setup, the worker loop (`WorkerClient._say`, at most once a minute for the same problem) and selftest use it. |
+| `unattended.py` | No terminal (nohup, Docker, a pod): `interactive()` (Windows calls NUL a terminal and getpass then waited for ever; it asks the console), `need()` (the one-line error naming the variable or flag), `save_words` (a new wallet's words to `recovery-words-ADDRESS.txt`, 0600, when output isn't a terminal, with a loud note in the log), `WorkerLock` (one worker per wallet: a second would prune the first's checkpoints and register as the same worker). |
+| `filelock.py` | Locks between processes (msvcrt / fcntl, released when the process ends): `hub.TensorCache.fetch` holds one per commit, and `modelstore.Store.acquire` one per store (in the temp folder), so workers on one computer don't fetch the same files at once. |
 | `gpusetup.py` | GPU detection without PyTorch (nvidia-smi, OS device list, ROCm). Picks PyTorch builds by driver CUDA version and compute capability, **probes PyTorch's index** (`pip index versions`) for what's published, installs, and self-tests in a fresh subprocess (Windows locks loaded DLLs). The build table needs updating when CUDA versions change. |
 | `protocol.py` | In-process driver for `simulate.py` and the tests. |
 | `transformer.py` | Llama-style decoder (RoPE, grouped-query attention, RMSNorm, SwiGLU) with LoRA, NumPy reference: Hugging Face tensor names and shapes for the frozen base, PEFT-compatible adapters (`peft_names`), deterministic SGD `train_segment`, and a stage API bit-identical to whole-model training for sharding. Jobs use `llm.py`; this is its float64 reference in `test_finetune` and the basis for sharded transformers. |
@@ -79,7 +84,9 @@ Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 (user-facing guide, published as a claude.ai artifact), `docs/whitepaper.pdf` (the design in eleven pages, in the
 style of Bitcoin's; printed from `docs/whitepaper.html`, whose first lines say how, and copied to
 vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
-`pyproject.toml` (package `vibehash`, console script `vibehash`).
+`pyproject.toml` (package `vibehash`, console script `vibehash`), `agents/` (the Muse agents, from calebluh's
+branch: an LLM, Meta's Muse Spark by default, designs a fine-tune from a plain-English goal and judges the result
+against the base model; `agents/README.md`, `tests/test_agents.py`; run from a checkout, not in the package).
 
 ## Key design decisions (don't undo without reason)
 
@@ -107,13 +114,65 @@ vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
   - The simulator's `_proposer` picks only staked workers.
   - Also fixed: `apply_block` now refuses a second genesis block appended to a chain, which previously re-applied the allocations.
   - Tests: `tests/test_earn_in.py`.
-- **Round length follows the job (2026-10-29).** `TrainingJob.phase_lengths()` sizes compute, reveal and verify so a reference machine (`tasks.REF_FLOPS` 2 GFLOP/s, `REF_UPLOAD` 20 Mbit/s, `REF_DOWNLOAD` 100 Mbit/s) can download the weights, train a unit and upload its checkpoints. An optional job field `compute_s` (5–3600) asks for a longer compute phase; it's omitted from specs when 0, so old job specs are byte-identical. `Node.times_for(job)` uses the longer of the node's phases and the job's. `Coordinator.timing` writes the round's compute seconds into `record["rules"]["compute_s"]`, which capacity uses. `Engine(propose_wait=...)` makes validators wait as long as the longest funded job's round. **A replay now copies the recorded rules verbatim:** before, it rebuilt them from today's config, so adding `max_newcomers` would have made every older record hash differently and fail `chain verify` (test: `test_round_length.py`).
+- **Round length follows the job (2026-10-29).** `TrainingJob.phase_lengths()` sizes compute, reveal and verify so a reference machine (`tasks.REF_FLOPS` 2 GFLOP/s, `REF_UPLOAD` 20 Mbit/s, `REF_DOWNLOAD` 100 Mbit/s) can download the weights, train a unit and upload its checkpoints. An optional job field `compute_s` (5–3600) asks for a longer compute phase; it's omitted from specs when 0, so old job specs are byte-identical. `Node.times_for(job)` uses the longer of the node's phases and the job's, at most: a phase ends once everything it waits for is in (`Coordinator.all_in`), never sooner than the node's own length for it, so a round nobody works in lasts the node's own round and none is shorter (2026-11-02). `Coordinator.timing` writes the round's compute seconds into `record["rules"]["compute_s"]`, which capacity uses. `Engine(propose_wait=...)` makes validators wait as long as the longest funded job's round. **A replay now copies the recorded rules verbatim:** before, it rebuilt them from today's config, so adding `max_newcomers` would have made every older record hash differently and fail `chain verify` (test: `test_round_length.py`).
 - **Jobs with budget left take turns, one round each** (`Coordinator.active_job_id`). Before 2026-10-29 it was first come, first served, so a new job waited for every earlier job to spend its budget.
 - **Job posters can get their model back.** `GET /job/<id>` reports each round's validation loss/accuracy (SQLite `job_rounds`, written when a round is sealed) and the model's size and sha256; `GET /job/<id>/model?offset=` serves the weights. They're public, because workers receive them every round anyway.
 - **A replay must match the segment's own update to within 1% (`UPDATE_TOLERANCE`), not just the job's `tolerance`.** For big or nearly trained models one segment's whole update can be smaller than the tolerance, and then a worker who resubmits its start weights untrained (the `freezer` test cheat) would pass. Replica comparisons use the same `reproduces()` rule.
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Release 0.5.7 (2026-11-02): for test night (PR #17, TONIGHT.md).** The three parts below, and the Muse agents (`agents/`,
+calebluh's `Meta-AI-Agents` with fixes; agents/README.md). The faster rounds are the node's: they take effect when
+the public node is upgraded with `deploy/setup-node.sh`.
+
+**In 0.5.7: a phase ends once its work is in, and a round nobody works in lasts the node's own 38 s.** On the
+public node the DeepSeek pilot, which nobody mines, took 1,521 s a round (its phases are a prep unit's deadline and
+its checks', never under 10 minutes), alternating with fruit-demo's 39 s ones: a newcomer earning its stake on
+fruit-demo got a paid round every 26 minutes. Now compute, reveal and verify each end as soon as everything they wait
+for is in (Coordinator.all_in: every unit handed out committed, every commitment revealed, every task answered), but
+never sooner than the node's own length for the phase (Node._run_round). So a round in which nothing was handed out
+(nobody registered who fits, or a fine-tune short of its quorum) lasts exactly the node's own round, and the pilot's
+empty rounds take 38 s; a unit or verdict still out keeps the job's full time. No round is shorter than the node's
+own, so a chain nobody mines still seals a block every 38 s, not every few seconds, and the mainnet halvings keep
+their timing. Records, blocks and replays are unchanged: rules.compute_s is still the job's, and nothing more can come
+in once a phase is all in. Only the node needs it: workers already poll. Expected on the public node, with nobody on
+the pilot: fruit-demo and the pilot alternate at about 39 s each, so a fruit-demo round every 78 s or so (20 times
+as often); a qwen3-0.6b fine-tune's round (264 s at 192 tokens) ends once its 8 units, reveals and checks are in,
+however fast that is. This folds in the commit before it, which ended a prep round's compute phase once every unit
+was committed (then Coordinator.prep_committed, with no floor).
+
+**In 0.5.7: `vibehash selftest`, and setup and the worker for tonight's machines.** For
+the owner's mixed Windows laptops and desktops and RunPod pods:
+- `selftest` (code map), in the menu as "Check this computer". On the 4070 SUPER it takes about 10 s.
+- Unattended: on Windows, `setup < NUL` (and so any setup or worker with no console) waited for ever in getpass; now
+  nothing asks without a terminal (`unattended.interactive`), a missing password stops setup and the worker at once
+  naming `VIBEHASH_PASSWORD`, and a new wallet's words go to a private file rather than the log. `setup --deepseek
+  yes|no` saves the worker's DeepSeek answer.
+- RunPod: `install.sh` keeps a PyTorch the Python already has exactly as it is (pip constraints pin `torch==` it,
+  and NumPy below 2 if it was 1), gives an externally managed Python's venv `--system-site-packages` when that
+  Python has PyTorch, and on a pod puts the settings in `/workspace/.vibehash` (settings.py does the same). Tested
+  against a stand-in python3 in four environments under Git Bash; not on a real pod.
+- Several GPUs: one worker per GPU, each with its own wallet (`worker --help`, README "Several GPUs"). A second worker
+  with the same wallet is refused (`WorkerLock`), and model downloads are locked between processes.
+- Errors newcomers hit (advice.py): node out of reach, clock skew (the worker checks it at start), a different
+  network, GPU out of memory and a full disk (no traceback), a job waiting for staked workers (once a job, with this
+  worker's stake and memory; selftest adds how long the stake should take at the network's recent pace).
+- The pilot's ~1,520 s empty rounds that held newcomers back are the node change above.
+
+**In 0.5.7: records of what happened.** For a night of mining on home PCs and rented
+pods with nobody watching a terminal: every `vibehash worker` and testnet worker keeps the dashboard feed's events in
+`~/.vibehash/logs/worker-DATE.log` and a JSON line per round in `logs/rounds.jsonl` (what it was given and did, the
+seconds it took, and what the round's block paid it or slashed, and why), says where at start and sums the session up
+at the end; a testnet logs its nodes to `node.log` in its folder. A job's rounds go to `~/.vibehash/jobs/JOB/history.csv`
+as `train` and `job watch` follow it, `job history` fetches them from the node for any job, and `job download` puts
+them and a `TRAINING.md` beside the model. Workers only ask the node for their account once a round beyond what they
+already asked (the receipts' audit fetches the round's block). The DeepSeek prep units' own stats (seconds, tokens a
+second, peak GPU memory) go into the round's line; fine-tune and DeepSeek training units have no such stats yet, so
+their lines have the seconds alone. `job history fruit-demo` was tried read-only on the public node (7,178 rounds, 37
+that trained, the budget worked back to its 5,000 VIBE exactly); a worker's records have only run on local networks.
+
+
 
 **Release 0.5.6 (2026-11-02): prep pieces stay with their miners.** A prep round now takes ready units a piece at a
 time (round robin), and each piece goes first to the miners it stands with by rendezvous hashing (coordinator._spread,

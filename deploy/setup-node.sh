@@ -54,7 +54,7 @@ say "Installing Vibe Hash"
 id vibehash >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --create-home --shell /usr/sbin/nologin vibehash
 [ -x "$VENV/bin/pip" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q --upgrade vibehash
+"$VENV/bin/pip" install -q --upgrade --no-cache-dir vibehash
 "$VENV/bin/pip" show vibehash | grep '^Version'
 
 # The wallet's password, made once and readable only by root and the node.
