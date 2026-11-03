@@ -11,6 +11,10 @@ Below it: the network's round and phase and whether this job is the one training
 chart that climbs, the units accepted each round, the budget spent and left in escrow with the rounds it still pays
 for, and the latest events.
 
+An Evo job (es.py) is shown as its chain instead (esui.py): sealed blocks, one a generation, and the open one
+incubating the round's population; then the mean reward by generation as the chart, the difficulty level marked where
+it moved, and the bytes each generation put on the chain, all from the node's blocks and round records (esui.Lineage).
+
 It asks the node about once a second (`/status`, plus `/job/<id>` when something changed), backs off when the node
 is busy or unreachable, and says so on screen rather than stopping. The `/job` reply is read defensively: any field
 may be missing, and the `model` field isn't used at all. Same conventions as the mining dashboard (termui.py):
@@ -32,7 +36,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from . import catalog, emblems, termui
+from . import catalog, emblems, esui, termui
 from .hub import check_repo
 from .client import NodeClient, NodeError
 from .termui import (DIM, GOLD, GREEN, LAMP, PHASES, RED, SPARKS, TEXT, TIMBER, WHITE, YELLOW, _cells, _line, _n,
@@ -62,6 +66,10 @@ STEEL_DULL, STEEL_BRIGHT = (88, 100, 116), (188, 208, 230)
 HOT = [(0.3, (190, 55, 30)), (0.55, (250, 120, 40)), (0.8, (255, 195, 80)), (1.0, (255, 245, 210))]  # heat -> colour
 DOING = {"register": "workers are signing up", "compute": "workers are training it", "reveal": "workers are "
          "revealing their work", "verify": "their work is being checked", "idle": "its block is being sealed"}
+DOING_EVO = {"register": "workers are signing up", "compute": "nudged copies are answering its puzzles",
+             "reveal": "workers are revealing their scores", "verify": "their answers are being checked",
+             "idle": "its block is being sealed"}
+EVO_AREA_RGB = [(30, 104, 100), (40, 134, 122), (52, 164, 138), (70, 196, 150), (110, 230, 160)]  # the reward chart's
 
 GLYPHS = {**termui.GLYPHS, "hammer": "▐█▌", "loss": "•", "dot": "·", "eighths": " ▁▂▃▄▅▆▇█", "axis": "┤",
           "rule": "│", "arrow": "→"}
@@ -103,6 +111,7 @@ class Job:
     escrow: int | None = None  # budget left
     rounds: tuple = ()
     base: str | None = None  # the open-weight model a fine-tune starts from (`hf:org/name@commit`), when it has one
+    es: "EsFacts | None" = None  # an Evo job's settings (es.py): its rounds' val_acc is their mean reward
 
     @property
     def scored(self) -> list[Round]:
@@ -122,6 +131,24 @@ class Job:
     def chance(self) -> float:
         """The accuracy of a blind guess: where the blade starts."""
         return 1 / self.classes if self.classes >= 2 else 0.0
+
+
+@dataclass(frozen=True)
+class EsFacts:
+    """What the dashboard reads of an Evo job's spec ("es"), each field checked."""
+    pairs: int = 8
+    problems: int = 32
+    n: int = 0  # numbers evolving
+    level: int = 0  # the level it starts at
+
+
+def parse_es(spec: dict) -> EsFacts | None:
+    e, m = spec.get("es"), spec.get("model")
+    if not isinstance(e, dict) or not isinstance(m, dict) or "n_in" in m or "lora" in spec:
+        return None
+    pairs, problems, n, level = (_num(e.get(k), int) for k in ("pairs", "problems", "n", "level"))
+    return EsFacts(pairs if pairs and 0 < pairs <= 4096 else 8, problems if problems and 0 < problems <= 512 else 32,
+                   n if n and n > 0 else 0, level if level is not None and 0 <= level < 64 else 0)
 
 
 _REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", re.ASCII)  # a branch, tag or commit, as git allows them
@@ -163,7 +190,8 @@ def parse_job(reply) -> Job:
                               None if acc is None else max(0.0, min(1.0, acc)))
     escrow = _num(d.get("escrow"), int)
     base = safe_base(spec.get("base"))
-    return Job(base=base, fee=max(0, _num(spec.get("fee_per_round"), int, 0)), units=max(0, _num(spec.get("units_per_round"), int, 0)),
+    return Job(base=base, es=parse_es(spec), fee=max(0, _num(spec.get("fee_per_round"), int, 0)),
+               units=max(0, _num(spec.get("units_per_round"), int, 0)),
                classes=max(0, _num(m.get("n_out"), int, 0)), widths=widths, escrow=None if escrow is None else max(0, escrow),
                rounds=tuple(rounds[h] for h in sorted(rounds)))
 
@@ -215,9 +243,12 @@ class JobWatch:
     for the dashboard. Events go to `events`, as (time, level, text), and to each of `listeners`."""
 
     def __init__(self, job_id: str, node_url: str, budget: int | None = None, posted: bool = False, api=None,
-                 base: str | None = None, history=None):
-        """`history`: a records.JobHistory, given each /job reply to keep the job's round-by-round files up to date."""
+                 base: str | None = None, history=None, evo: bool = False):
+        """`history`: a records.JobHistory, given each /job reply to keep the job's round-by-round files up to date.
+        `evo`: it's an Evo job (its poster knows before the node says), shown as one from the start."""
         self.job_id, self.url, self.posted = job_id, node_url.rstrip("/"), posted
+        self.evo_hint = evo
+        self.lineage: esui.Lineage | None = None  # an Evo job's generations, from the node's blocks and records
         self.history = history
         self.base_hint = safe_base(base)  # the model it fine-tunes, when the poster knows it before the node says
         self.api = api if api is not None else Reader(node_url)
@@ -290,9 +321,32 @@ class JobWatch:
                 else:
                     self._read_job(reply, now)
                 self._job_at, self._job_height = now, self.net.height if self.net else None
+            if self.job is not None and self.job.es is not None:
+                self._follow_lineage()
         except NodeError as e:
             return self._failed(e, now)
         return POLL_S
+
+    @property
+    def evo(self) -> bool:
+        return self.job.es is not None if self.job is not None else self.evo_hint
+
+    def _follow_lineage(self) -> None:
+        """An Evo job's generations, read from the blocks the node has sealed since the last read; those sealed while
+        watched (not the ones caught up on at the start) go in the events. A read that fails is tried again later."""
+        if self.lineage is None:
+            self.lineage = esui.Lineage(self.job_id)
+        lin, tip = self.lineage, self.net.height if self.net else None
+        if tip is None or tip <= lin.height:
+            return
+        was = lin.caught_up
+        try:
+            new = lin.poll(self.api, tip)
+        except (NodeError, ValueError, OSError, http.client.HTTPException):
+            return
+        for gen in new if was else ():
+            for text, level in lin.news(gen, esui.ASCII):
+                self.say(text, level)
 
     def follow(self, stop: threading.Event) -> None:
         """Poll until `stop` is set. Nothing a node says ends it: a reply that can't be read is waited out."""
@@ -354,10 +408,10 @@ class JobWatch:
                 acc = job.scored[-1].acc if job.scored else None
                 left = job.rounds_left
                 self.say(f"{self.job_id} so far: {_n(len(job.rounds), 'round')} trained"
-                         + (f", accuracy {acc:.1%}" if acc is not None else "") if job.rounds else
+                         + (f", {'reward' if job.es else 'accuracy'} {acc:.1%}" if acc is not None else "") if job.rounds else
                          f"{self.job_id} is on chain: {_vibe(job.escrow or 0)} budget"
                          + (f", about {_n(left, 'round')} at {_vibe(job.fee)} each" if left else ""))
-        else:
+        elif job.es is None:  # (an Evo job's generations are said as its lineage finds them: _follow_lineage)
             last = prev.rounds[-1].height if prev.rounds else -1
             before = list(prev.rounds)
             for r in job.rounds:
@@ -396,7 +450,8 @@ class JobWatch:
                     self.say(f"{self.job_id} has no budget left and trained no rounds: it was cancelled", logging.WARNING)
                 else:
                     self.say(f"finished: {_n(len(job.rounds), 'round')} trained"
-                             + (f", accuracy {scored[-1].acc:.1%} (best {max(r.acc for r in scored):.1%})" if scored else "")
+                             + (f", {'reward' if job.es else 'accuracy'} {scored[-1].acc:.1%} "
+                                f"(best {max(r.acc for r in scored):.1%})" if scored else "")
                              + (f"; {_vibe(self.budget)} spent" if self.budget else ""), GOOD)
             return
         budget, low = self.budget or 0, max(2 * job.fee, (self.budget or 0) // 5)
@@ -413,6 +468,10 @@ class JobWatch:
         scored = job.scored
         acc = (f", accuracy {scored[-1].acc:.1%} on held-back rows (started at {scored[0].acc:.1%}, "
                f"best {max(r.acc for r in scored):.1%})") if scored else ""
+        if job.es is not None and scored:  # an Evo job: its population's mean reward, and what the chain holds of it
+            acc = (f", mean reward {scored[-1].acc:.1%} (first {scored[0].acc:.1%}, best {max(r.acc for r in scored):.1%})"
+                   + (f"; its {_n(len(self.lineage.gens), 'generation')} put {esui.size(self.lineage.bytes)} of seeds "
+                      "and scores on the chain" if self.lineage and self.lineage.gens else ""))
         if self.finished_at is not None:
             if not job.rounds:
                 return f"{self.job_id} was cancelled before it trained."
@@ -514,6 +573,7 @@ class TrainDashboard:
         self.frame_no, self.phase_seen = 0, {}
         self.blade = 2.0  # the blade's drawn length, which grows toward its accuracy's
         self.fill = 0.0  # how many of an emblem's columns have taken on their colours, likewise
+        self.eg: dict | None = None  # an Evo job's scene's glyphs (_eg)
 
     def state(self, now: float) -> str:
         w = self.watch
@@ -716,6 +776,119 @@ class TrainDashboard:
         lines.append([(" " * 6, None), (axis, DIM)])
         return lines
 
+    # --- an Evo job: its chain, reward by generation (esui.py) ------------------------------------------------------
+
+    def _chain(self, width: int, now: float) -> list[str]:
+        """The chain of the job's generations, and the open block incubating while a round of it is open."""
+        watch = self.watch
+        lin, net, job, state = watch.lineage, watch.net, watch.job, self.state(now)
+        gens = list(lin.gens) if lin is not None else []
+        mine = state == "training" and net is not None and bool(net.round)
+        frac = 0.0
+        if mine:
+            first = self.phase_seen.get((net.round, net.phase), now)
+            frac = 1 - max(0.0, net.phase_ends - now) / max(net.phase_ends - first, 0.1)
+        waiting = {"finished": "the budget is spent", "offline": "the node isn't answering",
+                   "pending": "waiting for its block"}.get(state, "another job's turn" if net and net.round else
+                                                           "waiting for a round")
+        return esui.scene(self._eg(), width, gens, now, self.frame_no, number=len(gens) + 1 if mine else None,
+                          phase=net.phase if mine else "idle", progress=net.progress if mine else None, frac=frac,
+                          pairs=job.es.pairs if job is not None and job.es is not None else 8,
+                          landed=lin.landed if lin is not None else None, busy=mine and net.phase == "compute",
+                          waiting=waiting)
+
+    def _eg(self) -> dict:
+        if self.g is ASCII:
+            return esui.ASCII
+        if getattr(self, "eg", None) is None:
+            self.eg = esui.glyphs()
+        return self.eg
+
+    def _evo_headline(self, add, content: int) -> None:
+        g, lin = self.g, self.watch.lineage
+        scored = [x for x in (lin.gens if lin is not None else []) if x.mean is not None]
+        if not scored:
+            add((g["eighths"][6] + " ", AREA[-1]), ("reward -", DIM),
+                ("   no generations yet" if self.watch.job is not None else "", DIM))
+            return
+        last, best = scored[-1], max(x.mean for x in scored)
+        delta = last.mean - scored[-2].mean if len(scored) > 1 else None
+        change = [(f" {delta * 100:+.1f} pts", GREEN if delta > 0 else RED if delta < 0 else DIM)] if delta is not None else []
+        rew = [(g["eighths"][6] + " ", AREA[-1]), ("reward ", DIM), (f"{last.mean:.1%}", WHITE), *change]
+        lv = [("   level ", DIM), (f"{last.level}", TEXT)] if last.level is not None else []
+        add(*_pick(content, [*rew, ("  best ", DIM), (f"{best:.1%}", TEXT), *lv, (f"   after generation {last.number}", DIM)],
+                   [*rew, ("  best ", DIM), (f"{best:.1%}", TEXT), *lv], [*rew, *lv], rew))
+
+    def _evo_chart(self, plot: int, height: int, now: float) -> list[list]:
+        """The mean reward by generation as an area that climbs, one generation per column (or several columns each
+        when there are few), scaled to fill the chart, with a dot on the floor for a generation with nothing
+        accepted; then the level each generation's puzzles were at, written where it moved; the bytes each put on the
+        chain; and the generations."""
+        g, watch = self.g, self.watch
+        lin, job = watch.lineage, watch.job
+        gens = list(lin.gens) if lin is not None else []
+        future = job.rounds_left if job and watch.finished_at is None else 0
+        per = max(1, min(12, plot // max(1, len(gens) + future)))
+        shown = gens[-max(1, plot // per):] if gens else []
+        grid = [[(" ", None)] * plot for _ in range(height)]
+        for s in range(len(shown), min(len(shown) + future, plot // per)):  # a dot for each round the budget pays for
+            grid[-1][s * per + per - 1] = (g["dot"], DIM)
+        left = [" " * 5 + g["rule"]] * height
+        means = [x.mean for x in shown if x.mean is not None]
+        if means:
+            lo = max(0.0, math.floor(min(means) * 10 - 0.5) / 10)
+            hi = max(min(1.0, math.ceil(max(means) * 10 + 0.5) / 10), lo + 0.1)
+            flash = lin.landed is not None and now - lin.landed[0] < HEAT_S and lin.landed[1] is shown[-1]
+            prev = None
+            for i, x in enumerate(shown):
+                if x.mean is None:
+                    grid[-1][i * per + per - 1] = (g["dot"], DIM)
+                    continue
+                start = prev if prev is not None else x.mean
+                for j in range(per):
+                    v = start + (x.mean - start) * (j + 1) / per  # a slope between generations, not steps
+                    eighths = max(1, min(height * 8, round((v - lo) / (hi - lo) * height * 8)))
+                    top = -(-eighths // 8)
+                    for k in range(top):
+                        back = EVO_AREA_RGB[k * len(EVO_AREA_RGB) // height]
+                        if flash and i == len(shown) - 1:  # the generation just sealed: bright, with a gold cap
+                            back = GOLD_RGB if k == top - 1 else EVO_AREA_RGB[-1]
+                        grid[height - 1 - k][i * per + j] = (g["eighths"][min(8, eighths - 8 * k)],
+                                                             rgb(*back, bold=back == EVO_AREA_RGB[-1]))
+                prev = x.mean
+            left[0], left[-1] = f"{hi:>4.0%} {g['axis']}", f"{lo:>4.0%} {g['axis']}"
+        else:
+            note = "the first generation's reward lands here" if job is not None else "waiting for the job"
+            note = note[:plot]
+            for i, ch in enumerate(note):
+                grid[(height - 1) // 2][(plot - len(note)) // 2 + i] = (ch, DIM)
+        lines = [[(left[r], DIM), *_runs(grid[r])] for r in range(height)]
+        # The level, where it moved; the bytes each generation put on the chain; and where the generations start and end.
+        eg = self._eg()
+        levels, before = [(" ", None)] * plot, gens[len(gens) - len(shown) - 1].level if len(gens) > len(shown) else None
+        for i, x in enumerate(shown):
+            if x.level is not None and x.level != before:
+                up = before is None or x.level > before
+                mark = "" if before is None or per < 2 else eg["up"] if up else eg["down"]
+                for j, ch in enumerate(f"{mark}{x.level}"[:per] if per > 1 else str(x.level)):
+                    levels[i * per + j] = (ch, DIM if before is None else GREEN if up else YELLOW)
+            before = x.level if x.level is not None else before
+        lines.append([("level ", DIM), *_runs(levels)])
+        cap = max([x.bytes for x in shown] + [1])
+        chain = [(" ", None)] * plot
+        for i, x in enumerate(shown):
+            bar = g["eighths"][max(1 if x.bytes else 0, round(8 * x.bytes / cap))]
+            for j in range(per - (per >= 3)):
+                chain[i * per + j] = (bar, esui.TEAL)
+        lines.append([("chain ", DIM), *_runs(chain), (f" {esui.size(shown[-1].bytes)}" if shown else "", DIM)])
+        axis = ""
+        if shown:
+            first, end = f"generation {shown[0].number}", f"{shown[-1].number}"
+            axis = (first.ljust(len(shown) * per - len(end)) + end if len(shown) * per >= len(first) + len(end) + 2
+                    else f"gen {shown[0].number}")
+        lines.append([(" " * 6, None), (axis, DIM)])
+        return lines
+
     # --- the frame -----------------------------------------------------------------------------------------------
 
     def frame(self) -> str:
@@ -730,23 +903,26 @@ class TrainDashboard:
         room = w - 1 - len(termui.BANNER[0]) - 3
         shape = f" {g['arrow']} ".join(str(x) for x in job.widths) if job and job.widths else ""
         chain = net.chain_id if net else ""
+        evo = watch.evo  # an Evo job: its chain (esui.py) in place of the forge
         if watch.base:  # a fine-tune: the model it starts from, rather than layer widths
             shape = watch.base[3:] if watch.base.lower().startswith("hf:") else watch.base
             shape = shape.split("@")[0]
-        tails = [termui._fit(room, f"model forge  ·  {watch.job_id}", watch.job_id),
+        tails = [termui._fit(room, f"Evo mode: training by evolution  ·  {watch.job_id}", f"Evo  ·  {watch.job_id}",
+                             watch.job_id) if evo else
+                 termui._fit(room, f"model forge  ·  {watch.job_id}", watch.job_id),
                  termui._fit(room, f"{shape}  ·  {chain}" if shape and chain else shape or chain, shape, chain)]
         termui.header(add, g, ASCII, tails)
         head = len(lines)
         # Fixed rows: header, forge, two status lines, the headline, units and axis rows, two budget lines, footer.
-        emblem = emblems.for_base(watch.base)  # a fine-tune forges its model's emblem; a model from a CSV, a blade
-        spare = height - 1 - (head + BAND + 2 * (emblem is not None) + 2 + 3 + 2 + 1)
+        emblem = None if evo else emblems.for_base(watch.base)  # a fine-tune forges its model's emblem; a CSV's, a blade
+        spare = height - 1 - (head + BAND + 2 * (emblem is not None) + 2 + 3 + 2 + 1 + evo)  # (Evo: a level row too)
         gaps = spare >= 8  # blank lines between sections, when there's room
         spare -= 5 * gaps
         rows = max(3, min(10, height // 5, spare - 3))
         gap = (lambda: lines.append("")) if gaps else (lambda: None)  # noqa: E731
 
         gap()
-        lines += [" " + row for row in self._forge(w - 2, now, emblem)]
+        lines += [" " + row for row in (self._chain(w - 2, now) if evo else self._forge(w - 2, now, emblem))]
         gap()
         # The network: its round and phase, and whose turn it is.
         mine = net is not None and net.round and net.job_id == watch.job_id
@@ -765,7 +941,9 @@ class TrainDashboard:
         add((mark, PHASES.get(net.phase, DIM) if mine else DIM), (self._doing(state, now), TEXT))
         gap()
         # Accuracy and loss, then the chart.
-        if job and job.scored:
+        if evo:
+            self._evo_headline(add, content)
+        elif job and job.scored:
             last, best = job.scored[-1], max(r.acc for r in job.scored)
             delta = last.acc - job.scored[-2].acc if len(job.scored) > 1 else None
             change = ([(f" {delta * 100:+.1f} pts", GREEN if delta > 0 else RED if delta < 0 else DIM)]
@@ -777,7 +955,7 @@ class TrainDashboard:
         else:
             add((g["eighths"][6] + " ", AREA[-1]), ("accuracy -", DIM), ("   " + g["loss"] + " ", LOSS), ("loss -", DIM),
                 ("   no rounds yet" if job is not None else "", DIM))
-        chart = self._chart(max(10, content - 13), rows, now)
+        chart = (self._evo_chart if evo else self._chart)(max(10, content - 13), rows, now)
         for segs in chart[:-1] + ([chart[-1]] if spare - 3 >= rows else []):  # the axis row, when there's room
             add(*segs)
         gap()
@@ -796,13 +974,17 @@ class TrainDashboard:
                        [("budget    ", DIM), (_vibe(job.escrow), WHITE), (f" left of {_vibe(budget)[:-5]}", DIM)]))
             trained = [(f"{len(job.rounds)}", WHITE), (" trained", DIM)]
             units = sum(r.accepted for r in job.rounds)
+            held, spent = [(f"{units:,}", WHITE), (" units accepted", DIM)], [(f"{units:,}", WHITE),
+                                                                              (" units accepted · budget spent", DIM)]
+            if evo and watch.lineage is not None:  # what its generations put on the chain, rather than units
+                held = [(esui.size(watch.lineage.bytes), WHITE), (" on chain", DIM)]
+                spent = [*held, (" · budget spent", DIM)]
             if watch.finished_at is not None:
-                add(*_pick(content, [("rounds    ", DIM), *trained, (" · ", DIM), (f"{units:,}", WHITE),
-                                     (" units accepted · budget spent", DIM)], [("rounds    ", DIM), *trained]))
+                add(*_pick(content, [("rounds    ", DIM), *trained, (" · ", DIM), *spent], [("rounds    ", DIM), *trained]))
             else:
                 more = [(" · about ", DIM), (f"{job.rounds_left}", WHITE), (" more", DIM)]
                 add(*_pick(content, [("rounds    ", DIM), *trained, *more, (f" at {_vibe(job.fee)} each", DIM), (" · ", DIM),
-                                     (f"{units:,}", WHITE), (" units accepted", DIM)],
+                                     *held],
                            [("rounds    ", DIM), *trained, *more, (f" at {_vibe(job.fee)} each", DIM)],
                            [("rounds    ", DIM), *trained, *more]))
         gap()
@@ -830,7 +1012,7 @@ class TrainDashboard:
             return (f"waiting for {w.job_id} to reach a block" if w.missing_since is not None
                     else f"asking the node about {w.job_id}...")
         if state == "training":
-            return f"round {net.round} is training {w.job_id}: {DOING.get(net.phase, net.phase)}"
+            return f"round {net.round} is training {w.job_id}: {(DOING_EVO if w.evo else DOING).get(net.phase, net.phase)}"
         if net is not None and net.round:
             return f"round {net.round} trains {net.job_id or 'another job'}; {w.job_id} waits its turn"
         return "waiting for the next round to open"

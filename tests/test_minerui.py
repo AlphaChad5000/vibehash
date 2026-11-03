@@ -1,6 +1,7 @@
 """The terminal mining dashboard: every frame fits the terminal, whatever its size, state or character set, and its
 job selector follows the keys."""
 import io
+import json
 import logging
 import os
 import re
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from vibehash import minerui, termui
-from vibehash.client import NodeClient, WorkerStats
+from vibehash.client import NodeClient, NodeError, WorkerStats
 from vibehash.model import ModelSpec
 from vibehash.tasks import SYN_PER_VIBE, TrainingJob
 
@@ -243,6 +244,200 @@ class DashboardTests(unittest.TestCase):
 
     def test_summary(self):
         self.assertIn("Mined 111 units", self.dashboard(3).summary())
+
+
+# --- an Evo job (es.py): a chain of blocks in place of the drill (esui.py) ------------------------------------------
+
+def evo_job(job_id="evo-1"):
+    """The measured run's job (es_local.SETTINGS) on Qwen2.5-0.5B-Instruct's shapes, as testnet --evo posts it."""
+    from vibehash import es, es_local
+    spec = es.EsSpec(base="hf:Qwen/Qwen2.5-0.5B-Instruct@7ae557604adf67be50417f59c2c2f167def9a775", manifest="1" * 64,
+                     dims={"family": "qwen2", "vocab": 151936, "hidden": 896, "layers": 24, "heads": 14, "kv_heads": 2,
+                           "head_dim": 64, "ffn": 4864, "tied": True}, tensors=es.preset("mlp", 23), n=13_074_432,
+                     tensors_sha="2" * 64, sigma=1e-3, alpha=5e-7,
+                     **{k: v for k, v in es_local.SETTINGS.items() if k not in ("preset", "sigma")})
+    return es_local.job(spec, job_id, "req", 500 * SYN_PER_VIBE)
+
+
+def lineage(n=13, job_id="evo-1"):
+    """n generations of an Evo job: the reward climbing, the level moving up after the fourth."""
+    from vibehash import esui
+    lin = esui.Lineage(job_id)
+    for i in range(n):
+        m = 0.18 + 0.022 * i
+        update = [[j, round(min(1.0, m + 0.03 * ((j + i) % 3 - 1)), 5), round(max(0.0, m - 0.03 * ((j * i) % 3 - 1)), 5)]
+                  for j in range(8)] if i != 5 else []  # generation 6: nothing accepted
+        lin.gens.append(esui.parse_generation(i + 1, 28 + i, {"es": {"rule": 1, "level": 2 + (i >= 4), "seed": "ab" * 8,
+                                                                      "update": update}}))
+    lin.height, lin.caught_up = 28 + n, True
+    return lin
+
+
+def evo_rig(phase="compute", rnd=42, height=41, progress=(1, 4), busy=True):
+    import numpy as np
+    from vibehash import es
+    job = evo_job()
+    state = np.zeros(es.CTRL, np.float32)
+    state[-es.CTRL + 1] = 3
+    stats = WorkerStats(round=rnd, phase=phase, phase_ends=time.time() + 120, progress=progress, height=height, job=job,
+                        flops_per_sec=2e12, activity="answering unit 2 of 2 (4 nudged models x 32 problems)", busy=busy,
+                        assigned=2, trained=1, committed=1, rounds=14, units=26, checks=27, training_flops=4.3e14)
+    return SimpleNamespace(stats=stats, backend=SimpleNamespace(describe=lambda: "NVIDIA GeForce RTX 4070 SUPER (CUDA)"),
+                           keys=SimpleNamespace(address="vibe17b0d8bce54f6eab50df24fd44e5a408a9525"),
+                           es=SimpleNamespace(rebuilt=13, fetched=1, states={job.job_id: (height, state)}),
+                           jobs={job.job_id: job, "fruit-demo": JOB})
+
+
+class EvoDashboardTests(unittest.TestCase):
+    def dashboard(self, n=1, ascii=False, gens=13, **kw):
+        from vibehash import esui
+        dash = minerui.MinerDashboard([(f"worker-{i}", evo_rig(**kw)) for i in range(n)], "http://127.0.0.1:8545")
+        dash.g, dash.eg = (minerui.ASCII, esui.ASCII) if ascii else (minerui.GLYPHS, esui.GLYPHS)
+        dash.chain_id = "vibehash-local-3fa2c1"
+        for r in dash.rigs:
+            r.start, r.total, r.balance, r.stake, r.reputation = 0, 22 * SYN_PER_VIBE, 12 * SYN_PER_VIBE, 10 * SYN_PER_VIBE, 1.0
+        if gens is not None:
+            dash.lineages["evo-1"] = lineage(gens)
+        dash.jobs = ["evo-1", "fruit-demo"]
+        return dash
+
+    def frames(self, dash, size):
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size(size)):
+            return [dash.frame() for _ in range(3)]
+
+    def test_every_line_fits_the_terminal(self):
+        states = [{}, {"phase": "register", "progress": None}, {"phase": "reveal", "progress": (3, 4)},
+                  {"phase": "verify", "progress": (7, 8)}, {"phase": "idle", "height": 42},  # sealed: a new block opens
+                  {"phase": "idle", "rnd": None, "busy": False}, {"gens": 0}, {"gens": 200}, {"gens": None}]
+        for size in ((40, 20), (66, 34), (120, 50)):
+            for n in (1, 3):
+                for ascii in (False, True):
+                    for state in states:
+                        for hatching in (None, 0.5, 2.5):
+                            with self.subTest(size=size, workers=n, ascii=ascii, hatching=hatching, **state):
+                                dash = self.dashboard(n, ascii, **state)
+                                lin = dash.lineages.get("evo-1")
+                                if hatching is not None and lin is not None and lin.gens:
+                                    lin.landed = (time.time() - hatching, lin.gens[-1])
+                                for frame in self.frames(dash, size):
+                                    lines = frame.split("\n")
+                                    self.assertLessEqual(len(lines), size[1])
+                                    for line in lines:
+                                        self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
+                                    if ascii:
+                                        ESCAPE.sub("", frame).encode("ascii")
+
+    def test_shows_the_generation_and_what_the_chain_holds(self):
+        from vibehash import esui
+        dash = self.dashboard()
+        text = ESCAPE.sub("", self.frames(dash, (120, 50))[-1])
+        gens = dash.lineages["evo-1"].gens
+        for want in ("Evo miner", "generation 14", "population 16 (8 twin pairs, 8 yours)", "puzzles 32 a round",
+                     "level     3: 3 numbers 1-20 with + − ×", "moves every 2 rounds toward 50% solved",
+                     f"reward    {gens[-1].mean:.1%}", "the mean of generation 13", "for generation 13", "for all 13",
+                     esui.size(gens[-1].bytes), esui.size(sum(x.bytes for x in gens)),
+                     "which rebuild 13,074,432 numbers", "rebuilt from the chain 13x", "fetched 1x",
+                     "RTX 4070 SUPER", "incubating 1/4", "8 twin pairs, + and -", "g13 L3", "1 evo-1 (Evo)",
+                     "2 fruit-demo "):
+            self.assertIn(want, text)
+        self.assertNotIn("fruit-demo (Evo)", text)  # only Evo jobs are marked
+        self.assertNotIn("GFLOP/s", text)  # the drill's lines aren't
+        self.assertTrue(all(100 < x.bytes < 400 for x in gens if x.update))  # a few hundred bytes a generation
+        early = "\n".join(ESCAPE.sub("", r) for r in esui.scene(esui.GLYPHS, 118, gens[:6], time.time(), 1, number=7))
+        self.assertIn("g5 ▲3", early)  # where the level went up
+        self.assertIn("g6 L3", early)
+        self.assertEqual(early.count("╔══════╗"), 6)
+
+    def test_the_block_hatches_then_locks_into_the_chain(self):
+        from vibehash import esui
+        lin, now = lineage(5), time.time()
+        g = esui.GLYPHS
+        newest = lin.gens[-1]
+
+        def scene(t):
+            rows = [ESCAPE.sub("", r) for r in esui.scene(g, 100, lin.gens, now, 7, number=6, phase="register",
+                                                          pairs=8, landed=(now - t, newest))]
+            return rows, "\n".join(rows)
+        rows, text = scene(0.5)  # hatching: the fitter twin of each accepted pair glows
+        self.assertIn("generation 5", rows[0])
+        self.assertIn(g["hatched"], rows[2])
+        self.assertEqual(rows[2].count(g["hatched"]), sum(rp != rm for _, rp, rm in newest.update))
+        self.assertIn("hatched", text)
+        self.assertEqual(text.count("╔══════╗"), 4)  # the other four, sealed
+        rows, text = scene(2.5)  # locking: the open block's sides turn the sealed blocks' double lines
+        self.assertTrue(rows[0].rstrip().endswith("╗"))
+        self.assertIn("sealed", text)
+        rows, text = scene(esui.HATCH_S + 1)  # in the chain, and a new empty block open for generation 6
+        self.assertEqual(text.count("╔══════╗"), 5)
+        self.assertIn("generation 6", rows[0])
+        self.assertIn("g5 ▲3", text)
+        self.assertNotIn(g["hatched"], text)
+
+    def test_other_jobs_keep_the_drill(self):
+        """Only an Evo job's frame changes: a plain job's has no chain and none of its lines, whatever the hint."""
+        dash = minerui.MinerDashboard([("worker-0", rig())], "http://127.0.0.1:8545", evo=True)
+        dash.g, dash.chain_id = minerui.GLYPHS, "vibehash-local-123558"
+        text = ESCAPE.sub("", self.frames(dash, (120, 50))[-1])
+        for gone in ("generation", "Evo", "╔══════╗", "population"):
+            self.assertNotIn(gone, text)
+        self.assertIn("useful-work miner", text)
+        self.assertIn("290.00 GFLOP/s", text)
+        rig_ = rig()
+        rig_.stats.job = None  # an Evo testnet before its job reaches a block: the chain, waiting for it
+        dash = minerui.MinerDashboard([("worker-0", rig_)], "http://127.0.0.1:8545", evo=True)
+        dash.g = minerui.GLYPHS
+        text = ESCAPE.sub("", self.frames(dash, (120, 50))[-1])
+        self.assertIn("waiting for the Evo job", text)
+        self.assertIn("training by evolution, the chain is the model", text)
+
+    def test_the_lineage_follows_the_chain_defensively(self):
+        """Blocks and records as a node serves them, odd ones too: only the job's rounds count, a record's malformed
+        scores are dropped, and a generation sealed while followed lands (with news), not those caught up on."""
+        from vibehash import esui
+        good = {"es": {"rule": 1, "level": 2, "seed": "ab" * 8, "update": [[0, 0.5, 0.25], [1, 0.75, 0.75]]}}
+        odd = {"es": {"level": 99, "update": [[0, 2.0, 0.1], [1, float("nan"), 0], "junk", [2, 0.5], [3, 1, 0]]}}
+        blocks = {1: {"height": 1, "summary": None}, 2: {"height": 2, "summary": {"job_id": "evo-1"}},
+                  3: {"height": 3, "summary": {"job_id": "fruit-demo"}}, 4: {"height": 4, "summary": {"job_id": "evo-1"}},
+                  5: {"height": 5, "summary": {"job_id": "evo-1"}}}
+        records = {2: good, 4: odd, 5: good | {"es": good["es"] | {"level": 3}}}
+        calls = []
+
+        class Api:
+            def get(self, path):
+                calls.append(path)
+                m = re.fullmatch(r"/blocks\?from=(\d+)&to=(\d+)", path)
+                if m:
+                    return [blocks[h] for h in range(int(m[1]), int(m[2]) + 1)] + ["junk", {"height": "7"}]
+                h = int(re.fullmatch(r"/round/(\d+)/record", path)[1])
+                if h == 4 and calls.count(path) == 1:
+                    raise NodeError("GET: busy", 503)  # tried again at the next poll
+                return records[h]
+        lin = esui.Lineage("evo-1")
+        with self.assertRaises(NodeError):
+            lin.poll(Api(), 4)
+        self.assertEqual([x.height for x in lin.gens], [2])
+        self.assertEqual(lin.poll(Api(), 4)[0].height, 4)
+        self.assertTrue(lin.caught_up)
+        self.assertIsNone(lin.landed)  # caught up on: nothing lands
+        first, second = lin.gens
+        self.assertEqual((first.number, first.level, first.pairs, first.mean), (1, 2, 2, 0.5625))
+        self.assertEqual(first.bytes, len(json.dumps(good["es"], sort_keys=True, separators=(",", ":"))))
+        self.assertEqual((second.number, second.level, second.update), (2, None, ((3, 1, 0),)))
+        new = lin.poll(Api(), 5)
+        self.assertEqual([x.number for x in new], [3])
+        self.assertIs(lin.landed[1], new[0])
+        news = lin.news(new[0], esui.ASCII)
+        self.assertIn("generation 3 hatched in block 5: reward 56.2% (+6.2 pts), 2 pairs", news[0][0])
+        self.assertEqual(lin.poll(Api(), 5), [])  # nothing new: no request
+        self.assertEqual(sum(c.startswith("/blocks") for c in calls), 3)
+
+    def test_glyphs_have_an_ascii_twin(self):
+        from vibehash import esui
+        self.assertEqual(set(esui.GLYPHS), set(esui.ASCII))
+        for k, v in esui.ASCII.items():
+            ("".join(v.values()) if isinstance(v, dict) else v).encode("ascii")
+            if isinstance(v, str) and k not in termui.GLYPHS:  # the scene's own: one cell for one cell
+                self.assertEqual(len(v), len(esui.GLYPHS[k]), k)
 
 
 if __name__ == "__main__":

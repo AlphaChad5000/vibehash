@@ -10,6 +10,10 @@ Plain ANSI escape codes, nothing to install. Only used on a real terminal; `--pl
 piping the output) keeps the classic log, and `worker --job` picks the job there. NO_COLOR
 turns the colours off. What it shares with the training dashboard (trainui.py), from the
 palette and the rock to the screen and keys, is in termui.py.
+
+An Evo job (es.py) gets a scene of its own in place of the drill (esui.py): a chain of blocks, the open one
+incubating the round's population, and below it the generation, population, puzzles, difficulty, mean reward, the
+bytes each generation puts on the chain, and whether the model was rebuilt from the chain or fetched.
 """
 from __future__ import annotations
 
@@ -20,10 +24,11 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import termui
+from . import es, esui, termui
 from .client import JobChoice, NodeClient, NodeError, WorkerClient
 from .economics import REP_MAX, REP_MIN
-from .termui import DIM, GOLD, GREEN, LAMP, PHASES, SPARKS, TEXT, TIMBER, WHITE, _cells, _fit, _line, _n, _noise, _si, _vibe, rgb
+from .termui import (DIM, GOLD, GREEN, LAMP, PHASES, RED, SPARKS, TEXT, TIMBER, WHITE, YELLOW, _cells, _fit, _line,
+                     _n, _noise, _si, _vibe, rgb)
 from .termui import supported  # noqa: F401  (the commands ask minerui whether to show it)
 
 RAIL, TIE, CART = rgb(150, 152, 165), rgb(110, 86, 62), rgb(176, 116, 60)
@@ -89,7 +94,8 @@ class Rig:
 class MinerDashboard:
     """One or more workers' live view. `run()` draws until `stop` is set; the workers run on their own threads."""
 
-    def __init__(self, rigs: list[tuple[str, WorkerClient]], node_url: str, footer: str = ""):
+    def __init__(self, rigs: list[tuple[str, WorkerClient]], node_url: str, footer: str = "", evo: bool = False):
+        """`evo`: show the Evo scene until a job is known (an Evo testnet's); after that the job decides."""
         self.rigs = [Rig(name, c) for name, c in rigs]
         self.api, self.node_url, self.footer = NodeClient(node_url), node_url, footer
         self.feed: collections.deque = collections.deque(maxlen=40)
@@ -105,6 +111,9 @@ class MinerDashboard:
             r.client.choice = self.choice
         self.jobs: list[str] = []  # jobs with budget left, as the node lists them (_poll_jobs)
         self.keyed = False  # keys are being read (run), so the selector shows them
+        self.evo = evo
+        self.lineages: dict[str, esui.Lineage] = {}  # each Evo job's generations, followed from the node (_poll_lineage)
+        self.eg: dict | None = None  # the Evo scene's glyphs (_eg)
 
     def note(self, text: str, level: int = logging.INFO) -> None:
         self.feed.append((time.time(), level, text))
@@ -140,7 +149,12 @@ class MinerDashboard:
     def _selector(self, width: int):
         opts = self.options()
         sel = opts.index(self.choice.job_id) if self.choice.job_id in opts else 0
-        return selector(self.g, ["auto", *opts[1:]], sel, width, self.keyed)
+        evo = self._evo_ids()
+        return selector(self.g, ["auto", *(f"{j} (Evo)" if j in evo else j for j in opts[1:])], sel, width, self.keyed)
+
+    def _evo_ids(self) -> set[str]:
+        """The jobs the rigs have loaded that are Evo jobs, which the selector marks (no requests for it)."""
+        return {j for r in self.rigs for j, job in list(getattr(r.client, "jobs", {}).items()) if getattr(job, "es", False)}
 
     def _poll_jobs(self, stop: threading.Event) -> None:
         """The selector's jobs, from the node's /network, every JOBS_EVERY seconds: off the drawing thread."""
@@ -185,6 +199,23 @@ class MinerDashboard:
                 self.note(f"paid {_vibe(paid, sign=True)} in block {height}" if height else f"paid {_vibe(paid, sign=True)}",
                           logging.INFO + 1)
             stop.wait(1.5)
+
+    def _poll_lineage(self, stop: threading.Event) -> None:
+        """An Evo job's generations, followed from the node's blocks and records while it's the one on screen (esui.
+        Lineage): off the drawing thread, and only for Evo jobs. Those sealed while watched go in the feed."""
+        while not stop.is_set():
+            lead = self.rigs[0].client.stats
+            job = lead.job
+            if job is not None and getattr(job, "es", False):
+                lin = self.lineages.setdefault(job.job_id, esui.Lineage(job.job_id))
+                was = lin.caught_up
+                try:
+                    for gen in lin.poll(self.api, lead.height):
+                        for text, level in lin.news(gen, self._eg()) if was else ():
+                            self.note(text, level)
+                except Exception:  # noqa: BLE001 - the node is busy, or said something unreadable: try again later
+                    pass
+            stop.wait(1.0)
 
     # --- drawing -----------------------------------------------------------------------------------------
 
@@ -250,6 +281,101 @@ class MinerDashboard:
             put(0, max(0, dx - len(label) // 2), label, GOLD)
         return [_cells(row) for row in rows]
 
+    # --- an Evo job's scene and lines (esui.py) ------------------------------------------------------------
+
+    def _eg(self) -> dict:
+        """The Evo scene's glyphs: ASCII with the dashboard's ASCII, else esui's own if this terminal shows them."""
+        if self.g is ASCII:
+            return esui.ASCII
+        if self.eg is None:
+            self.eg = esui.glyphs()
+        return self.eg
+
+    def _evo_state(self, lead):
+        """(the Evo job on screen or None, its generations so far, the open round's generation number or None, the
+        phase its block shows). A round's block is sealed once the chain reaches its height (rounds are numbered by
+        the block that seals them); the open block is then a new, empty one, once its generation is in the lineage."""
+        job = lead.job if lead.job is not None and getattr(lead.job, "es", False) else None
+        lin = self.lineages.get(job.job_id) if job is not None else None
+        gens = list(lin.gens) if lin is not None else []
+        if job is None or lead.round is None:
+            return job, gens, None, lead.phase
+        if lead.height >= lead.round:
+            return job, gens, len(gens) + 1, "next" if gens and gens[-1].height >= lead.round else "idle"
+        return job, gens, len(gens) + 1, lead.phase
+
+    def _chain(self, width: int, lead) -> list[str]:
+        job, gens, number, phase = self._evo_state(lead)
+        lin = self.lineages.get(job.job_id) if job is not None else None
+        now = time.time()
+        first = self.phase_seen.get((lead.round, lead.phase), now)
+        frac = 1 - max(0.0, lead.phase_ends - now) / max(lead.phase_ends - first, 0.1)
+        return esui.scene(self._eg(), width, gens, now, self.frame_no, number=number, phase=phase,
+                          progress=lead.progress, frac=frac, pairs=job.spec.pairs if job is not None else 8,
+                          landed=lin.landed if lin is not None else None,
+                          busy=any(r.client.stats.busy for r in self.rigs),
+                          waiting="waiting for a round" if job is not None else "waiting for the Evo job")
+
+    def _evo_lines(self, add, width: int, lead, stats) -> None:
+        """Generation and population, difficulty, mean reward, what the chain holds, how the model was had."""
+        eg, pick = self._eg(), esui.pick
+        job, gens, number, _ = self._evo_state(lead)
+        if job is None:
+            add(("evo       ", DIM), ("Evo mode: training by evolution, the chain is the model", TEXT))
+            add(("job       ", DIM), ("waiting for the Evo job to reach a block", DIM))
+            return
+        spec = job.spec
+        lin = self.lineages.get(job.job_id)
+        mine = sum(s.assigned for s in stats) * spec.members
+        gen = [("generation ", DIM), (f"{number or len(gens) + 1}", WHITE)]
+        pop = [("   population ", DIM), (f"{2 * spec.pairs}", WHITE)]
+        add(*pick(width, [*gen, *pop, (f" ({spec.pairs} twin pairs, {mine} yours)", DIM), ("   puzzles ", DIM),
+                          (f"{spec.problems}", WHITE), (" a round", DIM)],
+                  [*gen, *pop, (f" ({mine} yours)", DIM), ("   puzzles ", DIM), (f"{spec.problems}", WHITE)],
+                  [*gen, *pop, ("   puzzles ", DIM), (f"{spec.problems}", WHITE)], [*gen, *pop]))
+        level = None
+        for r in self.rigs:  # the round's level, from the state a worker has for it
+            got = getattr(getattr(r.client, "es", None), "states", {}).get(job.job_id)
+            if got is not None:
+                level = es.level_of(got[1])
+                break
+        last_level = gens[-1].level if gens else None
+        level = level if level is not None else last_level if last_level is not None else spec.level
+        moved = ([(f" (up from {last_level})", GREEN)] if last_level is not None and level > last_level else
+                 [(f" (down from {last_level})", YELLOW)] if last_level is not None and level < last_level else [])
+        k, target, _ = spec.retarget
+        rule = f" · moves every {k} rounds toward {target:.0%} solved" if k else " · fixed"
+        lv = [("level     ", DIM), (f"{level}", WHITE), (": " + esui.level_words(level, eg), TEXT), *moved]
+        add(*pick(width, [*lv, (rule, DIM)], lv))
+        scored = [x for x in gens if x.mean is not None]
+        if scored:
+            last = scored[-1]
+            delta = last.mean - scored[-2].mean if len(scored) > 1 else None
+            change = ([(f" ({delta * 100:+.1f} pts)", GREEN if delta > 0 else RED if delta < 0 else DIM)]
+                      if delta is not None else [])
+            rew = [("reward    ", DIM), (f"{last.mean:.1%}", GOLD), *change]
+            best = lin.best() if lin is not None else None
+            add(*pick(width, [*rew, (f", the mean of generation {last.number}", DIM), (" · best ", DIM), (f"{best:.1%}", TEXT)],
+                      [*rew, (f", generation {last.number}", DIM)], rew))
+        else:
+            add(*pick(width, [("reward    ", DIM), ("-", DIM), ("   the first generation's lands when its block is sealed", DIM)],
+                      [("reward    ", DIM), ("-", DIM)]))
+        if gens:
+            total = sum(x.bytes for x in gens)
+            here = [("chain     ", DIM), (esui.size(gens[-1].bytes), WHITE), (f" for generation {gens[-1].number}", DIM)]
+            alls = [(" · ", DIM), (esui.size(total), WHITE), (f" for all {len(gens)}", DIM)]
+            add(*pick(width, [*here, *alls, (f", which rebuild {spec.n:,} numbers", DIM)], [*here, *alls], here))
+        else:
+            add(("chain     ", DIM), ("seeds and scores, a few hundred bytes a generation", DIM))
+        rebuilt = sum(getattr(getattr(r.client, "es", None), "rebuilt", 0) for r in self.rigs)
+        fetched = sum(getattr(getattr(r.client, "es", None), "fetched", 0) for r in self.rigs)
+        how = ([("rebuilt from the chain ", TEXT), (f"{rebuilt}x", WHITE), (" · fetched ", DIM), (f"{fetched}x", WHITE)]
+               if rebuilt or fetched else [("not needed yet", DIM)])
+        where = (f" · on {self.rigs[0].client.backend.describe()}" if len(self.rigs) == 1 else f" · {len(self.rigs)} workers")
+        units = f" · {_n(sum(s.units for s in stats), 'unit')}, {_n(sum(s.checks for s in stats), 'check')}"
+        add(*pick(width, [("model     ", DIM), *how, (where + units, DIM)], [("model     ", DIM), *how, (where, DIM)],
+                  [("model     ", DIM), *how]))
+
     def _phase_bar(self, s, width: int):
         return termui.phase_bar(self.g, self.phase_seen, s.round, s.phase, s.phase_ends, width, [(f"    block {s.height}", DIM)],
                                s.progress)
@@ -259,6 +385,7 @@ class MinerDashboard:
         w = max(40, width - 1)
         stats = [r.client.stats for r in self.rigs]
         lead = stats[0]
+        evo = bool(lead.job.es) if lead.job is not None else self.evo  # an Evo job's scene (esui.py), not the drill
         busy_training = any(s.busy and s.activity.startswith(("training", "uploading")) for s in stats)
         self.scroll += 1.0 if busy_training else 0.35 if any(s.busy for s in stats) else 0.0
         self.frame_no += 1
@@ -266,12 +393,14 @@ class MinerDashboard:
         add = lambda *segs: lines.append(_line([(" ", None), *segs], w))  # noqa: E731
         room = w - 1 - len(termui.BANNER[0]) - 3
         addr = self.rigs[0].client.keys.address
-        tails = [_fit(room, f"useful-work miner  ·  {self.chain_id}", self.chain_id or "useful-work miner"),
+        tails = [_fit(room, f"Evo miner: training by evolution  ·  {self.chain_id}", f"Evo miner  ·  {self.chain_id}",
+                      self.chain_id or "Evo miner") if evo else
+                 _fit(room, f"useful-work miner  ·  {self.chain_id}", self.chain_id or "useful-work miner"),
                  _fit(room, addr, f"{addr[:10]}{'…' if self.g is GLYPHS else '..'}{addr[-4:]}") if len(self.rigs) == 1
                  else f"{len(self.rigs)} workers"]
         termui.header(add, self.g, ASCII, tails)
         lines.append("")
-        lines += [" " + row for row in self._band(w - 2)]
+        lines += [" " + row for row in (self._chain(w - 2, lead) if evo else self._band(w - 2))]
         lines.append("")
         add(*self._phase_bar(lead, w))
         mark = (self.g["tips"][self.frame_no % 3] if lead.busy else self.g["tips"][0]) + " "
@@ -281,7 +410,9 @@ class MinerDashboard:
         lines.append("")
         job = lead.job
         what = f"{job.job_id} ({job.spec.n_params:,} {job.spec.precision} weights)" if job else "no job yet"
-        if len(self.rigs) == 1:
+        if evo:
+            self._evo_lines(add, w - 1, lead, stats)
+        elif len(self.rigs) == 1:
             c = self.rigs[0].client
             add(("rig       ", DIM), (c.backend.describe(), WHITE))
             add(("speed     ", DIM), (_si(lead.flops_per_sec, "FLOP/s") if lead.flops_per_sec else "measuring...", WHITE),
@@ -329,6 +460,7 @@ class MinerDashboard:
             lg.propagate = False
         threading.Thread(target=self._poll, args=(stop,), daemon=True, name="dashboard-poll").start()
         threading.Thread(target=self._poll_jobs, args=(stop,), daemon=True, name="dashboard-jobs").start()
+        threading.Thread(target=self._poll_lineage, args=(stop,), daemon=True, name="dashboard-evo").start()
         try:
             with termui.alternate_screen() as out, termui.keypresses() as read:
                 self.keyed = read is not None
