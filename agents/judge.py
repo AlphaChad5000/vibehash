@@ -15,8 +15,9 @@ Judging is pairwise and blind: the judge sees "A" and "B", never which is the fi
 once in each order, because LLM judges tend to favour whichever answer comes first; a win needs both.
 """
 import json
+import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from llm_call import chat_json, model_name
@@ -62,26 +63,43 @@ def compare(goal: str, pair: dict, tuned_is_a: bool) -> tuple[str, str]:
                                                      f"Reply A:\n{a}\n\nReply B:\n{b}"}])
     winner = verdict.get("winner")
     side = "tie" if winner not in ("A", "B") else "tuned" if (winner == "A") == tuned_is_a else "base"
-    return side, verdict.get("reason") or ""
+    return side, unblind(verdict.get("reason") or "", tuned_is_a)
 
 
-def grade(answers_file: Path) -> None:
+def unblind(reason: str, tuned_is_a: bool) -> str:
+    """The judge's reason names "Reply A" and "Reply B"; once it's decided, say which model each was, since the
+    letters swap between the two readings and mean nothing to whoever reads the verdict."""
+    name = {"A": "the fine-tune", "B": "the base model"} if tuned_is_a else {"A": "the base model", "B": "the fine-tune"}
+    reason = re.sub(r"\b[Rr]eply ([AB])\b", lambda m: name[m[1]], reason)
+    reason = re.sub(r"(^|[.!?]\s+)(the )", lambda m: m[1] + "The ", reason)  # sentence starts
+    return reason
+
+
+def verdict(goal: str, pair: dict) -> dict:
+    """Both readings of one pair, and the verdict they make together."""
+    one, two = compare(goal, pair, True), compare(goal, pair, False)
+    side = one[0] if one[0] == two[0] else "tie"
+    reason = one[1] if side == one[0] else two[1] if side == two[0] else \
+        f"The two readings disagreed. With the fine-tune first: {one[1]} With it second: {two[1]}"
+    return {"tuned_won": side == "tuned", "winner": side, "reason": reason, "readings": [one[0], two[0]]}
+
+
+def grade(answers_file: Path, on_verdict=None) -> None:
     """Each pair is read twice, once with each reply first, and only a verdict both readings agree on counts: a
     single reading of a borderline pair can go either way, and the judge can lean towards whichever reply it sees
-    first. A split is a tie."""
+    first. A split is a tie. `on_verdict(i, pair)` hears each one as it's decided, for the site's live view."""
     data = json.loads(answers_file.read_text())
-    with ThreadPoolExecutor(max_workers=4) as pool:  # independent calls; the API's rate limits are retried
-        readings = list(pool.map(lambda job: compare(data["goal"], *job),
-                                 [(pair, first) for pair in data["pairs"] for first in (True, False)]))
-    wins = ties = 0
-    for pair, (one, two) in zip(data["pairs"], zip(readings[::2], readings[1::2])):
-        side = one[0] if one[0] == two[0] else "tie"
-        wins, ties = wins + (side == "tuned"), ties + (side == "tie")
-        reason = one[1] if side == one[0] else two[1] if side == two[0] else \
-            f"The two readings disagreed. With the fine-tune first: {one[1]} With it second: {two[1]}"
-        pair["verdict"] = {"tuned_won": side == "tuned", "winner": side, "reason": reason,
-                           "readings": [one[0], two[0]]}
-        print(f"{side:>5}  {reason}")
+    with ThreadPoolExecutor(max_workers=2) as pool:  # two pairs, so four calls, at a time; rate limits are retried
+        pending = {pool.submit(verdict, data["goal"], pair): i for i, pair in enumerate(data["pairs"])}
+        for done in as_completed(pending):
+            i = pending[done]
+            pair = data["pairs"][i]
+            pair["verdict"] = done.result()
+            print(f"{pair['verdict']['winner']:>5}  {pair['verdict']['reason']}")
+            if on_verdict:
+                on_verdict(i, pair)
+    wins = sum(p["verdict"]["winner"] == "tuned" for p in data["pairs"])
+    ties = sum(p["verdict"]["winner"] == "tie" for p in data["pairs"])
     n = len(data["pairs"])
     data["model"] = model_name()
     data["summary"] = {"prompts": n, "tuned_wins": wins, "ties": ties, "base_wins": n - wins - ties}

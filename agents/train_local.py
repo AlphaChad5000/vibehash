@@ -94,7 +94,8 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
     held_set = [encode(tok, u, r, max_len) for u, r in heldout]
     before, acc = score(model, held_set)
     history = [{"epoch": 0, "loss": round(before, 4), "acc": round(acc, 4)}]
-    print(f"held-back loss before: {before:.3f}  ({len(training)} training chats, {held} held back)")
+    print(f"held-back loss before: {before:.3f}, {acc:.1%} of reply tokens right "
+          f"({len(training)} training chats, {held} held back)")
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     model.train()

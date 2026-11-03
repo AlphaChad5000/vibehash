@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -50,7 +51,17 @@ class Site:
 
     def report(self, rid: str, status: str, message: str | None = None, **extra) -> None:
         print(f"[{rid[:8]}] {status}: {message or ''}", flush=True)
-        self.post(f"dispatch/{rid}", {"status": status, "message": message, "machine": MACHINE, **extra})
+        for attempt in range(4):  # a blip in the connection shouldn't cost a run that's minutes in
+            try:
+                self.post(f"dispatch/{rid}", {"status": status, "message": message, "machine": MACHINE, **extra})
+                return
+            except OSError as e:
+                if attempt == 3:
+                    if status in ("done", "failed"):
+                        raise  # the result has to arrive; progress lines can be missed
+                    print(f"couldn't send that to the site ({e}); carrying on", flush=True)
+                    return
+                time.sleep(5 * (attempt + 1))
 
 
 class Terminal:
@@ -63,13 +74,28 @@ class Terminal:
             print(f"wrote {publish.OUT}")
 
 
-def train(site, rid: str, cmd: list[str]) -> None:
-    """Run train_local.py, passing its per-epoch lines on to the site as they're printed."""
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as proc:
+BEFORE = re.compile(r"held-back loss before: ([\d.]+), ([\d.]+)%")
+EPOCH = re.compile(r"epoch (\d+)/(\d+): held-back loss ([\d.]+), ([\d.]+)%")
+KEPT = re.compile(r"keeping epoch (\d+) of (\d+)")
+
+
+def train(site, rid: str, cmd: list[str], round_no: int) -> None:
+    """Run train_local.py, passing its per-epoch lines on to the site as they're printed, with the numbers the
+    request page charts."""
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                          encoding="utf-8", errors="replace") as proc:
         for line in proc.stdout:
             print(line, end="", flush=True)
-            if line.startswith(("epoch ", "held-back loss")):
-                site.report(rid, "training", line.strip())
+            if not line.startswith(("epoch ", "held-back loss")):
+                continue
+            detail = {"kind": "epoch", "round": round_no}
+            if m := BEFORE.search(line):
+                detail |= {"epoch": 0, "loss": float(m[1]), "acc": float(m[2]) / 100}
+            elif m := EPOCH.search(line):
+                detail |= {"epoch": int(m[1]), "epochs": int(m[2]), "loss": float(m[3]), "acc": float(m[4]) / 100}
+            elif m := KEPT.search(line):
+                detail = {"kind": "kept", "round": round_no, "epoch": int(m[1])}
+            site.report(rid, "training", line.strip().split("; adapter in")[0], detail=detail)
     if proc.returncode:
         raise RuntimeError(f"training stopped with exit code {proc.returncode}")
 
@@ -85,7 +111,7 @@ def run(site, req: dict, a) -> None:
         site.report(rid, "planning", f"Heads up: {plan['caveat']}")
     site.report(rid, "training", f"{len(plan['examples'])} examples on {plan['base']}, rank {plan['rank']}, "
                                  f"{plan['epochs']} epochs: {plan['reasoning']}", job_id=job)
-    results = [round_(site, rid, plan, chats, evals, out, title)]
+    results = [round_(site, rid, plan, chats, evals, out, title, 1)]
 
     # Repair rounds: while the judge isn't convinced, the Job Architect writes chats aimed at what went wrong and
     # fresh test prompts. Not for goals it warned need facts: more chats of the same size won't teach those.
@@ -99,7 +125,7 @@ def run(site, req: dict, a) -> None:
         chats, evals = architect.save(plan, out)
         site.report(rid, "training", f"round {n}: retraining on {len(plan['examples'])} chats, "
                                      f"{len(fix['examples'])} of them new")
-        results.append(round_(site, rid, plan, chats, evals, out, title))
+        results.append(round_(site, rid, plan, chats, evals, out, title, n))
 
     result = max(results, key=score)  # each round was judged on its own new prompts
     result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")}}
@@ -121,14 +147,26 @@ def usable(result: dict) -> bool:
     return score(result) >= USABLE
 
 
-def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str) -> dict:
+def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
     """Train, have both models answer the test prompts, have Muse Spark judge them: one round's run."""
     job = plan["job_id"]
-    train(site, rid, architect.train_command(plan, chats, out))
+    site.report(rid, "training", f"round {round_no}: training", detail={"kind": "round", "round": round_no})
+    train(site, rid, architect.train_command(plan, chats, out), round_no)
     site.report(rid, "judging", "the base and fine-tuned models are answering the held-back prompts")
     answers = judge.answer(evals, out / "adapters" / job)
-    site.report(rid, "judging", "Muse Spark is comparing the answers, blind")
-    judge.grade(answers)
+    n = len(json.loads(answers.read_text())["pairs"])
+    site.report(rid, "judging", f"Muse Spark is comparing the {n} pairs of answers, blind, twice each",
+                detail={"kind": "judging", "round": round_no, "prompts": n})
+
+    def heard(i: int, pair: dict) -> None:
+        v = pair["verdict"]
+        said = {"tuned": "fine-tune preferred", "base": "base model preferred", "tie": "tie"}[v["winner"]]
+        site.report(rid, "judging", f"prompt {i + 1} of {n}: {said}",
+                    detail={"kind": "verdict", "round": round_no, "i": i, "prompts": n, "winner": v["winner"],
+                            "prompt": pair["prompt"][:300], "base": pair["base"][:700], "tuned": pair["tuned"][:700],
+                            "reason": v["reason"][:500]})
+
+    judge.grade(answers, on_verdict=heard)
     return publish.build(job, out, title)
 
 
