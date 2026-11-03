@@ -319,7 +319,15 @@ def main():
     p.add_argument("--every", type=int, default=20, help="seconds between checks for new requests")
     p.add_argument("--once", action="store_true", help="run one request, then stop")
     p.add_argument("--rigor", choices=list(RIGOR), default="strict", help="with --goal: how hard it tries (RIGOR)")
+    p.add_argument("--cpu", action="store_true", help="run without a GPU (very slow; for testing only)")
     a = p.parse_args()
+    # Training falls back to the CPU on its own, so a Python whose PyTorch has no CUDA build (a fresh virtualenv, say)
+    # would run every request, and publish its timings, at a crawl without saying why. Stop here instead.
+    import torch
+    if not torch.cuda.is_available() and not a.cpu:
+        sys.exit(f"{sys.executable} has PyTorch {torch.__version__}, which can't use the GPU. Run the dispatcher with "
+                 f"a Python whose PyTorch has CUDA (outside the .venv: run `deactivate` first), or pass --cpu.")
+    print(f"{MACHINE}: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU, on the CPU'}", flush=True)
     if a.goal:
         run(Terminal(), {"id": os.urandom(4).hex(), "goal": a.goal, "rigor": a.rigor}, a)
         return
