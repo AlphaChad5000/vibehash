@@ -27,7 +27,7 @@ from .crypto import KeyPair
 from .ledger import Block, Tx, canonical
 from .model import params_hash
 from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
-from .wire import blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
+from .wire import WireError, blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
 from .worker import HardwareProfile, Worker
 
 log = logging.getLogger("vibehash.worker")
@@ -664,6 +664,11 @@ class WorkerClient:
         on its held-back data."""
         st = self.stats
         st.busy = bool(tasks)
+        # A worker far from the node spent the phase on round trips, a checkpoint and then a verdict at a time: a pod
+        # 150 ms away checked 2 of 9 fruit-demo tasks in its 10 s on test night. Every check's checkpoints now come
+        # down together first, and each verdict goes while the next task is checked; the checking itself stays in turn.
+        self._prefetch(job, [t for t in tasks if t.get("kind", "check") == "check"])
+        sender = ThreadPoolExecutor(PARALLEL_REQUESTS)
         try:
             for i, t in enumerate(tasks, 1):
                 if st.phase_ends and time.time() > st.phase_ends:
@@ -675,7 +680,7 @@ class WorkerClient:
                 if kind == "prep":  # a DeepSeek prep unit: replayed, and its commitment held up against the replay
                     st.activity = f"checking another miner's prep unit ({i} of {len(tasks)})"
                     body["ok"] = bool(self.ds.check(rnd, job, t))
-                    self._verdict(rnd, kind, body)
+                    sender.submit(self._verdict, rnd, kind, body)
                     st.checked += 1
                     st.checks += 1
                     continue
@@ -692,11 +697,27 @@ class WorkerClient:
                         openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
                     ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"])
                     body |= {"ok": bool(ok), "bad_segment": bad}
-                self._verdict(rnd, kind, body)
+                sender.submit(self._verdict, rnd, kind, body)
                 st.checked += 1
                 st.checks += 1
         finally:
+            sender.shutdown(wait=True)  # every verdict sent (or given up on) before the round is called done
             st.busy = False
+
+    def _prefetch(self, job: TrainingJob, tasks: list[dict]) -> None:
+        """Download the checkpoints these check tasks open, several at once. Each blob once (two tasks may open the
+        same checkpoint, and two writers would share its partial file); a failure here is left for the task itself,
+        which downloads what's still missing, and says why if it can't."""
+        try:
+            ids = list(dict.fromkeys(bid for t in tasks for bid, _ in blob_openings_in(t["openings"], job.n_segments).values()
+                                     if not self.blobs.has(bid)))
+        except (WireError, KeyError, TypeError):
+            return  # a malformed task: its own turn in _answer reports it
+        if len(ids) < 2:
+            return
+        self.stats.activity = f"fetching {len(ids)} checkpoints to check"
+        with ThreadPoolExecutor(min(PARALLEL_REQUESTS, len(ids))) as pool:
+            list(pool.map(lambda bid: self._try(self.node.download, "blob", bid, self.blobs, job.checkpoint_bytes), ids))
 
     def _verdict(self, rnd: int, kind: str, body: dict) -> None:
         """Send a task's verdict, and note it for the round log once the node has it."""

@@ -443,6 +443,39 @@ class DistantWorkerTest(unittest.TestCase):
         self.assertEqual(drops, [])
 
 
+    def test_a_far_checker_gets_its_verdicts_in_before_the_verify_phase_ends(self):
+        """A RunPod pod checking fruit-demo on test night (2026-11-02): "the verify phase ended with 7 tasks left
+        unchecked", every round. It fetched each task's checkpoints one at a time and then sent its verdict, a round
+        trip after another, and 9 tasks didn't fit the 10 s phase. They now come down together, and verdicts go while
+        the next task is checked."""
+        node, api, req, workers, clients, stop, *_ = start_network(
+            self, 3, times=PhaseTimes(register_s=1.0, compute_s=5.0, reveal_s=1.5, verify_s=4.0, idle_s=0.3),
+            config=CoordinatorConfig(canaries_per_round=0, newcomer_units=12))
+        far = clients[0]
+
+        def far_open(request, near=far.node._open):
+            time.sleep(0.1)
+            return near(request)
+        far.node._open = far_open
+        given, answer = [], far._answer
+        far._answer = lambda rnd, job, tasks: (given.append(len(tasks)), answer(rnd, job, tasks))[1]
+        late = []
+
+        class Late(logging.Handler):
+            def emit(self, record):
+                if "left unchecked" in record.getMessage():
+                    late.append(record.getMessage())
+        handler = Late()
+        logging.getLogger("vibehash.worker").addHandler(handler)
+        self.addCleanup(logging.getLogger("vibehash.worker").removeHandler, handler)
+        job = TrainingJob("far-checks", req.address, budget=60 * SYN_PER_VIBE, fee_per_round=10 * SYN_PER_VIBE,
+                          units_per_round=12, steps_per_unit=40, checkpoint_every=5)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        run_until(node, clients, stop, node.chain.tip.height + 3)
+        self.assertGreaterEqual(sum(given), 4, "the far worker was given too few checks to tell")
+        self.assertEqual(late, [])
+
+
 class RerunRoundTest(unittest.TestCase):
     def test_a_round_run_again_gets_its_checkpoints_again(self):
         """What a worker remembers the node has is for one attempt at a round: another leader, or the node after a
