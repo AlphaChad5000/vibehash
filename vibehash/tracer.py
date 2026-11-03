@@ -8,6 +8,8 @@ changed in place), so a state is just a dict of tensors and a snapshot of it is 
 """
 from __future__ import annotations
 
+import threading
+
 import torch
 import torch.nn.functional as F
 
@@ -382,6 +384,8 @@ class Party:
         self.tensors: dict[tuple, torch.Tensor] = {}  # by (blob id, rows, cols): a reshape has the same bytes
         self.hashes: dict[int, tuple] = {}  # id(tensor) -> (tensor, root, blob): every op makes a new tensor
         self.on_node: set[str] = set()  # blobs the node holds: fetched from it, or sent to it
+        self._sending: dict[str, threading.Event] = {}  # blobs on their way to the node, set once they're there
+        self._sending_lock = threading.Lock()
 
     def executor(self, prog, honest: bool) -> Executor:
         return Executor(self.rt, self.spec, prog, None if honest else self.tamper)
@@ -467,14 +471,28 @@ class Party:
                 send[root] = m
             roots.append(root)
             self.states[root] = (dict(st), m)
-        raws = [v if isinstance(v, bytes) else v.detach().cpu().numpy().astype("<f4").tobytes() for v in send.values()]
-        put_many = getattr(self.remote, "put_many", None)
-        if put_many is not None:
-            put_many(raws)
-        else:
-            for raw in raws:
-                self.remote.put(raw)
-        self.on_node.update(send)
+        # A worker plays its games at once (client.WorkerClient._move), and two may name the same tensor: one sends it,
+        # the other waits for that, as the node takes a blob from one upload of it at a time.
+        with self._sending_lock:
+            theirs = [self._sending[k] for k in send if k in self._sending]
+            send = {k: v for k, v in send.items() if k not in self._sending}
+            for k in send:
+                self._sending[k] = threading.Event()
+        try:
+            raws = [v if isinstance(v, bytes) else v.detach().cpu().numpy().astype("<f4").tobytes() for v in send.values()]
+            put_many = getattr(self.remote, "put_many", None)
+            if put_many is not None:
+                put_many(raws)
+            else:
+                for raw in raws:
+                    self.remote.put(raw)
+            self.on_node.update(send)
+        finally:
+            with self._sending_lock:
+                for k in send:
+                    self._sending.pop(k).set()
+        for sent in theirs:
+            sent.wait()
         return roots
 
     def forget(self) -> None:

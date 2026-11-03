@@ -451,6 +451,35 @@ class GameTests(_Tiny):
         self.assertEqual(d.split(prog, g.view(), ckpts), rerun)
         self.assertEqual(len(node.sent), (segments - 1) * (1 + 3 * len(self.spec.modules())))
 
+    def test_two_games_send_a_tensor_they_share_once(self):
+        """A worker's games are played at once (client.WorkerClient._move), and two may name the same tensor: sent by
+        both together, the node's partial file for it was written twice and its upload failed. One sends it; the other
+        waits for that."""
+        import threading
+        import time
+
+        self.tiny()
+
+        class Slow(_Remote):
+            def __init__(self):
+                super().__init__()
+                self.sent = []
+
+            def put(self, raw):
+                self.sent.append(hashlib.sha256(raw).hexdigest())
+                time.sleep(0.2)
+                return super().put(raw)
+        node, shared = Slow(), torch.ones(4, 4)
+        d = Party(self.rt, self.spec, self.data, node)
+        games = [threading.Thread(target=d.publish, args=({"shared": shared, "own": torch.full((4, 4), i + 2.0)},))
+                 for i in range(2)]
+        for g in games:
+            g.start()
+        for g in games:
+            g.join()
+        self.assertEqual(node.sent.count(merkle.blob_of(shared.numpy())), 1)
+        self.assertEqual(len(node.sent), 5)  # the shared tensor, each game's own, and two manifests
+
     def test_an_honest_challenger_withdraws_rather_than_lose(self):
         """A checker that rejected an honest unit (here, told to) finds nothing the referee would refuse when it gets
         to an op, and withdraws: unpaid, not slashed (dispute.play's concede)."""
