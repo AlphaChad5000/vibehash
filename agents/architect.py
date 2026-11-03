@@ -36,7 +36,7 @@ SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON obje
             learn many new facts from a few dozen chats: for a goal that depends on facts (lore, a catalogue, prices,
             dates), say it will copy the expert's voice and likely get facts wrong,
   "examples": [{{"user": "...", "assistant": "..."}}, ...]   (at least 40, varied, in exactly the style wanted),
-  "eval_prompts": ["...", ...]   (10 NEW user messages, not in examples, to test the result with)
+  "eval_prompts": ["...", ...]   (20 NEW user messages, not in examples, to test the result with)
 }}"""
 
 
@@ -60,8 +60,8 @@ def check(plan: dict) -> list[str]:
         problems.append("an example is missing its user or assistant text")
     if not isinstance(plan.get("caveat", ""), str):
         problems.append("caveat isn't a string")
-    if len(plan.get("eval_prompts") or []) < 5:
-        problems.append("fewer than 5 eval prompts")
+    if len(plan.get("eval_prompts") or []) < 15:
+        problems.append("fewer than 15 eval prompts; write 20")
     return problems
 
 
@@ -99,7 +99,7 @@ prompts below. Reply with ONE JSON object:
 {
   "examples": [{"user": "...", "assistant": "..."}, ...]   (at least 20 NEW chats in exactly the style wanted, aimed
                                                             at what the judge says went wrong, not copies of these prompts),
-  "eval_prompts": ["...", ...]   (10 NEW user messages, unlike any prompt below, to test the repaired model with)
+  "eval_prompts": ["...", ...]   (20 NEW user messages, unlike any prompt below, to test the repaired model with)
 }"""
 
 
@@ -117,7 +117,7 @@ def repair(plan: dict, graded: dict) -> dict:
         problems = ([f"only {len(examples)} examples; need at least 20"] if len(examples) < 20 else []) + \
                    (["an example is missing its user or assistant text"]
                     if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples) else []) + \
-                   ([f"only {len(prompts)} new eval prompts; need at least 5"] if len(prompts) < 5 else [])
+                   ([f"only {len(prompts)} new eval prompts; need at least 15"] if len(prompts) < 15 else [])
         if not problems:
             return {"examples": examples, "eval_prompts": prompts}
         ask += [{"role": "assistant", "content": json.dumps(fix)},

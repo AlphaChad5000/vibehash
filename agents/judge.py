@@ -11,12 +11,12 @@ Two steps, because they need different machines:
 Training reports held-back loss, which says the model fits the style of its examples. It doesn't say whether the
 answers are *good*. That's this agent's job, and the trainer's numbers and this one complement each other.
 
-Judging is pairwise and blind: the judge sees "A" and "B", never which is the fine-tune, and the order is shuffled
-per prompt, because LLM judges tend to favour whichever answer comes first.
+Judging is pairwise and blind: the judge sees "A" and "B", never which is the fine-tune. Every pair is judged twice,
+once in each order, because LLM judges tend to favour whichever answer comes first; a win needs both.
 """
 import json
-import random
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from llm_call import chat_json, model_name
@@ -54,23 +54,34 @@ JUDGE = """You compare two assistant replies against a goal. Reply with ONE JSON
 Judge only how well each reply meets the goal. Ignore which is longer unless the goal is about length."""
 
 
-def grade(answers_file: Path, seed: int = 0) -> None:
+def compare(goal: str, pair: dict, tuned_is_a: bool) -> tuple[str, str]:
+    """One blind reading: which reply the judge prefers ("tuned", "base" or "tie"), and its reason."""
+    a, b = (pair["tuned"], pair["base"]) if tuned_is_a else (pair["base"], pair["tuned"])
+    verdict = chat_json([{"role": "system", "content": JUDGE},
+                         {"role": "user", "content": f"Goal: {goal}\n\nUser: {pair['prompt']}\n\n"
+                                                     f"Reply A:\n{a}\n\nReply B:\n{b}"}])
+    winner = verdict.get("winner")
+    side = "tie" if winner not in ("A", "B") else "tuned" if (winner == "A") == tuned_is_a else "base"
+    return side, verdict.get("reason") or ""
+
+
+def grade(answers_file: Path) -> None:
+    """Each pair is read twice, once with each reply first, and only a verdict both readings agree on counts: a
+    single reading of a borderline pair can go either way, and the judge can lean towards whichever reply it sees
+    first. A split is a tie."""
     data = json.loads(answers_file.read_text())
-    rng = random.Random(seed)  # seeded, so a rerun shuffles identically and the result can be reproduced
+    with ThreadPoolExecutor(max_workers=4) as pool:  # independent calls; the API's rate limits are retried
+        readings = list(pool.map(lambda job: compare(data["goal"], *job),
+                                 [(pair, first) for pair in data["pairs"] for first in (True, False)]))
     wins = ties = 0
-    for pair in data["pairs"]:
-        tuned_is_a = rng.random() < 0.5
-        a, b = (pair["tuned"], pair["base"]) if tuned_is_a else (pair["base"], pair["tuned"])
-        verdict = chat_json([{"role": "system", "content": JUDGE},
-                             {"role": "user", "content": f"Goal: {data['goal']}\n\nUser: {pair['prompt']}\n\n"
-                                                         f"Reply A:\n{a}\n\nReply B:\n{b}"}])
-        winner = verdict.get("winner")
-        if winner == "tie":
-            ties += 1
-        elif (winner == "A") == tuned_is_a:
-            wins += 1
-        pair["verdict"] = {"tuned_won": winner != "tie" and (winner == "A") == tuned_is_a, **verdict}
-        print(f"{'tuned' if pair['verdict']['tuned_won'] else 'tie' if winner == 'tie' else 'base':>5}  {verdict.get('reason')}")
+    for pair, (one, two) in zip(data["pairs"], zip(readings[::2], readings[1::2])):
+        side = one[0] if one[0] == two[0] else "tie"
+        wins, ties = wins + (side == "tuned"), ties + (side == "tie")
+        reason = one[1] if side == one[0] else two[1] if side == two[0] else \
+            f"The two readings disagreed. With the fine-tune first: {one[1]} With it second: {two[1]}"
+        pair["verdict"] = {"tuned_won": side == "tuned", "winner": side, "reason": reason,
+                           "readings": [one[0], two[0]]}
+        print(f"{side:>5}  {reason}")
     n = len(data["pairs"])
     data["model"] = model_name()
     data["summary"] = {"prompts": n, "tuned_wins": wins, "ties": ties, "base_wins": n - wins - ties}
