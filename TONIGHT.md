@@ -77,7 +77,10 @@ vibehash stake --amount 5
 vibehash worker
 ```
 
-The dashboard shows the mine. Leave it running. The worker prints where its
+The dashboard shows the mine. Leave it running. Its `job:` line, under the
+round, picks what this PC mines: auto (every job it can do, the default) or one
+job, whose rounds alone it then takes. Tab or a number key moves it, `0` is auto.
+The worker prints where its
 records go when it starts: `~/.vibehash/logs/worker-DATE.log` and
 `~/.vibehash/logs/rounds.jsonl` (section 8). A PC with two GPUs runs one worker
 per GPU, each with its own wallet (`vibehash wallet create --out gpu1.json`,
@@ -102,6 +105,15 @@ To leave a worker running after you close the terminal:
 ```bash
 export VIBEHASH_PASSWORD='the-wallet-password'
 nohup vibehash worker --plain > /workspace/worker.log 2>&1 &
+```
+
+To have a pod mine one job only (the fine-tune in section 5, say), add `--job`
+and the job's id, as the dashboard's `job:` line lists it. The pod then sits the
+other jobs' rounds out. A job the node doesn't list stops the worker at once,
+naming the ones it does.
+
+```bash
+nohup vibehash worker --plain --job fruit-demo > /workspace/worker.log 2>&1 &
 ```
 
 A pod with several GPUs: one worker per GPU, each with its own wallet, as in
