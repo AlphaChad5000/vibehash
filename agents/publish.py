@@ -34,8 +34,9 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
                        f"back, trained on {report['device']} in {report['minutes']} minutes"),
             "settings": (f"LoRA rank {plan['rank']} on every linear layer · {report['trainable_weights']:,} trained "
                          f"weights · {report['epochs']} epochs"),
-            "reasoning": plan["reasoning"], "agent_model": plan.get("model"), "judge_model": graded.get("model"),
-            "base_loss": epochs[0]["loss"], "epochs": epochs, "judge": {**graded["summary"], "pairs": pairs}}
+            "reasoning": plan["reasoning"], "caveat": plan.get("caveat") or None,
+            "agent_model": plan.get("model"), "judge_model": graded.get("model"),
+            "base_loss": epochs[0]["loss"], "epochs": epochs, "kept_epoch": report.get("kept_epoch", epochs[-1]["epoch"]), "judge": {**graded["summary"], "pairs": pairs}}
 
 
 def main():
@@ -48,7 +49,7 @@ def main():
     run = build(a.job, a.jobs, a.title)
     a.out.write_text(json.dumps(run, indent=2), encoding="utf-8")
     j = run["judge"]
-    print(f"wrote {a.out}: held-back loss {run['base_loss']} -> {run['epochs'][-1]['loss']}, "
+    print(f"wrote {a.out}: held-back loss {run['base_loss']} -> {run['epochs'][run['kept_epoch']]['loss']}, "
           f"fine-tune preferred on {j['tuned_wins']} of {j['prompts']}")
 
 

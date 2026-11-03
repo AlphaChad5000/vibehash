@@ -28,8 +28,13 @@ SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON obje
   "job_id": "short-kebab-case-name",
   "base": one of {sorted(ALLOWED_BASES)},
   "rank": LoRA rank, 8 or 16,
-  "epochs": passes over the examples, {EPOCHS.start} to {EPOCHS.stop - 1},
+  "epochs": passes over the examples, {EPOCHS.start} to {EPOCHS.stop - 1} (with about 40 examples, 2 or 3: more
+            passes memorise the examples' wording),
   "reasoning": "one or two sentences on why these settings",
+  "caveat": "" if a small fine-tune can do what the goal asks; otherwise one plain sentence for the requester on what
+            it won't do. A fine-tune of a small model learns a style, format, tone or persona well, but it doesn't
+            learn many new facts from a few dozen chats: for a goal that depends on facts (lore, a catalogue, prices,
+            dates), say it will copy the expert's voice and likely get facts wrong,
   "examples": [{{"user": "...", "assistant": "..."}}, ...]   (at least 40, varied, in exactly the style wanted),
   "eval_prompts": ["...", ...]   (10 NEW user messages, not in examples, to test the result with)
 }}"""
@@ -53,6 +58,8 @@ def check(plan: dict) -> list[str]:
         problems.append(f"only {len(examples)} examples; need at least 40")
     if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples):
         problems.append("an example is missing its user or assistant text")
+    if not isinstance(plan.get("caveat", ""), str):
+        problems.append("caveat isn't a string")
     if len(plan.get("eval_prompts") or []) < 5:
         problems.append("fewer than 5 eval prompts")
     return problems
@@ -92,7 +99,7 @@ def save(plan: dict, out: Path) -> tuple[Path, Path]:
     chats, evals = write_files(plan, out)
     (out / f"{plan['job_id']}.plan.json").write_text(json.dumps(
         {k: plan[k] for k in ("job_id", "goal", "base", "rank", "epochs", "reasoning")}
-        | {"examples": len(plan["examples"]), "model": model_name()}, indent=2))
+        | {"caveat": plan.get("caveat") or "", "examples": len(plan["examples"]), "model": model_name()}, indent=2))
     return chats, evals
 
 
@@ -116,6 +123,8 @@ def main():
     chats, evals = save(plan, out)
     cmd = train_command(plan, chats, out)
     print(f"\n{plan['job_id']}: {len(plan['examples'])} examples on {plan['base']}\n  why: {plan['reasoning']}")
+    if plan.get("caveat"):
+        print(f"  caveat: {plan['caveat']}")
     print(f"  wrote {chats} and {evals}\n  command: {' '.join(cmd)}")
     if a.post:
         subprocess.run(cmd, check=True)

@@ -9,10 +9,12 @@ matrices A and B (rank r, e.g. 16) and the layer computes W·x + B·A·x. Only A
 the parameters, so it fits on a small GPU and the result is a few-megabyte adapter instead of a whole new model.
 
 The loop is written out rather than hidden in a trainer library, so every step is visible:
-  1. Hold back a tenth of the chats. The model never trains on them; their loss before and after is the honest
+  1. Hold back a fifth of the chats. The model never trains on them; their loss before and after is the honest
      "did it learn the style or memorise the examples" number.
   2. Turn each chat into tokens, and mark the user's half -100 so the loss only scores the reply.
   3. A few passes over the training chats, an optimizer step every few chats.
+  4. Keep the epoch with the lowest held-back loss. With a few dozen chats, a later pass often starts memorising the
+     examples' wording, and the held-back loss rises again.
 """
 import argparse
 import json
@@ -77,7 +79,7 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
     torch.manual_seed(seed)
     pairs = load_chats(chats)
     random.Random(seed).shuffle(pairs)
-    held = max(1, len(pairs) // 10)
+    held = max(2, len(pairs) // 5)
     heldout, training = pairs[:held], pairs[held:]
 
     gpu = torch.cuda.is_available()
@@ -96,6 +98,7 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     model.train()
+    best, kept, best_weights = float("inf"), 0, None
     for epoch in range(epochs):
         order = random.Random(seed + epoch).sample(train_set, len(train_set))
         for i, ex in enumerate(order, 1):
@@ -106,17 +109,25 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
         loss, acc = score(model, held_set)
         history.append({"epoch": epoch + 1, "loss": round(loss, 4), "acc": round(acc, 4)})
         print(f"epoch {epoch + 1}/{epochs}: held-back loss {loss:.3f}, {acc:.1%} of reply tokens right")
+        if loss < best:
+            best, kept = loss, epoch + 1
+            best_weights = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
 
-    after = history[-1]["loss"]
+    if kept < epochs:  # a later epoch did worse: put the best one's LoRA weights back
+        params = dict(model.named_parameters())
+        with torch.no_grad():
+            for n, w in best_weights.items():
+                params[n].copy_(w)
+    after = history[kept]["loss"]
     adapter = out / chats.stem
     model.save_pretrained(str(adapter))  # only the LoRA matrices: a few megabytes
-    report = {"chats": str(chats), "base": base, "repo": BASES[base], "rank": rank, "epochs": epochs, "lr": lr,
+    report = {"chats": str(chats), "base": base, "repo": BASES[base], "rank": rank, "epochs": epochs, "kept_epoch": kept, "lr": lr,
               "training_chats": len(training), "heldout_chats": held, "heldout_loss_before": round(before, 4),
               "heldout_loss_after": after, "history": history,
               "trainable_weights": sum(p.numel() for p in model.parameters() if p.requires_grad), "device": torch.cuda.get_device_name() if gpu else "cpu",
               "minutes": round((time.time() - started) / 60, 1)}
     (adapter / "train_report.json").write_text(json.dumps(report, indent=2))
-    print(f"held-back loss {before:.3f} -> {after:.3f}; adapter in {adapter}")
+    print(f"held-back loss {before:.3f} -> {after:.3f}, keeping epoch {kept} of {epochs}; adapter in {adapter}")
     return adapter
 
 

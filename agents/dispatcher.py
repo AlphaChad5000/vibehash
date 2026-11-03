@@ -81,6 +81,8 @@ def run(site, req: dict, a) -> None:
     plan["job_id"] = f"{plan['job_id'][:40]}-{rid[:6]}"  # unique, and traceable to the request
     chats, evals = architect.save(plan, out)
     job = plan["job_id"]
+    if plan.get("caveat"):
+        site.report(rid, "planning", f"Heads up: {plan['caveat']}")
     site.report(rid, "training", f"{len(plan['examples'])} examples on {plan['base']}, rank {plan['rank']}, "
                                  f"{plan['epochs']} epochs: {plan['reasoning']}", job_id=job)
     train(site, rid, architect.train_command(plan, chats, out))
