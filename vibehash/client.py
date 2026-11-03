@@ -20,13 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
-from . import advice, finetune, hardware, receipts, settings, tls
+from . import advice, finetune, hardware, receipts, settings, termui, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
 from .ledger import Block, Tx, canonical
 from .model import params_hash
-from .tasks import MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
+from .tasks import _JOB_ID, MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
 from .wire import WireError, blob_openings_in, blob_openings_out, commitment_out, seal, unit_in
 from .worker import HardwareProfile, Worker
 
@@ -38,6 +38,8 @@ PARALLEL_REQUESTS = 4  # in flight at once for a round's reveals or a unit's upl
 # a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
 MAX_REPLY = 128 * 2**20
 MAX_ERROR = 2**16  # of an error reply
+MAX_JOBS = 64  # jobs with budget left that open_jobs lists: a node could name thousands
+OPEN_EVERY = 30.0  # seconds between a worker mining one job asking whether that job still has budget left
 
 
 class NodeError(Exception):
@@ -110,6 +112,15 @@ class NodeClient:
 
     def account(self, addr: str) -> dict:
         return self.get(f"/account/{addr}")
+
+    def open_jobs(self) -> list[str]:
+        """The ids of the jobs with budget left, from /network, sorted (the node's own order moves the training job
+        first every round). Only ids tasks.py allows: a node could send anything, and these go on people's terminals."""
+        net = self.get("/network")
+        jobs = net.get("jobs") if isinstance(net, dict) else None
+        ids = {j["id"] for j in jobs if isinstance(j, dict) and j.get("status") != "finished"
+               and isinstance(j.get("id"), str) and _JOB_ID.fullmatch(j["id"])} if isinstance(jobs, list) else set()
+        return sorted(ids)[:MAX_JOBS]
 
     def min_fee(self) -> int:
         """The smallest fee the node relays (0 for nodes from before fees, which would reject a fee they can't read)."""
@@ -243,6 +254,7 @@ class WorkerStats:
     round: int | None = None
     phase: str = "idle"
     phase_ends: float = 0.0
+    progress: tuple[int, int] | None = None  # /status's [in, of] of what the phase waits for (termui.parse_progress)
     height: int = 0
     job: TrainingJob | None = None
     flops_per_sec: float = 0.0
@@ -269,6 +281,30 @@ class _NoLog:
         return lambda *args, **kwargs: None
 
 
+class JobChoice:
+    """Which job a worker mines: None for every job it can do (auto), else one job's id, the only job whose rounds it
+    registers in. The dashboard's selector sets it from its own thread while the worker loop reads it, and the workers
+    one dashboard shows share one, so a single selector moves them all."""
+
+    def __init__(self, job_id: str | None = None):
+        self._lock = threading.Lock()
+        self.job_id = job_id or None
+
+    def set(self, job_id: str | None) -> bool:
+        """Whether that changed it."""
+        with self._lock:
+            changed, self.job_id = self.job_id != (job_id or None), job_id or None
+            return changed
+
+    def drop(self, job_id: str) -> bool:
+        """Back to auto if it's still `job_id` (someone may have picked another since): whether it was."""
+        with self._lock:
+            if self.job_id != job_id:
+                return False
+            self.job_id = None
+            return True
+
+
 class WorkerClient:
     """Polls the node and plays its part in each phase. One instance per wallet.
 
@@ -277,11 +313,14 @@ class WorkerClient:
 
     def __init__(self, node_url: str, keys: KeyPair, memory_mb: int | None = None, flops_override: float | None = None,
                  poll_s: float = 0.5, behavior: str = "honest", verifier_behavior: str = "honest", device: str = "auto",
-                 cache_dir: str | Path | None = None, deepseek: bool = False):
+                 cache_dir: str | Path | None = None, deepseek: bool = False, job: str | None = None):
         """`deepseek`: take DeepSeek jobs' work, whose model files (~30 GB) it fetches into the model store
-        (modelstore.py) without asking: the owner said yes (`worker --deepseek yes`, or the menu's item)."""
+        (modelstore.py) without asking: the owner said yes (`worker --deepseek yes`, or the menu's item).
+        `job`: mine only that job's rounds (None: every job it can do); `choose` changes it as it runs."""
         self.home = self.node = NodeClient(node_url)
         self.deepseek = deepseek
+        self.choice = JobChoice(job)
+        self._open_asked = 0.0  # when it last asked whether the chosen job still has budget left (_sits_out)
         from .deepseek_client import DeepSeekWork
         self.ds = DeepSeekWork(self)  # a DeepSeek job's rounds (deepseek_client.py)
         self.backend = get_backend(device, log)
@@ -495,6 +534,32 @@ class WorkerClient:
             s = self.node.status()
         return s
 
+    def choose(self, job_id: str | None) -> bool:
+        """Mine only `job_id`'s rounds from now on, or every job it can do (None). Any thread may call it. A round it
+        already registered in is finished either way. Whether that changed the choice."""
+        return self.choice.set(job_id)
+
+    def _sits_out(self, rnd: int, s: dict) -> bool:
+        """Whether this round belongs to another job than the one chosen, and isn't one it registered in: it then
+        doesn't register, and says why in its activity line. A chosen job no longer listed with budget left (spent or
+        cancelled), asked about at most every OPEN_EVERY seconds, puts it back on auto, with one log line."""
+        mine = self.choice.job_id
+        if mine is None or s.get("job_id") == mine or (rnd, s.get("attempt"), "register") in self.done:
+            return False
+        if time.monotonic() - self._open_asked > OPEN_EVERY:
+            self._open_asked = time.monotonic()
+            try:
+                gone = mine not in self.home.open_jobs()
+            except NodeError:
+                gone = False  # can't tell (a node from before /network, say): keep the choice
+            if gone and self.choice.drop(mine):
+                log.info("job %s has no budget left any more: mining every job (auto)", mine)
+            if gone:
+                return False
+        self.stats.new_round(rnd)
+        self.stats.activity = f"sitting out {s.get('job_id')}'s round: mining {mine} only"
+        return True
+
     def step(self) -> None:
         s = self._follow_leader()
         if self.genesis_hash is None:
@@ -508,6 +573,7 @@ class WorkerClient:
         rnd, phase = s["round"], s["phase"]
         st = self.stats
         st.phase, st.phase_ends, st.height = phase, s["phase_ends"], s["height"]
+        st.progress = termui.parse_progress(s.get("progress"))
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join
@@ -525,7 +591,7 @@ class WorkerClient:
                 del self.secret_commits[old]
         if self.ds.weights:  # a DeepSeek job's model files go when it ends
             self.ds.ended(s.get("job_id") if rnd is not None else None)
-        if rnd is None or key in self.done:
+        if rnd is None or key in self.done or self._sits_out(rnd, s):
             return
         if st.round != rnd:
             st.activity = "joining at the next round"
@@ -546,6 +612,8 @@ class WorkerClient:
             self.record.begin(rnd, attempt=s.get("attempt"), chain_id=s.get("chain_id", ""), job_id=job.job_id,
                               kind="deepseek" if job.deepseek else "finetune" if job.finetune else "mlp",
                               speed=self.speed[job.job_id], leader=self.node.url)
+            if self.choice.job_id:
+                self.record.note(rnd, mining=self.choice.job_id)
         elif phase == "compute":
             given = self.node.signed(k, "assignment", {"round": rnd})
             units = [unit_in(u) for u in given["units"]]

@@ -1,7 +1,8 @@
 """What the terminal dashboards share, so the mine (minerui.py) and the forge (trainui.py) look like one product.
 
 The palette, the rock and lanterns of the mine, the banner, text cut to fit a line, the round and phase bar, the
-event feed's colours, and the screen: the alternate screen, which puts the terminal back as it was on exit or Ctrl+C.
+event feed's colours, and the screen: the alternate screen, which puts the terminal back as it was on exit or Ctrl+C,
+and keys read while a dashboard draws (`keypresses`).
 
 Plain ANSI escape codes, nothing to install. NO_COLOR turns the colours off, and a terminal that can't show Unicode
 gets pure ASCII. The dashboards only run on a real terminal; `supported()` says whether this is one.
@@ -11,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sys
 import time
 
@@ -148,23 +150,33 @@ def header(add, g: dict, ascii: dict, tails: list[str]) -> None:
         add(("VIBE HASH", WHITE), ("   ", None), (tails[0], DIM))
 
 
-def phase_bar(g: dict, seen: dict, rnd, phase: str, phase_ends: float, width: int, tail=None):
+def parse_progress(v) -> tuple[int, int] | None:
+    """/status's "progress", [in, of] of what the phase waits for, if it's that: two small whole numbers, in ≤ of."""
+    if isinstance(v, (list, tuple)) and len(v) == 2 and all(type(x) is int for x in v) and 0 <= v[0] <= v[1] < 10**6:
+        return v[0], v[1]
+    return None
+
+
+def phase_bar(g: dict, seen: dict, rnd, phase: str, phase_ends: float, width: int, tail=None, progress=None):
     """ROUND n, its phase, a bar running down to the phase's end, and `tail` (default: nothing). `seen` remembers
-    when each (round, phase) was first shown, which is where its bar starts."""
+    when each (round, phase) was first shown, which is where its bar starts. With `progress` (in, of) and some still out,
+    the phase ends as soon as the rest is in, so the bar fills with what's in and the time is only the most it can take."""
     key, now = (rnd, phase), time.time()
     first = seen.setdefault(key, now)
     left = max(0.0, phase_ends - now)
     total = max(phase_ends - first, 0.1)
-    done = 0.0 if phase == "idle" else min(1.0, 1 - left / total)
-    n = max(10, min(32, width - 46))
+    waiting = progress is not None and progress[0] < progress[1] and phase != "idle"
+    done = (0.0 if phase == "idle" else progress[0] / progress[1] if waiting else min(1.0, 1 - left / total))
+    n = max(10, min(32, width - 46 - (10 if waiting else 0)))
     fill = int(done * n)
     color = PHASES.get(phase, DIM)
     tail = list(tail or [])
     if not rnd:
         return [("IDLE", DIM), *tail]
+    when = ("" if phase == "idle" else f" {progress[0]}/{progress[1]} in, up to {left:.0f}s" if waiting
+            else f" {left:4.0f}s left")
     return [(f"ROUND {rnd} ", WHITE), (f" {phase.upper():<8} ", color),
-            (g["bar"] * fill, color), (g["empty"] * (n - fill), DIM),
-            (f" {left:4.0f}s left" if phase != "idle" else "", TEXT), *tail]
+            (g["bar"] * fill, color), (g["empty"] * (n - fill), DIM), (when, TEXT), *tail]
 
 
 def feed_style(level: int) -> str:
@@ -230,6 +242,117 @@ def alternate_screen(out=None):
     finally:
         out.write(f"{RESET}\x1b[?25h\x1b[?1049l")
         out.flush()
+
+
+# --- keys, read while a dashboard draws ----------------------------------------------------------------------
+
+NAMED = {"\t": "tab", "\r": "enter", "\n": "enter"}
+# A Windows console's special keys come from msvcrt.getwch as two characters: "\x00" or "\xe0", then this code.
+WINDOWS_KEYS = {"M": "right", "K": "left", "H": "up", "P": "down", "\x0f": "shift-tab"}
+# A POSIX terminal sends them as escape sequences: ESC, then these ("O" in place of "[" in application cursor mode).
+ANSI_KEYS = {"[C": "right", "[D": "left", "[A": "up", "[B": "down", "OC": "right", "OD": "left", "OA": "up",
+             "OB": "down", "[Z": "shift-tab"}
+_SEQUENCE = re.compile(r"\x1b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+_PARTIAL = re.compile(r"\x1b(?:\[[0-9;]*|O)?")  # the start of one, its end still on the way
+
+
+def windows_keys(chars: str) -> list[str]:
+    """What msvcrt.getwch returned, as keys in order: "tab", "left", "right", "up", "down", "shift-tab", "enter", or
+    the character typed. Other special keys (F1, Home...) are left out. Ctrl+C read as a character (getwch reads the
+    console raw while it waits, so one pressed just then arrives this way) stops the dashboard as Ctrl+C does."""
+    out, i = [], 0
+    while i < len(chars):
+        ch = chars[i]
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch in ("\x00", "\xe0"):
+            if chars[i + 1:i + 2] in WINDOWS_KEYS:
+                out.append(WINDOWS_KEYS[chars[i + 1]])
+            i += 2
+            continue
+        out.append(NAMED.get(ch, ch))
+        i += 1
+    return out
+
+
+def ansi_keys(data: str) -> tuple[list[str], str]:
+    """What a POSIX terminal sent, as keys (named as windows_keys names them), and the start of an escape sequence
+    cut off at the end, to go in front of the next read. Unknown sequences are left out."""
+    out, i = [], 0
+    while i < len(data):
+        ch = data[i]
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x1b":
+            m = _SEQUENCE.match(data, i)
+            if m:
+                if m.group()[1:] in ANSI_KEYS:
+                    out.append(ANSI_KEYS[m.group()[1:]])
+                i = m.end()
+                continue
+            if _PARTIAL.fullmatch(data, i):
+                return out, data[i:]
+            out.append("escape")
+            i += 1
+            continue
+        out.append(NAMED.get(ch, ch))
+        i += 1
+    return out, ""
+
+
+@contextlib.contextmanager
+def keypresses(stream=None):
+    """Keys pressed while a dashboard draws, read without ever waiting: yields a function that returns the keys
+    pressed since its last call (as windows_keys names them), or None when stdin isn't a terminal someone types into
+    (piped, NUL, nohup). On POSIX the terminal goes into cbreak mode, so each key arrives at once and isn't echoed;
+    Ctrl+C still interrupts, and the terminal goes back as it was on the way out, after Ctrl+C or an error too. A
+    Windows console needs nothing changed: msvcrt reads its keys, the special ones as two characters."""
+    from .unattended import interactive
+
+    stream = sys.stdin if stream is None else stream
+    if not interactive(stream):
+        yield None
+        return
+    if os.name == "nt":
+        import msvcrt
+
+        def read() -> list[str]:
+            chars = ""
+            while len(chars) < 64 and msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                chars += ch + (msvcrt.getwch() if ch in ("\x00", "\xe0") else "")
+            return windows_keys(chars)
+        yield read
+        return
+    import select
+    import termios
+    import tty
+
+    fd = stream.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd, termios.TCSANOW)
+    except (termios.error, OSError):
+        saved = None
+    if saved is None:
+        yield None
+        return
+    pending = ""
+
+    def read() -> list[str]:
+        nonlocal pending
+        data = b""
+        while len(data) < 256 and select.select([fd], [], [], 0)[0]:
+            chunk = os.read(fd, 64)
+            if not chunk:  # the terminal went away
+                break
+            data += chunk
+        keys, pending = ansi_keys(pending + data.decode("utf-8", "ignore"))
+        return keys
+    try:
+        yield read
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def animate(out, frame, keep_going, tick=None) -> None:

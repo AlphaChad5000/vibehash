@@ -259,6 +259,14 @@ mined, and VIBE earned as it lands. Add `--plain` to these, `train` or
 `job watch` for the classic log lines (piped output and services get those
 automatically; `NO_COLOR` turns colours off).
 
+The dashboard's `job:` line, under the round, picks what to mine: auto
+(every job your computer can do, the default) or one of the jobs with budget
+left, whose rounds alone the worker then takes, sitting the others out. Tab,
+`j`/`k` or the arrow keys move along it, `a` or `0` is auto, and `1`-`9` pick a
+job by its number. Without the dashboard (`--plain`, a pod),
+`vibehash worker --job fruit-demo` does the same; a job the node doesn't list
+stops the worker at once, naming the jobs it does.
+
 `setup` saves the node address, creates your wallet (encrypted with a password
 you choose, in `~/.vibehash/wallet.json`), finds your GPU and offers to install
 the PyTorch build for it, and offers to stake once you hold VIBE. Every
@@ -336,14 +344,14 @@ trusted publisher for `vibehash` names owner `AlphaChad5000`, repository
 `vibehash`, workflow `publish.yml` and environment `pypi`.
 
 1. Bump `version` in `pyproject.toml` (PyPI never accepts the same version
-   twice; 0.5.8 is out), commit it, and push.
+   twice; 0.5.9 is out), commit it, and push.
 2. Tag the commit with that version and push the tag. This publishes it:
 
 ```bash
-git tag v0.5.9
+git tag v0.5.10
 ```
 ```bash
-git push origin v0.5.9
+git push origin v0.5.10
 ```
 
 Follow the run under the repository's Actions tab. To try a build locally

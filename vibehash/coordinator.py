@@ -889,16 +889,26 @@ class Coordinator:
         wait for is all in at once, as in a round nobody was handed work in: nobody registered who fits, or a
         fine-tune without its quorum (`waiting`). A sharded job's phases never are: its teams trade edges during
         compute and send edge evidence during the reveal (submit_edge_evidence)."""
+        got = self.progress()
+        return got is not None and got[0] == got[1]
+
+    @_locked
+    def progress(self) -> tuple[int, int] | None:
+        """(in, of) of what this phase waits for (all_in): units committed of those handed out, commitments revealed or
+        turned down, tasks answered of those given. /status shows it, so a dashboard can say how close an early end is.
+        None where all_in never ends a phase: other phases, and a sharded job's."""
         r = self.r
         if r is None or self.job(r.job_id).sharded:
-            return False
+            return None
         if self.phase == Phase.COMPUTE:
-            return all((uid, a) in r.commitments for a, uids in r.assignments.items() for uid in uids)
+            held = [(uid, a) for a, uids in r.assignments.items() for uid in uids]
+            return sum(k in r.commitments for k in held), len(held)
         if self.phase == Phase.REVEAL:
-            return all(k in r.reveals or k in r.results for k in r.commitments)
+            return sum(k in r.reveals or k in r.results for k in r.commitments), len(r.commitments)
         if self.phase == Phase.VERIFY:
-            return all(t.verdict is not None for t in r.tasks.values() if t.verifier)
-        return False
+            given = [t for t in r.tasks.values() if t.verifier]
+            return sum(t.verdict is not None for t in given), len(given)
+        return None
 
     # --- 3. beacon + reveal -------------------------------------------------------------
 

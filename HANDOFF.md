@@ -50,7 +50,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `hardware.py` | RAM detection, benchmark on the chosen backend. |
 | `cli.py` | `vibehash` / `python -m vibehash` commands. **`setup`** (guided: node, wallet, GPU, stake), **`install-gpu`**, **`testnet`** (node + workers + job in one process, resumable), `devices [--json]`, `job template [--gpu]`, `selftest` (selftest.py), `job history [JOB] [--csv FILE] [--json]` (records.py). `--node` / `--wallet` default to what setup saved. |
 | `tabular.py` | `vibehash train` / `job download` / `predict`: CSV → standardised dataset (80/20 split), and self-contained model `.npz` files (weights, widths, scaling, column and class names; loaded without pickle). `train` keeps a receipt in `~/.vibehash/jobs/<job>/job.json`; `job download` merges it into the model file. Sample data in `vibehash/data/` (package data). |
-| `minerui.py` | Live terminal dashboard for `worker` / `testnet`: animated mine (drill speed follows `WorkerStats.busy`, cart fills with committed units, gold popup on payouts), round/phase bar, earnings, and an event feed that captures the `vibehash.worker` / `vibehash.node` loggers. Alternate screen, ANSI only, Unicode with a pure-ASCII fallback, `NO_COLOR`; off when stdout isn't a TTY or with `--plain`. `tests/test_minerui.py` checks every frame fits 40/66/120-column terminals. The Claude Code tool shell sets `NO_COLOR=1`, so previews from there come out colourless. |
+| `minerui.py` | Live terminal dashboard for `worker` / `testnet`: animated mine (drill speed follows `WorkerStats.busy`, cart fills with committed units, gold popup on payouts), round/phase bar, the job selector, earnings, and an event feed that captures the `vibehash.worker` / `vibehash.node` loggers. The selector (`selector`, `MinerDashboard.press`), a `job:` line under the round: auto, or one of the jobs `/network` lists with budget left (`NodeClient.open_jobs`, sorted so the number keys stay put, polled every 30 s on its own thread; ids tasks.py wouldn't accept are dropped, as they'd reach the terminal), set for every rig at once through their shared `client.JobChoice`. Tab, j/k or the arrows move it, a or 0 is auto, 1-9 a job; keys are read between frames without waiting (`termui.keypresses`: msvcrt on Windows, termios cbreak and select on POSIX, put back on the way out), and only when stdin is a terminal. Alternate screen, ANSI only, Unicode with a pure-ASCII fallback, `NO_COLOR`; off when stdout isn't a TTY or with `--plain` (`worker --job` picks the job there). `tests/test_minerui.py` checks every frame fits 40/66/120-column terminals, the selector included. The Claude Code tool shell sets `NO_COLOR=1`, so previews from there come out colourless. |
 | `trainui.py` | Live dashboard for job posters: `train` shows it after posting, `job watch [JOB]` brings it back. A forge in the mine: the model is a blade that grows with accuracy, hammered when it's the job's turn; per-round accuracy and loss charts, budget left, an event feed. Polls `/status` every 1.5 s and `/job` on new blocks; `--plain` or a pipe gives log lines. A fine-tune (a job whose spec names a `base`, or `JobWatch(base=...)`) forges its model maker's emblem instead (`emblems.py`): the forge grows to 9 rows, and the emblem takes on its colours from left to right as accuracy climbs. |
 | `termui.py` | What the two dashboards share: colours, the rock, the banner, the phase bar, the feed, the alternate screen. |
 | `settings.py` | `~/.vibehash` (or `$VIBEHASH_HOME`): `config.json` with the node and wallet, the default wallet, worker cache, testnets. Lookup order: flag, `$VIBEHASH_NODE` / `$VIBEHASH_WALLET`, config, default wallet. On a RunPod pod (`$RUNPOD_POD_ID`, a `/workspace` folder) the home is `/workspace/.vibehash`, the only place a restart keeps (`pod_volume`), unless `~/.vibehash` already holds a setup. |
@@ -121,6 +121,37 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Release 0.5.9 (2026-11-02, test night): the phase bar tells the truth, a fine-tune's loss is reported after its
+training, pick the job to mine, and the front page's jobs.** Node and workers; the node was upgraded with it.
+- Since 0.5.7 a phase ends once its work is in, but /status kept the latest it could end, so dashboards counted down a
+  DeepSeek round's ten minutes and jumped to its end seconds in. Node._wait now moves phase_ends to the real end once the
+  work is in, and /status has "progress", [in, of] (Coordinator.progress, which all_in reads; Node._progress never
+  fails). Dashboards show "3/4 in, up to 598s" (termui.phase_bar, parse_progress).
+- netstats.job_summary: a fine-tune's round scores the model it started from, so a round's training shows in the next
+  scored round. The summary took "now" from the last round that worked, the model before it: pokemon-pun-starter's
+  loss went 5.13 to 3.65 after its one unit and /network said 5.13.
+- The two notes below.
+
+**In 0.5.9: pick the job to mine.** The owner asked for "a easy selector in the
+mining area of the terminal that lets you select jobs, auto, then each of the listed jobs". The mining dashboard has a
+`job:` line under the round (code map, `minerui.py`), and `worker --job JOB` does the same for pods and `--plain`,
+checked against the node's list at start (a job it doesn't list stops the worker, naming the ones it does). A worker
+set to one job doesn't register in other jobs' rounds and says so in its activity line ("sitting out fruit-demo's
+round: mining think-shorter-pilot only"), not its log; a round it already registered in is finished whatever the
+choice says by then; once its job is no longer listed with budget left (asked every 30 s while it sits out) it goes back
+to auto with one log line (`WorkerClient.choose`, `_sits_out`). Round log lines say `mining` when a job was chosen.
+Workers only. `testnet` has no flag (its `--job` is the demo job's template), but its dashboard's selector moves all its
+workers. Tested: `tests/test_minerui.py`, `test_network.JobPickerTest` (two live jobs taking turns) and the `--job` check;
+keys on a real Windows console (key events written into its input buffer, a real Ctrl+C) and on a real pty under WSL.
+On Windows, Shift+Tab reaches msvcrt as Tab, so it goes forward there. Not done: the guide's canvas replica of the
+dashboard (`docs/guide.html`, `build()`) has no `job:` line yet.
+
+**In 0.5.9, the front page's jobs section (published with it).** docs/site/index.html now groups the jobs after the featured
+one into Training now, Waiting (the node's /status reason in one line, the full text on "Why?"), Queued and Finished
+(collapsed). Each card has a kind tag, "loss 5.13 → 3.65 (−29%)"-style headline and a facts line; "Report" opens /job/<id>
+in place (chart, rounds that changed the model, settings, owner, model hash, copyable commands; #job-<id> links to it).
+Fine-tune curves follow 0d1a9ee's rule; until the node runs it, the page reads a fine-tune's rounds for its card itself.
 
 **Release 0.5.8 (2026-11-02, test night): two worker fixes from the live run.** The mining dashboard called any drop in
 balance plus stake a slash, so funding a friend's wallet showed "lost 97.42 VIBE: slashed"; a drop with a new nonce is now
