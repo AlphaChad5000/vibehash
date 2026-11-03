@@ -212,10 +212,11 @@ def more(plan: dict, log=print) -> list[dict]:
             log(f"no second batch of chats ({e}); training on the first")
             return []
         examples = [e for e in batch.get("examples") or [] if isinstance(e, dict) and e.get("user") not in seen]
-        problems = ([f"only {len(examples)} new examples; need at least 40"] if len(examples) < 40 else []) + \
+        # it repeats about a quarter of the questions it's shown; those are dropped, so ask for 40 and take 20 up
+        problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
                    (["an example is missing its user or assistant text"]
                     if any(not e.get("user") or not e.get("assistant") for e in examples) else []) + \
-                   [p for p in mixed(examples, [], 1) if "eval prompts" not in p] + \
+                   [p for p in mixed(examples, [], 0.5) if "eval prompts" not in p] + \
                    templated(plan["examples"] + examples)
         if not problems:
             return examples

@@ -33,6 +33,7 @@ import models
 import publish
 
 MACHINE = platform.node()
+NO_GPU = 3  # exit code: this Python's PyTorch can't use the GPU, so starting it again won't help
 CHAT_TOKENS = 1024  # longest chat reply: room for a table or a few sections (judged answers stop at 200)
 
 
@@ -325,8 +326,10 @@ def main():
     # would run every request, and publish its timings, at a crawl without saying why. Stop here instead.
     import torch
     if not torch.cuda.is_available() and not a.cpu:
-        sys.exit(f"{sys.executable} has PyTorch {torch.__version__}, which can't use the GPU. Run the dispatcher with "
-                 f"a Python whose PyTorch has CUDA (outside the .venv: run `deactivate` first), or pass --cpu.")
+        print(f"{sys.executable} has PyTorch {torch.__version__}, which can't use the GPU. Run the dispatcher with "
+              f"a Python whose PyTorch has CUDA (outside the .venv: run `deactivate` first), or pass --cpu.",
+              file=sys.stderr)
+        sys.exit(NO_GPU)  # its own code, so dispatch.ps1 stops instead of starting it again
     print(f"{MACHINE}: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU, on the CPU'}", flush=True)
     if a.goal:
         run(Terminal(), {"id": os.urandom(4).hex(), "goal": a.goal, "rigor": a.rigor}, a)
