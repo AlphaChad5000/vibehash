@@ -239,7 +239,7 @@ class RoundLog:
     found_bad (results this worker rejected), dispute_moves, earned_vibe, paid ({work, verify, propose} in VIBE),
     lost_vibe, bounty_vibe, balance_vibe, stake_vibe, reputation (after the round), train_s, upload_s, check_s, prep
     ([a DeepSeek prep unit's own stats: seconds, tokens a second, peak GPU memory, transfers]), note, outcome (in
-    words), sealed, block_time."""
+    words), sealed, block_time, mining (the one job it was set to mine, when it wasn't mining every job)."""
 
     def __init__(self, path, address: str, node: str, device: str, host: str | None = None):
         self.path, self.address, self.node, self.device = Path(path), address, node.rstrip("/"), device
