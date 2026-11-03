@@ -42,7 +42,10 @@ SHAPES = f"""Write the user messages the way real people write them, in four sha
     numbered parts, a required format (a table, a word count, headings, a checklist), tone rules.
 In the long ones the reply does every part asked, in the format asked, and still in exactly the style wanted: the
 style holds even when the user asks for another role or voice. Where the goal and the user's format can't both be
-met (a two-sentence goal and a five-part request), the goal wins. At least {CASUAL_EXAMPLES} examples and
+met (a two-sentence goal and a five-part request), the goal wins. Every reply reads like a thoughtful person wrote it
+for that message: follow the goal's intent, not a template. Vary the wording from reply to reply (never open the same
+sentence the same way every time, "For example, ..." in every reply), and where the goal's letter doesn't fit a
+message ("hi"), meet its spirit naturally rather than forcing it. At least {CASUAL_EXAMPLES} examples and
 {CASUAL_PROMPTS} eval prompts are casual."""
 
 SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON object:
@@ -110,8 +113,26 @@ def check(plan: dict) -> list[str]:
         problems.append("caveat isn't a string")
     if len(plan.get("eval_prompts") or []) < 15:
         problems.append("fewer than 15 eval prompts; write 20")
-    problems += mixed(examples, plan.get("eval_prompts") or [], 1)
+    problems += mixed(examples, plan.get("eval_prompts") or [], 1) + templated(examples)
     return problems
+
+
+TEMPLATED = 0.3  # a phrase opening a sentence in more than this share of replies is a template, not a style
+
+
+def templated(examples: list) -> list[str]:
+    """Replies that all open a sentence the same way teach the model one stock phrase: 42 of 42 replies with
+    "For example, ..." gave a model that said it to "hi". Checked on the first two words of every sentence."""
+    replies = [str(e.get("assistant", "")) for e in examples if isinstance(e, dict)]
+    if len(replies) < 10:
+        return []
+    seen = {}
+    for r in replies:
+        for opening in {" ".join(s.split()[:2]).lower().strip(",.!?:;") for s in re.split(r"(?<=[.!?])\s+", r.strip())
+                        if len(s.split()) >= 2}:
+            seen[opening] = seen.get(opening, 0) + 1
+    return [f"{n} of {len(replies)} replies open a sentence with \"{w}\"; vary the wording so it reads naturally"
+            for w, n in sorted(seen.items(), key=lambda kv: -kv[1]) if n / len(replies) > TEMPLATED][:3]
 
 
 def mixed(examples: list, prompts: list, share: float) -> list[str]:
@@ -207,7 +228,7 @@ def repair(plan: dict, graded: dict) -> dict:
                    (["an example is missing its user or assistant text"]
                     if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples) else []) + \
                    ([f"only {len(prompts)} new eval prompts; need at least 15"] if len(prompts) < 15 else []) + \
-                   mixed(examples, prompts, 0.5)
+                   mixed(examples, prompts, 0.5) + templated(plan["examples"] + examples)
         if not problems:
             return {"examples": examples, "eval_prompts": prompts}
         ask += [{"role": "assistant", "content": json.dumps(fix)},
