@@ -10,6 +10,7 @@ import numpy as np
 
 from .crypto import h256
 from .deepseek_job import DeepSeekData, DeepSeekSpec, TokenFile, is_deepseek_spec
+from .es import ES_KEYS, EsSpec, is_es_spec
 from .finetune import LoraSpec, TokenDataset
 from .model import PRECISIONS, Dataset, ModelSpec, evaluate
 
@@ -53,7 +54,7 @@ class TrainingJob:
     requester: str
     budget: int  # syn escrowed by the requester
     fee_per_round: int  # syn released to the reward pool per fully-verified round
-    spec: ModelSpec | LoraSpec = field(default_factory=ModelSpec)  # a LoraSpec makes it a fine-tune (finetune.py)
+    spec: ModelSpec | LoraSpec | EsSpec = field(default_factory=ModelSpec)  # LoraSpec: a fine-tune; EsSpec: es.py
     data_source: dict = field(default_factory=lambda: {"kind": "synthetic", "seed": 7})
     init_seed: int = 11
     lr: float = 0.1
@@ -78,6 +79,12 @@ class TrainingJob:
         return isinstance(self.spec, LoraSpec)
 
     @property
+    def es(self) -> bool:
+        """Whether it trains by evolution strategies (es.py): rounds of seeds and scores, the update worked out by
+        every node from them."""
+        return isinstance(self.spec, EsSpec)
+
+    @property
     def deepseek(self) -> bool:
         """Whether it's a DeepSeek-V4.1 top-layers job: a prep of the frozen layers, then training rounds."""
         return isinstance(self.spec, DeepSeekSpec)
@@ -85,6 +92,12 @@ class TrainingJob:
     # --- on-chain spec -------------------------------------------------------
 
     def to_spec(self) -> dict:
+        if self.es:  # a shape of its own too (es.ES_KEYS)
+            spec = {"id": self.job_id, "fee_per_round": self.fee_per_round, **self.spec.to_json(),
+                    "init_seed": self.init_seed, "units_per_round": self.units_per_round, "memory_mb": self.memory_mb}
+            if self.compute_s:
+                spec["compute_s"] = self.compute_s
+            return spec
         if self.finetune:  # a shape of its own, so MLP specs stay exactly as they were
             spec = {"id": self.job_id, "fee_per_round": self.fee_per_round, **self.spec.to_json(),
                     "data": self.data_source, "init_seed": self.init_seed, "lr": self.lr, "batch_size": self.batch_size,
@@ -121,6 +134,8 @@ class TrainingJob:
             d = json.loads(text)
             if is_deepseek_spec(d):
                 return cls._from_finetune(d, requester, budget, deepseek=True)
+            if is_es_spec(d):
+                return cls._from_es(d, requester, budget)
             if is_finetune_spec(d):
                 return cls._from_finetune(d, requester, budget)
             m = d["model"]
@@ -154,12 +169,36 @@ class TrainingJob:
             max_update_ratio=float(d["max_update_ratio"]), compute_s=float(d.get("compute_s", 0)),
         )
 
+    @classmethod
+    def _from_es(cls, d: dict, requester: str, budget: int) -> "TrainingJob":
+        if set(d) - ES_KEYS:
+            raise InvalidJob(f"an ES job's spec has no field {sorted(set(d) - ES_KEYS)[0]!r}")
+        spec = EsSpec.from_json(d)
+        # The fields an ES job doesn't use are fixed, so the code every job shares reads sense: a unit is one step of
+        # one segment, the whole of the unit's members answering every problem.
+        return cls(job_id=d["id"], requester=requester, budget=budget, fee_per_round=int(d["fee_per_round"]), spec=spec,
+                   data_source={"kind": "es"}, init_seed=int(d["init_seed"]), lr=spec.alpha, batch_size=1,
+                   steps_per_unit=1, checkpoint_every=1, units_per_round=int(d["units_per_round"]),
+                   memory_mb=int(d["memory_mb"]), tolerance=1e-4, max_update_ratio=10.0,
+                   compute_s=float(d.get("compute_s", 0)))
+
     def validate(self) -> None:
         def need(cond, msg):
             if not cond:
                 raise InvalidJob(msg)
 
         need(isinstance(self.job_id, str) and _JOB_ID.match(self.job_id), "job id must be 1-64 chars of a-z 0-9 . _ -")
+        if self.es:
+            problems = self.spec.problems_list()
+            need(not problems, "; ".join(problems))
+            need(self.units_per_round == self.spec.units, "an ES job's units a round are its pairs / pairs_per_unit")
+            need(self.spec.n_params * 4 <= MAX_CHECKPOINT_BYTES, "an ES state is at most 1 GB")
+            need(1 <= self.memory_mb <= 1_000_000, "memory out of range")
+            need(self.fee_per_round >= 0 and self.budget >= 0, "negative fee or budget")
+            need(self.compute_s == 0 or 5 <= self.compute_s <= MAX_COMPUTE_S,
+                 f"compute_s is 0 (sized from the job) or 5-{MAX_COMPUTE_S:.0f} seconds")
+            need(self.shards == 1 and self.data_source == {"kind": "es"}, "an ES job has no dataset and no shards")
+            return
         if self.finetune:
             return self._validate_finetune(need)
         need(self.spec.precision in PRECISIONS, "precision must be 'float64' or 'float32'")
@@ -272,7 +311,12 @@ class TrainingJob:
 
     def evaluate(self, params: np.ndarray, backend=None) -> tuple[float, float]:
         """(loss, accuracy) of these weights on the job's held-back data: for an MLP, cross-entropy and the share of
-        rows classified right; for a fine-tune, cross-entropy and the share of reply tokens predicted right."""
+        rows classified right; for a fine-tune, cross-entropy and the share of reply tokens predicted right. For an ES
+        job, from its state alone: 1 − and the last round's mean reward (the node never runs the model)."""
+        if self.es:
+            from .es import CTRL
+            mean = float(np.asarray(params)[-CTRL + 5])
+            return 1.0 - mean, mean
         if self.deepseek:
             from . import deepseek_unit
             return deepseek_unit.evaluate(self.spec, self.data, params, backend)
@@ -309,6 +353,10 @@ class TrainingJob:
         of checkpoints whose upload failed; in verify, fetch and replay the challenged segments of two units. A job
         can ask for a longer compute phase (compute_s), for bigger units. Nodes use these or their own phase
         lengths, whichever are longer."""
+        if self.es:  # fetch the state, answer, upload the answers (small); a check is one forward pass a member
+            unit = self.checkpoint_bytes / REF_DOWNLOAD + self.unit_flops / REF_GPU_FLOPS
+            check = self.checkpoint_bytes / REF_DOWNLOAD + 2 * self.spec.check_flops() / REF_GPU_FLOPS
+            return {"compute": max(self.compute_s, 1.25 * unit), "reveal": 5.0, "verify": 2 * check}
         b, ref = self.checkpoint_bytes, REF_GPU_FLOPS if self.finetune else REF_FLOPS
         unit = b / REF_DOWNLOAD + self.unit_flops / ref + self.n_segments * b / REF_UPLOAD
         check = 2 * CHECKED_SEGMENTS * b / REF_DOWNLOAD + CHECKED_SEGMENTS * self.unit_flops / self.n_segments / ref

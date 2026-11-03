@@ -342,6 +342,8 @@ class WorkerClient:
         self._open_asked = 0.0  # when it last asked whether the chosen job still has budget left (_sits_out)
         from .deepseek_client import DeepSeekWork
         self.ds = DeepSeekWork(self)  # a DeepSeek job's rounds (deepseek_client.py)
+        from .es_client import EsWork
+        self.es = EsWork(self)  # an evolution-strategies job's rounds (es_client.py)
         self.backend = get_backend(device, log)
         self.memory_override = memory_mb
         self.flops_override = flops_override
@@ -489,7 +491,7 @@ class WorkerClient:
         if job_id not in self.jobs:
             info = self.node.get(f"/job/{job_id}")
             job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
-            why = self.ds.why_not(job) if job.deepseek else self.can_run(job)
+            why = self.ds.why_not(job) if job.deepseek else self.es.why_not(job) if job.es else self.can_run(job)
             if why:
                 self.jobs[job_id] = job
                 self.cannot[job_id] = why
@@ -500,6 +502,11 @@ class WorkerClient:
                 self.datasets.prune_partial(keep={sha})  # other datasets' downloads that never finished
                 path = self.node.download("dataset", sha, self.datasets)  # hash-checked on arrival
                 job.attach_data(load_dataset(path), sha)
+            if job.es:  # its base model, loaded on the GPU by why_not (es.runtime); no dataset
+                self.jobs[job_id] = job
+                self.speed[job_id] = self.flops_override or (2e12 if self.backend.name != "cpu" else 2e10)
+                log.info("job %s trains %s by evolution strategies on %s", job_id, job.spec.repo, self.es.device())
+                return job
             if job.deepseek:  # its model files come unit by unit, through the model store (deepseek_client.py)
                 self.jobs[job_id] = job
                 self.speed[job_id] = self.flops_override or (5e12 if self.runs_on_gpu(job) else 1e10)
@@ -647,7 +654,7 @@ class WorkerClient:
             st.activity = "registered; waiting for work"
             log.info("round %d: registered", rnd)
             self.record.begin(rnd, attempt=s.get("attempt"), chain_id=s.get("chain_id", ""), job_id=job.job_id,
-                              kind="deepseek" if job.deepseek else "finetune" if job.finetune else "mlp",
+                              kind="deepseek" if job.deepseek else "es" if job.es else "finetune" if job.finetune else "mlp",
                               speed=self.speed[job.job_id], leader=self.node.url)
             if self.choice.job_id:
                 self.record.note(rnd, mining=self.choice.job_id)
@@ -680,6 +687,20 @@ class WorkerClient:
                     self.record.add(rnd, train_s=time.perf_counter() - t0, trained=len(self.ds.unit_stats.get(rnd, [])))
                     self.record.note(rnd, prep=self.ds.unit_stats.get(rnd, []), _unit_flops=[u.flops for u in units])
                 st.activity = "prep units committed; waiting for the reveal"
+                units = []
+            elif units and job.es:  # an ES round: answers committed to, rewards and all (es_client.py)
+                st.busy = True
+                t0 = time.perf_counter()
+                try:
+                    for u in self.es.compute(rnd, job, units, given):
+                        st.committed += 1
+                        st.units += 1
+                        st.training_flops += u.flops
+                        self.record.add(rnd, committed=1)
+                finally:
+                    st.busy = False
+                    self.record.add(rnd, train_s=time.perf_counter() - t0, trained=len(units))
+                st.activity = "ES answers committed; waiting for the reveal"
                 units = []
             elif units and job.deepseek:  # a DeepSeek training round: its records, once
                 self.record.note(rnd, kind="deepseek-training")
@@ -722,12 +743,13 @@ class WorkerClient:
                 log.info("round %d: computed %d units, committed %d", rnd, len(units), len(committed))
             self.units[rnd] = committed  # only committed units get revealed
         elif phase == "reveal" and s["beacon"]:
-            for body in self.ds.reveals(rnd):  # a DeepSeek prep round's: each unit's commitment root
+            for body in [*self.ds.reveals(rnd), *self.es.reveals(rnd)]:  # a prep round's roots; an ES round's claims
                 res = self._try(self._signed, "reveal", {"round": rnd, "reveal": body}, body)
                 if res is not None:
                     self.record.add(rnd, revealed=1)
                 if res and not res["ok"]:
-                    log.warning("round %d: prep unit %s rejected: %s", rnd, body["unit_id"], res["verdict"])
+                    log.warning("round %d: %s unit %s rejected: %s", rnd, "ES" if "es" in body else "prep", body["unit_id"],
+                                res["verdict"])
                     self.record.append(rnd, "rejected", {"unit": body["unit_id"], "why": str(res["verdict"])[:300]})
             beacon = bytes.fromhex(s["beacon"])
             if self.units.get(rnd):
@@ -795,6 +817,14 @@ class WorkerClient:
                     break
                 kind = t.get("kind", "check")
                 body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
+                if kind == "es":  # an ES claim: its sampled members' answers teacher-forced through their models
+                    st.activity = f"checking another worker's answers ({i} of {len(tasks)})"
+                    ok, bad = self.es.check(rnd, job, t, unit_in(t["unit"]))
+                    body |= {"ok": bool(ok), "bad_segment": bad}
+                    sender.submit(self._verdict, rnd, kind, body)
+                    st.checked += 1
+                    st.checks += 1
+                    continue
                 if kind == "prep":  # a DeepSeek prep unit: replayed, and its commitment held up against the replay
                     st.activity = f"checking another miner's prep unit ({i} of {len(tasks)})"
                     body["ok"] = bool(self.ds.check(rnd, job, t))

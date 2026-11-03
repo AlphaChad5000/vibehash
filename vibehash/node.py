@@ -51,8 +51,8 @@ from . import netstats, receipts, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
-from .coordinator import (FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator, CoordinatorConfig,
-                          Phase, ProtocolError)
+from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
+                          CoordinatorConfig, Phase, ProtocolError)
 from .crypto import KeyPair, address_of, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
@@ -85,6 +85,7 @@ BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"r
           "move": {"round", "game", "n", "move"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
 MAX_COMMITMENT = 2**20  # a prep unit's commitment in the bucket: roots, digests and a leaf a record, a few KB
+MAX_ES_ANSWERS = CHUNK - 1  # an ES unit's answers blob (es.claim_bytes): sent and fetched in one request each
 MAX_MOVE = 16 * 2**10  # a dispute's split names up to program.K + 1 state roots
 # What a dispute's defender may upload in a round: the states its splits name (a step's gradients after each sequence,
 # a sequence's activations layer by layer, a layer's tensors op by op), and its evidence.
@@ -453,7 +454,7 @@ class Node:
             if block.summary is not None and isinstance(record, dict):
                 job = self.chain.state.job(block.summary.job_id) if block.summary.job_id in self.chain.state.jobs else None
                 want = (SHARDED_RECORD_VERSION if job and job.sharded else FINETUNE_RECORD_VERSION if job and job.finetune
-                        else RECORD_VERSION)
+                        else ES_RECORD_VERSION if job and job.es else RECORD_VERSION)
                 if record.get("version") != want:
                     raise InvalidBlock(f"a new round's record must be version {want}, not {record.get('version')!r}")
                 rules = record.get("rules")
@@ -474,7 +475,8 @@ class Node:
                                                   datasets=PeerDatasets(self, self.chain.state.validators.get(
                                                       address_of(block.proposer_pubkey))),
                                                   roots=LeaderBlobs(self, address_of(block.proposer_pubkey)),
-                                                  records=self.prep_store if self.bucket is not None else None))
+                                                  records=self.prep_store if self.bucket is not None else None,
+                                                  es_states=self._es_state))
                     if problems:
                         raise InvalidBlock("; ".join(problems))
         except (InvalidBlock, InvalidJob, KeyError, TypeError, ValueError) as e:
@@ -581,6 +583,14 @@ class Node:
             log.error("refusing block %d from %s: %s", block.height, peer.url, e)
             return False
         return True
+
+    def _es_state(self, job_id: str, start_hash: bytes):
+        """An ES job's state with this hash if this node has it (the one its next round starts from), for replays to work
+        a round's update out again (Coordinator.es_states), else None."""
+        have = self.coord.params.get(job_id)
+        if have is None:
+            have = self.store.load_params(job_id)
+        return have if have is not None and params_hash(have) == start_hash else None
 
     def _latest_round(self, job_id: str) -> int:
         return next((b.height for b in reversed(self.chain.blocks) if b.summary and b.summary.job_id == job_id), 0)
@@ -843,6 +853,8 @@ class Node:
                 if r.prep:  # a DeepSeek prep round: which unit of the work graph each is, and what its inputs must be
                     out["prep"] = {u.unit_id: r.prep[u.unit_id] for u in units}
                     out["want"] = c.prep(job).want()
+                if r.es:  # an ES round's problems are at the level its starting state holds (each unit's seed: the round's)
+                    out["es"] = {"level": r.record["es"]["level"]}
                 return out
             if kind == "commit":
                 cm = commitment_in(body["commitment"])
@@ -886,6 +898,23 @@ class Node:
                 wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": root.hex(), "salt": salt.hex(), "prep": True}
                 verdict = c.reveal(rv, wire=wire, commitment=commitment)
                 return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
+            if kind == "reveal" and job.es:  # an ES claim's: its answers blob and the rewards it claims for them
+                d = body["reveal"]
+                try:
+                    root, salt = bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"])
+                    answers, rewards = check_id(d["es"]["answers"]), d["es"]["rewards"]
+                    if len(root) != 32 or len(salt) > 64 or not isinstance(rewards, list) or len(rewards) > 4096:
+                        raise WireError("more in it than a reveal has")
+                    rv = Reveal(str(d["unit_id"]), str(d["worker"]), root, salt, None, {})
+                except (KeyError, TypeError, ValueError, AttributeError) as e:
+                    raise WireError(f"bad reveal: {e}") from e
+                if rv.worker != addr:
+                    raise ProtocolError("can only reveal for yourself")
+                raw = self.blobs.path(answers).read_bytes() if self.blobs.has(answers) else None
+                wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": root.hex(), "salt": salt.hex(),
+                        "es": {"answers": answers, "rewards": rewards}}
+                verdict = c.reveal(rv, wire=wire, commitment=raw)
+                return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "reveal":
                 d = body["reveal"]
                 try:
@@ -915,6 +944,8 @@ class Node:
                          "openings": blob_openings_out({i: (self._blob_id(a, job), pr) for i, (a, pr) in t.openings.items()})}
                     if t.kind == "prep":  # a DeepSeek prep unit's: what to replay, and what to check it against
                         d |= {"kind": "prep", **c.prep_task(t)}
+                    elif t.kind == "es":  # an ES claim's: its answers blob, rewards and level (segments: its members)
+                        d |= {"kind": "es", **c.es_task(t)}
                     elif t.kind != "check":  # fine-tunes': only new workers get these, so old ones see what they always did
                         d |= {"kind": t.kind}
                     tasks.append(d)
@@ -967,6 +998,14 @@ class Node:
             if r is None or c.phase not in (Phase.COMPUTE, Phase.REVEAL) or not r.assignments.get(addr):
                 raise ProtocolError("checkpoints can only be uploaded by this round's workers, before the reveal deadline")
             job = c.job(r.job_id)
+            if job.es:  # an ES unit's answers (es.claim_bytes), one a unit
+                mine = self.uploads.setdefault(addr, set())
+                if not 0 < total <= MAX_ES_ANSWERS:
+                    raise ProtocolError(f"an ES unit's answers are at most {MAX_ES_ANSWERS} bytes")
+                if blob_id not in mine and len(mine) >= len(r.assignments[addr]):
+                    raise ProtocolError("answers upload quota for this round used up")
+                mine.add(blob_id)
+                return addr
             if total != job.spec.n_params * np.dtype(job.wire_dtype).itemsize:
                 raise ProtocolError("upload isn't the size of one checkpoint for this job")
             mine = self.uploads.setdefault(addr, set())

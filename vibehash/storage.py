@@ -27,7 +27,8 @@ def record_blobs(record: dict) -> set[str]:
     keeps them (the third review's finding A: evidence pruned at the round's end left validators nothing to referee)."""
     keep: set[str] = set()
     for rv in record.get("reveals", []):
-        keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values())] if b)
+        keep.update(b for b in [rv.get("final"), *(o[0] for o in (rv.get("openings") or {}).values()),
+                                (rv.get("es") or {}).get("answers")] if b)
     for g in record.get("games", []):
         for env in g.get("moves", []):
             move = (env.get("body") or env).get("move") if isinstance(env, dict) else None
