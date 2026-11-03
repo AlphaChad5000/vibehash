@@ -122,7 +122,15 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
-**Unreleased (2026-11-02, branch `claude/trusting-germain-1fbaf8`): why honest fine-tune workers slashed each other on
+**0.5.10's checks, run before release on the owner's PC:** one real Qwen3-0.6B segment (64 tokens, batch 8) trained on the
+RTX 4070 SUPER and replayed on the CPU: rule 1 refuses it, rule 2 (adam_reproduces) takes it; round 7280's two real
+replicas of unit 1a2c65f5 (the owner's PC and a friend's) agree by replicas_agree, and an untrained copy doesn't. PR #20's
+CI ran 639 tests on Linux (3.10, 3.12) with one failure, test_selftest's fruit-demo hash, which had failed on main since
+0.5.7: an .npz's bytes depend on the system that writes it (zip metadata), so selftest now checks the public dataset by
+its arrays (selftest.arrays_sha, FRUIT_ARRAYS, checked against the dataset the node serves). Every machine that mines
+fine-tunes needs 0.5.10: a 0.5.9 checker still compares by rule 1.
+
+**Release 0.5.10 (2026-11-02, test night; PR #20): why honest fine-tune workers slashed each other on
 test night, fixed.** Job `pokemon-pun-starter-2d950a` (Qwen3-0.6B LoRA, 64 tokens, batch 8, 16 steps in 4 segments)
 was trained by the owner's RTX 4070 SUPER and a friend's PC. In rounds 7277 and 7280 each rejected the other's units at
 segment 0, replicas disagreed, and every dispute ended "the defender didn't split in time", so honest defenders were

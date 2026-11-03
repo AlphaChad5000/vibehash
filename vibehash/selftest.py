@@ -43,7 +43,10 @@ from . import advice, hardware, settings, termui, unattended
 from .tasks import SYN_PER_VIBE
 
 PYPI = "https://pypi.org/pypi/vibehash/json"
-FRUIT_SHA = "6c20387fc773f32fe44da0a87dfad7b55747d737beb4b1530568885a82eaab7b"  # the public fruit-demo job's dataset
+# The public fruit-demo job's dataset, by what's in it (arrays_sha): its file (sha256 6c20387f...) came from Windows, and
+# the same arrays saved on Linux, or by another Python or NumPy, are other bytes (an .npz is a zip, which notes the system
+# that wrote it), so the file's hash only matched where it was made. CI on Linux found it.
+FRUIT_ARRAYS = "60107810e50f4a90efaf0d9e845ac457756be0887c23652ae6bf252992591ccf"
 SKEW_WARN_S = 30  # a clock this far off still works, but drifts: worth fixing before it doesn't
 CACHE_FOR_FINETUNES = 10e9  # Qwen3-4B's 8 GB of weights, plus room
 STORE_FOR_DEEPSEEK = 40e9  # DeepSeek's ~30 GB of model files, hand-offs and modelstore's 2 GB margin (the menu says 40)
@@ -308,9 +311,20 @@ def choose(found: list[Device], want: str = "auto") -> Device:
 
 # --- training ---------------------------------------------------------------------------------------------------------
 
+def arrays_sha(data) -> str:
+    """A dataset's sha256 by its contents: each array's name, type, shape and little-endian bytes, in a fixed order. The
+    same wherever it's worked out, unlike its .npz file's."""
+    h = hashlib.sha256()
+    for name in ("x_train", "y_train", "x_val", "y_val"):
+        a = np.ascontiguousarray(getattr(data, name))
+        h.update(f"{name} {a.dtype.str} {a.shape}\n".encode())
+        h.update(a.astype(a.dtype.newbyteorder("<"), copy=False).tobytes())
+    return h.hexdigest()
+
+
 def fruit_job():
     """The public network's fruit-demo job, as `vibehash train fruit.csv` posted it, with its dataset attached: the
-    packaged fruit.csv makes it byte for byte."""
+    packaged fruit.csv makes the same arrays (FRUIT_ARRAYS), though not the same file bytes everywhere."""
     from importlib import resources
 
     from . import tabular
