@@ -17,6 +17,7 @@ The loop is written out rather than hidden in a trainer library, so every step i
      examples' wording, and the held-back loss rises again.
 """
 import argparse
+import hashlib
 import json
 import random
 import time
@@ -43,6 +44,15 @@ def encode(tok, user: str, reply: str, max_len: int) -> dict:
     answer = tok(reply + tok.eos_token, add_special_tokens=False).input_ids
     ids = (prompt + answer)[:max_len]
     return {"input_ids": ids, "labels": ([IGNORE] * len(prompt) + answer)[:max_len]}
+
+
+def sha256(path: Path) -> str:
+    """A file's SHA-256: the same chats and the same adapter always give the same digest, so a run can be checked."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def score(model, batch: list[dict]) -> tuple[float, float]:
@@ -122,11 +132,18 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
     after = history[kept]["loss"]
     adapter = out / chats.stem
     model.save_pretrained(str(adapter))  # only the LoRA matrices: a few megabytes
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    weights = next((f for f in adapter.glob("adapter_model.*")), None)
     report = {"chats": str(chats), "base": base, "repo": BASES[base], "rank": rank, "epochs": epochs, "kept_epoch": kept, "lr": lr,
               "training_chats": len(training), "heldout_chats": held, "heldout_loss_before": round(before, 4),
               "heldout_loss_after": after, "history": history,
-              "trainable_weights": sum(p.numel() for p in model.parameters() if p.requires_grad), "device": torch.cuda.get_device_name() if gpu else "cpu",
-              "minutes": round((time.time() - started) / 60, 1)}
+              "trainable_weights": trainable, "device": torch.cuda.get_device_name() if gpu else "cpu",
+              "minutes": round((time.time() - started) / 60, 1),
+              # the receipt: enough to check a published run is the one that was trained, and what it took
+              "frozen_weights": sum(p.numel() for p in model.parameters()) - trainable,
+              "lora_alpha": 2 * rank,  # set in LoraConfig above
+              "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 2**20, 1) if gpu else None,
+              "dataset_sha256": sha256(chats), "adapter_sha256": sha256(weights) if weights else None}
     (adapter / "train_report.json").write_text(json.dumps(report, indent=2))
     print(f"held-back loss {before:.3f} -> {after:.3f}, keeping epoch {kept} of {epochs}; adapter in {adapter}")
     return adapter

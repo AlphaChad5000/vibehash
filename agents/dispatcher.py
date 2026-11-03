@@ -210,6 +210,14 @@ def run(site, req: dict, a) -> None:
         site.report(rid, "training", f"round {n}: the Job Architect is writing chats aimed at the prompts it lost")
         graded = json.loads((out / f"{plan['job_id']}.eval.answers.graded.json").read_text())
         fix = architect.repair(plan, graded)
+        # What this round lost and what the Job Architect wrote about it, for the results page: a few of each
+        results[-1]["repair"] = {
+            "missed": len(architect.lost(graded)),
+            "sample_misses": [{"prompt": p["prompt"][:600], "tuned": p["tuned"][:600],
+                               "prompted": (p.get("prompted") or "")[:600], "reason": architect.why(p)[:400]}
+                              for p in architect.lost(graded)[:3]],
+            "sample_repairs": [{"user": e["user"][:600], "assistant": e["assistant"][:600]} for e in fix["examples"][:2]],
+            "new_chats": len(fix["examples"])}
         plan = {**plan, "job_id": f"{job}-r{n}", "examples": plan["examples"] + fix["examples"],
                 "eval_prompts": fix["eval_prompts"]}
         chats, evals = architect.save(plan, out)
@@ -223,6 +231,7 @@ def run(site, req: dict, a) -> None:
     result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")},
                          "vs_prompted": r["judge"].get("vs_prompted", {}).get("tuned_wins")}
                         | {s: wins(r["judge"][s]) for s in [*judge.SETS, judge.FRESH] if r["judge"].get(s)}
+                        | ({"repair": r["repair"]} if r.get("repair") else {})
                         for i, r in enumerate(results)]
     result["rigor"] = {"level": rigor, "met": good_enough(result, rigor) if RIGOR[rigor]["repairs"] else None}
     j = result["judge"]

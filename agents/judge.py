@@ -39,6 +39,29 @@ PROMPTED = "Follow this instruction in every reply: {goal}"
 SECOND = os.environ.get("JUDGE2_MODEL", "muse-spark-1.3-contributor")
 
 
+def wants_json(goal: str) -> bool:
+    return bool(re.search(r"\bjson\b", goal, re.I))
+
+
+def is_json(reply: str) -> bool:
+    """A reply that is one JSON object and nothing else: no ``` fences, no prose before or after, no empty values.
+    For a goal that asks for JSON, this is a score code measures, beside the judge's."""
+    try:
+        value = json.loads(reply.strip())
+    except ValueError:
+        return False
+    return isinstance(value, dict) and bool(value) and all(v not in ("", None, [], {}) for v in value.values())
+
+
+def structure(pairs: list[dict], goal: str) -> dict | None:
+    """Share of each model's replies that are clean JSON, when the goal asks for JSON (None otherwise)."""
+    if not wants_json(goal) or not pairs:
+        return None
+    rate = lambda side: round(sum(is_json(p.get(side) or "") for p in pairs) / len(pairs), 3)
+    return {"check": "json", "prompts": len(pairs), "tuned": rate("tuned"), "prompted": rate("prompted"),
+            "base": rate("base")}
+
+
 def fixed(name: str) -> list[str]:
     """A file of prompts: a paragraph on what they're for, then the prompts, each after a line of ====="""
     return [p.strip() for p in Path(__file__).with_name(name).read_text(encoding="utf-8").split("\n=====\n")[1:]]
@@ -232,6 +255,8 @@ def grade(answers_file: Path, on_verdict=None) -> None:
                 on_verdict(i, pair)
     data["model"] = model_name()
     data["summary"] = summary([p for p in data["pairs"] if not p.get("set")])
+    if checked := structure(data["pairs"], data["goal"]):  # over every prompt: the goal wins, even on a long brief
+        data["summary"]["structure"] = checked
     if data.get("cost"):
         data["summary"]["cost"] = data["cost"]
     for name in [*SETS, FRESH]:

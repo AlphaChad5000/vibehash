@@ -179,13 +179,25 @@ prompts below. Reply with ONE JSON object:
 {SHAPES}"""
 
 
+def why(pair: dict) -> str:
+    """The judge's reason for a lost prompt: against the model told the goal if it lost there, else the untrained."""
+    told = pair.get("vs_prompted")
+    return (told if told and not told["tuned_won"] else pair["verdict"]).get("reason") or ""
+
+
+def lost(graded: dict) -> list[dict]:
+    """The test prompts the fine-tune didn't win, against the untrained model or the model told the goal (the rival
+    a Standard or Strict request's bar is measured against). Never the fixed sets or the judge's own prompts
+    (judge.SETS, judge.FRESH): no run may be repaired against them."""
+    return [p for p in graded["pairs"] if not p.get("set") and
+            (not p["verdict"]["tuned_won"] or not p.get("vs_prompted", {}).get("tuned_won", True))]
+
+
 def repair(plan: dict, graded: dict) -> dict:
     """Round 2+: more chats aimed at the prompts the fine-tune lost or tied, and fresh test prompts, so the repaired
     model is judged on prompts it wasn't repaired against."""
-    # Not the fixed sets or the judge's own prompts (judge.SETS, judge.FRESH): no run may be repaired against them
-    misses = [p for p in graded["pairs"] if not p["verdict"]["tuned_won"] and not p.get("set")]
-    report = "\n\n".join(f"Prompt: {p['prompt']}\nFine-tune replied: {p['tuned']}\nJudge: {p['verdict'].get('reason')}"
-                         for p in misses)
+    misses = lost(graded)
+    report = "\n\n".join(f"Prompt: {p['prompt']}\nFine-tune replied: {p['tuned']}\nJudge: {why(p)}" for p in misses)
     seen = set(plan["eval_prompts"]) | {e["user"] for e in plan["examples"]}
     ask = [{"role": "system", "content": REPAIR}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{report}"}]
     for attempt in range(3):
