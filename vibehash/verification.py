@@ -91,9 +91,72 @@ def _reproduces(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, tole
     return err <= max(UPDATE_TOLERANCE * np.linalg.norm(expected - start), np.finfo(spec.dtype).eps * np.linalg.norm(expected))
 
 
+# How a fine-tune's checkpoints are compared, by version: a fine-tune round's record["rules"]["finetune_check"], and 1
+# for rounds recorded before there was a choice, so every round replays by its own rule. Checkers use the newest.
+#   1: reproduces(): B, m and v each within the job's tolerance of its size and 1% of its change; replicas the same, at
+#      finetune.WHOLE_TOLERANCE. Honest workers on different devices failed it (round 7280 on 2026-11-02, below).
+#   2: adam_reproduces() and replicas_agree().
+FINETUNE_CHECK = 2
+# Rule 2's numbers, measured on round 7280's unit (Qwen3-0.6B, rank 16, 64 tokens, batch 8, lr 5e-4) trained on an RTX
+# 4070 SUPER and replayed on the CPU, against the same unit trained with TF32 on (a cheaper, less precise worker):
+#   - A gradient's cross-device noise depends on the data: about 7e-6 of its size on most batches, 1.3e-4 on the one
+#     holding a sequence whose own gradient was 3.5e-4 apart. The moments are made of gradients, so their part of the
+#     check can't be as tight as the job's 1e-4: honest m and v came out 2.8e-4 and 1.9e-4 apart, TF32 at least 3e-3.
+#   - Each unit's Adam starts from zero moments, and its first step moves every weight of B by lr times the sign of its
+#     gradient. Where a gradient is nearer zero than the two devices' rounding (1e-9 against noise up to 1e-5), the
+#     sign comes out differently and the weight lands up to 2·lr away: 45 of 2.29M weights, enough on their own to fail
+#     rule 1. Set aside, the rest of B was 2.1e-4 of the first segment's change apart; TF32's was 3.4e-2, with 3,927
+#     weights flipped. Later segments, from built-up moments, replay to about 1e-6 of B's size (TF32: 4.5e-4).
+MOMENT_TOLERANCE = 1e-3  # m and v: of their size (or the job's tolerance, if that's larger), and 1% of their change
+FRESH_TOLERANCE = 1e-3  # B in a segment from zero moments, once its flips are set aside: of the segment's change
+FLIP_SHARE = 1e-4  # B's weights that may land a flip apart from zero moments: 5 times the share measured
+
+
+def adam_reproduces(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, tolerance: float, spec, lr: float,
+                    steps: int) -> bool:
+    """Rule 2 (FINETUNE_CHECK) for a fine-tune's segment of `steps` Adam steps from `start`, which a replay says ends at
+    `expected`. m and v: within MOMENT_TOLERANCE of their size and 1% of their change. B: from built-up moments, as rule
+    1 has it (the job's tolerance of its size, 1% of its change); from zero moments (a unit's first segment), its
+    FLIP_SHARE furthest weights are set aside, each still no further than two runs of Adam can put it, and the rest
+    within FRESH_TOLERANCE of the segment's change. A worker that skipped training (the freezer), trained on other
+    batches (a canary) or in TF32 still fails: measured above."""
+    b, m, v = spec.parts
+    moments = max(tolerance, MOMENT_TOLERANCE)
+    if not all(_reproduces(claim[p], expected[p], start[p], moments, spec) for p in (m, v)):
+        return False
+    if np.any(start[m]) or np.any(start[v]):  # Adam's steps from moments built up are smooth: nothing flips
+        return _reproduces(claim[b], expected[b], start[b], tolerance, spec)
+    return _flips_aside(claim[b], expected[b], start[b], FRESH_TOLERANCE, spec, lr, steps)
+
+
+def replicas_agree(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, spec, lr: float, steps: int) -> bool:
+    """Rule 2 for replicas of a fine-tune's unit, `steps` Adam steps from the round's start (zero moments): B alone,
+    its FLIP_SHARE furthest weights set aside (as adam_reproduces), the rest within 1% of the unit's change. The moments
+    are left out: they're zeroed once the round's results are averaged (LoraSpec.fresh), and each replica's are checked
+    segment by segment by its checkers. Over a whole unit the flips' effect on later gradients builds up: measured,
+    replicas' m 2e-2 apart after 16 steps, B 1.6e-3 of its change once the flips are set aside."""
+    b = spec.parts[0]
+    return _flips_aside(claim[b], expected[b], start[b], UPDATE_TOLERANCE, spec, lr, steps)
+
+
+def _flips_aside(claim: np.ndarray, expected: np.ndarray, start: np.ndarray, fraction: float, spec, lr: float,
+                 steps: int) -> bool:
+    """B within `fraction` of its change once the FLIP_SHARE of weights furthest from `expected` are set aside, and
+    none of those further than two runs of `steps` Adam steps can be apart (LoraSpec.max_step each)."""
+    d = np.abs(np.asarray(claim, dtype=np.float64) - expected)
+    if not np.all(d <= 2 * spec.max_step(lr, steps) * (1 + 1e-6)):  # (NaN fails it too)
+        return False
+    k = min(d.size, int(np.ceil(FLIP_SHARE * d.size)))
+    rest = np.partition(d, d.size - k)[:d.size - k]
+    return np.linalg.norm(rest) <= max(fraction * np.linalg.norm(expected - start),
+                                       np.finfo(spec.dtype).eps * np.linalg.norm(expected))
+
+
 def replay_segment(job: TrainingJob, unit: WorkUnit, seg: int, before: np.ndarray, after: np.ndarray, backend=None) -> bool:
     c = job.checkpoint_every
     expected = train_segment(job.spec, job.data, before, unit.seed, seg * c, c, job.lr, job.batch_size, backend)
+    if job.finetune:
+        return adam_reproduces(after, expected, before, job.tolerance, job.spec, job.lr, c)
     return reproduces(after, expected, before, job.tolerance, job.spec)
 
 
@@ -183,8 +246,9 @@ def replay_cost(job: TrainingJob, n_segments: int) -> int:
 
 
 def replay_openings(job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int],
-                    behavior: str = "honest", backend=None) -> tuple[bool, int | None]:
-    """A verifier's job. Returns (ok, first bad segment)."""
+                    behavior: str = "honest", backend=None, stop=None) -> tuple[bool, int | None] | None:
+    """A verifier's job. Returns (ok, first bad segment), or None if `stop()` turned true before a segment: a worker's
+    checks give way once the verify phase is over, to its disputes (client.WorkerClient._answer)."""
     if behavior == "lazy":
         return True, None
     if behavior == "false_accuser":
@@ -194,6 +258,8 @@ def replay_openings(job: TrainingJob, unit: WorkUnit, openings: dict, segments: 
                                                                          job.checkpoint_every)]
         return (False, bad[0]) if bad else (True, None)
     for seg in segments:
+        if stop is not None and stop():
+            return None
         if not replay_segment(job, unit, seg, openings[seg][0], openings[seg + 1][0], backend):
             return False, seg
     return True, None

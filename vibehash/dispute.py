@@ -456,6 +456,9 @@ class Game:
     evidence: bytes | None = None
     leaf: object = None  # the op picked, once it is one
     seed: int = 0  # the unit's, which the parties' program.Program needs
+    # States the node built from the defender's own checkpoints (Coordinator._open_game): a split at a unit names them,
+    # so a defender sends nothing it uploaded before. Not part of the game's record.
+    ready: list = field(default_factory=list)
 
     def node(self, prog):
         n = prog.segment(int(self.root[1])) if self.root[0] == "segment" else prog.unit()
@@ -483,7 +486,7 @@ class Game:
                 "a": self.a, "b": self.b, "turn": self.turn, "roots": self.roots, "tile": self.tile,
                 "groups": [list(g) for g in groups(self.lo, self.hi)] if self.turn in ("split", "pick") else None,
                 "n": len(self.moves), "deadline": self.deadline, "outcome": self.outcome, "detail": self.detail,
-                "seed": self.seed, "played": self.played}
+                "seed": self.seed, "played": self.played, "ready": list(self.ready)}
 
     def entry(self) -> dict:
         """The game as the round's record keeps it."""

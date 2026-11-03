@@ -25,8 +25,8 @@ from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair
 from vibehash.ledger import Chain, canonical
 from vibehash.model import Dataset, ModelSpec
-from vibehash.tasks import MAX_SPEC_BYTES, REF_GPU_FLOPS, InvalidJob, TrainingJob, load_dataset
-from vibehash.verification import adam_impossible, rescale_update, reproduces
+from vibehash.tasks import MAX_SPEC_BYTES, REF_DOWNLOAD, REF_GPU_FLOPS, REF_UPLOAD, InvalidJob, TrainingJob, load_dataset
+from vibehash.verification import adam_impossible, adam_reproduces, replicas_agree, rescale_update, reproduces
 
 try:
     import torch
@@ -119,7 +119,8 @@ class SpecTests(unittest.TestCase):
         from vibehash.node import MAX_PHASE_S, Node, PhaseTimes
         node = SimpleNamespace(times=PhaseTimes())
         t, need = Node.times_for(node, job_of()), job_of().phase_lengths()
-        self.assertEqual((need["moves"], t.move_s), (13, max(t.verify_s, need["move"])))  # the tree's depth
+        self.assertEqual((need["moves"], t.move_s),  # the tree's depth; each move as long as it needs, up to an hour in all
+                         (13, min(max(t.verify_s, need["move"]), MAX_PHASE_S / need["moves"])))
         self.assertEqual(t.dispute_s, need["moves"] * t.move_s)
         self.assertEqual(t.round_s, t.register_s + t.compute_s + t.reveal_s + t.verify_s + t.dispute_s)
         self.assertEqual(Node.times_for(node, TrainingJob("j", "", 1, 1)).dispute_s, 0)
@@ -149,7 +150,32 @@ class SpecTests(unittest.TestCase):
         ok = job_of()  # Qwen3-0.6B, 512 tokens, 4 steps a segment: 203 MB, 31 minutes
         moves, split = dispute_size(ok.spec, ok.batch_size, ok.n_segments, ok.checkpoint_every)
         self.assertLessEqual(split, MAX_SPLIT_BYTES)
-        self.assertLessEqual(moves * ok.phase_lengths()["move"], 3600)
+        self.assertLessEqual(moves * (ok.unit_flops / ok.n_segments / REF_GPU_FLOPS + split / REF_UPLOAD
+                                      + split / REF_DOWNLOAD), 3600)  # at the speeds post_job checks it by
+
+    def test_moves_are_timed_for_a_home_uplink(self):
+        """Round 7280 on the public network (2026-11-02): its job (Qwen3-0.6B, 64 tokens) gave each move 53.8 s, the
+        verify phase's length, since its moves were timed at the reference 20 Mbit/s and as if the challenger's
+        download and the defender's upload were one move. Its first split names 83 MB of states, which takes 66 s
+        at 10 Mbit/s. Moves are timed now for a slower computer and link (tasks.MOVE_*): a split's states at 10 Mbit/s
+        and a request a tensor, or a pick's re-run of every segment of a unit, whichever is longer. post_job still
+        judges a job by the reference speeds, so every job it took before it takes now."""
+        from types import SimpleNamespace
+
+        from vibehash.node import Node, PhaseTimes
+        from vibehash.program import dispute_size
+        from vibehash.tasks import MOVE_GPU_FLOPS, MOVE_UPLOAD
+
+        job = job_of(spec=spec_of(seq_len=64), lr=5e-4, batch_size=8, steps_per_unit=16, checkpoint_every=4)
+        moves, split = dispute_size(job.spec, job.batch_size, job.n_segments, job.checkpoint_every)
+        self.assertEqual((moves, round(split / 1e6, 1)), (13, 82.6))
+        t = Node.times_for(SimpleNamespace(times=PhaseTimes()), job)
+        self.assertAlmostEqual(t.verify_s, 53.8, places=1)  # what a move had in round 7280
+        seg = job.unit_flops / job.n_segments / MOVE_GPU_FLOPS
+        self.assertGreater(t.move_s, seg + split / MOVE_UPLOAD)  # a segment re-run and the split sent, at 10 Mbit/s
+        self.assertGreater(t.move_s, job.n_segments * seg)  # a pick at the unit re-runs all of it
+        self.assertLess(split / MOVE_UPLOAD, 53.8 * 1.25)
+        self.assertLessEqual(t.dispute_s, 3600)
 
     def test_the_tree_is_as_deep_as_the_reviewer_measured(self):
         """The second review's finding 6 (t_depth): Qwen3-4B's games take 15 to 21 moves with its settings, Qwen3-0.6B's
@@ -643,6 +669,66 @@ class TrainingTests(unittest.TestCase):
         self.assertTrue(_reproduces(doctored, honest, start, 1e-3, s))
         self.assertFalse(reproduces(doctored, honest, start, 1e-3, s))
         self.assertTrue(reproduces(honest, honest, start, 1e-3, s))
+        self.assertFalse(adam_reproduces(doctored, honest, start, 1e-3, s, 1e-2, 4))
+
+    def test_another_devices_training_passes_rule_2_and_cheats_dont(self):
+        """Round 7280 on the public network (2026-11-02): honest workers on two machines rejected each other's units,
+        and replicas of a unit disagreed (verification.FINETUNE_CHECK). Measured there, and played here: the first Adam
+        step from zero moments goes the other way at a weight whose gradient is nearer zero than the devices' rounding
+        (worker.elsewhere), and the gradients' noise leaves the moments 3e-4 apart. Rule 1 (reproduces) failed both;
+        rule 2 (adam_reproduces, replicas_agree) passes them either way round, and still fails a freezer, another
+        unit's training (a canary), a sign flipped across much of B, a step past Adam's reach, moments 1% off, and a
+        flip from moments built up, where nothing honest flips. At 5e-4, the real job's learning rate (and the largest
+        finetune.settings_for gives): a flip's knock-on through the steps after it grows with the step it took."""
+        from vibehash.tasks import WorkUnit
+        from vibehash.worker import elsewhere
+
+        s, d, lr = self.spec, self.data, 5e-4
+        b, m, v = s.parts
+        job = job_of(s, lr=lr, batch_size=8, steps_per_unit=16, checkpoint_every=4)
+        job._data = d
+        start, unit = s.init_params(), WorkUnit.make(job, 1, 0, b"\0" * 32)
+        honest = s.round(ft.train_segment(s, d, start, unit.seed, 0, 4, lr, 8))
+        flipped = s.round(elsewhere(job, unit, start))
+        self.assertEqual(int(np.sum(np.abs(flipped[b] - honest[b]) > lr)), 1, "one weight stepped the other way")
+        noisy = honest.copy()
+        rng = np.random.default_rng(0)
+        for p in (m, v):
+            noisy[p] *= 1 + 3e-4 * rng.standard_normal(s.n_adapter)
+        noisy = s.round(noisy)
+        for other in (flipped, noisy):
+            self.assertFalse(reproduces(other, honest, start, ft.TOLERANCE, s), "rule 1 failed honest work")
+            self.assertTrue(adam_reproduces(other, honest, start, ft.TOLERANCE, s, lr, 4))
+            self.assertTrue(adam_reproduces(honest, other, start, ft.TOLERANCE, s, lr, 4))
+
+        def fails(claim, expected=honest, begin=start):
+            self.assertFalse(adam_reproduces(s.round(claim), expected, begin, ft.TOLERANCE, s, lr, 4))
+        fails(start)  # the freezer
+        fails(ft.train_segment(s, d, start, unit.seed + 1, 0, 4, lr, 8))  # another unit's batches: a canary
+        signs = honest.copy()
+        signs[b] = np.where(rng.random(s.n_adapter) < 0.02, -honest[b], honest[b])
+        fails(signs)
+        far = honest.copy()
+        far[b.start] += 3 * s.max_step(lr, 4)
+        fails(far)
+        moments = honest.copy()
+        moments[m] *= 1.01
+        fails(moments)
+        later = s.round(ft.train_segment(s, d, honest, unit.seed, 4, 4, lr, 8))  # segment 1, from moments built up
+        one = later.copy()
+        one[b.start] += 2 * lr
+        self.assertTrue(adam_reproduces(later, later, honest, ft.TOLERANCE, s, lr, 4))
+        fails(one, later, honest)
+
+        # Replicas: a whole unit each, from the same start; B alone is compared, with the flips set aside.
+        whole = s.round(ft.train_segment(s, d, start, unit.seed, 0, 16, lr, 8))
+        there = s.round(ft.train_segment(s, d, flipped, unit.seed, 4, 12, lr, 8))
+        self.assertFalse(reproduces(there, whole, start, ft.WHOLE_TOLERANCE, s), "rule 1 failed honest replicas")
+        self.assertTrue(replicas_agree(there, whole, start, s, lr, 16))
+        self.assertTrue(replicas_agree(whole, there, start, s, lr, 16))
+        self.assertFalse(replicas_agree(start, whole, start, s, lr, 16))
+        self.assertFalse(replicas_agree(s.round(ft.train_segment(s, d, start, unit.seed + 1, 0, 16, lr, 8)), whole,
+                                        start, s, lr, 16))
 
 
 @needs_torch
@@ -787,12 +873,12 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.workers = [Worker(f"w{i}", KeyPair.generate(f"w{i}".encode()), hw, *b, fp_noise=0) for i, b in enumerate(behaviors)]
         self.by = {w.address: w for w in self.workers}
         req = KeyPair.generate(b"req")
-        stakes = cfg.pop("stakes", None)
+        stakes, lr = cfg.pop("stakes", None), cfg.pop("lr", 1e-2)
         chain = Chain({req.address: 1000 * VIBE}, stakes=stakes or {w.address: 10 * VIBE for w in self.workers},
                       earn_in=cfg.pop("earn_in", False))
         self.proto = Protocol(chain, self.workers, CoordinatorConfig(**cfg), seed=3)
         self.job = job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": self.sha}, units_per_round=8,
-                          lr=1e-2, memory_mb=2048, budget=100 * VIBE, fee_per_round=10 * VIBE)
+                          lr=lr, memory_mb=2048, budget=100 * VIBE, fee_per_round=10 * VIBE)
         self.job.attach_data(load_dataset(path), self.sha)
         patch = mock.patch("os.urandom", _Seeded())
         patch.start()
@@ -1337,6 +1423,32 @@ class NodeFreeRoundTests(unittest.TestCase):
             self.assertEqual(self.results(caught)[key].verdict.value, "unchecked")
         self.replays(reports)
 
+    def test_a_worker_on_other_hardware_is_accepted_and_old_rounds_keep_rule_1(self):
+        """Round 7280 on the public network: an honest worker whose GPU rounds differently (worker.elsewhere) had its
+        units rejected and its replicas disputed. Under rule 2 (verification.FINETUNE_CHECK) every one of its claims is
+        accepted and no replica disputes, and the round replays. A round under rule 1, recorded as rounds were before
+        there was a choice (no "finetune_check" among its rules), still compares its replicas by rule 1 when replayed:
+        its twins disagree, and the replay's recheck agrees with that."""
+        self.network([("honest", "honest")] * 3 + [("elsewhere", "honest")], replication_rate=1.0, canaries_per_round=0,
+                     lr=5e-4)  # (the real job's: see test_another_devices_training_passes_rule_2_and_cheats_dont)
+        there = self.workers[-1].address
+        rep = self.round()
+        self.assertEqual(rep.record["rules"]["finetune_check"], 2)
+        mine = [k for k in self.results(rep) if k[1] == there]
+        self.assertTrue(mine, "the worker on other hardware trained units")
+        self.assertTrue(all(res.verdict.value == "accepted" for res in rep.results), rep.results)
+        self.assertFalse(self.games)
+        self.assertTrue(all(rep.record["checks"]["redundancy"].values()))
+        self.replays([rep])
+
+        self.network([("honest", "honest")] * 3 + [("elsewhere", "honest")], replication_rate=1.0, canaries_per_round=0,
+                     lr=5e-4, finetune_check=1)
+        old = self.round(moves=lambda g, who: {"concede": True} if who == g["challenger"] else "default")
+        self.assertNotIn("finetune_check", old.record["rules"])
+        self.assertFalse(all(old.record["checks"]["redundancy"].values()), "rule 1: its twins disagree")
+        self.assertTrue(self.games)
+        self.replays([old])
+
     def test_two_workers_are_enough_to_start(self):
         """With the node refereeing, one honest checker a claim makes its verdict right: two staked workers train,
         checking each other."""
@@ -1507,14 +1619,25 @@ class ClientMoveTests(unittest.TestCase):
 
         from vibehash.client import NodeError, WorkerClient, WorkerStats, _NoLog
 
-        game = {"id": "g1", "turn": "split", "defender": "me", "challenger": "them", "n": 3, "seed": 1}
+        import threading
+        from concurrent.futures import Future
+
+        class Inline:  # moves are worked out in threads (WorkerClient._pool): here, one at a time as they're asked for
+            def submit(self, fn, *args):
+                f = Future()
+                f.set_result(fn(*args))
+                return f
+        game = {"id": "g1", "turn": "split", "defender": "me", "challenger": "them", "n": 3, "seed": 1,
+                "unit": "u1", "root": ["segment", 0], "a": "a" * 64, "b": "b" * 64}
         node = SimpleNamespace(get=lambda path: [dict(game)])
         party = SimpleNamespace(split=mock.Mock(return_value=["a" * 64, "b" * 64]))
         w = WorkerClient.__new__(WorkerClient)
         w.node, w.stats, w.moved, w.unsent = node, WorkerStats(), set(), {}
+        w.moving, w._moves_lock, w._pool = set(), threading.Lock(), Inline()
         w.home, w._last_said = SimpleNamespace(url="http://node.test"), ("", 0.0)  # what _try's warning reads
         w.record = _NoLog()
-        w.party, w.worker = {5: party}, SimpleNamespace(verifier_behavior="honest", keys=SimpleNamespace(address="me"))
+        w.party = {5: party}
+        w.worker = SimpleNamespace(verifier_behavior="honest", keys=SimpleNamespace(address="me"), _work={})
         sent = []
 
         def signed(kind, body):
@@ -1696,6 +1819,37 @@ class RealModelTests(unittest.TestCase):
                   f"{gap / np.linalg.norm(replay[part] - start[part]):.1e} of the segment's change")
         self.assertTrue(reproduces(claim, replay, start, ft.TOLERANCE, s))
         self.assertFalse(reproduces(rescale_update(s, start, claim, Draw(b"x")), replay, start, ft.TOLERANCE, s))
+
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs CUDA")
+    def test_round_7280s_segment_replays_on_the_cpu_by_rule_2(self):
+        """The public network's round 7280 (2026-11-02), as the owner measured it: a unit's first segment from fresh
+        adapters, 64-token sequences, batch 8, Qwen3-0.6B's learning rate, on CUDA, replayed on the CPU. Adam's first
+        step flips weights whose gradient is nearer zero than the devices' rounding, so rule 1 (reproduces) fails it;
+        rule 2 (adam_reproduces) passes it, and fails the same segment trained with TF32 on."""
+        from vibehash import compute
+        from vibehash.selftest import _token_data
+
+        spec = ft.LoraSpec(base=self.spec.base, manifest=self.spec.manifest, dims=dict(self.spec.dims), seq_len=64)
+        data = _token_data(self.mbytes, self.config, spec.model["vocab"], 64, 32, 8)
+        lr = ft.settings_for(spec.model)["lr"]
+        gpu, cpu = compute.TorchBackend("cuda:0"), compute.TorchBackend("cpu")
+        start = spec.init_params()
+        claim = spec.round(ft.train_segment(spec, data, start, 1, 0, 4, lr, 8, gpu))
+        replay = spec.round(ft.train_segment(spec, data, start, 1, 0, 4, lr, 8, cpu))
+        for name, part in zip("Bmv", spec.parts):
+            gap = np.linalg.norm(claim[part] - replay[part])
+            print(f"\n  {name}: CPU replay {gap / np.linalg.norm(replay[part]):.1e} of its size apart", end="")
+        flips = int(np.sum(np.abs(claim[spec.parts[0]] - replay[spec.parts[0]]) > lr / 2))
+        print(f"; {flips} of {spec.n_adapter} weights a step apart")
+        self.assertFalse(reproduces(claim, replay, start, ft.TOLERANCE, spec), "rule 1 rejects honest work")
+        self.assertTrue(adam_reproduces(claim, replay, start, ft.TOLERANCE, spec, lr, 4))
+        self.assertTrue(adam_reproduces(replay, claim, start, ft.TOLERANCE, spec, lr, 4))
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # (after the runtime's TorchBackend turned it off)
+            tf32 = spec.round(ft.train_segment(spec, data, start, 1, 0, 4, lr, 8, gpu))
+        finally:
+            compute.TorchBackend("cuda:0")
+        self.assertFalse(adam_reproduces(tf32, replay, start, ft.TOLERANCE, spec, lr, 4), "a TF32 worker fails")
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "needs CUDA")
     def test_a_whole_unit_on_cuda_replays_on_the_cpu(self):

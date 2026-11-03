@@ -34,6 +34,10 @@ log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
 PARALLEL_REQUESTS = 4  # in flight at once for a round's reveals or a unit's uploads: plenty, and gentle on a small node
+# A dispute's state tensors in flight at once (tasks.MOVE_PARALLEL times moves by it): a state is a blob a tensor, 336
+# for Qwen3-0.6B's adapters, and one at a time to a distant node took a defender past its move (round 7280).
+TRACE_REQUESTS = 8
+DISPUTE_THREADS = 4  # games whose moves are worked out at once (re-runs take turns on the GPU; uploads overlap)
 # The most of a reply we read, so a node can't feed us gigabytes: the biggest JSON a node sends is a round record or
 # a batch of blocks, each at most a proposal's size (node.MAX_PROPOSAL), and binary replies are one chunk.
 MAX_REPLY = 128 * 2**20
@@ -137,6 +141,12 @@ class NodeClient:
 
     # --- binary transfers -----------------------------------------------------------
 
+    def _auth(self, keys: KeyPair, kind: str, blob_id: str, total: int) -> dict:
+        ts = int(time.time())
+        sig = keys.sign(canonical([self.chain_id, kind, blob_id, total, ts]))
+        return {"X-VibeHash-Pubkey": keys.public.hex(), "X-VibeHash-Sig": sig.hex(), "X-VibeHash-Ts": str(ts),
+                "X-Total": str(total), "Content-Type": "application/octet-stream"}
+
     def upload(self, keys: KeyPair, kind: str, path: Path, blob_id: str) -> None:
         """Send a file in chunks, resuming from whatever the node already has. kind: 'blob' or 'dataset'."""
         total = path.stat().st_size
@@ -146,10 +156,7 @@ class NodeClient:
                 if st["complete"]:
                     return
                 offset = st["received"]
-                ts = int(time.time())
-                sig = keys.sign(canonical([self.chain_id, kind, blob_id, total, ts]))
-                auth = {"X-VibeHash-Pubkey": keys.public.hex(), "X-VibeHash-Sig": sig.hex(), "X-VibeHash-Ts": str(ts),
-                        "X-Total": str(total), "Content-Type": "application/octet-stream"}
+                auth = self._auth(keys, kind, blob_id, total)
                 with open(path, "rb") as f:
                     f.seek(offset)
                     while offset < total:
@@ -161,6 +168,18 @@ class NodeClient:
                 if not e.retryable or attempt == RETRIES - 1:
                     raise
                 time.sleep(1 + attempt)
+
+    def put_blob(self, keys: KeyPair, raw: bytes, blob_id: str) -> None:
+        """A blob of at most a chunk in one request, without asking first how much of it the node has (upload's way, a
+        round trip more each, which a dispute's hundreds of small tensors can't spare): a node that holds it already
+        takes it as done. NodeError if it isn't taken (a node holding part of it wants the rest from where it got to)."""
+        self._req("PUT", f"/blob/{blob_id}", raw, self._auth(keys, "blob", blob_id, len(raw)) | {"X-Offset": "0"})
+
+    def get_blob(self, blob_id: str) -> bytes | None:
+        """A blob of less than a chunk in one request, checked against its id (download asks for its size first, a
+        round trip more), or None when it's more than that: then download it."""
+        raw = self._req("GET", f"/blob/{blob_id}?offset=0", limit=CHUNK)
+        return raw if len(raw) < CHUNK and hashlib.sha256(raw).hexdigest() == blob_id else None
 
     def download(self, kind: str, blob_id: str, store: BlobStore, size: int | None = None, check=None) -> Path:
         """Fetch a file in chunks into `store`, resuming a partial copy. The store checks the hash, and `check` (if
@@ -344,6 +363,18 @@ class WorkerClient:
         self.moved: set[tuple] = set()  # (round, dispute, move number) the node took our move for
         self.unsent: dict[tuple, dict] = {}  # moves worked out whose sending failed: sent again, not worked out again
         self.party: dict = {}  # this round's tracer.Party, for its disputes
+        # Disputes come first. A round's checks run beside the loop (`checking`), so it sees the dispute phase open
+        # and starts its moves at once, each game's in a thread of its own (`moving`), while a check finishes the
+        # segment it's on and stops. Round 7280 on the public network: a defender still checking when its dispute
+        # opened, then fetching and sending states a tensor at a time, made its first move a minute late and lost its
+        # stake. A round's units and checkpoints are kept until its disputes are over (_tidy): a split at a unit sends
+        # the checkpoints the node has had since compute, and the states a game starts from are the defender's own.
+        self.checking: threading.Thread | None = None
+        self.moving: set[tuple] = set()  # (round, dispute, move number) of moves being worked out
+        self._pool = None  # those threads (concurrent.futures), made when first needed
+        self._moves_lock = threading.Lock()
+        self.seen: tuple = (None, None)  # (round, phase) as the last poll found them, which a check stops by
+        self.untidy: set[int] = set()  # rounds whose checkpoints and downloads are still kept
         self.genesis_hash: str | None = None
         self.stats = WorkerStats()
         self.receipt_file = cache / "receipts.jsonl"  # every receipt, kept as evidence (see receipts.py)
@@ -574,6 +605,12 @@ class WorkerClient:
         st = self.stats
         st.phase, st.phase_ends, st.height = phase, s["phase_ends"], s["height"]
         st.progress = termui.parse_progress(s.get("progress"))
+        self.seen = (rnd, phase)
+        if rnd is None or phase in ("register", "compute"):
+            if self.checking is not None and self.checking.is_alive():  # an earlier round's, stopping at its next segment
+                self.checking.join()
+            if phase != "compute":  # (before this round has files of its own: pruning empties the folder)
+                self._tidy(rnd)
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join
@@ -648,6 +685,7 @@ class WorkerClient:
                 self.record.note(rnd, kind="deepseek-training")
                 self.ds.records(rnd, job)
             if units:
+                self.untidy.add(rnd)
                 p = self.node.get("/round/params")
                 self.node.download("blob", p["blob"], self.blobs, size=job.checkpoint_bytes)
                 start = self.blobs.load(p["blob"], job.wire_dtype, job.spec.n_params)
@@ -710,26 +748,39 @@ class WorkerClient:
         elif phase == "verify":
             absent = self.worker.verifier_behavior == "absent"  # tests only: a checker that never answers
             tasks = [] if absent else self.node.signed(k, "tasks", {"round": rnd})["tasks"]
-            t0 = time.perf_counter()
-            try:
-                self._answer(rnd, job, tasks)
-            finally:
-                self.record.add(rnd, checks_given=len(tasks), **({"check_s": time.perf_counter() - t0} if tasks else {}))
+            self.untidy.add(rnd)
             st.activity = "round done; waiting for the block"
-            if tasks:
-                log.info("round %d: verified %d tasks", rnd, len(tasks))
-            for u in self.units.pop(rnd, []):
-                self.worker.forget(u.unit_id)
-            self.start_blob.pop(rnd, None)
-            self.uploaded.pop(rnd, None)
-            self.blobs.prune()
+            if tasks:  # beside the loop, which goes on to the round's disputes as soon as they open
+                self.checking = threading.Thread(target=self._check, args=(rnd, job, tasks), daemon=True, name="checks")
+                self.checking.start()
+            else:
+                self.record.add(rnd, checks_given=0)
         else:
             return
         self.done[key] = True
 
+    def _check(self, rnd: int, job: TrainingJob, tasks: list[dict]) -> None:
+        """The verify phase's checks, in a thread of their own (`checking`)."""
+        t0, before = time.perf_counter(), self.stats.checks
+        try:
+            self._answer(rnd, job, tasks)
+        except NodeError as e:
+            self._say(logging.WARNING, advice.explain(e, self.home.url) or str(e))
+        except Exception:  # noqa: BLE001 - as the loop does (run): one bad check mustn't stop the worker
+            log.exception("checking round %d's tasks failed", rnd)
+        finally:
+            self.record.add(rnd, checks_given=len(tasks), check_s=time.perf_counter() - t0)
+        log.info("round %d: verified %d of %d tasks", rnd, self.stats.checks - before, len(tasks))
+
+    def _verify_over(self, rnd: int) -> bool:
+        """Whether round `rnd`'s verify phase has ended, as the loop last saw (or by the clock): the node refuses
+        verdicts then, and a fine-tune's disputes may be waiting on this worker's move."""
+        st = self.stats
+        return self.seen != (rnd, "verify") or bool(st.phase_ends and time.time() > st.phase_ends)
+
     def _answer(self, rnd: int, job: TrainingJob, tasks: list[dict]) -> None:
         """Do this phase's tasks and send a verdict for each: replay segments, or score a fine-tune's starting model
-        on its held-back data."""
+        on its held-back data. Stops once the verify phase is over, between tasks and between a check's segments."""
         st = self.stats
         st.busy = bool(tasks)
         # A worker far from the node spent the phase on round trips, a checkpoint and then a verdict at a time: a pod
@@ -739,8 +790,7 @@ class WorkerClient:
         sender = ThreadPoolExecutor(PARALLEL_REQUESTS)
         try:
             for i, t in enumerate(tasks, 1):
-                if st.phase_ends and time.time() > st.phase_ends:
-                    # The node refuses verdicts now, and a fine-tune's disputes may be waiting on this worker's move.
+                if self._verify_over(rnd):
                     log.warning("round %d: the verify phase ended with %d tasks left unchecked", rnd, len(tasks) - i + 1)
                     break
                 kind = t.get("kind", "check")
@@ -763,7 +813,12 @@ class WorkerClient:
                     for j, (bid, proof) in blob_openings_in(t["openings"], job.n_segments).items():
                         self.node.download("blob", bid, self.blobs, size=job.checkpoint_bytes)
                         openings[j] = (self.blobs.load(bid, job.wire_dtype, job.spec.n_params), proof)
-                    ok, bad = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"])
+                    got = self.worker.verify(job, unit_in(t["unit"]), openings, t["segments"],
+                                             stop=lambda: self._verify_over(rnd))
+                    if got is None:  # stopped part way: the phase is over
+                        log.warning("round %d: the verify phase ended with %d tasks left unchecked", rnd, len(tasks) - i + 1)
+                        break
+                    ok, bad = got
                     body |= {"ok": bool(ok), "bad_segment": bad}
                 sender.submit(self._verdict, rnd, kind, body)
                 st.checked += 1
@@ -795,15 +850,30 @@ class WorkerClient:
 
     def _disputes(self, rnd: int, job: TrainingJob) -> None:
         """Make our move in each of this round's disputes that waits on us (dispute.py): as the defender, post the
-        states between our training's ops, or the evidence for one op; as the challenger, name where they go wrong."""
+        states between our training's ops, or the evidence for one op; as the challenger, name where they go wrong.
+        Each game's move is worked out in a thread of its own (_move), so one game's re-run or upload doesn't hold up
+        another's, and the loop keeps polling."""
         st, me = self.stats, self.keys.address
         games = [g for g in self.node.get("/round/games") if g["turn"] != "done"
                  and (g["defender"] if g["turn"] in ("split", "evidence") else g["challenger"]) == me
-                 and (rnd, g["id"], g["n"]) not in self.moved]
+                 and (rnd, g["id"], g["n"]) not in self.moved and (rnd, g["id"], g["n"]) not in self.moving]
         if not games:
-            st.activity = "waiting on this round's disputes"
+            if not self.moving:
+                st.activity = "waiting on this round's disputes"
             return
-        from .program import Program
+        party = self._party(rnd, job)
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(DISPUTE_THREADS, thread_name_prefix="dispute")
+        for g in games:
+            if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
+                continue  # tests only: a challenger that goes quiet
+            key = (rnd, g["id"], g["n"])
+            with self._moves_lock:  # (claimed before the thread starts, which lets go of it when it's done)
+                self.moving.add(key)
+            self._pool.submit(self._move, rnd, job, party, g)
+
+    def _party(self, rnd: int, job: TrainingJob):
+        """This round's tracer.Party (made once), for its disputes."""
         from .tracer import Party
 
         party = self.party.get(rnd)
@@ -823,30 +893,72 @@ class WorkerClient:
                 rt = finetune.runtime(job.spec, job.data, finetune.device_of(self.backend))
                 party = Party(rt, job.spec, job.data, _Remote(self), cheat)
             self.party = {rnd: party}
+        return party
+
+    def _move(self, rnd: int, job: TrainingJob, party, g: dict) -> None:
+        """Work out and send our move in one game (a thread of _disputes')."""
+        from .program import Program
+
+        st, me, key = self.stats, self.keys.address, (rnd, g["id"], g["n"])
         st.busy = True
+        st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
         try:
-            for g in games:
-                if g["turn"] == "pick" and self.worker.verifier_behavior == "quitter":
-                    continue  # tests only: a challenger that goes quiet
-                st.activity = f"dispute {g['id'][:8]}: {g['turn']} ({'defending' if g['defender'] == me else 'challenging'})"
-                key = (rnd, g["id"], g["n"])
+            with self._moves_lock:
                 move = self.unsent.pop(key, None)
-                if move is None:
-                    if job is not None and job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's
-                        prog, p = self.ds.prep_game(rnd, job, g, party.remote)
-                    else:
-                        prog, p = Program.of(job, int(g["seed"])), party
-                    move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g)}
-                            if g["turn"] == "split" else {"evidence": p.remote.put(p.evidence(prog, g))})
-                # Made only once the node takes it: a send that fails is tried again next time round, until the game's
-                # move count passes it (taken after all, or too late).
-                if self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move}) is None:
-                    self.unsent = {k: v for k, v in self.unsent.items() if k[0] == rnd} | {key: move}
+            if move is None:
+                mine = None
+                if job is not None and job.deepseek and g["unit"] in self.ds.names.get(rnd, {}):  # a prep unit's
+                    prog, p = self.ds.prep_game(rnd, job, g, party.remote)
                 else:
-                    self.moved.add(key)
-                    self.record.add(rnd, dispute_moves=1)
+                    prog, p = Program.of(job, int(g["seed"])), party
+                    mine = self._own(job, p, g)
+                move = (p.pick(prog, g) if g["turn"] == "pick" else {"split": p.split(prog, g, mine)}
+                        if g["turn"] == "split" else {"evidence": p.remote.put(p.evidence(prog, g))})
+            # Made only once the node takes it: a send that fails is tried again next time round, until the game's
+            # move count passes it (taken after all, or too late).
+            if self._try(self._signed, "move", {"round": rnd, "game": g["id"], "n": g["n"], "move": move}) is None:
+                with self._moves_lock:
+                    self.unsent = {k: v for k, v in self.unsent.items() if k[0] == rnd} | {key: move}
+            else:
+                self.moved.add(key)
+                self.record.add(rnd, dispute_moves=1)
+        except NodeError as e:
+            self._say(logging.WARNING, advice.explain(e, self.home.url) or str(e))
+        except Exception:  # noqa: BLE001 - as the loop does (run): one game's trouble mustn't stop the others
+            log.exception("dispute %s: working out our move failed", g["id"])
         finally:
-            st.busy = False
+            with self._moves_lock:
+                self.moving.discard(key)
+                st.busy = bool(self.moving)
+
+    def _own(self, job: TrainingJob, party, g: dict) -> list | None:
+        """For a game over a unit we trained: its checkpoints, by segment boundary, after taking the game's ends as
+        states of our own (tracer.Party.adopt) where they're ours, so they needn't be fetched from the node. None for
+        another worker's unit, or a DeepSeek job's (its units train elsewhere: deepseek_client)."""
+        work = self.worker._work.get(g["unit"]) if job is not None and not job.deepseek else None
+        if work is None:
+            return None
+        root = g["root"]
+        ends = (0, job.n_segments) if root == ["unit"] else (int(root[1]), int(root[1]) + 1)
+        for i in ends:
+            if g["a"] not in party.states or g["b"] not in party.states:
+                party.adopt(work.checkpoints[i])
+        return work.checkpoints
+
+    def _tidy(self, rnd: int | None) -> None:
+        """Forget earlier rounds' units, checkpoints and downloads, once their checks and disputes are done (a round's
+        disputes come after its verify phase, and read them). Called while a round registers, before it has any."""
+        done = [r for r in self.untidy if rnd is None or r < rnd]
+        if not done or (self.checking is not None and self.checking.is_alive()) or self.moving:
+            return
+        for r in done:
+            for u in self.units.pop(r, []):
+                self.worker.forget(u.unit_id)
+            self.start_blob.pop(r, None)
+            self.uploaded.pop(r, None)
+            self.party.pop(r, None)
+            self.untidy.discard(r)
+        self.blobs.prune()
 
     def _round_start(self, rnd: int, job: TrainingJob) -> np.ndarray:
         """The weights this round started from, fetched if it trained nothing this round."""
@@ -904,19 +1016,55 @@ class WorkerClient:
 
 
 class _Remote:
-    """A dispute's states and evidence, through the node's blob endpoints (tracer.Party's `remote`)."""
+    """A dispute's states and evidence, through the node's blob endpoints (tracer.Party's `remote`): a state is a blob a
+    tensor, so they go up and down TRACE_REQUESTS at a time, and the small ones in one request each."""
 
     def __init__(self, client: WorkerClient):
         self.client = client
 
     def put(self, raw: bytes) -> str:
+        return self.put_many([raw])[0]
+
+    def put_many(self, raws: list[bytes]) -> list[str]:
         c = self.client
-        bid = c.blobs.put_array(np.frombuffer(raw, dtype=np.uint8), "uint8")
-        c.node.upload(c.keys, "blob", c.blobs.path(bid), bid)
-        return bid
+
+        def one(raw: bytes) -> str:
+            bid = hashlib.sha256(raw).hexdigest()
+            if len(raw) <= CHUNK:
+                try:
+                    c.node.put_blob(c.keys, raw, bid)
+                    return bid
+                except NodeError:  # (part of it there already, or the link dropped: upload resumes, and retries)
+                    pass
+            c.blobs.put_array(np.frombuffer(raw, dtype=np.uint8), "uint8")
+            c.node.upload(c.keys, "blob", c.blobs.path(bid), bid)
+            return bid
+        return _each(one, raws)
 
     def get(self, bid: str) -> bytes:
+        return self.get_many([bid])[0]
+
+    def get_many(self, bids: list[str]) -> list[bytes]:
         c = self.client
-        if not c.blobs.has(bid):
-            c.node.download("blob", bid, c.blobs)
-        return c.blobs.path(bid).read_bytes()
+
+        def one(bid: str) -> bytes:
+            if not c.blobs.has(bid):
+                try:
+                    raw = c.node.get_blob(bid)
+                except NodeError as e:
+                    if not e.retryable:
+                        raise
+                    raw = None
+                if raw is not None:
+                    return raw
+                c.node.download("blob", bid, c.blobs)
+            return c.blobs.path(bid).read_bytes()
+        return _each(one, bids)
+
+
+def _each(fn, items: list) -> list:
+    """fn of each item, TRACE_REQUESTS at a time."""
+    if len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(min(TRACE_REQUESTS, len(items))) as pool:
+        return list(pool.map(fn, items))

@@ -397,9 +397,88 @@ class GameTests(_Tiny):
             tracer.Executor = old
         self.assertFalse(verification.reproduces(lazy, self.unit(), np.zeros(self.spec.n_params), ft.TOLERANCE,
                                                  self.spec), "the checker rejects it")
+        self.assertFalse(verification.adam_reproduces(lazy, self.unit(), np.zeros(self.spec.n_params), ft.TOLERANCE,
+                                                      self.spec, self.lr, self.per), "and by rule 2 (FINETUNE_CHECK)")
         g = self.play(lazy, self.rt, self.rt, party=LazyParty)
         self.assertEqual(g.outcome, "challenger", g.detail)
         self.assertIn(g.leaf.kind, ("linear", "linear_bwd"))
+
+    def test_a_split_at_a_unit_sends_its_checkpoints_and_nothing_the_node_has(self):
+        """Round 7280 on the public network: a defender re-ran its unit's segments to split it, and sent their states
+        tensor by tensor, past its move's deadline. A split at a unit names its segment ends, which are the defender's
+        own checkpoints (the node built those its reveal opened: Coordinator._checkpoint_states, Game.ready), so it
+        re-runs nothing and sends nothing the node has; its roots are the ones re-running gives. The state it defends
+        is one of its own checkpoints too (Party.adopt), so it fetches nothing either."""
+        self.tiny()
+        lr, batch, seed, segments, per = self.lr, self.batch, self.seed, 3, 2
+        prog = Program(self.spec, self.data, lr, batch, seed, segments, per)
+        ckpts = [np.zeros(self.spec.n_params)]
+        for sg in range(segments):
+            ckpts.append(self.spec.round(ft.train_segment(self.spec, self.data, ckpts[-1], seed, sg * per, per, lr, batch)))
+
+        class Counting(_Remote):
+            def __init__(self):
+                super().__init__()
+                self.sent, self.fetched = [], []
+
+            def put(self, raw):
+                self.sent.append(hashlib.sha256(raw).hexdigest())
+                return super().put(raw)
+
+            def get(self, k):
+                self.fetched.append(k)
+                return super().get(k)
+        node = Counting()
+        roots = []
+        for theta in ckpts:  # what the node puts with the game: its ends, and the opened checkpoints between
+            root, m, blobs = dispute.checkpoint_state(self.spec, theta)
+            for b in blobs.values():
+                super(Counting, node).put(b)
+            super(Counting, node).put(m)
+            roots.append(root)
+        g = dispute.Game("g", "u", "D", "C", "replicas", ["unit"], roots[0], roots[-1], seed=seed).start(prog)
+        g.ready = roots[1:-1]
+        view = g.view()
+        self.assertEqual(view["ready"], roots[1:-1])
+        rerun = Party(self.rt, self.spec, self.data, node).split(prog, view)
+        node.sent, node.fetched = [], []
+        d = Party(self.rt, self.spec, self.data, node)
+        d.adopt(ckpts[0])
+        self.assertEqual(d.split(prog, view, ckpts), rerun)
+        self.assertEqual((node.sent, node.fetched), ([], []))
+        g.ready = []  # a node from before: the split's states go up, the manifests and every tensor
+        d = Party(self.rt, self.spec, self.data, node)
+        self.assertEqual(d.split(prog, g.view(), ckpts), rerun)
+        self.assertEqual(len(node.sent), (segments - 1) * (1 + 3 * len(self.spec.modules())))
+
+    def test_two_games_send_a_tensor_they_share_once(self):
+        """A worker's games are played at once (client.WorkerClient._move), and two may name the same tensor: sent by
+        both together, the node's partial file for it was written twice and its upload failed. One sends it; the other
+        waits for that."""
+        import threading
+        import time
+
+        self.tiny()
+
+        class Slow(_Remote):
+            def __init__(self):
+                super().__init__()
+                self.sent = []
+
+            def put(self, raw):
+                self.sent.append(hashlib.sha256(raw).hexdigest())
+                time.sleep(0.2)
+                return super().put(raw)
+        node, shared = Slow(), torch.ones(4, 4)
+        d = Party(self.rt, self.spec, self.data, node)
+        games = [threading.Thread(target=d.publish, args=({"shared": shared, "own": torch.full((4, 4), i + 2.0)},))
+                 for i in range(2)]
+        for g in games:
+            g.start()
+        for g in games:
+            g.join()
+        self.assertEqual(node.sent.count(merkle.blob_of(shared.numpy())), 1)
+        self.assertEqual(len(node.sent), 5)  # the shared tensor, each game's own, and two manifests
 
     def test_an_honest_challenger_withdraws_rather_than_lose(self):
         """A checker that rejected an honest unit (here, told to) finds nothing the referee would refuse when it gets

@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import logging
@@ -466,7 +467,6 @@ class DistantWorkerTest(unittest.TestCase):
         self.assertIn(12, [s.accepted_units for s in worked])
         self.assertEqual(drops, [])
 
-
     def test_a_far_checker_gets_its_verdicts_in_before_the_verify_phase_ends(self):
         """A RunPod pod checking fruit-demo on test night (2026-11-02): "the verify phase ended with 7 tasks left
         unchecked", every round. It fetched each task's checkpoints one at a time and then sent its verdict, a round
@@ -609,6 +609,63 @@ class JobPickerTest(unittest.TestCase):
         self.assertEqual(c.stats.activity, "this test's worker can't run it")
         self.assertFalse(c.choose("another"))
         self.assertTrue(c.choose(None))
+
+
+@unittest.skipIf(importlib.util.find_spec("torch") is None, "needs PyTorch")
+class DistantDefenderTest(unittest.TestCase):
+    def test_a_defender_on_a_slow_link_splits_in_time(self):
+        """Round 7280 on the public network (2026-11-02): an honest worker's claim was disputed, and it lost its stake
+        because its first split reached the node a minute after its move's deadline. Its loop was still checking others'
+        units when the dispute phase opened, and then it fetched the state it was defending, tensor by tensor, and sent
+        its split's states the same way, two round trips to New York each. Here every request of the defender's takes
+        0.3 s (a TLS handshake overseas), and its check of the other worker's unit outlasts the verify phase; a false
+        accuser disputes its claim. Its first split must reach the node in time, and the accuser withdraw."""
+        from tests.finetune_fixtures import TinyModel
+
+        home = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(home.cleanup)
+        tiny = TinyModel(Path(home.name)).use(self)
+        node, api, req, workers, clients, stop, _, _, tmp = start_network(
+            self, 2, times=PhaseTimes(register_s=1.0, compute_s=8.0, reveal_s=3.0, verify_s=3.0, idle_s=0.3),
+            config=CoordinatorConfig(canaries_per_round=0, replication_rate=0.0))
+        far, accuser = clients
+        accuser.worker.verifier_behavior = "false_accuser"
+        near = far.node._open
+
+        def far_open(request):
+            time.sleep(0.3)
+            return near(request)
+        far.node._open = far_open
+        checks = far.worker.verify
+
+        def slow_check(*args, **kw):  # a check that outlasts the verify phase, as a GPU replaying three segments does
+            time.sleep(6)
+            return checks(*args, **kw)
+        far.worker.verify = slow_check
+        sha = api.upload_dataset(req, tiny.dataset().save(tmp / "chats.npz"))
+        job = TrainingJob("far-ft", req.address, budget=200 * VIBE, fee_per_round=10 * VIBE, spec=tiny.spec(),
+                          data_source={"kind": "tokens", "sha256": sha}, lr=1e-2, batch_size=4, steps_per_unit=8,
+                          checkpoint_every=2, units_per_round=2, memory_mb=1024, tolerance=1e-4,
+                          max_update_ratio=1.0)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+
+        def defended():  # games the far worker defended, once their round is sealed
+            return [g for b in node.chain.blocks if b.summary for g in (node.store.load_record(b.height) or {}).get("games", [])
+                    if g["defender"] == workers[0].address]
+        threads = [threading.Thread(target=c.run, args=(stop,), daemon=True) for c in clients]
+        for t in threads:
+            t.start()
+        try:
+            wait_for(lambda: defended(), seconds=300)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=30)
+        games = defended()
+        self.assertTrue(all(g["moves"] and g["outcome"] != "challenger" for g in games),
+                        [(g["outcome"], g["detail"], len(g["moves"])) for g in games])
+        self.assertFalse([s for b in node.chain.blocks if b.summary for s in b.summary.slashes
+                          if s[0] == workers[0].address], "the honest defender wasn't slashed")
 
 
 class RerunRoundTest(unittest.TestCase):

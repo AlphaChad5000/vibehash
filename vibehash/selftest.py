@@ -473,9 +473,9 @@ def _token_data(manifest: bytes, config: bytes, vocab: int, seq_len: int, n_trai
 
 def lora_step(device: str, replay: str = "cpu", steps: int = 4) -> dict:
     """Adam steps of a fine-tune unit on the tiny model, through finetune.train_segment (program.py's ops, as workers
-    train), on `device`; then the same on `replay`, compared as a checker compares them (verification.reproduces,
-    part by part, within finetune.TOLERANCE). The model is put into finetune's runtimes directly, so nothing is
-    fetched, and taken out again after."""
+    train), on `device`; then the same on `replay`, compared as a checker compares them (verification.adam_reproduces,
+    part by part, from finetune.TOLERANCE). The model is put into finetune's runtimes directly, so nothing is fetched,
+    and taken out again after."""
     from . import compute, finetune, llm, verification
     from .model import relative_distance
 
@@ -503,7 +503,7 @@ def lora_step(device: str, replay: str = "cpu", steps: int = 4) -> dict:
         with finetune._lock:
             for k in keys:
                 finetune._runtimes.pop(k, None)
-    ok = verification.reproduces(trained, again, start, finetune.TOLERANCE, spec)
+    ok = verification.adam_reproduces(trained, again, start, finetune.TOLERANCE, spec, 1e-3, steps)
     worst = max(relative_distance(trained[p], again[p]) for p in spec.parts)
     moved = float(np.max(np.abs(trained[spec.parts[0]])))
     return {"ok": bool(ok and moved > 0), "seconds": took, "worst": worst, "tolerance": finetune.TOLERANCE,

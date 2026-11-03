@@ -23,6 +23,8 @@ Verifier behaviours, for whole units' segments and sharded units' cells alike:
 Lazy and false-accusing scorers of a fine-tune report a made-up score. A fine-tune's worker can also be
     tamper         trains honestly but for one op of one step of each segment, whose output it scales (tamper below),
                    and defends that training in disputes
+    elsewhere      honest, on other hardware: its unit's first Adam step goes the other way at one weight (elsewhere
+                   below), as two devices' rounding made it go for 45 weights in round 7280 on the public network
 """
 from __future__ import annotations
 
@@ -50,6 +52,26 @@ def tamper(where: tuple, op) -> float | None:
     if where[1].endswith(" backward") and where[2].endswith("sequence 0") and op.kind == "ds_attn_dkv":
         return 1.25
     return None
+
+
+def elsewhere(job: TrainingJob, unit: WorkUnit, start: np.ndarray, backend=None) -> np.ndarray:
+    """The "elsewhere" behaviour's first segment of a fine-tune's unit: honest training as other hardware can do it.
+    Adam's first step from zero moments moves each weight by lr times the sign of its gradient, and where a gradient is
+    nearer zero than two devices' rounding apart, the sign comes out the other way (verification.FINETUNE_CHECK). Here
+    it does at the weight with the smallest gradient Adam still takes a whole step for; the segment trains on from
+    there."""
+    from .finetune import OPTIMIZERS
+
+    spec, c = job.spec, job.checkpoint_every
+    b, m, _ = spec.parts
+    b1, _, eps = OPTIMIZERS[spec.optimizer]
+    one = spec.round(train_segment(spec, job.data, start, unit.seed, 0, 1, job.lr, job.batch_size, backend))
+    g = np.abs(one[m]) / (1 - b1)
+    i = b.start + int(np.argmin(np.where(g >= 100 * eps, g, np.inf)))
+    one[i] = 2 * start[i] - one[i]
+    if c == 1:
+        return one
+    return train_segment(spec, job.data, one, unit.seed, 1, c - 1, job.lr, job.batch_size, backend)
 
 
 @dataclass(frozen=True)
@@ -122,6 +144,8 @@ class Worker:
                 theta = theta + (checkpoints[-1] - checkpoints[-2])  # extrapolate the last real segment
             elif self.behavior == "freezer":
                 pass  # passes any check that only asks "within tolerance?" once updates are smaller than it
+            elif self.behavior == "elsewhere" and seg == 0 and job.finetune:
+                theta = elsewhere(job, unit, theta, self.backend)
             else:
                 theta = train_segment(job.spec, job.data, theta, unit.seed, seg * c, c, job.lr, job.batch_size, self.backend,
                                       tamper=tamper if self.behavior == "tamper" else None)
@@ -160,9 +184,10 @@ class Worker:
         openings = {i: (work.checkpoints[i], merkle_proof(work.leaves, i)) for i in need}
         return Reveal(unit.unit_id, self.address, work.root, work.salt, work.final, openings)
 
-    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int]) -> tuple[bool, int | None]:
-        """Replay the challenged segments."""
-        return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend)
+    def verify(self, job: TrainingJob, unit: WorkUnit, openings: dict, segments: list[int],
+               stop=None) -> tuple[bool, int | None] | None:
+        """Replay the challenged segments. None if `stop()` turned true before one of them (replay_openings)."""
+        return replay_openings(job, unit, openings, segments, self.verifier_behavior, self.backend, stop)
 
     def score(self, job: TrainingJob, start: np.ndarray) -> tuple[float, float]:
         """A fine-tune's score task: (loss, accuracy) of the round's starting model on the job's held-back data."""
