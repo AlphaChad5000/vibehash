@@ -143,8 +143,15 @@ class UpdateTests(unittest.TestCase):
         b = es.step(spec, spec.init_params(), 5, self.update)
         with mock.patch.object(es, "_CHUNK", 256):
             c = es.step(spec, spec.init_params(), 5, self.update)
+        es.cache_noise(16)  # whole streams, kept: the same bits
+        self.addCleanup(es.cache_noise, 0)
+        d = es.step(spec, spec.init_params(), 5, self.update)
+        e = es.step(spec, spec.init_params(), 5, self.update)
         self.assertEqual(a.tobytes(), b.tobytes())
         self.assertEqual(a.tobytes(), c.tobytes())
+        self.assertEqual(a.tobytes(), d.tobytes())
+        self.assertEqual(a.tobytes(), e.tobytes())
+        self.assertTrue(es._cache)
 
     def test_sgd_is_alpha_over_n_sigma_times_the_shaped_rewards_noise(self):
         """θ += alpha/(N·σ)·Σ r̂_i·ε_i, exactly as the docstring's order works it out."""
@@ -504,6 +511,10 @@ class NetworkTests(unittest.TestCase):
         self.assertNotEqual(es.state_hash(state), es.state_hash(spec.init_params()), "the model never moved")
         updates = [records[b.height]["es"]["update"] for b in es_rounds]
         self.assertTrue(any(updates))
+        last_es = es_rounds[-1].height
+        forged = {**records, last_es: records[last_es] | {"es": records[last_es]["es"] | {"update": []}}}
+        with self.assertRaisesRegex(ValueError, "commits to"):  # a record that isn't the block's
+            es.rebuild_chain(blocks, forged.__getitem__, "es-job")
         # An auditor replays every round from its record, working each ES update out again from the state before it.
         audit, state = Chain.from_genesis(api.get("/genesis")), spec.init_params()
         last = None

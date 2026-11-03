@@ -654,7 +654,8 @@ class WorkerClient:
             st.activity = "registered; waiting for work"
             log.info("round %d: registered", rnd)
             self.record.begin(rnd, attempt=s.get("attempt"), chain_id=s.get("chain_id", ""), job_id=job.job_id,
-                              kind="deepseek" if job.deepseek else "es" if job.es else "finetune" if job.finetune else "mlp",
+                              kind=("deepseek" if job.deepseek else "es" if job.es else "finetune" if job.finetune
+                                    else "mlp"),
                               speed=self.speed[job.job_id], leader=self.node.url)
             if self.choice.job_id:
                 self.record.note(rnd, mining=self.choice.job_id)

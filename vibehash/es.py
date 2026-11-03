@@ -36,6 +36,18 @@ answers greedily, and `check` teacher-forces a committed answer through the pert
 greedy choice within a small logit margin, which absorbs the rounding differences between a worker's GPU and a
 checker's. The worker can't use vLLM (Windows), so generation is plain PyTorch through transformers.
 
+Measured on the RTX 4070 SUPER with Qwen2.5-0.5B-Instruct (float32, TF32 off): CUDA's and the CPU's logits at answer
+tokens differ by at most 1.3e-4 (logits up to 31), and in 1,728 honest answer tokens none was off the greedy choice on
+either device; answers regenerated on the CPU were identical, rewards too. Forged answers (the right expression, which
+the model didn't write) sat 1.15 to 3.6 logits below the greedy choice at their worst token. So `margin` is 0.05: 400×
+the devices' difference, 23× under the smallest forgery's.
+
+Not built yet: refereeing a checker's rejection (a dispute over one token's logits, the node recomputing one op as for
+fine-tunes; until then a rejected claim is unchecked, unpaid, nobody slashed); canaries that catch a checker approving
+without checking; fetching the base from the Hub by its manifest (`register` points at a local folder); racing (each
+member answers a few problems first and only the promising finish, in a pinned order); a block version for a public
+rollout (a genesis rule gates it today: ledger.ES_GATE).
+
 Not copied from the paper's code (its licence is academic only): this is written from the method's description.
 """
 from __future__ import annotations
@@ -140,11 +152,42 @@ def _box_muller(raw: np.ndarray) -> np.ndarray:
     return z.astype(np.float32)
 
 
+_cache: dict = {}  # (seed, n) -> a whole stream, read-only, newest last; off unless cache_noise sets a size
+_cache_room = [0]
+_cache_lock = threading.Lock()
+
+
+def cache_noise(max_mb: int) -> None:
+    """Keep up to max_mb of whole noise streams in memory (0: none, the default). In one process that plays several
+    parts (a testnet: the node, workers answering and checking, each worker following the chain), a pair's ε is then
+    made once a round instead of six times. It changes no bits, only how often they're worked out."""
+    with _cache_lock:
+        _cache.clear()
+        _cache_room[0] = max_mb * 2**20
+
+
 def noise(seed: int, n: int, start: int = 0) -> np.ndarray:
     """Elements [start, start + n) of seed's stream of standard normals, float32: the same bits on every machine, and
     any stretch of it the same as that stretch of the whole (Philox is counter-based: word i is counter i // 4's)."""
     if not 0 <= seed < 2**128 or n < 0 or start < 0:
         raise ValueError("a seed is 0..2^128, and a stretch of the stream starts at 0 or later")
+    if start == 0 and 0 < 4 * n <= _cache_room[0]:
+        with _cache_lock:
+            hit = _cache.pop((seed, n), None)
+            if hit is not None:
+                _cache[(seed, n)] = hit
+                return hit
+        out = _noise(seed, n, 0)
+        out.flags.writeable = False
+        with _cache_lock:
+            _cache[(seed, n)] = out
+            while sum(a.nbytes for a in _cache.values()) > _cache_room[0]:
+                _cache.pop(next(iter(_cache)))
+        return out
+    return _noise(seed, n, start)
+
+
+def _noise(seed: int, n: int, start: int) -> np.ndarray:
     out = np.empty(n, np.float32)
     pos = 0
     while pos < n:
@@ -636,11 +679,20 @@ def step(spec: EsSpec, state: np.ndarray, seed: int, update: list) -> np.ndarray
     b1, b2 = spec.betas
     c1, c2 = 1.0 - _ipow(b1, t), 1.0 - _ipow(b2, t)
     seeds = [(pair_seed(seed, j), c) for j, c in zip(js, coef) if c != 0.0]
+    whole = 4 * n <= _cache_room[0]  # each ε whole, kept for the round's other users (cache_noise), else in stretches
+    total = np.zeros(n, np.float64) if whole else None
+    for s, c in seeds if whole else ():
+        e = noise(s, n)
+        for lo in range(0, n, _CHUNK):
+            total[lo:lo + _CHUNK] += e[lo:lo + _CHUNK].astype(np.float64) * c
     for lo in range(0, n, _CHUNK):
         hi = min(n, lo + _CHUNK)
-        g = np.zeros(hi - lo, np.float64)
-        for s, c in seeds:
-            g += noise(s, hi - lo, lo).astype(np.float64) * c
+        if whole:
+            g = total[lo:hi]
+        else:
+            g = np.zeros(hi - lo, np.float64)
+            for s, c in seeds:
+                g += noise(s, hi - lo, lo).astype(np.float64) * c
         g = g * scale
         d = out[lo:hi].astype(np.float64)
         if spec.optimizer == "sgd":
@@ -693,8 +745,11 @@ def rebuild(spec: EsSpec, history: list[dict], state: np.ndarray | None = None) 
 
 def rebuild_chain(blocks, record_of, job_id: str, spec: EsSpec | None = None) -> tuple[np.ndarray, int]:
     """A job's state rebuilt from a chain alone: its blocks (ledger.Block, in order) and `record_of(height)`, each
-    round's record. Every round's state is checked against the params_hash its block's summary holds; ValueError at
-    the first that differs. Returns (state, rounds rebuilt)."""
+    round's record. Every record is checked against the record_hash its block commits to, and every round's state
+    against the params_hash its block's summary holds; ValueError at the first that differs. (The blocks themselves
+    are the caller's to validate, as Chain.append does.) Returns (state, rounds rebuilt)."""
+    from .crypto import h256
+    from .ledger import canonical
     from .tasks import TrainingJob
 
     state, rounds = None, 0
@@ -715,7 +770,10 @@ def rebuild_chain(blocks, record_of, job_id: str, spec: EsSpec | None = None) ->
             raise ValueError(f"no post_job for {job_id} before block {b.height}")
         if state is None:
             state = spec.init_params()
-        h = record_of(b.height)["es"]
+        record = record_of(b.height)
+        if h256(canonical(record)).hex() != s.record_hash:
+            raise ValueError(f"block {b.height}'s record isn't the one it commits to")
+        h = record["es"]
         if h.get("rule") != spec.rule:
             raise ValueError(f"block {b.height}'s round follows ES rule {h.get('rule')}, this code rule {spec.rule}")
         state = step(spec, state, int(h["seed"], 16), h["update"])
@@ -856,7 +914,7 @@ class Group:
             rows = []
             for s, sign in self.members:
                 if sign:
-                    e = torch.from_numpy(eps[s][at:at + size]).to(rt.device, torch.float64).view(shape)
+                    e = torch.tensor(eps[s][at:at + size], device=rt.device, dtype=torch.float64).view(shape)
                     rows.append((b + e * (sign * spec.sigma)).to(torch.float32))
                 else:
                     rows.append(b.to(torch.float32))

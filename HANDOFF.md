@@ -78,6 +78,8 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `emblems.py` | Pixel-art emblems (at most 18×10, two pixels a cell in half blocks) of DeepSeek, Meta, Qwen, Gemma, OpenAI, Microsoft, Mistral and Hugging Face, by model family (`FAMILIES`: an organisation and the start of the model's name, so Google's T5 or Meta's Prompt-Guard don't get Gemma's star or Llama's loop); a generic gem for anything else (Z.ai's GLM too). `scripts/preview_forge.py NAME` plays a made-up job so you can see one. |
 | `catalog.py` | The model picker: 17 popular open-weight models (`CATALOG`, short name → Hugging Face repo, smallest first), their facts from `Hub.describe` cached a day in `~/.vibehash/cache/models.json`, and "what it takes" (`team`: GPUs of 12/24/32 GB holding the weights as stored, whole layers each, a quarter of each card kept free; DEEPSEEK.md §2's 40/20/14). `ready`: an architecture `llm.py` trains and one 12 GB card holds it (qwen3-0.6b, llama-3.2-1b, smollm3-3b, qwen3-4b today). `vibehash models` and `train --base` print it; `train DATA --base` fine-tunes a ready one (`cli._finetune`) and shows the pre-flight for the rest. |
 | `shards.py` | Sharded units: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard, and signed edge messages. The coordinator runs sharded jobs in-process (teams, cell tasks, edge evidence, per-shard pay and averaging, record version 3; `simulate.py --shards N`). Nodes don't yet (`Coordinator.runs_teams` is off, `waiting` says why), and there's no worker-to-worker transport. See `SHARDING.md`. |
+| `es.py` | **Evolution strategies on the chain (prototype, branch `es-chain`): the model is a pure function of the chain.** A round is one ES step: antithetic seed pairs, greedy answers to Countdown problems, scores; the node works the update out with `step` and a fresh node gets the same bits with `rebuild`/`rebuild_chain` (no GPU, no weight files). The state is how far training moved the perturbed tensors from the pinned base (`delta`), the optimiser's moments and control words (level, steps). Pinned: `noise` (Philox raw words, Box-Muller with the module's own ln/sin/cos in exactly rounded ops), `step`'s order (z-scores; sgd, momentum or Adam in float64; float32 once), `problem` (built solvable from a seed with `crypto.Draw`), `reward` (fractions; binary or partial), `LEVELS` and the retarget rule. `EsSpec` (spec field `es`; tensors by glob pattern, `PRESETS`), `Group` (several members' weights in one batch), `generate` (greedy), `gaps`/`check` (teacher forcing: each token the greedy choice within `margin`), `rescore` (what the node checks every reward with). `cache_noise` for processes that play several parts. Tests: `tests/test_es.py`. |
+| `es_client.py` | A worker's ES rounds (from `client.py`): the round's state rebuilt from the chain's records (each block's `params_hash` checked), else fetched; answering units, uploading the answers blob and committing to it and the rewards; checking others' sampled members. `cheat` (tests only): `liar`, `forger`. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 `tests/` (`test_core.py`, `test_network.py`, `test_gpu.py`), `docs/guide.html`
@@ -121,6 +123,24 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Branch `es-chain` (2026-11-03, not merged): evolution strategies on the chain, the blockchain becomes the AI.** The
+owner's idea: train with ES so a round's learning step is only seeds and scores in the block, and every node computes
+the update with deterministic arithmetic, so the weights are a pure function of the chain (code map, `es.py`). A
+prototype `es` job kind, on chains whose genesis says `"es": true` only (`ledger.ES_GATE`), record version 5. Real run on
+the RTX 4070 SUPER, local testnet, a node and two in-process workers sharing the GPU: Qwen2.5-0.5B-Instruct, layer 23's
+MLP perturbed (13,074,432 numbers), σ 1e-3, sgd with the paper's step (alpha = σ²/2), 8 antithetic pairs, 32 problems
+a round, 64 tokens, starting at level 2 with retarget (every 2 rounds toward 0.5), 20 rounds, ~44 s a round. Held-out
+pass@1 (200 problems a level, greedy): level 0 41% → 70%, level 1 28% → 59.5%, level 2 18.5% → 25%, level 6 (four
+numbers) 4% → 3%. On held-out problems never seen in training (level 0's space is small: 164 of its 200 had come up):
+level 0 39.8% → 71.0% (93 problems), level 1 27.0% → 58.5%, level 2 17.5% → 25.5%. A fresh rebuild from the chain's
+blocks and records alone matched the final params_hash bit for bit (20 rounds, 315 s on the CPU); both workers rebuilt
+every round's state from the chain and never downloaded it. Generation: 713 tokens/s (49 short answers a second) in
+batches of 128. The same run with Adam (lr 1e-4, not tuned) learned less: 59%, 47%, 23.5% and 4% at those levels, its
+rebuild matching too. Compared with the WSL vLLM run (all 494M weights, 256 tokens, a reasoning prompt, 4 numbers: 4.1% →
+6.5%), this perturbs 2.6% of the weights and gains nothing at four numbers; its gains are where retargeting put the
+training, near half solved. `python scripts/es_local_run.py MODEL_DIR OUT_DIR` repeats the run (its defaults are the
+sgd run's). What's left: es.py's docstring, "Not built yet".
 
 **0.5.10's checks, run before release on the owner's PC:** one real Qwen3-0.6B segment (64 tokens, batch 8) trained on the
 RTX 4070 SUPER and replayed on the CPU: rule 1 refuses it, rule 2 (adam_reproduces) takes it; round 7280's two real
