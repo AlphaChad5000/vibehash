@@ -29,6 +29,7 @@ from pathlib import Path
 
 import architect
 import judge
+import models
 import publish
 
 MACHINE = platform.node()
@@ -46,6 +47,12 @@ class Site:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
 
+    def claim_chat(self) -> dict | None:
+        return self.post("dispatch/chat", {"machine": MACHINE})
+
+    def answer_chat(self, cid: str, **reply) -> None:
+        self.post(f"dispatch/chat/{cid}", reply)
+
     def claim(self) -> dict | None:
         return self.post("dispatch/claim", {"machine": MACHINE})  # also tells the site this machine is online
 
@@ -62,6 +69,47 @@ class Site:
                     print(f"couldn't send that to the site ({e}); carrying on", flush=True)
                     return
                 time.sleep(5 * (attempt + 1))
+
+
+class Chatter:
+    """Answers the site's chat messages: the base model and a finished fine-tune, one reply each. The base model
+    stays loaded between messages (a reply then takes seconds) and is freed before a request needs the GPU."""
+
+    def __init__(self, jobs: Path):
+        self.jobs, self.base, self.tok, self.model, self.adapters = jobs, None, None, None, set()
+
+    def reply(self, job: str, message: str) -> tuple[str, str]:
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        plan = self.jobs / f"{job}.plan.json"
+        adapter = self.jobs / "adapters" / job
+        if not plan.exists() or not adapter.exists():
+            raise FileNotFoundError(f"this machine doesn't have the model {job} (it was trained elsewhere)")
+        base = json.loads(plan.read_text())["base"]
+        if base != self.base:
+            self.free()
+            repo = models.BASES[base]
+            self.tok = AutoTokenizer.from_pretrained(repo)
+            loaded = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, device_map="auto")
+            self.model, self.base = PeftModel.from_pretrained(loaded, str(adapter), adapter_name=job), base
+            self.adapters = {job}
+        elif job not in self.adapters:
+            self.model.load_adapter(str(adapter), adapter_name=job)  # a few megabytes next to the same base
+            self.adapters.add(job)
+        self.model.set_adapter(job)
+        tuned = judge.reply(self.tok, self.model, message)
+        with self.model.disable_adapter():
+            base_reply = judge.reply(self.tok, self.model, message)
+        return base_reply, tuned
+
+    def free(self) -> None:
+        if self.model is not None:
+            import torch
+            self.model = self.tok = self.base = None
+            self.adapters = set()
+            torch.cuda.empty_cache()
 
 
 class Terminal:
@@ -187,12 +235,20 @@ def main():
     token = os.environ.get("DISPATCH_TOKEN") or sys.exit("set DISPATCH_TOKEN to the site's dispatch secret first")
     site = Site(a.site, token)
     print(f"{MACHINE}: waiting for requests from {site.url}", flush=True)
+    chatter, next_claim = Chatter(Path(a.out)), 0.0
     while True:
-        try:
-            req = site.claim()
-        except OSError as e:  # the site or the connection is down: try again later
-            print(f"couldn't reach the site ({e})", flush=True)
-            req = None
+        req = None
+        if time.time() >= next_claim:
+            next_claim = time.time() + a.every
+            try:
+                req = site.claim()
+            except OSError as e:  # the site or the connection is down: try again later
+                print(f"couldn't reach the site ({e})", flush=True)
+        if not req:
+            if not chat(site, chatter):
+                time.sleep(CHAT_EVERY)
+            continue
+        chatter.free()  # training and judging need the GPU's memory
         if req:
             try:
                 run(site, req, a)
@@ -204,8 +260,30 @@ def main():
                 site.report(req["id"], "failed", f"{type(e).__name__}: {e}"[:500])
             if a.once:
                 return
-        else:
-            time.sleep(a.every)
+
+
+CHAT_EVERY = 2  # seconds between checks for chat messages while idle
+
+
+def chat(site, chatter: Chatter) -> bool:
+    """Answer one waiting chat message, if there is one."""
+    try:
+        msg = site.claim_chat()
+    except OSError:
+        return False
+    if not msg:
+        return False
+    try:
+        base, tuned = chatter.reply(msg["job"], msg["message"])
+        print(f"chat {msg['id'][:8]} ({msg['job']}): {msg['message'][:60]!r}", flush=True)
+        site.answer_chat(msg["id"], base=base, tuned=tuned)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            site.answer_chat(msg["id"], error=f"{type(e).__name__}: {e}"[:300])
+        except OSError:
+            pass
+    return True
 
 
 if __name__ == "__main__":

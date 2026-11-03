@@ -24,6 +24,13 @@ from llm_call import chat_json, model_name
 from models import BASES, chat_prompt
 
 
+def reply(tok, model, prompt: str) -> str:
+    """One reply, greedy so the same prompt always gets the same answer (the site's chat answers this way too)."""
+    ids = tok(chat_prompt(tok, prompt), add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)
+    out = model.generate(ids, max_new_tokens=200, do_sample=False)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+
 def answer(eval_file: Path, adapter_dir: Path) -> Path:
     import torch
     from peft import PeftModel
@@ -34,14 +41,9 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     tok = AutoTokenizer.from_pretrained(repo)
     model = AutoModelForCausalLM.from_pretrained(repo, torch_dtype=torch.bfloat16, device_map="auto")
 
-    def reply(m, prompt):
-        ids = tok(chat_prompt(tok, prompt), add_special_tokens=False, return_tensors="pt").input_ids.to(m.device)
-        out = m.generate(ids, max_new_tokens=200, do_sample=False)  # greedy: the same answer every run
-        return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
-
-    base = [reply(model, p) for p in spec["prompts"]]
+    base = [reply(tok, model, p) for p in spec["prompts"]]
     tuned_model = PeftModel.from_pretrained(model, str(adapter_dir))  # the same weights plus the LoRA adapter
-    tuned = [reply(tuned_model, p) for p in spec["prompts"]]
+    tuned = [reply(tok, tuned_model, p) for p in spec["prompts"]]
 
     out = eval_file.with_suffix(".answers.json")
     out.write_text(json.dumps({"goal": spec["goal"], "pairs": [
