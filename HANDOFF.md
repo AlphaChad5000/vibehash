@@ -122,7 +122,18 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
-**Unreleased (branch `job-picker`, 2026-11-02): pick the job to mine.** The owner asked for "a easy selector in the
+**Release 0.5.9 (2026-11-02, test night): the phase bar tells the truth, a fine-tune's loss is reported after its
+training, pick the job to mine, and the front page's jobs.** Node and workers; the node was upgraded with it.
+- Since 0.5.7 a phase ends once its work is in, but /status kept the latest it could end, so dashboards counted down a
+  DeepSeek round's ten minutes and jumped to its end seconds in. Node._wait now moves phase_ends to the real end once the
+  work is in, and /status has "progress", [in, of] (Coordinator.progress, which all_in reads; Node._progress never
+  fails). Dashboards show "3/4 in, up to 598s" (termui.phase_bar, parse_progress).
+- netstats.job_summary: a fine-tune's round scores the model it started from, so a round's training shows in the next
+  scored round. The summary took "now" from the last round that worked, the model before it: pokemon-pun-starter's
+  loss went 5.13 to 3.65 after its one unit and /network said 5.13.
+- The two notes below.
+
+**In 0.5.9: pick the job to mine.** The owner asked for "a easy selector in the
 mining area of the terminal that lets you select jobs, auto, then each of the listed jobs". The mining dashboard has a
 `job:` line under the round (code map, `minerui.py`), and `worker --job JOB` does the same for pods and `--plain`,
 checked against the node's list at start (a job it doesn't list stops the worker, naming the ones it does). A worker
@@ -136,7 +147,7 @@ keys on a real Windows console (key events written into its input buffer, a real
 On Windows, Shift+Tab reaches msvcrt as Tab, so it goes forward there. Not done: the guide's canvas replica of the
 dashboard (`docs/guide.html`, `build()`) has no `job:` line yet.
 
-**Front page jobs section (branch site-jobs, not published).** docs/site/index.html now groups the jobs after the featured
+**In 0.5.9, the front page's jobs section (published with it).** docs/site/index.html now groups the jobs after the featured
 one into Training now, Waiting (the node's /status reason in one line, the full text on "Why?"), Queued and Finished
 (collapsed). Each card has a kind tag, "loss 5.13 → 3.65 (−29%)"-style headline and a facts line; "Report" opens /job/<id>
 in place (chart, rounds that changed the model, settings, owner, model hash, copyable commands; #job-<id> links to it).
