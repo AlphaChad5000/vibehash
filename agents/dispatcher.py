@@ -85,18 +85,56 @@ def run(site, req: dict, a) -> None:
         site.report(rid, "planning", f"Heads up: {plan['caveat']}")
     site.report(rid, "training", f"{len(plan['examples'])} examples on {plan['base']}, rank {plan['rank']}, "
                                  f"{plan['epochs']} epochs: {plan['reasoning']}", job_id=job)
-    train(site, rid, architect.train_command(plan, chats, out))
+    results = [round_(site, rid, plan, chats, evals, out, title)]
 
+    # Repair rounds: while the judge isn't convinced, the Job Architect writes chats aimed at what went wrong and
+    # fresh test prompts. Not for goals it warned need facts: more chats of the same size won't teach those.
+    while len(results) <= REPAIRS and not usable(results[-1]) and not plan.get("caveat"):
+        n = len(results) + 1
+        site.report(rid, "training", f"round {n}: the Job Architect is writing chats aimed at the prompts it lost")
+        graded = json.loads((out / f"{plan['job_id']}.eval.answers.graded.json").read_text())
+        fix = architect.repair(plan, graded)
+        plan = {**plan, "job_id": f"{job}-r{n}", "examples": plan["examples"] + fix["examples"],
+                "eval_prompts": fix["eval_prompts"]}
+        chats, evals = architect.save(plan, out)
+        site.report(rid, "training", f"round {n}: retraining on {len(plan['examples'])} chats, "
+                                     f"{len(fix['examples'])} of them new")
+        results.append(round_(site, rid, plan, chats, evals, out, title))
+
+    result = max(results, key=score)  # each round was judged on its own new prompts
+    result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")}}
+                        for i, r in enumerate(results)]
+    j = result["judge"]
+    site.report(rid, "done", " → ".join(f"{r['tuned_wins']}/{r['prompts']}" for r in result["rounds"]) +
+                f": fine-tune preferred on {j['tuned_wins']} of {j['prompts']} prompts", run=result)
+
+
+REPAIRS = 2     # at most this many repair rounds after the first, so a request finishes in minutes
+USABLE = 0.8    # the judge preferring the fine-tune on this share of prompts ends the repairs
+
+
+def score(result: dict) -> float:
+    return result["judge"]["tuned_wins"] / result["judge"]["prompts"]
+
+
+def usable(result: dict) -> bool:
+    return score(result) >= USABLE
+
+
+def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str) -> dict:
+    """Train, have both models answer the test prompts, have Muse Spark judge them: one round's run."""
+    job = plan["job_id"]
+    train(site, rid, architect.train_command(plan, chats, out))
     site.report(rid, "judging", "the base and fine-tuned models are answering the held-back prompts")
     answers = judge.answer(evals, out / "adapters" / job)
     site.report(rid, "judging", "Muse Spark is comparing the answers, blind")
     judge.grade(answers)
-    result = publish.build(job, out, title)
-    j = result["judge"]
-    site.report(rid, "done", f"fine-tune preferred on {j['tuned_wins']} of {j['prompts']} prompts", run=result)
+    return publish.build(job, out, title)
 
 
 def main():
+    # Windows consoles default to a code page without "→" or "é", and a print of one would stop a finished run
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description="Take fine-tune requests from the site and run them.")
     p.add_argument("--site", default="https://agents.luhlabs.com", help="the site whose form it takes requests from")
     p.add_argument("--goal", help="run this one goal instead of taking requests from a site")

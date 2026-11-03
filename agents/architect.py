@@ -94,6 +94,37 @@ def plan_job(goal: str, log=print) -> dict:
     return plan
 
 
+REPAIR = """You repair a fine-tuning job. The fine-tuned model was judged against the goal and lost or tied on the
+prompts below. Reply with ONE JSON object:
+{
+  "examples": [{"user": "...", "assistant": "..."}, ...]   (at least 20 NEW chats in exactly the style wanted, aimed
+                                                            at what the judge says went wrong, not copies of these prompts),
+  "eval_prompts": ["...", ...]   (10 NEW user messages, unlike any prompt below, to test the repaired model with)
+}"""
+
+
+def repair(plan: dict, graded: dict) -> dict:
+    """Round 2+: more chats aimed at the prompts the fine-tune lost or tied, and fresh test prompts, so the repaired
+    model is judged on prompts it wasn't repaired against."""
+    misses = [p for p in graded["pairs"] if not p["verdict"]["tuned_won"]]
+    report = "\n\n".join(f"Prompt: {p['prompt']}\nFine-tune replied: {p['tuned']}\nJudge: {p['verdict'].get('reason')}"
+                         for p in misses)
+    seen = set(plan["eval_prompts"]) | {e["user"] for e in plan["examples"]}
+    ask = [{"role": "system", "content": REPAIR}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{report}"}]
+    for attempt in range(3):
+        fix = chat_json(ask)
+        examples, prompts = fix.get("examples") or [], [p for p in fix.get("eval_prompts") or [] if p not in seen]
+        problems = ([f"only {len(examples)} examples; need at least 20"] if len(examples) < 20 else []) + \
+                   (["an example is missing its user or assistant text"]
+                    if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples) else []) + \
+                   ([f"only {len(prompts)} new eval prompts; need at least 5"] if len(prompts) < 5 else [])
+        if not problems:
+            return {"examples": examples, "eval_prompts": prompts}
+        ask += [{"role": "assistant", "content": json.dumps(fix)},
+                {"role": "user", "content": "Fix these and reply with the whole JSON again:\n" + "\n".join(problems)}]
+    raise ValueError("repair still invalid after retries:\n  " + "\n  ".join(problems))
+
+
 def save(plan: dict, out: Path) -> tuple[Path, Path]:
     """The chats and eval files, and what publish.py needs later: the goal and the settings."""
     chats, evals = write_files(plan, out)
