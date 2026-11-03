@@ -26,7 +26,11 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
     base = plan["base"]
     epochs = [{"epoch": h["epoch"], "loss": h["loss"], "acc": h["acc"]} for h in report["history"]]
     pairs = [{"prompt": p["prompt"], "base": p["base"], "tuned": p["tuned"], "tuned_won": p["verdict"]["tuned_won"],
-              "winner": p["verdict"].get("winner"), "reason": p["verdict"].get("reason")} for p in graded["pairs"]]
+              "winner": p["verdict"].get("winner"), "reason": p["verdict"].get("reason"),
+              "flagged": p["verdict"].get("flagged", False) or p.get("vs_prompted", {}).get("flagged", False)}
+             | ({"prompted": p["prompted"], "vs_prompted": p["vs_prompted"]["winner"],
+                 "prompted_reason": p["vs_prompted"]["reason"]} if "vs_prompted" in p else {})
+             for p in graded["pairs"]]
     return {"title": title or job.replace("-", " ").capitalize(), "job": job, "goal": plan["goal"],
             "base_title": TITLES.get(base, base), "base_repo": BASES[base],
             "date": datetime.date.today().isoformat(),

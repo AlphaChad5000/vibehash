@@ -22,7 +22,7 @@ import random
 import time
 from pathlib import Path
 
-from models import BASES, chat_prompt
+from models import BASES, chat_prompt, source
 
 IGNORE = -100  # PyTorch's cross-entropy skips labels with this value
 
@@ -83,8 +83,8 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
     heldout, training = pairs[:held], pairs[held:]
 
     gpu = torch.cuda.is_available()
-    tok = AutoTokenizer.from_pretrained(BASES[base])
-    model = AutoModelForCausalLM.from_pretrained(BASES[base], torch_dtype=torch.bfloat16 if gpu else torch.float32,
+    tok = AutoTokenizer.from_pretrained(**source(base))
+    model = AutoModelForCausalLM.from_pretrained(**source(base), dtype=torch.bfloat16 if gpu else torch.float32,
                                                  device_map="cuda" if gpu else None)
     model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.05,
                                              target_modules="all-linear", task_type="CAUSAL_LM"))

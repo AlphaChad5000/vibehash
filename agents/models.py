@@ -8,6 +8,18 @@ BASES = {
     "llama-3.2-1b": "meta-llama/Llama-3.2-1B-Instruct",
 }
 
+# The exact snapshot of each repo to download, so a later change to it on Hugging Face (or a tampered upload)
+# can't silently change what's trained and served. None follows the repo's main branch.
+REVISIONS = {
+    "qwen3-0.6b": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "llama-3.2-1b": None,
+}
+
+
+def source(base: str) -> dict:
+    """What to pass to from_pretrained for a base model: its repo and pinned snapshot."""
+    return {"pretrained_model_name_or_path": BASES[base], "revision": REVISIONS.get(base)}
+
 
 def chat_prompt(tok, user: str | list[dict]) -> str:
     """The text a model sees before it replies to `user` (one message, or a conversation of {role, content}

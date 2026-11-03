@@ -77,6 +77,18 @@ class Site:
                 time.sleep(5 * (attempt + 1))
 
 
+class Unavailable(Exception):
+    """A chat for a model this machine can't answer as: its message is meant for the visitor."""
+
+
+def public(e: BaseException) -> str:
+    """What a visitor is told when something fails: the screen's refusal or a chat's "no such model" as they are,
+    anything else only in general terms. The details (paths, this machine, the trace) stay in this console."""
+    if isinstance(e, (architect.Refused, Unavailable)):
+        return str(e)[:500]
+    return "something went wrong on the GPU machine while running it; the details are in its log"
+
+
 class Chatter:
     """Answers the site's chats with a finished fine-tune or with the base model as it comes. The base model stays
     loaded between messages, with each fine-tune's adapter (a few megabytes) beside it once used, so a reply takes
@@ -87,10 +99,14 @@ class Chatter:
 
     def say(self, job: str | None, conversation: str | list[dict], base: str = "qwen3-0.6b") -> str:
         """One reply to a message or a conversation: from the fine-tune `job`, or with no job from the base model."""
+        if job and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,59}", job):  # a file name here, so a plain id only
+            raise Unavailable("that isn't a model this site has")
+        if base not in models.BASES:
+            raise Unavailable("that isn't a model this site has")
         if job:
             plan = self.jobs / f"{job}.plan.json"
             if not plan.exists() or not (self.jobs / "adapters" / job).exists():
-                raise FileNotFoundError(f"this machine doesn't have the model {job} (it was trained elsewhere)")
+                raise Unavailable("this model isn't on the GPU machine that's online")
             base = json.loads(plan.read_text())["base"]
         self.load(base)
         if not job:
@@ -118,8 +134,8 @@ class Chatter:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.free()
-        self.tok = AutoTokenizer.from_pretrained(models.BASES[base])
-        self.model = AutoModelForCausalLM.from_pretrained(models.BASES[base], dtype=torch.bfloat16, device_map="auto")
+        self.tok = AutoTokenizer.from_pretrained(**models.source(base))
+        self.model = AutoModelForCausalLM.from_pretrained(**models.source(base), dtype=torch.bfloat16, device_map="auto")
         self.base = base
 
     def free(self) -> None:
@@ -193,12 +209,18 @@ def run(site, req: dict, a) -> None:
                                      f"{len(fix['examples'])} of them new")
         results.append(round_(site, rid, plan, chats, evals, out, title, n))
 
-    result = max(results, key=score)  # each round was judged on its own new prompts
-    result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")}}
+    # The last round, not the best: picking the best of several scores would flatter it. Repairs stop once a round
+    # is good enough, so the last round is usually the best anyway; every round's score is shown.
+    result = results[-1]
+    result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")},
+                         "vs_prompted": r["judge"].get("vs_prompted", {}).get("tuned_wins")}
                         for i, r in enumerate(results)]
     j = result["judge"]
+    told = f"; over the base model told the goal, {j['vs_prompted']['tuned_wins']} of {j['prompts']}" \
+        if j.get("vs_prompted") else ""
     site.report(rid, "done", " → ".join(f"{r['tuned_wins']}/{r['prompts']}" for r in result["rounds"]) +
-                f": fine-tune preferred on {j['tuned_wins']} of {j['prompts']} prompts", run=result)
+                f": fine-tune preferred over the untrained model on {j['tuned_wins']} of {j['prompts']} prompts{told}",
+                run=result)
 
 
 REPAIRS = 2     # at most this many repair rounds after the first, so a request finishes in minutes
@@ -225,12 +247,15 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
                 detail={"kind": "judging", "round": round_no, "prompts": n})
 
     def heard(i: int, pair: dict) -> None:
-        v = pair["verdict"]
+        v, told = pair["verdict"], pair.get("vs_prompted")
         said = {"tuned": "fine-tune preferred", "base": "base model preferred", "tie": "tie"}[v["winner"]]
-        site.report(rid, "judging", f"prompt {i + 1} of {n}: {said}",
-                    detail={"kind": "verdict", "round": round_no, "i": i, "prompts": n, "winner": v["winner"],
-                            "prompt": pair["prompt"][:300], "base": pair["base"][:700], "tuned": pair["tuned"][:700],
-                            "reason": v["reason"][:500]})
+        detail = {"kind": "verdict", "round": round_no, "i": i, "prompts": n, "winner": v["winner"],
+                  "flagged": v["flagged"] or bool(told and told["flagged"]), "prompt": pair["prompt"][:300],
+                  "base": pair["base"][:550], "tuned": pair["tuned"][:550], "reason": v["reason"][:400]}
+        if told:
+            detail |= {"vs_prompted": told["winner"], "prompted": pair["prompted"][:550],
+                       "prompted_reason": told["reason"][:400]}
+        site.report(rid, "judging", f"prompt {i + 1} of {n}: {said}", detail=detail)
 
     judge.grade(answers, on_verdict=heard)
     return publish.build(job, out, title)
@@ -275,7 +300,7 @@ def main():
                 raise
             except BaseException as e:  # SystemExit too: llm_call exits on bad settings
                 traceback.print_exc()
-                site.report(req["id"], "failed", f"{type(e).__name__}: {e}"[:500])
+                site.report(req["id"], "failed", public(e))
             if a.once:
                 return
 
@@ -298,7 +323,7 @@ def chat(site, chatter: Chatter) -> bool:
         except Exception as e:
             traceback.print_exc()
             try:
-                site.answer_talk(turn["id"], error=f"{type(e).__name__}: {e}"[:300])
+                site.answer_talk(turn["id"], error=public(e))
             except OSError:
                 pass
         return True
@@ -315,7 +340,7 @@ def chat(site, chatter: Chatter) -> bool:
     except Exception as e:
         traceback.print_exc()
         try:
-            site.answer_chat(msg["id"], error=f"{type(e).__name__}: {e}"[:300])
+            site.answer_chat(msg["id"], error=public(e))
         except OSError:
             pass
     return True
