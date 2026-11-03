@@ -50,10 +50,22 @@ def job_summary(job_id: str, spec: dict, escrow: int, rounds: list[dict], curren
     """One job: what it trains, its budget, the rounds that did work, and how its held-back score moved over them:
     accuracy for a model trained from scratch, loss for a fine-tune (whose rounds carry the scorers' median loss)."""
     worked = [r for r in rounds if r["accepted_units"] > 0]
-    # Where the model started (the first round scored, before any work) and every round that changed it.
-    curve = ([rounds[0]] if rounds and rounds[0] not in worked else []) + worked
     metric = "loss" if "base" in spec else "accuracy"
     key = "val_loss" if metric == "loss" else "val_acc"
+    if metric == "accuracy":
+        # Where the model started (the first round scored, before any work) and every round that changed it: the node
+        # scores the model a round leaves.
+        curve = ([rounds[0]] if rounds and rounds[0] not in worked else []) + worked
+    else:
+        # A fine-tune's scorers score the model its round started from, so what a round that worked left is the next
+        # scored round's: on test night a job's loss went 5.13 to 3.65 after its one unit, and this said 5.13.
+        after, scored = [], None
+        for r in reversed(rounds):
+            if r["accepted_units"] > 0 and scored is not None and (not after or after[-1] is not scored):
+                after.append(scored)
+            if _number(r[key]) is not None:
+                scored = r
+        curve = ([rounds[0]] if rounds else []) + after[::-1]
     last = worked[-1] if worked else None
     per_unit = spec.get("batch_size", 0) * spec.get("steps_per_unit", 0)  # examples a unit trains on (with repeats)
     units = sum(r["accepted_units"] for r in worked)
