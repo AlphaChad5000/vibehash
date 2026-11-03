@@ -90,6 +90,15 @@ def _deepseek() -> list[list[str]] | None:
     return [["worker", "--deepseek", "yes"]] if _yes("Mine it?") else None
 
 
+def _evo() -> list[list[str]] | None:
+    print("Evo mode: training by evolution, the chain is the model. It runs a test network on this computer, a node\n"
+          "and two workers, that trains Qwen2.5-0.5B-Instruct on Countdown puzzles by evolution strategies: each round\n"
+          "tries nudged copies of the model in twin pairs, and its block keeps only their seeds and scores, a few hundred\n"
+          "bytes from which anyone can work the model out again. The model comes from your Hugging Face cache, or is\n"
+          "downloaded once (about 1 GB). A graphics card helps a lot. Ctrl+C stops it; running it again carries on.")
+    return [["testnet", "--evo"]] if _yes("Start it?") else None
+
+
 def _cancel() -> list[list[str]] | None:
     return [["cancel-job"]] if _yes("Cancel your last training job?") else None
 
@@ -145,6 +154,7 @@ SECTIONS = [
         Item("My job's status", "rounds, accuracy, budget left", ("job", "status")),
         Item("Download my trained model", "save it to use with predict", ("job", "download")),
         Item("Models to fine-tune", "popular open-weight models and what they take", ("models",)),
+        Item("Try Evo mode (local)", "training by evolution: the chain is the model", ask=_evo, usage="testnet --evo"),
     ]),
     ("Settings", [
         Item("Set up again", "network, wallet, graphics card, stake", ("setup",)),

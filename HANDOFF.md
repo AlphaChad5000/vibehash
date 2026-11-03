@@ -79,7 +79,9 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `catalog.py` | The model picker: 17 popular open-weight models (`CATALOG`, short name → Hugging Face repo, smallest first), their facts from `Hub.describe` cached a day in `~/.vibehash/cache/models.json`, and "what it takes" (`team`: GPUs of 12/24/32 GB holding the weights as stored, whole layers each, a quarter of each card kept free; DEEPSEEK.md §2's 40/20/14). `ready`: an architecture `llm.py` trains and one 12 GB card holds it (qwen3-0.6b, llama-3.2-1b, smollm3-3b, qwen3-4b today). `vibehash models` and `train --base` print it; `train DATA --base` fine-tunes a ready one (`cli._finetune`) and shows the pre-flight for the rest. |
 | `shards.py` | Sharded units: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard, and signed edge messages. The coordinator runs sharded jobs in-process (teams, cell tasks, edge evidence, per-shard pay and averaging, record version 3; `simulate.py --shards N`). Nodes don't yet (`Coordinator.runs_teams` is off, `waiting` says why), and there's no worker-to-worker transport. See `SHARDING.md`. |
 | `es.py` | **Evolution strategies on the chain (prototype, branch `es-chain`): the model is a pure function of the chain.** A round is one ES step: antithetic seed pairs, greedy answers to Countdown problems, scores; the node works the update out with `step` and a fresh node gets the same bits with `rebuild`/`rebuild_chain` (no GPU, no weight files). The state is how far training moved the perturbed tensors from the pinned base (`delta`), the optimiser's moments and control words (level, steps). Pinned: `noise` (Philox raw words, Box-Muller with the module's own ln/sin/cos in exactly rounded ops), `step`'s order (z-scores; sgd, momentum or Adam in float64; float32 once), `problem` (built solvable from a seed with `crypto.Draw`), `reward` (fractions; binary or partial), `LEVELS` and the retarget rule. `EsSpec` (spec field `es`; tensors by glob pattern, `PRESETS`), `Group` (several members' weights in one batch), `generate` (greedy), `gaps`/`check` (teacher forcing: each token the greedy choice within `margin`), `rescore` (what the node checks every reward with). `cache_noise` for processes that play several parts. Tests: `tests/test_es.py`. |
-| `es_client.py` | A worker's ES rounds (from `client.py`): the round's state rebuilt from the chain's records (each block's `params_hash` checked), else fetched; answering units, uploading the answers blob and committing to it and the rewards; checking others' sampled members. `cheat` (tests only): `liar`, `forger`. |
+| `es_client.py` | A worker's ES rounds (from `client.py`): the round's state rebuilt from the chain's records (each block's `params_hash` checked), else fetched; answering units, uploading the answers blob and committing to it and the rewards; checking others' sampled members. `cheat` (tests only): `liar`, `forger`. A local network's base is looked for in the Hugging Face cache first (`es_local.find_base`). |
+| `es_local.py` | Evo mode's wiring (branch `evo-mode`): `find` (a model's folder, or a Hugging Face model from the local cache, else downloaded), `manifest` (es_local_run's stand-in), `spec_for` (the measured run's settings, `SETTINGS`, the last layer's MLP; tensors from the config on the meta device), `job`, `accepts` (a genesis with `"es": true`), `chain_bytes` (a round's ES entry, canonical JSON), `find_base` (a worker's: looks, never downloads). |
+| `esui.py` | The Evo scene both dashboards show for an Evo job: sealed blocks joined by links, each with a hatchling and a bar of its generation's mean reward, its level (an arrow when it moved) and its bytes on chain; the open block incubating the round's twin pairs by phase (laid, growing, cracking, checked), hatching and locking into the chain when sealed. `Lineage` follows a job's generations from `/blocks` and `/round/<h>/record`, read defensively. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 `tests/` (`test_core.py`, `test_network.py`, `test_gpu.py`), `docs/guide.html`
@@ -141,6 +143,38 @@ rebuild matching too. Compared with the WSL vLLM run (all 494M weights, 256 toke
 6.5%), this perturbs 2.6% of the weights and gains nothing at four numbers; its gains are where retargeting put the
 training, near half solved. `python scripts/es_local_run.py MODEL_DIR OUT_DIR` repeats the run (its defaults are the
 sgd run's). What's left: es.py's docstring, "Not built yet".
+
+**Branch `evo-mode` (2026-11-03, from `es-chain`, not merged): Evo mode, the switch and its own dashboards.** People see
+ES jobs as "Evo" jobs ("Evo mode: training by evolution, the chain is the model"); the code keeps `es`.
+- `vibehash testnet --evo [--evo-model MODEL]`: a local network (default folder `~/.vibehash/testnet-evo`) whose genesis
+  has `"es": true` and stakes its eight worker wallets 10 VIBE each (an ES job's work only goes to staked workers, and an
+  Evo network has nothing else to earn stake on), posting `evo-1`, `evo-2`... with the measured run's settings at 1 VIBE
+  a round. The model (Qwen/Qwen2.5-0.5B-Instruct by default) comes from the Hugging Face cache or is downloaded once,
+  before anything is made; `evo.json` in the folder remembers it, so running it again without the switch carries on as
+  an Evo network. The node takes jobs up to 512 MB. `--plain` prints each sealed generation's level, reward and bytes.
+  Plain `testnet` is unchanged (an existing folder made without Evo refuses `--evo`).
+- `vibehash train --evo [--base MODEL] [--budget] [--fee]`: reads the node's `/genesis` first, and on a chain without
+  `"es": true` (today's public one) stops with one line, before a model is looked for or a wallet opened. Otherwise it
+  shows the plan, asks, posts, and follows the job on the training dashboard.
+- The menu's Train section has "Try Evo mode (local)" (`testnet --evo`, asked first). The mining selector marks Evo
+  jobs "(Evo)" (from the jobs the workers have loaded: no requests). A `vibehash worker` on its own takes a local
+  network's Evo job if its Hugging Face cache has the base at the pinned commit (`es_local.find_base`), with no switch.
+- Dashboards: an Evo job gets the block-and-chain scene (esui.py) in a green and teal palette, the owner's design ("actual
+  block and chains, then the mining process is incubating something inside the block"). Mining: generation, population
+  (and the rigs' share), puzzles a round, the round's level (from the worker's state) and the retarget rule, mean reward
+  and best, bytes for the last generation and all of them, and how often the model was rebuilt from the chain or
+  fetched. Training: reward by generation as the chart, the level row (where it moved), the chain-bytes row, bytes on
+  chain in the rounds line; events say each generation as it's sealed. Every other job's frames are byte for byte as
+  before (checked against HEAD's code on a frozen clock). No node field was added: blocks and round records were enough.
+- ES-path fixes on the worker: its round log now counts an Evo round's units accepted (it noted no `_unit_flops`, so
+  every Evo line said 0), and its activity and log lines say "Evo". No ES arithmetic, record, consensus or other job's
+  behaviour changed.
+- Tested: `tests/test_minerui.py` and `tests/test_trainui.py` (every Evo frame fits 40/66/120 columns, ASCII, the hatch
+  and lock, the lineage read defensively), `tests/test_menu.py`, `tests/test_es.py` `EvoModeTests` (`train --evo`
+  refused by a real node without ES jobs with nothing spent, posting on one, the cache lookup, `testnet --evo` end to
+  end on the CPU with the tiny model and carrying on, the chain rebuilding the state). Run on the CPU with the tiny
+  model only: the real model wasn't run in Evo mode (the GPU was busy with experiments), and Qwen2.5-0.5B-Instruct isn't
+  in this PC's Hugging Face cache yet, so the first `testnet --evo` downloads it (about 1 GB).
 
 **0.5.10's checks, run before release on the owner's PC:** one real Qwen3-0.6B segment (64 tokens, batch 8) trained on the
 RTX 4070 SUPER and replayed on the CPU: rule 1 refuses it, rule 2 (adam_reproduces) takes it; round 7280's two real

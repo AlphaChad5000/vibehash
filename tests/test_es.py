@@ -562,5 +562,188 @@ class NetworkTests(unittest.TestCase):
         np.testing.assert_array_equal(store.load_params("es-job"), params)
 
 
+# --- Evo mode: the switch (es_local.py, cli.py) ----------------------------------------------------------------------
+
+class EvoModeTests(unittest.TestCase):
+    """`testnet --evo` and `train --evo`, as people type them, against real nodes on this computer."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        import logging
+        import os
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        patch = mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(self.root / "home")})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for var in ("VIBEHASH_NODE", "VIBEHASH_WALLET"):
+            os.environ.pop(var, None)
+        logging.disable(logging.INFO)  # cli.main turns on INFO logging for the whole process
+        self.addCleanup(logging.disable, logging.NOTSET)
+        self.io, self.redirect = io, contextlib.redirect_stdout
+
+    def run_cli(self, *argv) -> tuple[object, str]:
+        from vibehash import cli
+        out = self.io.StringIO()
+        with self.redirect(out):
+            try:
+                cli.main(list(argv))
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, out.getvalue()
+
+    def node(self, es_gate: bool):
+        from vibehash import wallet as wallets
+        from vibehash.client import NodeClient
+        from vibehash.node import Node, PhaseTimes
+        keys, req = KeyPair.generate(b"evo node"), KeyPair.generate(b"evo requester")
+        genesis = {"chain_id": "vibehash-evo-test", "timestamp": 0, "allocations": {req.address: 100 * VIBE},
+                   "stakes": {keys.address: 10 * VIBE}, **({"es": True} if es_gate else {})}
+        node = Node(self.root / f"node-{es_gate}", genesis, keys, port=0,
+                    times=PhaseTimes(register_s=0.5, compute_s=0.5, reveal_s=0.5, verify_s=0.5, idle_s=0.2)).start()
+        self.addCleanup(node.stop)
+        wallets.save(req, self.root / "requester.json", None)
+        return node, NodeClient(node.url), req
+
+    def test_train_evo_on_a_chain_without_evo_jobs_spends_nothing(self):
+        """Today's public network's genesis has no "es": the command stops at its first request, before a model is
+        looked for or the wallet opened, with one line."""
+        from vibehash import cli, es_local
+        node, api, req = self.node(es_gate=False)
+        with mock.patch.object(es_local, "find", side_effect=AssertionError("looked for a model")), \
+                mock.patch.object(cli, "load_wallet", side_effect=AssertionError("opened the wallet")):
+            code, out = self.run_cli("train", "--evo", "--node", node.url, "--wallet", str(self.root / "requester.json"),
+                                     "--yes", "--plain")
+        self.assertEqual(code, es_local.LOCAL_ONLY)
+        self.assertEqual(len(code.splitlines()), 1)
+        self.assertIn("Evo mode is for local test networks for now", code)
+        self.assertEqual(node.coord.mempool, [])
+        self.assertEqual(api.account(req.address)["balance"], 100 * VIBE)
+        self.assertFalse((self.root / "home" / "jobs").exists())
+
+    def test_testnet_evo_on_a_testnet_made_without_it(self):
+        d = self.root / "plain-testnet"
+        d.mkdir()
+        (d / "genesis.json").write_text(json.dumps({"chain_id": "vibehash-local-1", "allocations": {}}))
+        code, _ = self.run_cli("testnet", "--evo", "--dir", str(d), "--plain")
+        self.assertIn("made without Evo jobs", str(code))
+
+    def test_a_folder_and_the_cache(self):
+        """A model's folder is pinned by where it is; a Hugging Face model by its commit, looked for in the cache first
+        (downloaded only when it isn't there), and a worker finds a local network's base in its cache by itself."""
+        from vibehash import es_local
+        folder = self.root / "My Model"
+        folder.mkdir()
+        (folder / "config.json").write_text("{}")
+        found = es_local.find(str(folder))
+        self.assertRegex(found.base, r"^hf:local/My-Model@[0-9a-f]{40}$")
+        self.assertEqual(found.folder, folder.resolve())
+        self.assertEqual(es_local.find(str(folder)), found)
+        commit = "7ae557604adf67be50417f59c2c2f167def9a775"
+        snap = self.root / "hub" / "snapshots" / commit
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "model.safetensors").write_bytes(b"")
+        calls = []
+
+        def snapshot(repo, revision=None, allow_patterns=None, local_files_only=False):
+            calls.append((repo, revision, local_files_only))
+            if local_files_only and not (snap / "model.safetensors").exists():
+                raise FileNotFoundError("not cached")
+            return str(snap)
+        import huggingface_hub
+        with mock.patch.object(huggingface_hub, "snapshot_download", snapshot):
+            got = es_local.find("hf:Qwen/Qwen2.5-0.5B-Instruct")
+            self.assertEqual(got.base, f"hf:Qwen/Qwen2.5-0.5B-Instruct@{commit}")
+            self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", None, True)])  # the cache, and no more
+            spec = es.EsSpec(**{**spec_for().__dict__, "base": got.base, "manifest": es_local.manifest(got.base)})
+            self.assertTrue(es_local.find_base(spec))
+            self.assertEqual(es.LOCAL[spec.manifest], str(snap))
+            del es.LOCAL[spec.manifest]
+            (snap / "model.safetensors").unlink()  # not in the cache any more: a worker never downloads it
+            calls.clear()
+            self.assertFalse(es_local.find_base(spec))
+            self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", commit, True)])
+            self.assertFalse(es_local.find_base(es.EsSpec(**{**spec.__dict__, "manifest": "9" * 64})))  # not a local one
+            calls.clear()
+            es_local.find("Qwen/Qwen2.5-0.5B-Instruct")  # a testnet's: downloaded once
+            self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", None, True), ("Qwen/Qwen2.5-0.5B-Instruct", None, False)])
+        for bad in ("not a model", "https://example.com/x/y", "a/b/c d"):
+            with self.assertRaises(ValueError):
+                es_local.parse_ref(bad)
+        self.assertEqual(es_local.parse_ref("https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct@main"),
+                         ("Qwen/Qwen2.5-0.5B-Instruct", "main"))
+        self.assertTrue(es_local.accepts({"es": True}))
+        for g in ({}, {"es": "true"}, {"es": 1}, None, []):
+            self.assertFalse(es_local.accepts(g))
+
+    @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
+    def test_train_evo_posts_the_measured_runs_job(self):
+        from vibehash import es_local, settings
+        node, api, req = self.node(es_gate=True)
+        tiny = tiny_model(self.root / "tiny", seed=1)
+        code, out = self.run_cli("train", "--evo", "--base", str(tiny), "--node", node.url, "--wallet",
+                                 str(self.root / "requester.json"), "--budget", "20", "--yes", "--plain")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Posted Evo job evo-tiny-", out)
+        self.assertIn("8 twin pairs a generation (16 nudged copies, sigma 0.001), 32 Countdown puzzles each", out)
+        self.assertIn("up to 20 generations at 1 VIBE each", out)
+        self.assertIn("workers   only this computer's", out)  # a folder's model: no cache elsewhere has it
+        txs = [*node.coord.mempool, *(t for b in node.chain.blocks for t in b.txs)]  # waiting, or sealed already
+        tx = next(t for t in txs if t.kind == "post_job")
+        job = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount)
+        spec = job.spec
+        self.assertTrue(job.es)
+        self.assertEqual((tx.sender, tx.amount, job.fee_per_round), (req.address, 20 * VIBE, es_local.FEE))
+        self.assertEqual(spec.tensors, es.preset("mlp", 1))  # the last layer's MLP
+        self.assertEqual((spec.pairs, spec.pairs_per_unit, spec.problems, spec.max_tokens, spec.level, spec.retarget,
+                          spec.optimizer, spec.sigma), (8, 2, 32, 64, 2, (2, 0.5, 0.1), "sgd", 1e-3))
+        self.assertAlmostEqual(spec.alpha, 5e-7, delta=1e-18)  # the paper's step, sigma**2 / 2
+        self.assertEqual(spec.manifest, es_local.manifest(spec.base))
+        self.assertEqual(settings.load()["last_job"], job.job_id)
+
+    @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
+    def test_testnet_evo_end_to_end_and_carrying_on(self):
+        """A whole Evo network on the CPU: its genesis takes ES jobs and stakes its workers, it posts the job, its
+        workers rebuild each round's state from the chain, and the chain alone rebuilds the job's state. Run again
+        without the switch, it carries on as an Evo network with the model it was made with."""
+        from vibehash.storage import Store
+        tiny = tiny_model(self.root / "tiny", seed=1)
+        d = self.root / "evo-net"
+        patch = mock.patch.object(es, "reward", fake_reward)  # scores a random tiny model's babble can earn
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(es.unload)
+        self.addCleanup(es.cache_noise, 0)
+        fast = ["--device", "cpu", "--port", "0", "--plain", "--register-s", "1", "--compute-s", "2", "--reveal-s", "1",
+                "--verify-s", "2"]
+        code, out = self.run_cli("testnet", "--evo", "--evo-model", str(tiny), "--dir", str(d), "--rounds", "3", *fast)
+        self.assertEqual(code, 0, out)
+        genesis = json.loads((d / "genesis.json").read_text())
+        self.assertIs(genesis["es"], True)
+        self.assertEqual(len(genesis["stakes"]), 8)
+        self.assertIn("evo      Evo mode: training by evolution, the chain is the model: local/tiny", out)
+        self.assertRegex(out, r"block \d+: Evo job evo-1, level \d, mean reward [\d.]+% over 8 pairs, \d+ B of seeds")
+        self.assertIn("train --evo --node", out)
+        code, again = self.run_cli("testnet", "--dir", str(d), "--rounds", "1", *fast)  # no --evo: carries on as one
+        self.assertEqual(code, 0, again)
+        self.assertIn("Finding " + str(tiny), again)
+        store = Store(d / "node-data")
+        self.addCleanup(store.close)
+        chain = store.open_chain(genesis)
+        state, rounds = es.rebuild_chain(chain.blocks, store.load_record, "evo-1")
+        mine = [b for b in chain.blocks if b.summary is not None and b.summary.job_id == "evo-1"]
+        self.assertEqual(rounds, len(mine))
+        self.assertGreaterEqual(rounds, 4)
+        self.assertEqual(es.state_hash(state), mine[-1].summary.params_hash)
+        self.assertIn("evo-1", chain.state.jobs)
+        lines = [json.loads(x) for x in (self.root / "home" / "logs" / "rounds.jsonl").read_text().splitlines()]
+        self.assertTrue(any(x.get("kind") == "es" and (x.get("accepted") or 0) > 0 for x in lines),
+                        lines[-3:])  # its round log counts an Evo round's units
+
+
 if __name__ == "__main__":
     unittest.main()

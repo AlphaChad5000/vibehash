@@ -698,10 +698,11 @@ class WorkerClient:
                         st.units += 1
                         st.training_flops += u.flops
                         self.record.add(rnd, committed=1)
+                        self.record.append(rnd, "_unit_flops", u.flops)  # (so its line can count the units accepted)
                 finally:
                     st.busy = False
                     self.record.add(rnd, train_s=time.perf_counter() - t0, trained=len(units))
-                st.activity = "ES answers committed; waiting for the reveal"
+                st.activity = "Evo answers committed; waiting for the reveal"
                 units = []
             elif units and job.deepseek:  # a DeepSeek training round: its records, once
                 self.record.note(rnd, kind="deepseek-training")
@@ -749,7 +750,7 @@ class WorkerClient:
                 if res is not None:
                     self.record.add(rnd, revealed=1)
                 if res and not res["ok"]:
-                    log.warning("round %d: %s unit %s rejected: %s", rnd, "ES" if "es" in body else "prep", body["unit_id"],
+                    log.warning("round %d: %s unit %s rejected: %s", rnd, "Evo" if "es" in body else "prep", body["unit_id"],
                                 res["verdict"])
                     self.record.append(rnd, "rejected", {"unit": body["unit_id"], "why": str(res["verdict"])[:300]})
             beacon = bytes.fromhex(s["beacon"])

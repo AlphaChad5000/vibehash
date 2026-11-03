@@ -48,6 +48,8 @@ class EsWork:
         return device_of(self.client.backend)
 
     def runtime(self, job: TrainingJob) -> es.Runtime:
+        from .es_local import find_base
+        find_base(job.spec)  # a local network's base, from this computer's Hugging Face cache (es_local.py)
         return es.runtime(job.spec, self.device())
 
     # --- the state ---
@@ -139,7 +141,7 @@ class EsWork:
                                          "salt": salt.hex(), "es": {"answers": bid, "rewards": rewards}})
                 yield u
         self.timings.setdefault(rnd, {})["answer_s"] = time.perf_counter() - t0
-        log.info("round %d: answered %d ES units in %.1f s", rnd, len(units), time.perf_counter() - t0)
+        log.info("round %d: answered %d Evo units in %.1f s", rnd, len(units), time.perf_counter() - t0)
 
     def reveals(self, rnd: int) -> list[dict]:
         return self.claims.pop(rnd, [])

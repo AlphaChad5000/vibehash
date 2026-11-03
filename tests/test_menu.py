@@ -90,6 +90,20 @@ class MenuTests(unittest.TestCase):
         with mock.patch("builtins.input", lambda *a: ""):
             self.assertIsNone(menu._finetune())  # no file, nothing posted
 
+    def test_evo_mode_starts_a_local_evo_network_when_asked(self):
+        labels = [i.label for i in menu.items()]
+        item = menu.items()[labels.index("Try Evo mode (local)")]
+        self.assertIn("Train", [title for title, group in menu.SECTIONS if item in group])
+        self.assertEqual(item.usage, "testnet --evo")
+        with no_wallet():
+            page = menu.frame(labels.index("Try Evo mode (local)"), menu.Status(), "vibehash", 120, termui.ASCII)
+        self.assertIn("same as:  vibehash testnet --evo", re.sub(r"\x1b\[[0-9;]*[mKJH]", "", page))
+        with mock.patch("builtins.input", lambda *a: "y"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(item.ask(), [["testnet", "--evo"]])
+        self.assertIn("the chain is the model", out.getvalue())
+        with mock.patch("builtins.input", lambda *a: ""), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(item.ask())  # nothing started without a yes
+
     def test_nothing_is_sent_without_a_yes(self):
         answers = iter(["vibe1friend", "2.5", ""])
         with mock.patch("builtins.input", lambda *a: next(answers)):

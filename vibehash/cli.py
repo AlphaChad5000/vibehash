@@ -921,13 +921,80 @@ def _finetune(a) -> None:
               f"When it's trained:  {prog()} job download   (a LoRA adapter for transformers, PEFT and vLLM)")
 
 
+def _evo(a) -> None:
+    """`train --evo`: post an Evo job (es.py, es_local.py) to the node: training by evolution on Countdown puzzles the
+    chain draws, so there's no data file. Only a chain whose genesis takes ES jobs accepts one, which is checked first,
+    before a model is looked for or a wallet opened: on any other chain nothing is spent. Then the plan, and one question
+    before anything is posted."""
+    from . import es_local, trainui
+
+    url = node_of(a)
+    node = NodeClient(url)
+    if not es_local.accepts(node.get("/genesis")):
+        sys.exit(es_local.LOCAL_ONLY)
+    if a.data is not None:
+        sys.exit("an Evo job trains on Countdown puzzles drawn from the chain, so it takes no data file: leave it out")
+    model = a.base or es_local.MODEL
+    print(f"{es_local.TAGLINE}. Reading {model}'s config…", file=sys.stderr)
+    try:
+        found = es_local.find(model, config_only=True)
+        spec = es_local.spec_for(found)
+    except (RuntimeError, ValueError, OSError) as e:
+        sys.exit(f"error: {e}")
+    stem = re.sub(r"[^a-z0-9._-]+", "-", found.repo.split("/")[-1].lower()).strip("-._")[:30] or "model"
+    job_id = a.id or f"evo-{stem}-{secrets.token_hex(2)}"
+    fee = es_local.FEE if a.fee is None else a.fee
+    try:
+        job = es_local.job(spec, job_id, "", a.budget, fee)
+    except InvalidJob as e:
+        sys.exit(f"error: {e}")
+    home = _job_home(job_id)
+    if home.exists():
+        sys.exit(f"you already have a job called {job_id}; pick another name with --id")
+    rounds = a.budget // fee if fee else 0
+    print(f"Evo job {job_id}: training by evolution, the chain is the model\n"
+          f"  model     {found.folder if found.base.startswith('hf:local/') else found.repo + ' at ' + found.base[-40:][:7]}: "
+          f"{spec.n:,} numbers evolve "
+          f"({', '.join(spec.tensors)})\n"
+          f"  method    {spec.pairs} twin pairs a generation ({2 * spec.pairs} nudged copies, sigma {spec.sigma:g}), "
+          f"{spec.problems} Countdown puzzles each, starting at level {spec.level}\n"
+          f"  budget    {fmt(a.budget)}: up to {rounds} generations at {fmt(fee)} each, paid only for work that passes "
+          "its checks\n"
+          + (f"  workers   only this computer's: a model's folder is in no one else's cache\n"
+             if found.base.startswith("hf:local/") else
+             f"  workers   need {found.repo} in their Hugging Face cache (a `testnet --evo`'s have it)\n"))
+    if not ask("Post it?", a.yes):
+        print("Nothing was posted, and nothing was spent.")
+        return
+    keys = load_wallet(wallet_of(a))
+    home.mkdir(parents=True)
+    (home / "job.json").write_text(json.dumps({"job_id": job_id, "node": url, "kind": "es", "base": spec.base,
+                                               "budget": a.budget, "fee": fee}, indent=2))
+    try:
+        node.send_tx(keys, "post_job", "system", a.budget, job.spec_json())
+    except NodeError:
+        shutil.rmtree(home, ignore_errors=True)
+        raise
+    settings.save(last_job=job_id)
+    print(f"Posted Evo job {job_id}")
+    if trainui.supported(a.plain):
+        _follow(job_id, url, budget=a.budget, posted=True, evo=True)
+    else:
+        print(f"\nWatch it evolve:  {prog()} job watch")
+
+
 def cmd_train(a):
     """A CSV file in, a training job on the network out, with sensible model settings chosen for it. On a terminal
     it then follows the job on the live training dashboard. With `--base` and a file of chats or text, it fine-tunes
-    an open-weight model instead (_finetune); `--base` alone shows what that model would take."""
+    an open-weight model instead (_finetune); `--base` alone shows what that model would take. With `--evo`, an Evo
+    job (_evo)."""
     from . import catalog, tabular, trainui
     from .blobs import file_sha256
 
+    if getattr(a, "evo", False):
+        return _evo(a)
+    if a.fee is None:
+        a.fee = to_syn("10")
     if a.base is None and a.data is None and sys.stdin.isatty() and sys.stdout.isatty():
         a.base = _pick_model()
         if a.base is None:
@@ -1059,12 +1126,13 @@ def cmd_job_status(a):
         print(f"Watch it train live: {prog()} job watch {job_id}")
 
 
-def _follow(job_id: str, url: str, budget: int | None = None, posted: bool = False, plain: bool = False) -> None:
+def _follow(job_id: str, url: str, budget: int | None = None, posted: bool = False, plain: bool = False,
+            evo: bool = False) -> None:
     """Follow a training job until its budget is spent, or Ctrl+C: the live dashboard on a terminal, else a log line
-    per event. Then say where it stands, and what's next."""
+    per event. Then say where it stands, and what's next. `evo`: an Evo job, shown as one before the node says."""
     from . import records, trainui
 
-    watch = trainui.JobWatch(job_id, url, budget=budget, posted=posted)
+    watch = trainui.JobWatch(job_id, url, budget=budget, posted=posted, evo=evo)
     folder = records.job_folder(job_id)
     if folder is not None:  # its rounds, kept in ~/.vibehash/jobs/<job> as they land
         watch.history = records.JobHistory(job_id, folder, watch.api)
@@ -1447,6 +1515,19 @@ def _in_onedrive(path: Path) -> bool:
     return any(r and path.resolve().is_relative_to(Path(r).resolve()) for r in roots)
 
 
+def _evo_round(node, block) -> str:
+    """A testnet's sealed Evo round in a line, from the node's own record of it (--plain)."""
+    from . import es_local, esui
+
+    record = node.store.load_record(block.height) if block.summary is not None else None
+    if not isinstance(record, dict) or not isinstance(record.get("es"), dict):
+        return ""
+    gen = esui.parse_generation(0, block.height, record)
+    reward = f"mean reward {gen.mean:.1%}" if gen.mean is not None else "no pair accepted"
+    return (f"Evo job {block.summary.job_id}, level {gen.level}, {reward} over {gen.pairs} pairs, "
+            f"{es_local.chain_bytes(record['es'])} B of seeds and scores on chain")
+
+
 def cmd_testnet(a):
     """A whole network on this computer: node, workers and a training job, from one command.
     Its wallets are unencrypted throwaway keys, so never send real coins to them."""
@@ -1455,7 +1536,8 @@ def cmd_testnet(a):
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with the node's log, even when piped
-    d = Path(a.dir) if a.dir else settings.home() / "testnet"
+    evo = bool(getattr(a, "evo", False) or getattr(a, "evo_model", None))  # Evo mode (es_local.py)
+    d = Path(a.dir) if a.dir else settings.home() / ("testnet-evo" if evo else "testnet")
     if a.reset and d.exists():
         if not (d / "genesis.json").exists():
             sys.exit(f"{d} doesn't look like a testnet folder; not deleting it")
@@ -1464,6 +1546,23 @@ def cmd_testnet(a):
         print(f"warning: {d} is inside OneDrive, whose syncing can corrupt a running node's database; "
               "use --dir somewhere else", file=sys.stderr)
     existing = json.loads((d / "genesis.json").read_text()) if (d / "genesis.json").exists() else None
+    if existing is not None and existing.get("es") is True:
+        evo = True  # an Evo testnet carries on as one
+    elif existing is not None and evo:
+        sys.exit(f"{d} is a testnet made without Evo jobs: add --reset to start it over as an Evo one, or use another --dir")
+    found = evo_spec = None
+    if evo:  # the model first: a failed download leaves no half-made testnet
+        from . import es, es_local
+        kept = json.loads((d / "evo.json").read_text()).get("model") if (d / "evo.json").exists() else None
+        model = getattr(a, "evo_model", None) or kept or es_local.MODEL  # carrying on: the model its jobs were made for
+        print(f"{es_local.TAGLINE}. Finding {model} on this computer (or downloading it once)…", flush=True)
+        try:
+            found = es_local.find(model)
+            evo_spec = es_local.spec_for(found)
+        except Exception as e:  # noqa: BLE001 - not on this computer and couldn't be downloaded, or not a model we can run
+            sys.exit(f"error: couldn't get {model} for Evo mode: {e}")
+        es_local.register(found)  # where this process's workers find it
+        es.cache_noise(es_local.noise_mb(evo_spec))  # the node and the workers share one process: a pair's noise once
     count = (len(existing.get("validators", {})) or 1) if existing else (a.validators or 1)
     if existing and a.validators and a.validators != count:
         sys.exit(f"this testnet has {count} validator{'s' * (count > 1)}; add --reset to start one with {a.validators}")
@@ -1484,7 +1583,11 @@ def cmd_testnet(a):
                    "allocations": {keys["requester"].address: 10_000 * SYN_PER_VIBE}, "stakes": {},
                    "bootstrap": {keys[v].address: 10 * SYN_PER_VIBE for v in validators}, "earn_in": True,
                    "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)}}
+        if evo:  # a chain that takes ES jobs (ledger.ES_GATE), whose workers are staked: nothing else here to earn it on
+            genesis |= {"es": True, "stakes": {keys[n].address: es_local.STAKE for n in worker_names}}
         (d / "genesis.json").write_text(json.dumps(genesis, indent=2))
+    if evo:
+        (d / "evo.json").write_text(json.dumps({"model": model, "base": found.base}, indent=2))
     genesis = json.loads((d / "genesis.json").read_text())
     named = genesis.get("validators", {})
     ports = [urlsplit(named[keys[v].address]).port for v in validators] if named else [a.port]
@@ -1496,10 +1599,12 @@ def cmd_testnet(a):
         logging.getLogger("vibehash.worker").setLevel(logging.WARNING)  # the node's log tells the story
 
     times = PhaseTimes(a.register_s, a.compute_s, a.reveal_s, a.verify_s, idle_s=1.0)
+    big = {"max_job_bytes": 512 * 2**20} if evo else {}  # an Evo job's state is its evolving numbers (es_local_run's)
     nodes = []
     try:
         for v, port in zip(validators, ports):
-            nodes.append(Node(d / ("node-data" if v == "node" else f"{v}-data"), genesis, keys[v], a.host, port, times))
+            nodes.append(Node(d / ("node-data" if v == "node" else f"{v}-data"), genesis, keys[v], a.host, port, times,
+                              **big))
     except OSError as e:
         for n in nodes:
             n.server.server_close()
@@ -1530,7 +1635,8 @@ def cmd_testnet(a):
     port = urlsplit(node.url).port
     url = f"http://{_lan_ip() if a.host == '0.0.0.0' else urlsplit(node.url).hostname}:{port}"
     p = prog()
-    dash = minerui.MinerDashboard(clients, node.url, footer=f"kept in {d}") if minerui.supported(a.plain) else None
+    dash = (minerui.MinerDashboard(clients, node.url, footer=f"kept in {d}", **({"evo": True} if evo else {}))
+            if minerui.supported(a.plain) else None)
     say = dash.note if dash else (lambda text: print("  " + text))
     posted = None
 
@@ -1539,16 +1645,26 @@ def cmd_testnet(a):
         s = node.chain.state
         if a.job == "none" or any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
             return  # a job is running, or the one just posted hasn't reached a block yet
-        job = template_job(f"demo-{len(s.jobs) + 1}", a.job == "gpu", keys["requester"].address, a.budget)
+        if evo:  # an Evo job, with the measured run's settings (es_local.py)
+            job = es_local.job(evo_spec, f"evo-{len(s.jobs) + 1}", keys["requester"].address, a.budget)
+        else:
+            job = template_job(f"demo-{len(s.jobs) + 1}", a.job == "gpu", keys["requester"].address, a.budget)
         if s.balance(keys["requester"].address) >= job.budget + node.coord.config.min_fee:
             api.send_tx(keys["requester"], "post_job", "system", job.budget, job.spec_json())
             posted = job.job_id
-            say(f"posted job {job.job_id}: {job.spec.n_params:,} {job.spec.precision} weights, "
-                f"budget {job.budget / SYN_PER_VIBE:,.0f} VIBE")
+            if evo:
+                say(f"posted Evo job {job.job_id}: {found.repo} evolving {evo_spec.n:,} numbers, {evo_spec.pairs} twin "
+                    f"pairs a generation, {evo_spec.problems} puzzles each; budget {job.budget / SYN_PER_VIBE:,.0f} VIBE")
+            else:
+                say(f"posted job {job.job_id}: {job.spec.n_params:,} {job.spec.precision} weights, "
+                    f"budget {job.budget / SYN_PER_VIBE:,.0f} VIBE")
 
     hints = (f"Try these in another terminal:\n"
              f"  {p} balance --node {url} --wallet {_q(d / 'worker-1.json')}\n"
              f"  {p} chain verify --node {url} --genesis {_q(d / 'genesis.json')}")
+    if evo:
+        hints += (f"\n  {p} train --evo --node {url} --wallet {_q(d / 'requester.json')}   (another Evo job)\n"
+                  f"  {p} job watch evo-1 --node {url}   (a generation at a time)")
     if a.host == "0.0.0.0":
         hints += (f"\nOther computers join with `{p} setup --node {url}`. Send each one VIBE to stake:\n"
                   f"  {p} send --node {url} --wallet {_q(d / 'requester.json')} --to THEIR-ADDRESS --amount 20")
@@ -1558,6 +1674,7 @@ def cmd_testnet(a):
               + (f"  validators {len(nodes)}, on ports {', '.join(str(p) for p in ports)}; they take turns leading rounds "
                  f"and vote on every block\n" if len(nodes) > 1 else "")
               + f"  workers  {len(clients)}, training on {clients[0][1].backend.describe()}\n"
+              + (f"  evo      {es_local.TAGLINE}: {found.repo}, {evo_spec.n:,} numbers evolving\n" if evo else "")
               + f"  logs     {d / 'node.log'} (the node's)" + (f"; the workers are {session.where()}" if session else "")
               + f"\n\n{hints}\nStop with Ctrl+C. Running it again carries on where it stopped; --reset starts over.\n")
     else:
@@ -1587,6 +1704,10 @@ def cmd_testnet(a):
             s = node.chain.state
             earned = ", ".join(f"{n} {(s.balance(keys[n].address) + s.stake(keys[n].address) - start[n]) / SYN_PER_VIBE:.2f}"
                                for n in workers)
+            if evo:  # what the round put on the chain: a generation's seeds and scores
+                gen = _evo_round(node, tip)
+                if gen:
+                    print(f"  block {tip.height}: {gen}", flush=True)
             print(f"  block {tip.height}: earned this session {earned} VIBE; "
                   f"{sum(s.escrow.values()) / SYN_PER_VIBE:,.0f} VIBE of job budget left")
         if a.rounds is not None and rounds >= a.rounds:
@@ -1671,6 +1792,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, help="stop after this many rounds (default: run until Ctrl+C)")
     p.add_argument("--reset", action="store_true", help="delete this testnet's chain and wallets and start over")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
+    p.add_argument("--evo", action="store_true", help="Evo mode: training by evolution, the chain is the model. A "
+                   "network whose genesis takes Evo jobs, training an open model on Countdown puzzles, its blocks holding "
+                   f"only seeds and scores (default folder {settings.home() / 'testnet-evo'})")
+    p.add_argument("--evo-model", metavar="MODEL", help="Evo mode's model: a Hugging Face name, from this computer's "
+                   "cache or downloaded once, or a model's folder (default Qwen/Qwen2.5-0.5B-Instruct, about 1 GB)")
     for name, default in (("register-s", 3.0), ("compute-s", 8.0), ("reveal-s", 3.0), ("verify-s", 4.0)):
         p.add_argument(f"--{name}", type=float, default=default)
     p.set_defaults(fn=cmd_testnet)
@@ -1810,8 +1936,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--units", type=int, default=8, help="fine-tunes: units of training a round (default 8)")
     p.add_argument("--yes", "-y", action="store_true", help="fine-tunes: don't ask before checking weights or posting")
     p.add_argument("--label", help="the column to predict (default: the last one)")
+    p.add_argument("--evo", action="store_true", help="Evo mode: post an Evo job, training --base (default "
+                   "Qwen/Qwen2.5-0.5B-Instruct) by evolution on puzzles the chain draws, no data file. For local test "
+                   "networks for now (`testnet --evo`)")
     p.add_argument("--budget", type=to_syn, default="100", help="VIBE to spend, paid only for work that passes its checks (default 100)")
-    p.add_argument("--fee", type=to_syn, default="10", help="VIBE per round of training (default 10)")
+    p.add_argument("--fee", type=to_syn, default=None, help="VIBE per round of training (default 10; an Evo job's 1)")
     p.add_argument("--hidden", default="128,128", help="hidden layer widths (default 128,128)")
     p.add_argument("--id", help="job name (default: from the file name)")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
