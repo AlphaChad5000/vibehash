@@ -122,6 +122,17 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
+**Release 0.5.8 (2026-11-02, test night): two worker fixes from the live run.** The mining dashboard called any drop in
+balance plus stake a slash, so funding a friend's wallet showed "lost 97.42 VIBE: slashed"; a drop with a new nonce is now
+the wallet's own transaction (minerui.Rig.nonce, .sent). And a worker far from the node (a RunPod pod) checked 2 of 9
+fruit-demo tasks in the 10 s verify phase, fetching checkpoints and sending verdicts one round trip at a time: they now
+come down together first and verdicts go while the next task is checked (WorkerClient._prefetch, _answer). Workers only.
+Found the same night and not fixed here: honest fine-tune workers on different machines slash each other. A Qwen3-0.6B
+segment's B differs by 5.6e-4 between this PC's GPU and CPU (over the 1e-4 tolerance; same on torch 2.14 and 2.15), most
+likely Adam's sign-like first steps from fresh moments, and a disputed defender can't make its first split in the 53.8 s a
+move gets. Rounds 7277 and 7280 of job pokemon-pun-starter-2d950a; a separate session (branch from task
+"Fine-tunes slash honest workers across GPUs") works on it.
+
 **Release 0.5.7 (2026-11-02): for test night (PR #17, TONIGHT.md).** The three parts below, and the Muse agents (`agents/`,
 calebluh's `Meta-AI-Agents` with fixes; agents/README.md). The faster rounds are the node's: they take effect when
 the public node is upgraded with `deploy/setup-node.sh`.
