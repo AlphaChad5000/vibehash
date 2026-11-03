@@ -220,7 +220,7 @@ def run(site, req: dict, a) -> None:
     result = results[-1]
     result["rounds"] = [{"round": i + 1, **{k: r["judge"][k] for k in ("tuned_wins", "ties", "prompts")},
                          "vs_prompted": r["judge"].get("vs_prompted", {}).get("tuned_wins")}
-                        | {s: wins(r["judge"][s]) for s in judge.SETS if r["judge"].get(s)}
+                        | {s: wins(r["judge"][s]) for s in [*judge.SETS, judge.FRESH] if r["judge"].get(s)}
                         for i, r in enumerate(results)]
     result["rigor"] = {"level": rigor, "met": good_enough(result, rigor) if RIGOR[rigor]["repairs"] else None}
     j = result["judge"]
@@ -269,6 +269,12 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
     job = plan["job_id"]
     site.report(rid, "training", f"round {round_no}: training", detail={"kind": "round", "round": round_no, "epochs": plan.get("epochs"), "rank": plan.get("rank")})
     train(site, rid, architect.train_command(plan, chats, out), round_no)
+    # Written after training, so nothing trained on them; never shown to the Job Architect, so nothing repairs on them
+    site.report(rid, "judging", "Muse Spark is writing its own test prompts: casual, everyday and demanding")
+    spec = json.loads(evals.read_text())
+    used = spec["prompts"] + [p for ps in judge.SETS.values() for p in ps] + [e["user"] for e in plan["examples"]]
+    spec[judge.FRESH] = judge.fresh(plan["goal"], used)
+    evals.write_text(json.dumps(spec, indent=2))
     site.report(rid, "judging", "the base and fine-tuned models are answering the held-back prompts")
     answers = judge.answer(evals, out / "adapters" / job)
     n = len(json.loads(answers.read_text())["pairs"])
