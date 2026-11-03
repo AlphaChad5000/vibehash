@@ -185,7 +185,44 @@ def plan_job(goal: str, log=print) -> dict:
     if problems := check(plan):
         raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
     plan["goal"] = goal
+    plan["examples"] += more(plan, log)
     return plan
+
+
+MORE = f"""You add training chats to a fine-tuning job. Reply with ONE JSON object:
+{{
+  "examples": [{{"user": "...", "assistant": "..."}}, ...]   (at least 40 NEW chats in exactly the style wanted, on
+                                                            topics unlike the chats below; at least {LONG_EXAMPLES} long,
+                                                            {CASUAL_EXAMPLES} casual)
+}}
+{SHAPES}"""
+
+
+def more(plan: dict, log=print) -> list[dict]:
+    """A second batch of chats before training. 32 natural, varied chats taught a two-sentence style only 18 times in
+    32; one batch is all a single reply holds, so a second call doubles what the model learns from. Best effort: if
+    the batch keeps failing the checks, train on the first one."""
+    shown = "\n\n".join(f"User: {e['user']}\nAssistant: {e['assistant']}" for e in plan["examples"])
+    ask = [{"role": "system", "content": MORE}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{shown}"}]
+    seen = {e["user"] for e in plan["examples"]}
+    for attempt in range(2):
+        try:
+            batch = chat_json(ask)
+        except Exception as e:
+            log(f"no second batch of chats ({e}); training on the first")
+            return []
+        examples = [e for e in batch.get("examples") or [] if isinstance(e, dict) and e.get("user") not in seen]
+        problems = ([f"only {len(examples)} new examples; need at least 40"] if len(examples) < 40 else []) + \
+                   (["an example is missing its user or assistant text"]
+                    if any(not e.get("user") or not e.get("assistant") for e in examples) else []) + \
+                   [p for p in mixed(examples, [], 1) if "eval prompts" not in p] + \
+                   templated(plan["examples"] + examples)
+        if not problems:
+            return examples
+        ask += [{"role": "assistant", "content": json.dumps(batch)},
+                {"role": "user", "content": "Fix these and reply with the whole JSON again:\n" + "\n".join(problems)}]
+    log("second batch of chats rejected:\n  " + "\n  ".join(problems) + "\ntraining on the first")
+    return []
 
 
 REPAIR = f"""You repair a fine-tuning job. The fine-tuned model was judged against the goal and lost or tied on the
