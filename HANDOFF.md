@@ -122,6 +122,7 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
+<<<<<<< HEAD
 **Unreleased (branch `job-picker`, 2026-11-02): pick the job to mine.** The owner asked for "a easy selector in the
 mining area of the terminal that lets you select jobs, auto, then each of the listed jobs". The mining dashboard has a
 `job:` line under the round (code map, `minerui.py`), and `worker --job JOB` does the same for pods and `--plain`,
@@ -135,6 +136,13 @@ workers. Tested: `tests/test_minerui.py`, `test_network.JobPickerTest` (two live
 keys on a real Windows console (key events written into its input buffer, a real Ctrl+C) and on a real pty under WSL.
 On Windows, Shift+Tab reaches msvcrt as Tab, so it goes forward there. Not done: the guide's canvas replica of the
 dashboard (`docs/guide.html`, `build()`) has no `job:` line yet.
+=======
+**Front page jobs section (branch site-jobs, not published).** docs/site/index.html now groups the jobs after the featured
+one into Training now, Waiting (the node's /status reason in one line, the full text on "Why?"), Queued and Finished
+(collapsed). Each card has a kind tag, "loss 5.13 → 3.65 (−29%)"-style headline and a facts line; "Report" opens /job/<id>
+in place (chart, rounds that changed the model, settings, owner, model hash, copyable commands; #job-<id> links to it).
+Fine-tune curves follow 0d1a9ee's rule; until the node runs it, the page reads a fine-tune's rounds for its card itself.
+>>>>>>> site-jobs
 
 **Release 0.5.8 (2026-11-02, test night): two worker fixes from the live run.** The mining dashboard called any drop in
 balance plus stake a slash, so funding a friend's wallet showed "lost 97.42 VIBE: slashed"; a drop with a new nonce is now
