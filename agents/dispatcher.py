@@ -8,9 +8,9 @@ Run one on each machine that should take jobs; the site hands each request to ex
   1. planning   the Job Architect designs and checks the job (architect.py)
   2. training   train_local.py trains a LoRA adapter on this machine's GPU, reporting each epoch
   3. judging    both models answer the held-back prompts, then Muse Spark grades them blind (judge.py)
-  4. done       the run, the same JSON as web/public/results/run.json, sent back to the site (publish.py)
+  4. done       the run, the same JSON as web/public/results/<job>.json, sent back to the site (publish.py)
 Each step's progress goes to the site, so the requester can follow it on the form. With --goal there's no site: the
-progress prints here and the run is written to web/public/results/run.json.
+progress prints here and the run is written to web/public/results/<job>.json.
 
 Needs: DISPATCH_TOKEN (the same secret the site has), MODEL_API_KEY (or the LLM_* settings llm_call.py reads), and
 requirements-train.txt with a GPU (training and judging both run here).
@@ -152,8 +152,7 @@ class Terminal:
     def report(self, rid: str, status: str, message: str | None = None, run: dict | None = None, **extra) -> None:
         print(f"{status}: {message or ''}", flush=True)
         if run:
-            publish.OUT.write_text(json.dumps(run, indent=2), encoding="utf-8")
-            print(f"wrote {publish.OUT}")
+            print(f"wrote {publish.save(run)}")
 
 
 BEFORE = re.compile(r"held-back loss before: ([\d.]+), ([\d.]+)%")

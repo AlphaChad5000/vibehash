@@ -1,7 +1,10 @@
 """Publish a finished job to the results page: the plan, the training numbers and the judge's verdicts in one file.
 
-    python agents/publish.py support-bot                     # -> web/public/results/run.json
+    python agents/publish.py support-bot                     # -> web/public/results/support-bot.json
     python agents/publish.py support-bot --title "Support replies"
+    python agents/publish.py car-noises-only-4bc0eb pirate-captain-two-sentences-0352d5   # several at once
+
+Each run gets its own file, and runs.json lists every published run, best first, for the page's run picker.
 
 It reads what the other steps left in agent-jobs/:
   <job>.plan.json                       the Job Architect's plan
@@ -16,7 +19,7 @@ from pathlib import Path
 from models import BASES
 
 TITLES = {"qwen3-0.6b": "Qwen3 0.6B", "llama-3.2-1b": "Llama 3.2 1B"}
-OUT = Path(__file__).parent.parent / "web" / "public" / "results" / "run.json"  # what the results page reads
+RESULTS = Path(__file__).parent.parent / "web" / "public" / "results"  # what the results page reads
 
 
 def build(job: str, jobs: Path, title: str | None = None) -> dict:
@@ -43,18 +46,47 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
             "base_loss": epochs[0]["loss"], "epochs": epochs, "kept_epoch": report.get("kept_epoch", epochs[-1]["epoch"]), "judge": {**graded["summary"], "pairs": pairs}}
 
 
+def score(run: dict) -> tuple[int, int, str]:
+    """The run's headline verdict: against the base model told the goal when it was judged that way, else untrained."""
+    j = run["judge"]
+    if j.get("vs_prompted"):
+        return j["vs_prompted"]["tuned_wins"], j["prompts"], "told the goal"
+    return j["tuned_wins"], j["prompts"], "untrained"
+
+
+def save(run: dict, results: Path = RESULTS) -> Path:
+    """Write the run as results/<job>.json and rebuild results/runs.json from every run there, best first."""
+    results.mkdir(parents=True, exist_ok=True)
+    out = results / f"{run['job']}.json"
+    out.write_text(json.dumps(run, indent=2), encoding="utf-8")
+    runs = [json.loads(f.read_text(encoding="utf-8")) for f in results.glob("*.json") if f.name != "runs.json"]
+    index = []
+    for r in runs:
+        wins, prompts, against = score(r)
+        index.append({"job": r["job"], "title": r["title"], "base_title": r["base_title"], "date": r["date"],
+                      "wins": wins, "prompts": prompts, "against": against})
+    # the honest comparison first, then the share of prompts won, then the newest
+    index.sort(key=lambda r: (r["against"] == "told the goal", r["wins"] / r["prompts"], r["date"]), reverse=True)
+    (results / "runs.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description="Write a finished job's results for the results page.")
-    p.add_argument("job")
-    p.add_argument("--title", help="the run's name on the page (default: from the job id)")
+    p.add_argument("jobs_", nargs="+", metavar="job")
+    p.add_argument("--title", help="the run's name on the page (default: from the job id; one job only)")
     p.add_argument("--jobs", type=Path, default=Path("agent-jobs"))
-    p.add_argument("--out", type=Path, default=OUT)
+    p.add_argument("--results", type=Path, default=RESULTS)
     a = p.parse_args()
-    run = build(a.job, a.jobs, a.title)
-    a.out.write_text(json.dumps(run, indent=2), encoding="utf-8")
-    j = run["judge"]
-    print(f"wrote {a.out}: held-back loss {run['base_loss']} -> {run['epochs'][run['kept_epoch']]['loss']}, "
-          f"fine-tune preferred on {j['tuned_wins']} of {j['prompts']}")
+    if a.title and len(a.jobs_) > 1:
+        p.error("--title names one run; publish the others separately")
+    for job in a.jobs_:
+        run = build(job, a.jobs, a.title)
+        out = save(run, a.results)
+        wins, prompts, against = score(run)
+        print(f"wrote {out}: held-back loss {run['base_loss']} -> {run['epochs'][run['kept_epoch']]['loss']}, "
+              f"fine-tune preferred over the {'base model ' if against == 'told the goal' else ''}{against}"
+              f"{'' if against == 'told the goal' else ' model'} on {wins} of {prompts}")
 
 
 if __name__ == "__main__":
