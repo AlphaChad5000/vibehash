@@ -177,6 +177,7 @@ class Network:
     phase_ends: float = 0.0
     job_id: str | None = None
     chain_id: str = ""
+    progress: tuple[int, int] | None = None  # [in, of] of what the phase waits for (termui.parse_progress)
 
 
 def parse_status(reply) -> Network:
@@ -184,7 +185,8 @@ def parse_status(reply) -> Network:
     phase, job = d.get("phase"), d.get("job_id")
     return Network(_num(d.get("height"), int), _num(d.get("round"), int), phase if phase in PHASES else "idle",
                    _num(d.get("phase_ends"), float, 0.0), job if isinstance(job, str) else None,
-                   d.get("chain_id")[:64] if isinstance(d.get("chain_id"), str) else "")
+                   d.get("chain_id")[:64] if isinstance(d.get("chain_id"), str) else "",
+                   termui.parse_progress(d.get("progress")))
 
 
 _UNSET = object()
@@ -758,7 +760,7 @@ class TrainDashboard:
             tail = ([(f"    block {net.height}", DIM)] if not net.round or state == "finished" else
                     [("    your job's turn", GREEN)] if mine else [("    another job's turn", DIM)])
             add(*termui.phase_bar(g, self.phase_seen, net.round, net.phase, net.phase_ends,
-                                  w - max(0, len(tail[0][0]) - 12), tail))
+                                  w - max(0, len(tail[0][0]) - 12), tail, net.progress))
         mark = (g["tips"][self.frame_no % 3] if state == "training" else g["tips"][0]) + " "
         add((mark, PHASES.get(net.phase, DIM) if mine else DIM), (self._doing(state, now), TEXT))
         gap()

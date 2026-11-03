@@ -229,16 +229,20 @@ class Node:
     def _wait(self, seconds: float, still=None, done=None, least: float = 0.0) -> bool:
         """Sleep through a phase. False if we're stopping, or `still()` turns false (the round's no longer wanted).
         `done()`: the phase's work is all in, so it ends then rather than when its time runs out, though not before
-        `least` seconds. /status's `phase_ends` stays the latest it can end: nobody it waits for is cut short."""
+        `least` seconds. /status's `phase_ends` is the latest it can end until then (nobody it waits for is cut short),
+        and when it will end from then on: a dashboard counting down a DeepSeek round's ten minutes, then seeing it end
+        in twenty seconds, was showing the wrong one (test night, 2026-11-02)."""
         began = time.time()
         self.phase_ends = end = began + seconds
         if still is None and done is None:
             return not self.stopping.wait(seconds)
         while (left := end - time.time()) > 0:
-            if self.stopping.wait(min(left, 0.2)) or (still is not None and not still()):
+            if done is not None and done():
+                end = self.phase_ends = min(end, max(time.time(), began + least))
+                if time.time() >= end:
+                    break
+            if self.stopping.wait(min(max(end - time.time(), 0.0), 0.2)) or (still is not None and not still()):
                 return False
-            if done is not None and time.time() - began >= least and done():
-                break
         return still() if still is not None else not self.stopping.is_set()
 
     def _evidence(self) -> set[str]:
@@ -667,6 +671,9 @@ class Node:
                 "chain_id": self.chain.chain_id, "genesis_hash": self.chain.genesis_hash,
                 "height": self.chain.tip.height, "tip": self.chain.tip.hash.hex(),
                 "phase": c.phase.value, "phase_ends": self.phase_ends,
+                # [in, of] of what the phase waits for (Coordinator.progress): while some is out, phase_ends is only
+                # the latest it can end, since it ends as soon as the rest is in.
+                "progress": list(p) if (p := c.progress()) is not None else None,
                 "round": r.round_no if r else None, "job_id": r.job_id if r else None,
                 "attempt": r.record.get("attempt") if r else None,
                 "beacon": r.beacon.hex() if r and r.beacon else None,

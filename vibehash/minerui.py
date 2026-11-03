@@ -167,7 +167,8 @@ class MinerDashboard:
         return [_cells(row) for row in rows]
 
     def _phase_bar(self, s, width: int):
-        return termui.phase_bar(self.g, self.phase_seen, s.round, s.phase, s.phase_ends, width, [(f"    block {s.height}", DIM)])
+        return termui.phase_bar(self.g, self.phase_seen, s.round, s.phase, s.phase_ends, width, [(f"    block {s.height}", DIM)],
+                               s.progress)
 
     def frame(self) -> str:
         width, height = shutil.get_terminal_size((100, 32))

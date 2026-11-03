@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import advice, finetune, hardware, receipts, settings, tls
+from . import advice, finetune, hardware, receipts, settings, termui, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
 from .crypto import KeyPair
@@ -243,6 +243,7 @@ class WorkerStats:
     round: int | None = None
     phase: str = "idle"
     phase_ends: float = 0.0
+    progress: tuple[int, int] | None = None  # /status's [in, of] of what the phase waits for (termui.parse_progress)
     height: int = 0
     job: TrainingJob | None = None
     flops_per_sec: float = 0.0
@@ -508,6 +509,7 @@ class WorkerClient:
         rnd, phase = s["round"], s["phase"]
         st = self.stats
         st.phase, st.phase_ends, st.height = phase, s["phase_ends"], s["height"]
+        st.progress = termui.parse_progress(s.get("progress"))
         if rnd is None:
             st.activity = "waiting for someone to post a training job"
         key = (rnd, s.get("attempt"), phase)  # a round run again (by the next leader, say) is a new attempt to join

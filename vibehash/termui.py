@@ -148,23 +148,33 @@ def header(add, g: dict, ascii: dict, tails: list[str]) -> None:
         add(("VIBE HASH", WHITE), ("   ", None), (tails[0], DIM))
 
 
-def phase_bar(g: dict, seen: dict, rnd, phase: str, phase_ends: float, width: int, tail=None):
+def parse_progress(v) -> tuple[int, int] | None:
+    """/status's "progress", [in, of] of what the phase waits for, if it's that: two small whole numbers, in ≤ of."""
+    if isinstance(v, (list, tuple)) and len(v) == 2 and all(type(x) is int for x in v) and 0 <= v[0] <= v[1] < 10**6:
+        return v[0], v[1]
+    return None
+
+
+def phase_bar(g: dict, seen: dict, rnd, phase: str, phase_ends: float, width: int, tail=None, progress=None):
     """ROUND n, its phase, a bar running down to the phase's end, and `tail` (default: nothing). `seen` remembers
-    when each (round, phase) was first shown, which is where its bar starts."""
+    when each (round, phase) was first shown, which is where its bar starts. With `progress` (in, of) and some still out,
+    the phase ends as soon as the rest is in, so the bar fills with what's in and the time is only the most it can take."""
     key, now = (rnd, phase), time.time()
     first = seen.setdefault(key, now)
     left = max(0.0, phase_ends - now)
     total = max(phase_ends - first, 0.1)
-    done = 0.0 if phase == "idle" else min(1.0, 1 - left / total)
-    n = max(10, min(32, width - 46))
+    waiting = progress is not None and progress[0] < progress[1] and phase != "idle"
+    done = (0.0 if phase == "idle" else progress[0] / progress[1] if waiting else min(1.0, 1 - left / total))
+    n = max(10, min(32, width - 46 - (10 if waiting else 0)))
     fill = int(done * n)
     color = PHASES.get(phase, DIM)
     tail = list(tail or [])
     if not rnd:
         return [("IDLE", DIM), *tail]
+    when = ("" if phase == "idle" else f" {progress[0]}/{progress[1]} in, up to {left:.0f}s" if waiting
+            else f" {left:4.0f}s left")
     return [(f"ROUND {rnd} ", WHITE), (f" {phase.upper():<8} ", color),
-            (g["bar"] * fill, color), (g["empty"] * (n - fill), DIM),
-            (f" {left:4.0f}s left" if phase != "idle" else "", TEXT), *tail]
+            (g["bar"] * fill, color), (g["empty"] * (n - fill), DIM), (when, TEXT), *tail]
 
 
 def feed_style(level: int) -> str:
