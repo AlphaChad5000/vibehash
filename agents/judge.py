@@ -33,8 +33,10 @@ from models import chat_prompt, source
 PROMPTED = "Follow this instruction in every reply: {goal}"
 # A second judge reads every pair against the base model told the goal, the headline rival: Muse Spark wrote the
 # training chats and judges them too, which may favour the fine-tune. How often the two judges agree is reported.
-# Set JUDGE2_MODEL to another model on the same provider, or to nothing to skip it.
-SECOND = os.environ.get("JUDGE2_MODEL", "muse-wonder-1.0")
+# By default a newer Muse Spark on the same cheaper Contributor tier: another version, not another family, so its
+# agreement is a check on one model's quirks, not on Muse Spark as a whole. Set JUDGE2_MODEL to another model on the
+# same provider (muse-wonder-1.0 is a different model, at its own price), or to nothing to skip it.
+SECOND = os.environ.get("JUDGE2_MODEL", "muse-spark-1.3-contributor")
 
 
 def fixed(name: str) -> list[str]:
