@@ -220,7 +220,7 @@ def run(site, req: dict, a) -> None:
             "sample_repairs": [{"user": e["user"][:600], "assistant": e["assistant"][:600]} for e in fix["examples"][:2]],
             "new_chats": len(fix["examples"])}
         plan = {**plan, "job_id": f"{job}-r{n}", "examples": plan["examples"] + fix["examples"],
-                "eval_prompts": fix["eval_prompts"]}
+                "eval_prompts": fix["eval_prompts"], "off_scope_prompts": fix.get("off_scope_prompts") or []}
         chats, evals = architect.save(plan, out)
         site.report(rid, "training", f"round {n}: retraining on {len(plan['examples'])} chats, "
                                      f"{len(fix['examples'])} of them new")
@@ -255,6 +255,7 @@ RIGOR = {
 }
 BAR = 0.8          # share of its test prompts the fine-tune must win against the base model told the goal
 CHECK_BAR = 2 / 3  # share of the check prompts (judge.SETS) it must win, the same way, for a strict request
+SCOPE_BAR = 0.75   # share of the off-task prompts a narrow goal's model must decline (judge.scope, scored by code)
 
 
 def wins(summary: dict) -> int:
@@ -266,6 +267,8 @@ def good_enough(result: dict, rigor: str) -> bool:
     j = result["judge"]
     if wins(j) / j["prompts"] < BAR:
         return False
+    if j.get("scope") and j["scope"]["tuned"] < SCOPE_BAR:  # a narrow goal's model must also decline off-task asks
+        return False
     return not RIGOR[rigor]["check"] or not j.get("check") or wins(j["check"]) / j["check"]["prompts"] >= CHECK_BAR
 
 
@@ -273,7 +276,8 @@ def progress(result: dict, rigor: str) -> float:
     """How close a round got to the bar, to tell whether a repair helped."""
     j = result["judge"]
     check = wins(j["check"]) / j["check"]["prompts"] if RIGOR[rigor]["check"] and j.get("check") else 0
-    return wins(j) / j["prompts"] + check
+    scope = j["scope"]["tuned"] if j.get("scope") else 0
+    return wins(j) / j["prompts"] + check + scope
 
 
 def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
@@ -284,7 +288,8 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
     # Written after training, so nothing trained on them; never shown to the Job Architect, so nothing repairs on them
     site.report(rid, "judging", "Muse Spark is writing its own test prompts: casual, everyday and demanding")
     spec = json.loads(evals.read_text())
-    used = spec["prompts"] + [p for ps in judge.SETS.values() for p in ps] + [e["user"] for e in plan["examples"]]
+    used = spec["prompts"] + spec.get("off_scope", []) + [p for ps in judge.SETS.values() for p in ps] + \
+        [e["user"] for e in plan["examples"]]
     spec[judge.FRESH] = judge.fresh(plan["goal"], used)
     evals.write_text(json.dumps(spec, indent=2))
     site.report(rid, "judging", "the base and fine-tuned models are answering the held-back prompts")
