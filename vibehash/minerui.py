@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import re
 import shutil
 import threading
 import time
@@ -333,20 +334,27 @@ class MinerDashboard:
                           (f"{spec.problems}", WHITE), (" a round", DIM)],
                   [*gen, *pop, (f" ({mine} yours)", DIM), ("   puzzles ", DIM), (f"{spec.problems}", WHITE)],
                   [*gen, *pop, ("   puzzles ", DIM), (f"{spec.problems}", WHITE)], [*gen, *pop]))
-        level = None
-        for r in self.rigs:  # the round's level, from the state a worker has for it
-            got = getattr(getattr(r.client, "es", None), "states", {}).get(job.job_id)
-            if got is not None:
-                level = es.level_of(got[1])
-                break
-        last_level = gens[-1].level if gens else None
-        level = level if level is not None else last_level if last_level is not None else spec.level
-        moved = ([(f" (up from {last_level})", GREEN)] if last_level is not None and level > last_level else
-                 [(f" (down from {last_level})", YELLOW)] if last_level is not None and level < last_level else [])
-        k, target, _ = spec.retarget
-        rule = f" · moves every {k} rounds toward {target:.0%} solved" if k else " · fixed"
-        lv = [("level     ", DIM), (f"{level}", WHITE), (": " + esui.level_words(level, eg), TEXT), *moved]
-        add(*pick(width, [*lv, (rule, DIM)], lv))
+        if getattr(spec, "rule", 1) == 2:  # Evo v2 (es2.py): no level; its task, and which cycle's average it's from
+            m = re.match(r"^evo2-c(\d+)-", job.job_id)
+            src = (f"the mean of {len(spec.start)} earlier jobs" if len(spec.start) > 1 else
+                   f"{spec.start[0][0]}" if spec.start else "the base model")
+            tl = [("task      ", DIM), (spec.task, WHITE), *([(f" · cycle {m.group(1)}", TEXT)] if m else [])]
+            add(*pick(width, [*tl, (f", starting from {src}", DIM)], tl))
+        else:
+            level = None
+            for r in self.rigs:  # the round's level, from the state a worker has for it
+                got = getattr(getattr(r.client, "es", None), "states", {}).get(job.job_id)
+                if got is not None:
+                    level = es.level_of(got[1])
+                    break
+            last_level = gens[-1].level if gens else None
+            level = level if level is not None else last_level if last_level is not None else spec.level
+            moved = ([(f" (up from {last_level})", GREEN)] if last_level is not None and level > last_level else
+                     [(f" (down from {last_level})", YELLOW)] if last_level is not None and level < last_level else [])
+            k, target, _ = spec.retarget
+            rule = f" · moves every {k} rounds toward {target:.0%} solved" if k else " · fixed"
+            lv = [("level     ", DIM), (f"{level}", WHITE), (": " + esui.level_words(level, eg), TEXT), *moved]
+            add(*pick(width, [*lv, (rule, DIM)], lv))
         scored = [x for x in gens if x.mean is not None]
         if scored:
             last = scored[-1]

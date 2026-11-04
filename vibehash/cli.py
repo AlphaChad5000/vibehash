@@ -1524,6 +1524,13 @@ def _evo_round(node, block) -> str:
         return ""
     gen = esui.parse_generation(0, block.height, record)
     reward = f"mean reward {gen.mean:.1%}" if gen.mean is not None else "no pair accepted"
+    e = record["es"]
+    if e.get("rule") == 2:  # Evo v2 (es2.py): its task and cycle instead of a level, and what its entry holds
+        m = re.match(r"^evo2-c(\d+)-", block.summary.job_id)
+        cycle = f" (cycle {m.group(1)})" if m else ""
+        return (f"Evo v2 job {block.summary.job_id}, {e.get('task')}{cycle}, {reward} over {gen.pairs} pairs, "
+                f"fitness {e.get('used') or e.get('fitness')}, {len(e.get('targets') or [])} targets, "
+                f"{es_local.chain_bytes(e)} B on chain")
     return (f"Evo job {block.summary.job_id}, level {gen.level}, {reward} over {gen.pairs} pairs, "
             f"{es_local.chain_bytes(record['es'])} B of seeds and scores on chain")
 
@@ -1656,6 +1663,10 @@ def cmd_testnet(a):
         from . import es2
         path = d / "evo2.json"
         cyc = json.loads(path.read_text()) if path.exists() else {"cycle": 1, "jobs": [], "parents": []}
+        lost = [j for j in cyc["jobs"] if j not in node.chain.state.jobs]
+        if lost:  # posted, but the network stopped before its transaction reached a block: the same job again
+            spec = es_local.spec2_for(found, lost[0].split("-", 2)[2], start=cyc["parents"], rounds=a.evo2_rounds)
+            return es_local.job2(spec, lost[0], keys["requester"].address)
         if len(cyc["jobs"]) >= len(evo2_tasks):
             done = [j for j in cyc["jobs"] if j in node.chain.state.jobs]  # posted and on the chain
             # Each parent pinned by its final state's hash: start_params also rebuilds it from the chain when another
