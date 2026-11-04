@@ -69,10 +69,11 @@ class SpecTests(unittest.TestCase):
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class NetworkTests2(unittest.TestCase):
     def test_rounds_replay_cheats_a_child_and_a_restart(self):
+        from vibehash import economics as econ
         from vibehash import es_client
         from vibehash.client import NodeClient, WorkerClient
         from vibehash.coordinator import Coordinator, CoordinatorConfig
-        from vibehash.ledger import Block
+        from vibehash.ledger import Block, Chain
         from vibehash.node import Node, PhaseTimes
         from vibehash.storage import Store
         from tests.test_network import run_until
@@ -91,8 +92,10 @@ class NetworkTests2(unittest.TestCase):
             self.addCleanup(p.stop)
         node_keys, req = KeyPair.generate(b"es2 node"), KeyPair.generate(b"es2 requester")
         workers = [KeyPair.generate(f"es2 worker {i}".encode()) for i in range(4)]
+        # As a new testnet's: only rounds that pay for work mint (economics.PAID_ROUNDS), checked below.
         genesis = {"chain_id": "vibehash-es2-test", "timestamp": 0, "allocations": {req.address: 500 * VIBE},
-                   "stakes": {k.address: 10 * VIBE for k in [node_keys, *workers]}, "es": True}
+                   "stakes": {k.address: 10 * VIBE for k in [node_keys, *workers]}, "es": True,
+                   "economics": econ.NEW_SCHEDULES["testnet"].to_dict()}
         node = Node(root / "node", genesis, node_keys, port=0,
                     times=PhaseTimes(register_s=1.0, compute_s=20.0, reveal_s=3.0, verify_s=15.0, idle_s=0.3),
                     config=CoordinatorConfig(newcomer_units=4)).start()
@@ -130,6 +133,18 @@ class NetworkTests2(unittest.TestCase):
         self.assertLess(st.stake(liar), 10 * VIBE, "the liar wasn't slashed")
         self.assertTrue(all(forger not in b.summary.accepted for b in mine), "forged answers were accepted")
         self.assertTrue(any(w.address in b.summary.accepted for b in mine for w in workers[:2]))
+        # An Evo round pays for work when a claim was approved and nobody rejected it: those rounds minted 50 VIBE each,
+        # and no other did, as the blocks applied again from the genesis say.
+        again = Chain.from_genesis(genesis)
+        for b in blocks[1:]:
+            again.append(b)
+        worked = [b for b in mine if b.summary.pays_for_work]
+        self.assertTrue(worked)
+        self.assertEqual((again.state.paid_rounds, again.state.minted), (len(worked), 50 * VIBE * len(worked)))
+        for b in mine:
+            self.assertEqual(any(t.memo == "work" for t in b.txs), b.summary.pays_for_work, b.height)
+            if not b.summary.pays_for_work:
+                self.assertFalse([t for t in b.txs if t.kind == "reward"], b.height)
 
         # The workers' change (float32, rounds applied as their blocks came) against the canonical float64 one.
         rt = es_client.runtime2(spec, "cpu")

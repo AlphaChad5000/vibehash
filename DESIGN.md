@@ -195,12 +195,16 @@ Each round has a pool:
 
 ```
 pool = block_subsidy(round) + fee_release(job)
-block_subsidy(round) = 50 VIBE / 2^(round // HALVING_INTERVAL)
+block_subsidy(round) = 50 VIBE / 2^(paid_rounds // HALVING_INTERVAL)   if the round pays for work, else 0
 fee_release          = min(job_escrow_remaining,
                            job_fee_per_round × accepted_units / units_per_round)
 ```
 
-The requester pays only for the share of the round that verified.
+The requester pays only for the share of the round that verified. Each
+network's genesis fixes the subsidy's numbers, and on networks made since
+2026-11-03 only a round that pays for work mints one, with `paid_rounds` the
+rounds before it that did; older ones mint in every round and halve by block
+height (§10, "Issuance schedule").
 
 The pool is split:
 
@@ -210,8 +214,9 @@ The pool is split:
 | 15 % | Verifiers | replay FLOPs × reputation |
 | 5 %  | Block proposer | — |
 
-Anything unclaimed (for example, no unit verified that round) is burned, not
-handed to the proposer, so proposers can't profit from rejecting good work.
+Anything unclaimed (for example, no verifiers that round, or on an older
+network a round in which no unit verified) is burned, not handed to the
+proposer, so proposers can't profit from rejecting good work.
 
 **Reputation** is a multiplier in `[0.5, 1.0]`: new workers start at 0.8, gain
 +0.02 per round with verified work, lose 0.05 per round with a missed
@@ -1080,29 +1085,79 @@ before recovery words load as they are.
 
 ### Issuance schedule (`economics.Economics`)
 
-The block subsidy, halving interval and supply cap are fixed in the genesis
-file's `"economics"` field (`genesis create --economics testnet|mainnet`):
+The block subsidy, halving interval, supply cap and which rounds count are
+fixed in the genesis file's `"economics"` field (`genesis create --economics
+testnet|mainnet`):
 
 | | testnet | mainnet |
 |---|---|---|
-| Subsidy per round | 50 VIBE | 3.125 VIBE |
-| Halving interval | 210 blocks | 3,320,000 blocks |
-| One halving, at 38 s rounds | ~2.2 hours | ~4.0 years |
+| Subsidy per round that pays for work | 50 VIBE | 3.125 VIBE |
+| Halving interval | 210 rounds that paid for work | 3,320,000 rounds that paid for work |
+| One halving, if every 38 s round is worked | ~2.2 hours | ~4.0 years |
+| A round that pays nobody for work | mints nothing | mints nothing |
 | Issued in total | ~21,000 VIBE | ~20,750,000 VIBE |
 | Cap on all coins ever (genesis + issued) | none | 21,000,000 VIBE |
 
-The testnet numbers are the old ones, so existing chains and tests are
-unchanged. Mainnet is Bitcoin's shape stretched to Vibe Hash's block time.
-The node's default round is 38 s (register 3 + compute 20 + reveal 5 +
-verify 10), and 4 × 365.25 days / 38 s ≈ 3.32M blocks. 3.125 VIBE per block
-then issues 20.75M VIBE, which leaves room for up to 250,000 VIBE of genesis
-allocations under the 21M cap. The cap is enforced as well as designed in: a
-genesis that allocates more is invalid, and a subsidy never takes coins
-created past the cap. Halvings count block heights, and blocks that only
-carry transactions (when no job is running) mint nothing, so the 4 years
-assume the network is busy. No round is shorter than the node's own, however
-fast its work comes in (§3, "Round length follows the job"), so at the
-default phases blocks never come faster than the schedule assumes.
+The testnet numbers are the old ones. Mainnet is Bitcoin's shape stretched
+to Vibe Hash's block time. The node's default round is 38 s (register 3 +
+compute 20 + reveal 5 + verify 10), and 4 × 365.25 days / 38 s ≈ 3.32M
+rounds. 3.125 VIBE per round then issues 20.75M VIBE, which leaves room for
+up to 250,000 VIBE of genesis allocations under the 21M cap. The cap is
+enforced as well as designed in: a genesis that allocates more is invalid,
+and a subsidy never takes coins created past the cap.
+
+**Only rounds that pay for work mint (`"count": "paid_rounds"`).** A chain
+seals a block every round whether anyone works or not. A round that pays
+nobody for work mints nothing and burns nothing, and the halvings count
+rounds that paid for work, not block heights: the subsidy is
+`initial_subsidy >> (paid_rounds // halving_interval)`, capped as above,
+where `paid_rounds` (`State.paid_rounds`) is how many earlier rounds on the
+chain paid for work. A quiet network so delays its halvings rather than
+losing coins: the 20.75M VIBE are minted in full however busy it is, and the
+4 years per halving are the shortest it can take. (A share nobody claims in a
+round that does pay for work, such as the checkers' 15% when nobody checked,
+is still burned.) Blocks that carry only
+transactions (when no job is running) mint nothing either. No round is
+shorter than the node's own, however fast its work comes in (§3, "Round
+length follows the job"), so at the default phases rounds never come faster
+than the schedule assumes.
+
+A round pays for work (`RoundSummary.pays_for_work`) when its summary credits
+accepted work, worker FLOPs above zero, to a worker who isn't an offender:
+the same work `_reward_txs` pays workers for, and that a proposer's 5% needs.
+It's that in every kind of round: an MLP's (a unit that verified), a sharded
+team's (a member whose cells and edges checked out), a fine-tune's (a claim a
+checker approved or that won its disputes), an Evo round's (approved, and
+nobody rejected it) and a DeepSeek prep round's (a unit kept into the work
+graph). Checking and scoring don't make a round one on their own: they are
+paid out of a round that pays for work. In a round where no work is
+accepted, a checker that caught a cheater is paid by the slash's bounty, and
+other checks, approvals of claims someone else rejected and fine-tune scores
+go unpaid, since nothing is minted. The rule reads the summary, not what the
+split comes to, which depends on the subsidy itself. The count isn't in any
+block: every node derives it while applying blocks, and the reward
+transactions follow from it, so a block paying a subsidy in a round without
+accepted work, or one from a different halving, doesn't match the derived
+transactions and is invalid. A proposer can make a round count only by
+crediting work in its summary, which is paying for it; validators replay the
+round from its signed record before voting (§9), and `chain verify` does the
+same, so that is caught as any forged payment is. Fees are unchanged: a
+round's job fee is charged only for its accepted units, so a round nobody's
+work is accepted in leaves the job's escrow as it was, and transaction fees
+go to the block's proposer whatever the round did.
+
+**Older networks.** A genesis whose `"economics"` has no `"count"` (or
+`"count": "blocks"`), names a preset (`"economics": "mainnet"`), or has no
+`"economics"` at all, keeps the original rule, and its hash: every block that
+seals a round mints its subsidy, whatever nobody earned of it is burned, and
+the halvings count block heights. On such a chain a quiet network still sees
+its halvings on time, and the coins of every empty round are destroyed. On
+2026-11-03 a local Evo testnet minted and burned 325 VIBE in 26 empty rounds,
+and by block 9,654 `vibehash-public-1` had paid for work in 133 rounds and
+minted and burned 29,743.75 VIBE in the 9,518 that paid nobody.
+`vibehash-public-1` and every testnet folder made before 2026-11-03 are on it.
+`genesis create`, with either preset, and new `vibehash testnet` folders
+write the preset's numbers with `"count": "paid_rounds"`, the rule above.
 
 **Commitment.** A schedule other than the testnet one adds one genesis
 transaction, `memo = "economics:" + canonical JSON of the numbers`, so it's
@@ -1110,8 +1165,13 @@ in the genesis block's transaction root and hash. Nodes with different
 schedules never share a genesis hash, refuse each other's data directories,
 and workers stop if their node changes networks. A genesis file without the
 field, or naming the testnet schedule, gets no such transaction and keeps its
-old hash. The schedule lives in `State.economics` and is read by settlement,
-`Coordinator.finalize` and `/status` (`economics`, `subsidy`).
+old hash. `"count"` is in the committed JSON only when it's `"paid_rounds"`,
+so schedules from before it keep theirs, and a node from before it, which
+would read such a genesis as the original rule, works out a different genesis
+hash and can't take the network's blocks for its own. The schedule lives in
+`State.economics` and is read by settlement, `Coordinator.finalize` and
+`/status` (`economics`; `subsidy`, what the next round that pays for work
+mints).
 
 ### TLS (`tls.py`)
 
