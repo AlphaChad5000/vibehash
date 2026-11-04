@@ -35,8 +35,9 @@ CASUAL_EXAMPLES, CASUAL_PROMPTS = 8, 3
 # A narrow goal (turn X into Y) gets messages that aren't an X: "what's the weather" to an Excel-formula model. Trained
 # only on the task, a model forces the task onto them (a weather formula). So such a goal gets a decline sentence,
 # chats that use it, and off-task test prompts scored by code: did the reply decline?
-OFF_EXAMPLES, OFF_PROMPTS = 6, 4
-OFF_LONG_EXAMPLES, OFF_LONG_PROMPTS = 2, 1  # of those, long ones: trained to decline "hi", a model still forced a
+OFF_EXAMPLES, OFF_PROMPTS = 12, 8  # a 0.6B model trained on 6 declines once declined 0 of 5, the next run 5 of 5: it
+#                                    needs more of them to learn, and more test prompts for the share to mean much
+OFF_LONG_EXAMPLES, OFF_LONG_PROMPTS = 4, 2  # of those, long ones: trained to decline "hi", a model still forced a
 #                                             formula onto a five-part brief; it has to see long off-task asks too
 
 SHAPES = f"""Write the user messages the way real people write them, in four shapes:
@@ -85,10 +86,10 @@ SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON obje
             or translate something) rather than a voice, tone or style for any conversation. For a narrow goal,
             decline is the one plain sentence the model says, word for word, when a message isn't that kind of input
             ("Sorry, I only turn spreadsheet requests into Excel formulas; send me one and I'll write it."), and at
-            least {OFF_EXAMPLES} examples are such messages (a greeting, the weather, a recipe, an essay request) with
-            that sentence as the whole reply, at least {OFF_LONG_EXAMPLES} of them long ({LONG}+ characters: a role to
-            play, numbered parts, a format), since a long off-task brief is still off-task. For a goal that isn't
-            narrow, decline is "".
+            least {OFF_EXAMPLES} examples are such messages, of every shape (a greeting, a question, an order like
+            "write me", "plan my", "how do I make", a request to explain or translate) with that sentence as the whole
+            reply, at least {OFF_LONG_EXAMPLES} of them long ({LONG}+ characters: a role to play, numbered parts, a
+            format), since a long off-task brief is still off-task. For a goal that isn't narrow, decline is "".
   "off_scope_prompts": ["...", ...]   (for a narrow goal, {OFF_PROMPTS}+ NEW messages outside the task, varied, at
             least {OFF_LONG_PROMPTS} of them long, not in examples, to test that it declines; otherwise [])
 }}
@@ -219,10 +220,10 @@ def scoped(scope, examples: list, off_prompts: list, share: float) -> list[str]:
     if (have := sum(len(str(e.get("user", ""))) >= LONG for e in declined)) < (need := max(1, int(OFF_LONG_EXAMPLES * share))):
         problems.append(f"only {have} of the decline examples have a long ({LONG}+ characters) user message; need at "
                         f"least {need}: a long off-task brief (a role, numbered parts, a format) still gets the decline")
-    if len(off_prompts) < OFF_PROMPTS:
-        problems.append(f"only {len(off_prompts)} off_scope_prompts; need at least {OFF_PROMPTS}")
-    if sum(len(p) >= LONG for p in off_prompts) < OFF_LONG_PROMPTS:
-        problems.append(f"no off_scope_prompt is long ({LONG}+ characters); write at least {OFF_LONG_PROMPTS}")
+    if len(off_prompts) < (need := max(1, int(OFF_PROMPTS * share))):
+        problems.append(f"only {len(off_prompts)} off_scope_prompts; need at least {need}")
+    if (have := sum(len(p) >= LONG for p in off_prompts)) < (need := max(1, int(OFF_LONG_PROMPTS * share))):
+        problems.append(f"only {have} off_scope_prompts are long ({LONG}+ characters); write at least {need}")
     return problems
 
 

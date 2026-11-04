@@ -219,7 +219,13 @@ def run(site, req: dict, a) -> None:
             break
         site.report(rid, "training", f"round {n}: the Job Architect is writing chats aimed at the prompts it lost")
         graded = json.loads((out / f"{plan['job_id']}.eval.answers.graded.json").read_text())
-        fix = architect.repair(plan, graded)
+        try:
+            fix = architect.repair(plan, graded)
+        except ValueError as e:  # the Architect couldn't write a repair that passes the checks: keep the round it had
+            print(e, flush=True)
+            site.report(rid, "training", f"round {n}: no repair; the Job Architect's chats didn't pass the checks after "
+                                         f"three tries ({str(e).splitlines()[-1].strip()}), so round {n - 1} stands")
+            break
         # What this round lost and what the Job Architect wrote about it, for the results page: a few of each
         results[-1]["repair"] = {
             "missed": len(architect.lost(graded)),
