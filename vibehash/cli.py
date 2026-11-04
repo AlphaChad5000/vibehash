@@ -248,10 +248,11 @@ def cmd_genesis_create(a):
                      f"{', '.join(unstaked)}")
     if a.earn_in:
         g["earn_in"] = True
-    g["economics"] = econ.SCHEDULES[a.economics].to_dict()
+    economics = econ.NEW_SCHEDULES[a.economics]  # only rounds that pay for work mint, and the halvings count them
+    g["economics"] = economics.to_dict()
     hash_ = Chain.from_genesis(g).genesis_hash  # also checks the allocations fit under the supply cap
     Path(a.out).write_text(json.dumps(g, indent=2))
-    print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(econ.SCHEDULES[a.economics])}")
+    print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(economics)}")
     if a.earn_in:
         print(f"workers can start with no stake: their first {fmt(econ.MIN_STAKE)} of pay becomes their stake")
 
@@ -260,6 +261,11 @@ def _describe_economics(e: econ.Economics) -> str:
     s = e.halving_interval * econ.MAINNET_BLOCK_S
     span = f"{s / (365.25 * 86400):.3g} years" if s > 86400 * 365 else f"{s / 86400:.3g} days" if s > 86400 else f"{s / 3600:.3g} hours"
     cap = f", never more than {fmt(e.max_supply)} in all" if e.max_supply else ""
+    if e.count == econ.PAID_ROUNDS:
+        return (f"issuance ({e.name}): {fmt(e.initial_subsidy)} per round that pays for work, halving every "
+                f"{e.halving_interval:,} such rounds (~{span} if every {econ.MAINNET_BLOCK_S} s round is worked, longer "
+                f"if not); {fmt(e.total_issuance())} issued in total{cap}. "
+                "A round nobody's work is accepted in mints nothing")
     return (f"issuance ({e.name}): {fmt(e.initial_subsidy)} per round, halving every {e.halving_interval:,} blocks "
             f"(~{span} of {econ.MAINNET_BLOCK_S} s rounds); {fmt(e.total_issuance())} issued in total{cap}")
 
@@ -1461,6 +1467,8 @@ def cmd_chain_verify(a):
     st = chain.state
     print(f"verified {len(chain.blocks)} blocks: {'VALID' if ok else 'INVALID'}")
     print(f"supply {fmt(st.total_supply())} = genesis {fmt(st.genesis)} + minted {fmt(st.minted)} - burned {fmt(st.burned)}")
+    if st.economics.count == econ.PAID_ROUNDS:  # (counted from the blocks, as everything above)
+        print(f"{st.paid_rounds:,} rounds paid for work: the halvings count them, and only they minted")
     if certified or chain.state.validators:
         print(f"{certified} blocks final: each signed by validators holding more than two thirds of the stake "
               f"({len(chain.state.validator_set())} validators now)")
@@ -1620,13 +1628,15 @@ def _testnet(a, held: list) -> None:
     if existing is None:
         # Validators run the chain, even just one: each listens on the address the genesis gives it. They vote with
         # bootstrap stake, which can't be spent; the workers start with nothing and earn their stake. Only the
-        # requester is handed coins, to pay for the demo jobs.
+        # requester is handed coins, to pay for the demo jobs. The testnet schedule, with only rounds that pay for work
+        # minting (economics.NEW_SCHEDULES); a folder made before keeps the genesis it has, and with it the old rule.
         public = _lan_ip() if a.host == "0.0.0.0" else "127.0.0.1" if a.host in ("127.0.0.1", "localhost") else a.host
         ports = _free_ports(count) if a.port == 0 else [a.port + i for i in range(count)]
         genesis = {"chain_id": f"vibehash-local-{secrets.token_hex(3)}", "timestamp": int(time.time()),
                    "allocations": {keys["requester"].address: 10_000 * SYN_PER_VIBE}, "stakes": {},
                    "bootstrap": {keys[v].address: 10 * SYN_PER_VIBE for v in validators}, "earn_in": True,
-                   "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)}}
+                   "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)},
+                   "economics": econ.NEW_SCHEDULES["testnet"].to_dict()}
         if evo:  # a chain that takes ES jobs (ledger.ES_GATE), whose workers are staked: nothing else here to earn it on
             genesis |= {"es": True, "stakes": {keys[n].address: es_local.STAKE for n in worker_names}}
         (d / "genesis.json").write_text(json.dumps(genesis, indent=2))
@@ -1904,7 +1914,8 @@ def parser() -> argparse.ArgumentParser:
                         "one node runs the chain alone")
     p.add_argument("--out", required=True); p.set_defaults(fn=cmd_genesis_create)
     p.add_argument("--economics", choices=sorted(econ.SCHEDULES), default="testnet",
-                   help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year halvings)")
+                   help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year "
+                        "halvings on a busy network); either way only rounds that pay for work mint, and halvings count them")
     p.add_argument("--bootstrap", action="append", metavar="ADDR=VIBE",
                    help="stake for a first validator that votes but can never be withdrawn or spent; burned if it leaves")
     p.add_argument("--no-earn-in", dest="earn_in", action="store_false",

@@ -14,6 +14,10 @@ proposer. Each block carries a RoundSummary (who did how much verified work,
 who cheated) and every node re-derives the exact system transactions from it
 and the current state. A block whose system transactions differ is invalid, so
 a proposer cannot pay itself extra, skip a slash, or overcharge a requester.
+What a round mints is derived the same way, by the genesis schedule
+(economics.py): on a chain counting paid rounds, a round mints only if its
+summary pays for work (RoundSummary.pays_for_work), and State.paid_rounds,
+the halving clock, counts the rounds that did.
 
 Blocks carry a version (VERSION). A rule change applies only to blocks of the
 version that brought it and later, so every block already on a chain still
@@ -179,6 +183,23 @@ class RoundSummary:
     def offenders(self) -> set[str]:
         return {s[0] for s in self.slashes}
 
+    @property
+    def pays_for_work(self) -> bool:
+        """Whether the round paid someone for work, which on a chain counting paid rounds (economics.PAID_ROUNDS) is
+        what mints its subsidy and moves the halving clock: it credits accepted work (worker FLOPs above 0) to a worker
+        who isn't an offender. That's the work _reward_txs pays workers for, and the proposer's share needs
+        (economics.compute_payout), in every kind of round: an MLP's, a sharded team's, a fine-tune's (a claim a
+        checker approved or that won its disputes; a DeepSeek training round is one), an Evo round's (approved, and
+        nobody rejected it) and a DeepSeek prep round's (a unit kept into the work graph). It's read from the summary
+        alone, not from what the split comes to, which depends on the subsidy itself. Checking or scoring doesn't make
+        a round one: they're paid out of a round that pays for work, and in a round with none accepted, a catcher is
+        paid by its slash's bounty and other checks and scores go unpaid, as nothing is minted to pay them with. A
+        proposer can make a round count only by crediting work in its summary, which is paying for it: replay_block
+        re-derives the summary from the round's signed record, so validators vote such a block down and `chain verify`
+        reports it, as it would any forged payment."""
+        offenders = self.offenders
+        return any(f > 0 for a, f in self.worker_flops.items() if a not in offenders)
+
     def to_dict(self) -> dict:
         d = asdict(self)
         if not self.record_hash:
@@ -271,10 +292,24 @@ class State:
     minted: int = 0
     burned: int = 0
     economics: econ.Economics = econ.TESTNET  # set by the genesis block
+    # Rounds so far that paid for work (RoundSummary.pays_for_work), counted on every chain from its blocks, never
+    # taken from a proposer. It's the halving clock of a schedule that counts paid rounds (economics.PAID_ROUNDS).
+    paid_rounds: int = 0
 
     def subsidy(self, height: int) -> int:
-        """The block subsidy at `height` on this chain, before that block is applied."""
-        return self.economics.subsidy(height, self.genesis + self.minted)
+        """The subsidy a round mints at `height` on this chain, before that block is applied: any round's under the
+        original rule, a round that pays for work's on a chain counting paid rounds, where the height doesn't matter,
+        only how many rounds before it paid for work (round_subsidy says which rounds mint)."""
+        e = self.economics
+        return e.subsidy(self.paid_rounds if e.count == econ.PAID_ROUNDS else height, self.genesis + self.minted)
+
+    def round_subsidy(self, summary: RoundSummary, height: int) -> int:
+        """What the block sealing `summary`'s round at `height` mints. A round that paid nobody for work mints nothing
+        on a chain counting paid rounds; under the original rule (economics.BLOCKS) every round mints its subsidy, and
+        whatever nobody earned of it is burned."""
+        if self.economics.count == econ.PAID_ROUNDS and not summary.pays_for_work:
+            return 0
+        return self.subsidy(height)
 
     def balance(self, addr: str) -> int:
         return self.balances.get(addr, 0)
@@ -358,7 +393,7 @@ def _reward_txs(s: State, summary: RoundSummary, height: int, chain_id: str, ver
     offenders = summary.offenders
     # v1 read the fee from the escrow after the block's user txs, so cancelling the job in the same block dodged it.
     fee = owed[summary.job_id] if version >= 2 else _round_fee(s, summary)
-    pool = s.subsidy(height) + fee
+    pool = s.round_subsidy(summary, height) + fee
     reps = {a: s.rep(a) for a in set(summary.worker_flops) | set(summary.verifier_flops)}
     try:
         payout = econ.compute_payout(
@@ -672,7 +707,7 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
     _pay_fees(s, user, proposer)
 
     post = _reward_txs(s, summary, block.height, chain_id, block.version, owed) if summary is not None else []
-    pool = subsidy = s.subsidy(block.height) if summary is not None else 0
+    pool = subsidy = s.round_subsidy(summary, block.height) if summary is not None else 0
     for tx in post:
         pool += _apply_system_tx(s, tx, block.version)
 
@@ -684,6 +719,7 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
     if summary is not None:
         s.minted += subsidy
         s.burned += pool  # unclaimed pool is burned
+        s.paid_rounds += summary.pays_for_work  # after its own subsidy, which the rounds before it decide
         accepted, missed, offenders = set(summary.accepted), set(summary.missed), summary.offenders
         for addr in accepted | missed | offenders:
             s.reputation[addr] = econ.update_reputation(s.rep(addr), addr in accepted, addr in missed, addr in offenders)

@@ -2626,7 +2626,7 @@ class Coordinator:
                              teams=[list(t.members) for t in r.teams], waiting=r.waiting)
         rewards = [t for t in block.txs if t.kind == "reward"]
         fee = sum(t.amount for t in block.txs if t.kind == "fee_release")
-        report.pool = self.chain.state.subsidy(block.height) + fee  # the subsidy this block issues, plus released fees
+        report.pool = self.chain.state.round_subsidy(summary, block.height) + fee  # what this block mints, plus released fees
         report.burned = report.pool - sum(t.amount for t in rewards)
         report.worker_pay = {t.recipient: t.amount for t in rewards if t.memo == "work"}
         report.verifier_pay = {t.recipient: t.amount for t in rewards if t.memo == "verify"}
