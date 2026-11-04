@@ -360,7 +360,11 @@ def more(plan: dict, log=print) -> list[dict]:
     """A second batch of chats before training. 32 natural, varied chats taught a two-sentence style only 18 times in
     32; one batch is all a single reply holds, so a second call doubles what the model learns from. Best effort: if
     the batch keeps failing the checks, train on the first one."""
-    shown = "\n\n".join(f"User: {e['user']}\nAssistant: {e['assistant']}" for e in plan["examples"])
+    # A sample of the first batch, long chats first: shown all 40-odd, mostly short, the model copied their shape and
+    # wrote no long ones at all, twice. Shown a dozen with the long ones up front, it writes both kinds.
+    by_length = sorted(plan["examples"], key=lambda e: -len(str(e.get("user", ""))))
+    sample = by_length[:6] + by_length[6::max(1, (len(by_length) - 6) // 6)][:6]
+    shown = "\n\n".join(f"User: {e['user'][:1200]}\nAssistant: {e['assistant'][:1200]}" for e in sample)
     decline = narrow(plan.get("scope"))
     rules = ", ".join(checks.name(r) for r in plan.get("checks") or [])
     ask = [{"role": "system", "content": MORE}, {"role": "user", "content": f"Goal: {plan['goal']}\n" + (
@@ -379,7 +383,7 @@ def more(plan: dict, log=print) -> list[dict]:
         problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
                    (["an example is missing its user or assistant text"]
                     if any(not e.get("user") or not e.get("assistant") for e in examples) else []) + \
-                   [p for p in mixed(examples, [], 0.5) if "eval prompts" not in p] + \
+                   [p for p in mixed(examples, [], 0.3) if "eval prompts" not in p] + \
                    templated(plan["examples"] + examples, decline) + scoped(plan.get("scope"), examples, ["x" * LONG] * OFF_PROMPTS, 0.5) + \
                    ruled(plan.get("checks"), plan.get("scope"), examples)
         if not problems:
