@@ -126,6 +126,8 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
+**Release 0.5.12 (2026-11-03): es2.TASKS is es_tasks.NAMES.** 0.5.11 kept rule 2's own list of three tasks, so `testnet --evo2` stopped at its fourth job (sciq) with "task is one of countdown, arithmetic, arc_easy".
+
 **Release 0.5.11 (2026-11-03): Evo mode, on local test networks.** Branches es-chain, evo-mode and evo-v2 merged.
 - **`testnet --evo`** is ES rule 1: one layer's MLP, Countdown.
 - **`testnet --evo2`** is ES rule 2 (es2.py, es2_rounds.py, es_fast.py, es_tasks.py):

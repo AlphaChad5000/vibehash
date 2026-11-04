@@ -27,11 +27,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import es
+from . import es, es_tasks
 
 RULE2 = 2
 WORDS = 16  # the chain hash's 32 bytes as 16 uint16 values, ahead of es.CTRL control words
-TASKS = ("countdown", "arithmetic", "arc_easy")
+TASKS = es_tasks.NAMES  # the tasks a rule-2 job may name (es_tasks.py: problems and their checks)
 TENSORS = ("model.layers.*_proj.weight",)  # every attention and MLP projection's weight (es.select keeps out the head)
 _JOB = re.compile(r"^[\w.-]{1,64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
