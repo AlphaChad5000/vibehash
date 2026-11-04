@@ -126,7 +126,19 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
-**Branch `es-chain` (2026-11-03, not merged): evolution strategies on the chain, the blockchain becomes the AI.** The
+**Release 0.5.11 (2026-11-03): Evo mode, on local test networks.** Branches es-chain, evo-mode and evo-v2 merged.
+- **`testnet --evo`** is ES rule 1: one layer's MLP, Countdown.
+- **`testnet --evo2`** is ES rule 2 (es2.py, es2_rounds.py, es_fast.py, es_tasks.py):
+  - rank-1 twists of all 168 projections (357.8M weights), shared prompts, the fast engine, and replay-log-probability fitness;
+  - a node that keeps a hash chain instead of weights;
+  - averaging cycles (one job per task, the next cycle starting from their mean);
+  - measured on the owner's RTX 4070 SUPER at about 20-25 s a round and 2.3 KB a generation, the model rebuilt from the chain every round.
+- **Off the public chain:** Evo jobs need a genesis with "es": true, so the public network is unchanged and needs no upgrade for this release.
+- **Checks are loose in bf16.** The engine's answers and transformers' teacher forcing differ: an honest member's worst gap is up to about 0.375 logits, so v2's margin is 0.5. That is fine for a local network; a public one needs checks on the engine's own path or in float32.
+- **The tests (test_es, test_es2) aren't in CI's list** (they need PyTorch). The measurements behind the recipe are in the paper "The Chain Is the Model" (a Claude Doc) and in memory.
+- **Progress checker:** `scripts/evo2_progress.py` scores each finished cycle's averaged model.
+
+**Branch `es-chain` (2026-11-03, merged in 0.5.11): evolution strategies on the chain, the blockchain becomes the AI.** The
 owner's idea: train with ES so a round's learning step is only seeds and scores in the block, and every node computes
 the update with deterministic arithmetic, so the weights are a pure function of the chain (code map, `es.py`). A
 prototype `es` job kind, on chains whose genesis says `"es": true` only (`ledger.ES_GATE`), record version 5. Real run on
