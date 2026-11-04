@@ -392,7 +392,7 @@ class ArchitectTests(AgentTest):
                          (str(chats.resolve()), "qwen3-0.6b", 8, 50 * 10**8, 5 * 10**8, 256, "support-bot-1a2b", True,
                           True, "http://127.0.0.1:8545", "req.json"))
         self.assertIs(a.fn, cli.cmd_train)
-        self.assertEqual(cli.parser().parse_args(cmd[3:]).fee, 10 * 10**8)  # FEE is train's default
+        self.assertIsNone(cli.parser().parse_args(cmd[3:]).fee)  # unset: cmd_train makes it 10 VIBE (an Evo job 1)
 
     def run_main(self, *argv) -> tuple[str, str]:
         out, err = io.StringIO(), io.StringIO()
