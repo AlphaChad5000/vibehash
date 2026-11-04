@@ -348,6 +348,25 @@ class EvoDashboardTests(unittest.TestCase):
         self.assertIn("g6 L3", early)
         self.assertEqual(early.count("╔══════╗"), 6)
 
+    def test_a_rebuild_from_the_chain_shows_how_far_along_it_is(self):
+        """A process's first round of an Evo v2 job replays the chain on the CPU (half an hour by a few hundred rounds):
+        the status line and the model line say so, with the rounds done and the time left, at every size."""
+        with mock.patch.object(minerui, "_rebuilding", return_value=(212, 480, "evo2-c2-sciq", 600.0)):
+            text = ESCAPE.sub("", self.frames(self.dashboard(3), (120, 50))[-1])
+            self.assertIn("rebuilding the model from the chain: 212 of 480 rounds (44%), now evo2-c2-sciq's · about "
+                          "10 min left", text)
+            self.assertIn("model     rebuilding from the chain on the CPU 212 of 480 rounds (44%) · about 10 min left", text)
+            self.assertNotIn("workers busy", text)  # (every worker waits on the one rebuild)
+            for size in ((40, 20), (66, 34)):
+                for ascii in (False, True):
+                    with self.subTest(size=size, ascii=ascii):
+                        for line in self.frames(self.dashboard(3, ascii), size)[-1].split("\n"):
+                            self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
+                        self.assertIn("rebuilding", ESCAPE.sub("", self.frames(self.dashboard(3, ascii), size)[-1]))
+        text = ESCAPE.sub("", self.frames(self.dashboard(3), (120, 50))[-1])
+        self.assertNotIn("rebuilding", text)  # none going on: the usual lines
+        self.assertIn("rebuilt from the chain 39x", text)
+
     def test_the_block_hatches_then_locks_into_the_chain(self):
         from vibehash import esui
         lin, now = lineage(5), time.time()
