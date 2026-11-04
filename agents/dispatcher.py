@@ -22,6 +22,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -37,6 +38,7 @@ import teacher
 MACHINE = platform.node()
 NO_GPU = 3  # exit code: this Python's PyTorch can't use the GPU, so starting it again won't help
 CHAT_TOKENS = 1024  # longest chat reply: room for a table or a few sections (judged answers stop at 200)
+HEARTBEAT_EVERY = 30  # seconds between check-ins; the site calls a machine it hasn't heard from in 90 s offline
 
 
 _last_complaint = 0.0
@@ -84,6 +86,9 @@ class Site:
 
     def claim(self) -> dict | None:
         return self.post("dispatch/claim", {"machine": MACHINE})  # also tells the site this machine is online
+
+    def seen(self) -> None:
+        self.post("dispatch/seen", {"machine": MACHINE})
 
     def report(self, rid: str, status: str, message: str | None = None, **extra) -> None:
         print(f"[{rid[:8]}] {status}: {message or ''}", flush=True)
@@ -406,6 +411,7 @@ def main():
 
     token = os.environ.get("DISPATCH_TOKEN") or sys.exit("set DISPATCH_TOKEN to the site's dispatch secret first")
     site = Site(a.site, token)
+    threading.Thread(target=heartbeat, args=(site,), daemon=True).start()
     print(f"{MACHINE}: waiting for requests from {site.url}", flush=True)
     chatter, next_claim = Chatter(Path(a.out)), 0.0
     while True:
@@ -435,6 +441,17 @@ def main():
 
 
 CHAT_EVERY = 2  # seconds between checks for chat messages while idle
+
+
+def heartbeat(site: Site) -> None:
+    """Tells the site this machine is here every HEARTBEAT_EVERY seconds, whatever the main thread is doing: planning
+    and training go minutes without a report, and the site called a machine it hadn't heard from offline mid-job."""
+    while True:
+        try:
+            site.seen()
+        except OSError as e:
+            complain("checking in with the site", e)
+        time.sleep(HEARTBEAT_EVERY)
 
 
 def chat(site, chatter: Chatter) -> bool:
