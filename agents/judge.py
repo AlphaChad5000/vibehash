@@ -40,11 +40,11 @@ def told(goal: str, decline: str | None = None) -> str:
     the same sentence the fine-tune learned rather than one it was never shown."""
     return PROMPTED.format(goal=goal) + (f" If a message isn't that kind of input, reply exactly: {decline}" if decline else "")
 # A second judge reads every pair against the base model told the goal, the headline rival: Muse Spark wrote the
-# training chats and judges them too, which may favour the fine-tune. How often the two judges agree is reported.
-# By default a newer Muse Spark on the same cheaper Contributor tier: another version, not another family, so its
-# agreement is a check on one model's quirks, not on Muse Spark as a whole. Set JUDGE2_MODEL to another model on the
-# same provider (muse-wonder-1.0 is a different model, at its own price), or to nothing to skip it.
-SECOND = os.environ.get("JUDGE2_MODEL", "muse-spark-1.3-contributor")
+# training chats and judges them too, which may favour the fine-tune. How often the two judges agree is reported,
+# as a count and as Cohen's kappa. By default Muse Wonder, a different model on the same provider, so its agreement
+# is a check on Muse Spark's verdicts rather than on one version's quirks. Set JUDGE2_MODEL to another model
+# (muse-spark-1.3-contributor is the cheaper, same-family choice), or to nothing to skip it.
+SECOND = os.environ.get("JUDGE2_MODEL", "muse-wonder-1.0")
 
 
 def wants_json(goal: str) -> bool:
