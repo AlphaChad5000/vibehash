@@ -1181,6 +1181,8 @@ def cmd_job_download(a):
 
     job_id = _job_of(a)
     node = _job_node(a, job_id)
+    if _evo_job(node, job_id):  # an Evo job keeps no weights: its model is worked out from the chain
+        return _evo_export(node, job_id, a.out)
     info, raw = node.download_model(job_id)
     job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
     weights = np.frombuffer(raw, dtype=job.wire_dtype).astype(np.float64)
@@ -1236,6 +1238,62 @@ def _download_adapter(a, job, info: dict, weights, receipt_path: Path) -> Path:
           f"  model = PeftModel.from_pretrained(base, \"{out.as_posix()}\")\n\n"
           f"or vLLM: vllm serve {spec.repo} --revision {spec.commit} --enable-lora --lora-modules mine={out.as_posix()}")
     return out
+
+
+def _evo_job(node: NodeClient, job_id: str) -> bool:
+    """Whether `job_id` is an Evo job (its model is worked out from the chain, not downloaded)."""
+    from . import es_export
+    try:
+        return bool(es_export.job_of(node, job_id).es)
+    except (NodeError, KeyError, ValueError):
+        return False  # download_model says what's wrong with it
+
+
+def _evo_export(node: NodeClient, job_id: str, out, device: str | None = None, dtype: str = "bfloat16") -> None:
+    """An Evo Hash job's model, worked out from the chain, saved as a Hugging Face folder (es_export.py)."""
+    import logging
+
+    from . import es_export
+    from .finetune import available
+
+    if not available():
+        sys.exit(f"exporting an Evo model needs PyTorch: {prog()} install-gpu (or pip install vibehash[evo])")
+    out = Path(out or f"{job_id}-model")
+    print(f"Working out {job_id}'s model from {node.url}'s chain: every round of it and of the jobs it started "
+          "from, each checked against its block. A line a worker on this computer saved makes it quick; without one "
+          "it's about 5 s a round on the CPU.", flush=True)
+    worker_log = logging.getLogger("vibehash.worker")
+    if not worker_log.handlers and not logging.getLogger().handlers:  # the rebuild's progress lines, on screen
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("  %(message)s"))
+        worker_log.addHandler(h)
+        worker_log.setLevel(logging.INFO)
+    try:
+        info = es_export.export(node, job_id, out, device=device, dtype=dtype)
+    except (NodeError, ValueError, FileNotFoundError, FileExistsError, RuntimeError) as e:
+        sys.exit(f"error: {e}")
+    settings.save(last_model=str(out.resolve()))
+    parents = len(info["lineage"])
+    print(f"saved {out}/: {info['base'].split('@')[0].removeprefix('hf:')} after Evo job {job_id} ({info['task']}, "
+          f"{info['rounds_learned']} rounds that changed it"
+          + (f", built on {parents} earlier job{'s' * (parents != 1)}" if parents else "")
+          + f"), as of block {info['block']}, {info['dtype']}, in {info['seconds']:.0f} s\n"
+          f"What it is and how to use it: {out / 'EVO.md'}")
+
+
+def cmd_evo_export(a):
+    """`vibehash evo export [JOB]`: an Evo Hash job's model as a Hugging Face folder; the newest Evo job by default."""
+    from . import es_export
+
+    node = NodeClient(normalise_url(a.node) if a.node else es_export.LOCAL_NODE)
+    try:
+        job_id = a.job_id or es_export.newest_job(node)
+    except NodeError as e:
+        sys.exit(f"error: {e}\n(is the Evo testnet running? Start it again with `{prog()} testnet --evo2`: it carries "
+                 "on where it stopped. Or name its node with --node)")
+    if not job_id:
+        sys.exit(f"{node.url} has no Evo Hash job with a round that changed its model yet")
+    _evo_export(node, job_id, a.out, device="cpu" if a.cpu else None, dtype="float32" if a.float32 else "bfloat16")
 
 
 # --- records of what happened: worker logs, and a job's history ------------------------------------------------
@@ -2038,6 +2096,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="job.json"); p.add_argument("--id", default="my-first-job")
     p.add_argument("--gpu", action="store_true", help="a larger float32 model sized for GPUs")
     p.set_defaults(fn=cmd_job_template)
+
+    e = sub.add_parser("evo", help="Evo Hash's models").add_subparsers(dest="ecmd", required=True)
+    p = e.add_parser("export", help="save an Evo Hash job's model (the tuned Qwen) as a Hugging Face folder, worked "
+                     "out from the chain")
+    p.add_argument("job_id", nargs="?", help="default: the newest Evo job that has trained")
+    p.add_argument("--out", help="folder to save (default JOB-model)")
+    p.add_argument("--node", help="the Evo network's node (default http://127.0.0.1:8545, testnet --evo2's)")
+    p.add_argument("--cpu", action="store_true", help="work it out on the CPU even with a GPU")
+    p.add_argument("--float32", action="store_true", help="save float32 weights (twice the size) instead of bfloat16")
+    p.set_defaults(fn=cmd_evo_export)
 
     c = sub.add_parser("chain").add_subparsers(dest="ccmd", required=True)
     p = c.add_parser("verify", help="download every block, re-check it from genesis, and replay every round")

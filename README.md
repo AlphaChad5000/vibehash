@@ -319,6 +319,22 @@ dashboard shows each generation incubating in the open block. `--evo2-rounds N` 
 job's length (default 12). `vibehash testnet --evo` is the first, simpler version: one layer
 of the model, Countdown only.
 
+To take the tuned Qwen out, while the testnet runs (or after starting it again: it carries on
+where it stopped), in another terminal:
+
+```
+vibehash evo export
+```
+
+It works the newest Evo job's model out from the chain the way a miner does, every round
+checked against its block, and saves it as an ordinary Hugging Face folder (`JOB-model/`:
+safetensors in bfloat16, the tokenizer and chat template, and an `EVO.md` saying which chain,
+job and block it is). Name a job to take an earlier one (`vibehash evo export evo2-c1-arc_easy`),
+`--out DIR` for the folder, `--float32` for unrounded weights. A line a miner on this computer
+saved makes it quick; on another computer it replays every round on the CPU (about 5 s a round),
+and needs Qwen2.5-0.5B-Instruct in its Hugging Face cache. `vibehash job download JOB` does the
+same for an Evo job.
+
 ## Logs and records
 
 What a worker or a job poster does is also kept in files, so a night of

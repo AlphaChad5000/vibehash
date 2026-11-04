@@ -201,6 +201,42 @@ class NetworkTests2(unittest.TestCase):
         self.assertTrue(any(f"{total} rounds to replay" in m for m in logs.output), logs.output)
         self.assertTrue(any(f"rebuilt from the chain: {n} rounds" in m for m in logs.output), logs.output)
 
+        # `vibehash evo export`: the child's model worked out from the node's chain alone (no line in memory or on disk)
+        # and saved as a Hugging Face folder that loads with transformers and holds exactly base + the child's change.
+        from transformers import AutoModelForCausalLM
+        from vibehash import es_export
+        from vibehash.cli import _evo_job
+        newest = max((b for b in node.chain.blocks if b.summary is not None and b.summary.accepted_units),
+                     key=lambda b: b.height).summary.job_id
+        self.assertEqual(es_export.newest_job(api), newest)
+        self.assertTrue(_evo_job(api, "evo2-b"))  # (so `job download evo2-b` exports it too)
+        cache.lines.clear()
+        cache.starts.clear()
+        for f in es_client._saved_dir().glob("*.pt"):
+            f.unlink()
+        out = root / "evo2-b-model"
+        info = es_export.export(api, "evo2-b", out, device="cpu", dtype="float32")
+        self.assertEqual(info["params_hash"], cline.params_hash)
+        self.assertGreaterEqual(info["block"], cline.last_round)  # (the node seals empty rounds meanwhile)
+        self.assertEqual([p["job"] for p in info["lineage"]], ["evo2-a"])
+        self.assertTrue((out / "EVO.md").is_file() and (out / "evo.json").is_file())
+        self.assertFalse(out.with_name(out.name + ".partial").exists())
+        got = AutoModelForCausalLM.from_pretrained(out, dtype=torch_float32())
+        params = dict(got.named_parameters())
+        for n, _, _ in layout:
+            np.testing.assert_allclose(params[n + ".weight"].detach().numpy(),
+                                       (rt.base[n] + cline.change.d[n]).numpy(), rtol=0, atol=1e-6)
+        self.assertGreater(max(float(np.abs(params[n + ".weight"].detach().numpy() - rt.base[n].numpy()).max())
+                               for n, _, _ in layout), 1e-4, "the export is the base")
+        half = es_export.export(api, "evo2-b", root / "half", device="cpu")  # bfloat16, the default
+        self.assertEqual(half["params_hash"], cline.params_hash)
+        cfg = json.loads((root / "half" / "config.json").read_text())
+        self.assertEqual(cfg.get("dtype", cfg.get("torch_dtype")), "bfloat16")
+        self.assertIsNotNone(AutoModelForCausalLM.from_pretrained(root / "half", dtype="auto"))
+        es_export.export(api, "evo2-b", out, device="cpu")  # an earlier export's folder is written over
+        with self.assertRaises(FileExistsError):  # but not a folder of other files
+            es_export.export(api, "evo2-b", root / "node", device="cpu")
+
         # A restart: the node works the jobs' states out from the chain, even with its saved copies gone.
         want = {j: node.coord.start_params(j).copy() for j in ("evo2-a", "evo2-b")}
         node.stop()
@@ -213,6 +249,11 @@ class NetworkTests2(unittest.TestCase):
         for j, s in want.items():
             np.testing.assert_array_equal(c.start_params(j), s)
             self.assertEqual(es.state_hash(c.start_params(j)), c.expected_start_hash(c.job(j)).hex())
+
+
+def torch_float32():
+    import torch
+    return torch.float32
 
 
 def _cuda() -> bool:
