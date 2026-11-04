@@ -47,6 +47,8 @@ CHECKS = {
     "json": (None, lambda r, a: _json(r) is not None and bool(_json(r))
              and all(v not in ("", None, [], {}) for v in _json(r).values())),
     "json_keys": ("list of the exact keys", lambda r, a: _json(r) is not None and set(_json(r)) == set(a)),
+    "json_enum": ("list: a key, then every value it may take",
+                  lambda r, a: _json(r) is not None and a[0] in _json(r) and _json(r)[a[0]] in a[1:]),
     "one_line": (None, lambda r, a: len(_lines(r)) == 1),
     "starts_with": ("text", lambda r, a: r.strip().startswith(a)),
     "ends_with": ("text", lambda r, a: r.strip().endswith(a)),
