@@ -5,6 +5,7 @@ workers' weight change against the canonical one, cheats caught, a child job sta
 node restart rebuilding the job's state from the chain.
 """
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -84,6 +85,10 @@ class NetworkTests2(unittest.TestCase):
         patch = mock.patch.object(es, "reward", fake_reward)  # Countdown's check: a score the tiny model's babble earns
         patch.start()
         self.addCleanup(patch.stop)
+        for p in (mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(root / "home")}),  # where lines are saved
+                  mock.patch.object(es_client, "SAVE_EVERY", 1)):
+            p.start()
+            self.addCleanup(p.stop)
         node_keys, req = KeyPair.generate(b"es2 node"), KeyPair.generate(b"es2 requester")
         workers = [KeyPair.generate(f"es2 worker {i}".encode()) for i in range(4)]
         genesis = {"chain_id": "vibehash-es2-test", "timestamp": 0, "allocations": {req.address: 500 * VIBE},
@@ -154,6 +159,13 @@ class NetworkTests2(unittest.TestCase):
                                       parents=[(0.5, history, [])])
         worst = max(float(np.abs((rt.base[n] + cline.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         self.assertLess(worst, 1e-5, f"the child's change is {worst} from the canonical one")
+
+        # A worker restarted carries on from the line it saved to disk, not from the start.
+        saved = es_client._load_line(next(iter(es_client._chains.values())), "evo2-b", child)
+        self.assertIsNotNone(saved, "the child's line wasn't saved")
+        self.assertEqual(saved.params_hash, cline.params_hash)
+        for n, _, _ in layout:
+            np.testing.assert_array_equal(saved.change.d[n].numpy(), cline.change.d[n].numpy())
 
         # A restart: the node works the jobs' states out from the chain, even with its saved copies gone.
         want = {j: node.coord.start_params(j).copy() for j in ("evo2-a", "evo2-b")}

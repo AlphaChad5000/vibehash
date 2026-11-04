@@ -211,10 +211,65 @@ class _Line:
     def __init__(self, job_id: str, spec, change):
         self.job_id, self.spec, self.change = job_id, spec, change
         self.height, self.state, self.history = 0, spec.init_params(), []
+        self.last_round = self.saved = 0  # the height of its newest round, and of the one last saved to disk
 
     @property
     def params_hash(self) -> str:
         return es.state_hash(self.state)
+
+
+# A line's change saved to disk, so a restarted worker carries on from it instead of rebuilding every round since the
+# job's first ancestor on the CPU (which grows with the chain: 15+ minutes by a few hundred rounds). Only a cache: a
+# saved line is used only when its state is the one the chain's block at its height holds.
+SAVE_EVERY = 8  # rounds between a line's saves
+KEEP_SAVED = 3  # newest saved lines kept (each 1.4 GB for Qwen2.5-0.5B)
+
+
+def _saved_dir() -> Path:
+    from . import settings
+    return settings.home() / "cache" / "evo2-lines"
+
+
+def _save_line(ln: _Line) -> None:
+    import torch
+    d = _saved_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f"{ln.job_id}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        torch.save({"job": ln.job_id, "height": ln.height, "last_round": ln.last_round,
+                    "state": np.asarray(ln.state, np.float32).tolist(), "history": json.dumps(ln.history, default=float), "d": ln.change.d}, tmp)
+        os.replace(tmp, d / f"{ln.job_id}.pt")
+        ln.saved = ln.last_round
+        for old in sorted(d.glob("*.pt"), key=lambda p: p.stat().st_mtime)[:-KEEP_SAVED]:
+            old.unlink(missing_ok=True)
+    except OSError as e:  # a full disk: the line works on, unsaved
+        log.warning(f"couldn't save job {ln.job_id}'s line to {d}: {e}")
+        tmp.unlink(missing_ok=True)
+
+
+def _load_line(c: _Chain, job_id: str, spec):
+    """The saved line of `job_id`, if there is one and its state is what the chain's block at its height holds."""
+    import torch
+    f = _saved_dir() / f"{job_id}.pt"
+    if not f.exists():
+        return None
+    try:
+        saved = torch.load(f, map_location="cpu", weights_only=True)
+        b = c.blocks.get(int(saved["last_round"]))
+        state = np.asarray(saved["state"], np.float32)
+        if saved["job"] != job_id or b is None or b.summary is None or b.summary.job_id != job_id or \
+                b.summary.params_hash != es.state_hash(state):
+            return None
+    except Exception as e:  # noqa: BLE001 - a damaged or foreign file: rebuilt from the chain instead
+        log.warning(f"ignoring {f}: {e}")
+        return None
+    ch = es2.Change.__new__(es2.Change)
+    ch.d = saved["d"]
+    ln = _Line(job_id, spec, ch)
+    ln.height, ln.state, ln.history = int(saved["height"]), state, json.loads(saved["history"])
+    ln.last_round = ln.saved = int(saved["last_round"])
+    log.info(f"job {job_id}: carried on from its line saved at block {ln.last_round}")
+    return ln
 
 
 def runtime2(spec, device: str) -> es.Runtime:
@@ -375,7 +430,7 @@ class Es2Work:
             c, tip = self._chain()
             ln = c.lines.get(job_id)
             if ln is None:
-                ln = _Line(job_id, spec, self._start(rt, spec))
+                ln = _load_line(c, job_id, spec) or _Line(job_id, spec, self._start(rt, spec))
                 c.lines[job_id] = ln
                 while len(c.lines) > MAX_LINES:
                     c.lines.popitem(last=False)
@@ -404,9 +459,12 @@ class Es2Work:
                     if ln.params_hash != s.params_hash:
                         c.lines.pop(job_id, None)  # (whatever it holds is wrong now: worked out again next time)
                         raise ValueError(f"block {h}: the state worked out isn't the one the block holds")
+                    ln.last_round = h
                 ln.height = h
                 if pinned():
                     break
+            if ln.last_round - ln.saved >= SAVE_EVERY:  # once caught up, not along the way
+                _save_line(ln)
             if pin and not pinned():
                 raise ValueError(f"job {job_id} never reached the state {pin[:16]}… its child starts from")
             return ln
