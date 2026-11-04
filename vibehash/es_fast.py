@@ -7,8 +7,10 @@ token already comes from the twisted model. Member (j, s) adds s * sigma / sqrt(
 linear's output.
 
 On CUDA with a bf16 model, answering runs on an engine ported from the speed experiments: one decode for every member's
-rows at once from a static KV cache, rows dropped as they end (in fixed bucket sizes), and one CUDA graph per bucket
-size. Elsewhere (the CPU tests' tiny model), a plain loop computes the same rule.
+rows at once from a static KV cache, in passes of ROWS rows, rows dropped as they end (in fixed bucket sizes), and one
+CUDA graph per bucket size. A checker teacher-forces committed answers through the same engine (gaps_items), so it
+rounds exactly as the worker did. Elsewhere (the CPU tests' tiny model), a plain loop computes the same rule and a
+checker reads answers in one forward pass.
 """
 from __future__ import annotations
 
@@ -20,7 +22,13 @@ import torch.nn.functional as F
 
 from . import es
 
-BUCKETS = (4096, 3072, 2048, 1536, 1024, 768, 512, 384, 256, 192, 128, 96, 64, 48, 32, 24, 16, 8)
+# The engine passes through the model ROWS rows at a time, padding the last pass: cuBLAS picks a matrix product's
+# kernel, and so its rounding, by the matrix's rows, so a row's numbers then depend on nothing but the row. A checker
+# teacher-forcing one member's 16 answers rounds exactly as the worker who wrote them among a thousand (on the same GPU
+# and libraries). Measured on the RTX 4070 SUPER (Qwen2.5-0.5B-Instruct): a row's result is the same wherever it sits
+# in a pass, and a pass of 256 rows costs about what one of 8 does.
+ROWS = 256
+BUCKETS = tuple(ROWS * k for k in (16, 12, 8, 6, 4, 3, 2, 1))
 _ENGINE: dict = {}
 
 
@@ -155,12 +163,14 @@ def _rotate_half(x):
 
 
 class _Engine:
-    """Buffers and CUDA graphs for decoding up to R rows with a cache of L slots (bf16 on CUDA)."""
+    """Buffers and CUDA graphs for decoding up to R rows with a cache of L slots (bf16 on CUDA), in passes of ROWS rows
+    (the rows rounded up to a multiple of ROWS: `cap`; the rows past R are padding)."""
 
     def __init__(self, rt, linears, R, PR, L, T):
         model, cfg = rt.model, rt.model.config
         dev, bf = "cuda", torch.bfloat16
         self.rt, self.R, self.L, self.T = rt, R, L, T
+        self.cap = cap = -(-R // ROWS) * ROWS
         self.H, self.KVH = cfg.num_attention_heads, cfg.num_key_value_heads
         self.D = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.G = self.H // self.KVH
@@ -171,15 +181,18 @@ class _Engine:
         self.tw = {id(m): (torch.zeros(m.in_features, PR, dtype=bf, device=dev),
                            torch.zeros(PR, m.out_features, dtype=bf, device=dev)) for n, m in linears}
         nl = len(self.layers)
-        self.kc = [torch.zeros(R, self.KVH, L, self.D, dtype=bf, device=dev) for _ in range(nl)]
-        self.vc = [torch.zeros(R, self.KVH, L, self.D, dtype=bf, device=dev) for _ in range(nl)]
-        self.bias = torch.zeros(R, L, dtype=bf, device=dev)
-        self.tok = torch.zeros(R, dtype=torch.long, device=dev)
-        self.pos = torch.zeros(R, dtype=torch.long, device=dev)
-        self.rowid = torch.zeros(R, dtype=torch.long, device=dev)
-        self.done = torch.ones(R, dtype=torch.bool, device=dev)
-        self.sel = torch.zeros(R, PR, dtype=bf, device=dev)
+        self.kc = [torch.zeros(cap, self.KVH, L, self.D, dtype=bf, device=dev) for _ in range(nl)]
+        self.vc = [torch.zeros(cap, self.KVH, L, self.D, dtype=bf, device=dev) for _ in range(nl)]
+        self.bias = torch.zeros(cap, L, dtype=bf, device=dev)
+        self.tok = torch.zeros(cap, dtype=torch.long, device=dev)
+        self.pos = torch.zeros(cap, dtype=torch.long, device=dev)
+        self.rowid = torch.zeros(cap, dtype=torch.long, device=dev)
+        self.done = torch.ones(cap, dtype=torch.bool, device=dev)
+        self.sel = torch.zeros(cap, PR, dtype=bf, device=dev)
         self.out = torch.zeros(R + 1, T, dtype=torch.long, device=dev)
+        self.ans = torch.zeros(R + 1, T, dtype=torch.long, device=dev)  # teacher forcing: each row's committed answer,
+        self.alen = torch.zeros(R + 1, dtype=torch.long, device=dev)  # its length, and each token's gap below the
+        self.gap = torch.zeros(R + 1, T, dtype=torch.float32, device=dev)  # step's highest logit
         self.slot = torch.zeros(1, dtype=torch.long, device=dev)
         self.tcol = torch.zeros(1, dtype=torch.long, device=dev)
         self.eos = torch.tensor(rt.eos, device=dev)
@@ -194,64 +207,90 @@ class _Engine:
             Bt.copy_(B.permute(1, 0, 2).reshape(Bt.shape))
             Aa.copy_(A.permute(0, 2, 1).reshape(Aa.shape))
 
-    def _lin(self, mod, x, B):
+    def _lin(self, mod, x, sel):
         y = F.linear(x, mod.weight, mod.bias)
         t = self.tw.get(id(mod))
         if t is None:
             return y
         Bt, Aa = t
-        return y.addmm_(torch.mm(x, Bt) * self.sel[:B], Aa)  # the row's twist: one nonzero factor column, times coef
+        return y.addmm_(torch.mm(x, Bt) * sel, Aa)  # the row's twist: one nonzero factor column, times coef
 
-    def _step(self, B):
-        H, KVH, D, G = self.H, self.KVH, self.D, self.G
-        bias = self.bias[:B]
-        bias.index_fill_(1, self.slot, 0.0)
-        mask = bias[:, None, None, :]
-        h = self.embed(self.tok[:B])
-        cos, sin = self.rot(h, self.pos[:B, None])
+    def _pass(self, lo):
+        """One decode step's logits (bf16) for rows lo to lo + ROWS, their keys and values written into the cache."""
+        H, KVH, D, G, n = self.H, self.KVH, self.D, self.G, ROWS
+        hi = lo + n
+        mask = self.bias[lo:hi, None, None, :]
+        sel = self.sel[lo:hi]
+        h = self.embed(self.tok[lo:hi])
+        cos, sin = self.rot(h, self.pos[lo:hi, None])
         for l, layer in enumerate(self.layers):
             at, mlp = layer.self_attn, layer.mlp
             res = h
             x = layer.input_layernorm(h)
-            q = self._lin(at.q_proj, x, B).view(B, H, D)
-            k = self._lin(at.k_proj, x, B).view(B, KVH, D)
-            v = self._lin(at.v_proj, x, B).view(B, KVH, D)
+            q = self._lin(at.q_proj, x, sel).view(n, H, D)
+            k = self._lin(at.k_proj, x, sel).view(n, KVH, D)
+            v = self._lin(at.v_proj, x, sel).view(n, KVH, D)
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
-            kc, vc = self.kc[l][:B], self.vc[l][:B]
+            kc, vc = self.kc[l][lo:hi], self.vc[l][lo:hi]
             kc.index_copy_(2, self.slot, k[:, :, None, :])
             vc.index_copy_(2, self.slot, v[:, :, None, :])
-            o = F.scaled_dot_product_attention(q.view(B, KVH, G, D), kc, vc, attn_mask=mask, scale=at.scaling)
-            h = res + self._lin(at.o_proj, o.reshape(B, H * D), B)
+            o = F.scaled_dot_product_attention(q.view(n, KVH, G, D), kc, vc, attn_mask=mask, scale=at.scaling)
+            h = res + self._lin(at.o_proj, o.reshape(n, H * D), sel)
             res = h
             x = layer.post_attention_layernorm(h)
-            x = mlp.act_fn(self._lin(mlp.gate_proj, x, B)) * self._lin(mlp.up_proj, x, B)
-            h = res + self._lin(mlp.down_proj, x, B)
-        nxt = F.linear(self.norm(h), self.lm_w).argmax(-1)
-        self.out.index_put_((self.rowid[:B], self.tcol.expand(B)), nxt)
-        self.done[:B] |= (nxt[:, None] == self.eos).any(-1)
-        self.tok[:B].copy_(nxt)
+            x = mlp.act_fn(self._lin(mlp.gate_proj, x, sel)) * self._lin(mlp.up_proj, x, sel)
+            h = res + self._lin(mlp.down_proj, x, sel)
+        return F.linear(self.norm(h), self.lm_w)
+
+    def _step(self, B):
+        self.bias[:B].index_fill_(1, self.slot, 0.0)
+        col = self.tcol.expand(ROWS)
+        for lo in range(0, B, ROWS):
+            nxt = self._pass(lo).argmax(-1)
+            self.out.index_put_((self.rowid[lo:lo + ROWS], col), nxt)
+            self.done[lo:lo + ROWS] |= (nxt[:, None] == self.eos).any(-1)
+            self.tok[lo:lo + ROWS].copy_(nxt)
+        self._advance(B)
+
+    def _forced_step(self, B):
+        """_step reading each row's committed token instead of choosing one, and recording how far its logit is below
+        the pass's highest (0 when it's the greedy choice)."""
+        self.bias[:B].index_fill_(1, self.slot, 0.0)
+        col = self.tcol.expand(ROWS)
+        for lo in range(0, B, ROWS):
+            logits = self._pass(lo)
+            rows = self.rowid[lo:lo + ROWS]
+            want = self.ans[rows, col]
+            top = logits.max(-1).values.float()
+            self.gap.index_put_((rows, col), top - logits.gather(1, want[:, None])[:, 0].float())
+            self.done[lo:lo + ROWS] |= self.alen[rows] <= col + 1
+            self.tok[lo:lo + ROWS].copy_(want)
+        self._advance(B)
+
+    def _advance(self, B):
         self.pos[:B] += 1
         self.slot += 1
         self.tcol += 1
 
-    def run(self, B):
-        g = self.graphs.get(B)
+    def run(self, B, forced=False):
+        g = self.graphs.get((forced, B))
         if g is not None:
             g.replay()
             return
+        step = self._forced_step if forced else self._step
         cur = torch.cuda.current_stream()
         self.stream.wait_stream(cur)
         with torch.cuda.stream(self.stream):
-            self._step(B)
+            step(B)
             g = torch.cuda.CUDAGraph()
             g.capture_begin(self.pool)
             try:
-                self._step(B)
+                step(B)
             finally:
                 g.capture_end()
         cur.wait_stream(self.stream)
-        self.graphs[B] = g
+        self.graphs[(forced, B)] = g
 
     def compact(self, B, nb):
         keep = torch.nonzero(~self.done[:B]).squeeze(1)
@@ -275,6 +314,43 @@ def _bucket(n, R):
 
 
 def _answer_engine(rt, linears, fac, members, rows, T, sigma, rank):
+    nq, M = len(rows), len(members)
+    eng, R = _engine(rt, linears, fac, members, rows, T, sigma, rank)
+    _decode(eng, T)
+    toks = eng.out[:R].tolist()
+    answers = []
+    for row in toks:
+        cut = next((i + 1 for i, t in enumerate(row) if t in rt.eos), len(row))
+        answers.append(row[:cut])
+    return [answers[k * nq:(k + 1) * nq] for k in range(M)]
+
+
+def _gaps_engine(rt, linears, fac, members, rows, answers, T, sigma, rank):
+    """Teacher forcing on the answering engine: every member's committed answers (answers[member][prompt]) read
+    through the same decode steps that wrote them, so a checker rounds as the worker did. The worst gap of each
+    member's answer to each prompt, a [members, prompts] float tensor (0 for an empty answer)."""
+    nq, M = len(rows), len(members)
+    R = M * nq
+    ans, alen = torch.zeros(R + 1, T, dtype=torch.long), torch.zeros(R + 1, dtype=torch.long)
+    for k, member in enumerate(answers):
+        for q, a in enumerate(member):
+            if len(a) > T:
+                raise ValueError(f"an answer of {len(a)} tokens, past the {T} answering stops at")
+            ans[k * nq + q, :len(a)] = torch.tensor(a, dtype=torch.long)
+            alen[k * nq + q] = len(a)
+    eng, R = _engine(rt, linears, fac, members, rows, T, sigma, rank)
+    eng.ans.copy_(ans)
+    eng.alen.copy_(alen)
+    eng.gap.zero_()
+    eng.done[:R] = eng.alen[:R] == 0
+    _decode(eng, T, forced=True)
+    cols = torch.arange(T, device="cuda")[None, :] < eng.alen[:R, None]  # (a done row's later steps are padding)
+    return torch.where(cols, eng.gap[:R], 0.0).max(-1).values.view(M, nq)
+
+
+def _engine(rt, linears, fac, members, rows, T, sigma, rank):
+    """The engine for len(members) x len(rows) rows, set up as a decode's first step finds it: the round's twists
+    loaded, each row's twist selected, the shared reading in its cache, each row about to read its prompt's last token."""
     dev, bf = "cuda", torch.bfloat16
     nq, M = len(rows), len(members)
     R = M * nq
@@ -295,7 +371,10 @@ def _answer_engine(rt, linears, fac, members, rows, T, sigma, rank):
     eng.sel.zero_()
     for k in range(r):
         eng.sel[torch.arange(R, device=dev), jr * r + k] = cr
-    eng.rowid.copy_(torch.arange(R, device=dev))
+    eng.rowid[:R].copy_(torch.arange(R, device=dev))
+    eng.rowid[R:] = R  # the padding rows: done from the start, writing to the spare row
+    eng.done[R:] = True
+    eng.bias[R:].zero_()
     ids, mask, pos, kv = _shared_cache(rt, rows)
     for l, (k, v) in enumerate(kv):
         eng.kc[l][:R, :, :W - 1].copy_(k.repeat(M, 1, 1, 1))
@@ -307,22 +386,22 @@ def _answer_engine(rt, linears, fac, members, rows, T, sigma, rank):
     eng.done[:R] = False
     eng.slot.fill_(W - 1)
     eng.tcol.fill_(0)
-    B, n = R, R
+    return eng, R
+
+
+def _decode(eng, T, forced=False):
+    """Up to T decode steps, rows dropped as they end (in fixed bucket sizes)."""
+    B = eng.cap
+    n = int((~eng.done[:B]).sum())
     for _ in range(T):
         if n == 0:
             break
-        nb = _bucket(n, R)
+        nb = _bucket(n, eng.cap)
         if nb < B:
             eng.compact(B, nb)
             B = nb
-        eng.run(B)
+        eng.run(B, forced)
         n = int((~eng.done[:B]).sum())
-    toks = eng.out[:R].tolist()
-    answers = []
-    for row in toks:
-        cut = next((i + 1 for i, t in enumerate(row) if t in rt.eos), len(row))
-        answers.append(row[:cut])
-    return [answers[k * nq:(k + 1) * nq] for k in range(M)]
 
 
 # --- scoring ----------------------------------------------------------------------------------------------------------
@@ -336,10 +415,22 @@ def _mean_logprob(rt, h, w):
 
 
 def gaps_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, sigma: float, rank: int = 1,
-               max_rows: int = 512):
+               max_rows: int = 512, max_tokens: int | None = None):
     """A checker's teacher forcing under the shared-prompt rule: for each member and each item (prompt ids, answer
     ids), the worst gap over the answer's tokens between the highest logit and the committed token's (0 when every
-    token is the greedy choice). A [members, items] float tensor; an empty answer's gap is 0."""
+    token is the greedy choice). A [members, items] float tensor; an empty answer's gap is 0.
+
+    On CUDA with a bf16 model the answers are read through the answering engine's own decode steps (max_tokens: the
+    answers' limit, which sizes the engine's cache as answering did), so a checker rounds exactly as the worker did
+    however many rows each had; elsewhere in one forward pass."""
+    p = next(rt.model.parameters())
+    if p.device.type == "cuda" and p.dtype == torch.bfloat16:
+        T = max([max_tokens or 0] + [len(a) for _, a in items])
+        if not members or not items or T == 0:
+            return torch.zeros(len(members), len(items), device=p.device)
+        with torch.no_grad():
+            return _gaps_engine(rt, linears, fac, members, [q for q, _ in items], [[a for _, a in items]] * len(members),
+                                T, sigma, rank)
     return _forced(rt, linears, fac, members, items, sigma, rank, max_rows, _worst_gap)
 
 

@@ -181,5 +181,47 @@ class NetworkTests2(unittest.TestCase):
             self.assertEqual(es.state_hash(c.start_params(j)), c.expected_start_hash(c.job(j)).hex())
 
 
+def _cuda() -> bool:
+    if not HAVE_TORCH:
+        return False
+    import torch
+    return torch.cuda.is_available()
+
+
+@unittest.skipUnless(_cuda(), "needs a CUDA GPU")
+class EngineCheckTests(unittest.TestCase):
+    def test_a_member_checked_alone_rounds_as_it_did_among_thousands(self):
+        """es_fast's engine in bf16 on CUDA: a worker's members answer in one batch of 2,048 rows (eight passes of
+        es_fast.ROWS), and a checker teacher-forcing one member's answers alone (one pass, mostly padding) finds every
+        token exactly its greedy choice; a member's answers claimed for its twin fail wherever the two differ. The
+        model has Qwen2.5-0.5B's widths, whose products cuBLAS rounds differently by their rows (the old check, on
+        transformers' path, found gaps here)."""
+        from vibehash import es_fast
+        from vibehash.es_client import prompt_rows, round_factors, runtime2
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        folder = tiny_model(Path(tmp.name) / "tiny", seed=2, hidden_size=896, intermediate_size=4864,
+                            num_attention_heads=14, num_key_value_heads=2)
+        spec = tiny_spec2(folder, pairs=64, pairs_per_unit=8, problems=16, max_tokens=12)
+        rt = runtime2(spec, "cuda")
+        seed = 12345
+        rows = prompt_rows(rt, es2_rounds.items(spec, seed))
+        fac = round_factors(rt, spec, seed)
+        members = [(j, sign) for u in range(spec.units) for j, _, sign in es.unit_members(spec, seed, u)]
+        self.assertEqual(len(members) * len(rows), 8 * es_fast.ROWS)
+        got = es_fast.answer_members(rt, rt.linears, fac, members, rows, spec.max_tokens, spec.sigma, spec.rank)
+
+        def gaps(k, answers):
+            return es_fast.gaps_items(rt, rt.linears, fac, [members[k]], list(zip(rows, answers)), spec.sigma,
+                                      spec.rank, max_tokens=spec.max_tokens)[0].tolist()
+        for k in (0, 1, 70, len(members) - 1):
+            self.assertEqual(gaps(k, got[k]), [0.0] * len(rows), f"member {k}")
+        differ = [q for q in range(len(rows)) if got[0][q] != got[1][q]]
+        self.assertTrue(differ, "the twins answered alike everywhere")
+        claimed = gaps(1, got[0])
+        self.assertTrue(all(claimed[q] > 0 for q in differ), [claimed[q] for q in differ])
+
+
 if __name__ == "__main__":
     unittest.main()

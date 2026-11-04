@@ -606,7 +606,7 @@ class Es2Work:
                     break
                 j, _, sign = members[k]
                 gaps = es_fast.gaps_items(rt, rt.linears, fac, [(j, sign)], list(zip(rows, got[k])), spec.sigma,
-                                          spec.rank)
+                                          spec.rank, max_tokens=spec.max_tokens)
                 worst = float(gaps.max()) if gaps.numel() else 0.0
                 if worst > spec.margin:
                     ok, bad, why = False, k, f"a token {worst:.4f} below the greedy choice's logit"
