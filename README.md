@@ -307,12 +307,13 @@ yet. It needs a GPU with PyTorch (`vibehash install-gpu`) and `pip install vibeh
 vibehash testnet --evo2
 ```
 
-This runs a node and two miners on this computer, training Qwen2.5-0.5B-Instruct in cycles.
-Each cycle is a job on Countdown puzzles, one on arithmetic, and one on ARC-Easy science
-questions. The next cycle starts from the average of the three, which in our tests made a
-model better than any single job, including on tasks none of them trained on. The
+This is Evo Hash (also in the menu: run `vibehash` and pick it under Mine). It runs a node
+and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another:
+Countdown puzzles, arithmetic, ARC-Easy science questions, then round again. Each job is
+short, because evolution makes most of its gains on a task in the first dozen rounds, and
+each starts where the last one ended, so the model keeps what every task taught it. The
 dashboard shows each generation incubating in the open block. `--evo2-rounds N` sets a
-job's length (default 40). `vibehash testnet --evo` is the first, simpler version: one layer
+job's length (default 12). `vibehash testnet --evo` is the first, simpler version: one layer
 of the model, Countdown only.
 
 ## Logs and records

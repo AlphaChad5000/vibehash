@@ -1658,8 +1658,10 @@ def cmd_testnet(a):
     posted = None
 
     def next_cycle_job(s):
-        """Evo v2's next job: this cycle's next task, or, every task done, the next cycle's first, starting from the
-        mean of this cycle's jobs (each pinned by its final params_hash). The cycle's state is kept in evo2.json."""
+        """Evo v2's next job: the next task in turn, starting where the last job ended (its whole change at full
+        weight, pinned by its final params_hash), so the model keeps what each task taught it and moves on once a
+        task's quick early gains are in. A cycle is one job per task; evo2.json keeps this cycle's jobs and the newest
+        one's parents."""
         from . import es2
         path = d / "evo2.json"
         cyc = json.loads(path.read_text()) if path.exists() else {"cycle": 1, "jobs": [], "parents": []}
@@ -1667,12 +1669,11 @@ def cmd_testnet(a):
         if lost:  # posted, but the network stopped before its transaction reached a block: the same job again
             spec = es_local.spec2_for(found, lost[0].split("-", 2)[2], start=cyc["parents"], rounds=a.evo2_rounds)
             return es_local.job2(spec, lost[0], keys["requester"].address)
+        last = cyc["jobs"][-1] if cyc["jobs"] else None  # None only before the first job
         if len(cyc["jobs"]) >= len(evo2_tasks):
-            done = [j for j in cyc["jobs"] if j in node.chain.state.jobs]  # posted and on the chain
-            # Each parent pinned by its final state's hash: start_params also rebuilds it from the chain when another
-            # validator led the job's last round.
-            cyc = {"cycle": cyc["cycle"] + 1, "jobs": [],
-                   "parents": [[j, 1 / len(done), es2.hash_of(node.coord.start_params(j))] for j in done]}
+            cyc = {"cycle": cyc["cycle"] + 1, "jobs": []}
+        # start_params also rebuilds the last job's final state from the chain when another validator led its last round
+        cyc["parents"] = [[last, 1.0, es2.hash_of(node.coord.start_params(last))]] if last else []
         task = evo2_tasks[len(cyc["jobs"])]
         spec = es_local.spec2_for(found, task, start=cyc["parents"], rounds=a.evo2_rounds)
         job = es_local.job2(spec, f"evo2-c{cyc['cycle']}-{task}", keys["requester"].address)
@@ -1685,7 +1686,7 @@ def cmd_testnet(a):
         s = node.chain.state
         if a.job == "none" or any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
             return  # a job is running, or the one just posted hasn't reached a block yet
-        if evo2:  # Evo v2: the next job of this cycle, or the next cycle from this one's average
+        if evo2:  # Evo v2: the next task, starting where the last job ended
             job = next_cycle_job(s)
         elif evo:  # an Evo job, with the measured run's settings (es_local.py)
             job = es_local.job(evo_spec, f"evo-{len(s.jobs) + 1}", keys["requester"].address, a.budget)
@@ -1842,10 +1843,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--evo", action="store_true", help="Evo mode: training by evolution, the chain is the model. A "
                    "network whose genesis takes Evo jobs, training an open model on Countdown puzzles, its blocks holding "
                    f"only seeds and scores (default folder {settings.home() / 'testnet-evo'})")
-    p.add_argument("--evo2", action="store_true", help="Evo v2: the fast recipe on every layer, in cycles: a job per "
-                   "task (countdown, arithmetic, arc_easy), then the next cycle starts from their average (es2.py)")
-    p.add_argument("--evo2-rounds", type=int, default=40, metavar="N", help="Evo v2: rounds a job plans its step size "
-                   "over (default 40)")
+    p.add_argument("--evo2", action="store_true", help="Evo Hash (Evo v2): the fast recipe on every layer, a short job "
+                   "per task in turn (countdown, arithmetic, arc_easy, then round again), each starting where the last "
+                   "ended (es2.py)")
+    p.add_argument("--evo2-rounds", type=int, default=12, metavar="N", help="Evo v2: rounds a job runs, its step size "
+                   "planned over them (default 12: a task's quick early gains, then the next task)")
     p.add_argument("--evo-model", metavar="MODEL", help="Evo mode's model: a Hugging Face name, from this computer's "
                    "cache or downloaded once, or a model's folder (default Qwen/Qwen2.5-0.5B-Instruct, about 1 GB)")
     for name, default in (("register-s", 3.0), ("compute-s", 8.0), ("reveal-s", 3.0), ("verify-s", 4.0)):

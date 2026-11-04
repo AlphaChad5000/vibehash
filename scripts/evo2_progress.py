@@ -1,11 +1,12 @@
-"""Watch an Evo v2 testnet's model get better: after each cycle, rebuild its averaged model from the chain alone and
-score it on the trained tasks and two it never trains on.
+"""Watch an Evo v2 testnet's model get better: after each job, rebuild its model from the chain alone and score it
+on the trained tasks and two it never trains on.
 
-For every finished rule-2 job the node has, the job's change is rebuilt from its parents (es2.Spec2.start: [[job,
-weight, params_hash], ...]) and its rounds' entries (es2.rebuild), as a worker rebuilds it; each job's change is kept
-on disk (bf16) so it is rebuilt once. A cycle's model is the base plus the mean of its jobs' changes, the start the next
-cycle's jobs train from. Scores: greedy, 64 tokens, 200 items a task (es_tasks' eval items; GSM8K and ARC-Challenge
-test items for the never-trained pair), in bf16 on the GPU, beside the miners.
+Jobs run one at a time, each starting where the last ended, so a finished job's model carries every job before it.
+Its change is rebuilt from its parents (es2.Spec2.start: [[job, weight, params_hash], ...]) and its rounds' entries
+(es2.rebuild), as a worker rebuilds it. Only the newest few changes stay in RAM (one is 1.4 GB in float32), and the
+newest scored one on disk (bf16), so a restart carries on from there. Scores: greedy, 64 tokens, 200 items a task
+(es_tasks' eval items; GSM8K and ARC-Challenge test items for the never-trained pair), in bf16 on the GPU, beside the
+miners.
 
   python scripts/evo2_progress.py [--node http://127.0.0.1:8545] [--dir ~/.vibehash/testnet-evo2] [--watch 300]
 """
@@ -15,6 +16,7 @@ import argparse
 import json
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -100,7 +102,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--node", default="http://127.0.0.1:8545")
     p.add_argument("--dir", default=str(Path.home() / ".vibehash" / "testnet-evo2"))
-    p.add_argument("--watch", type=float, default=0, help="seconds between checks for a newly finished cycle (0: once)")
+    p.add_argument("--watch", type=float, default=0, help="seconds between checks for a newly finished job (0: once)")
     a = p.parse_args()
     d = Path(a.dir)
     found = es_local.find(json.loads((d / "evo.json").read_text())["model"] if (d / "evo.json").exists()
@@ -117,7 +119,7 @@ def main():
     sets = eval_sets()
     cache_dir = d / "progress"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    changes: dict = {}
+    changes: "OrderedDict[str, es2.Change]" = OrderedDict()
     chain = Chain(a.node)
     out_path = cache_dir / "progress.json"
     results = json.loads(out_path.read_text()) if out_path.exists() else {}
@@ -127,8 +129,9 @@ def main():
         return list(x["input_ids"] if hasattr(x, "keys") else x)
 
     def change_of(job_id: str) -> es2.Change:
-        """A finished job's change: from disk, or rebuilt from its parents and its entries (then kept)."""
+        """A finished job's change: kept, from disk, or rebuilt from its parents and its entries."""
         if job_id in changes:
+            changes.move_to_end(job_id)
             return changes[job_id]
         f = cache_dir / f"{job_id}.pt"
         ch = es2.Change(linears, "cpu")  # changes live in RAM: the miners have the GPU
@@ -139,8 +142,9 @@ def main():
             spec = chain.specs[job_id]
             parents = [(w, change_of(j)) for j, w, _ in spec.start]
             ch = es2.rebuild(linears, chain.entries.get(job_id, []), parents, "cpu")
-            torch.save({n: v.to(torch.bfloat16).cpu() for n, v in ch.d.items()}, f)
         changes[job_id] = ch
+        while len(changes) > 3:  # enough for a start averaged from a cycle of three
+            changes.popitem(last=False)
         return ch
 
     def score(label: str, ch: es2.Change | None) -> dict:
@@ -166,22 +170,17 @@ def main():
         out_path.write_text(json.dumps(results, indent=1))
     while True:
         chain.poll()
-        cyc = json.loads((d / "evo2.json").read_text()) if (d / "evo2.json").exists() else {"cycle": 1, "jobs": []}
-        # Cycle c's jobs are those named evo2-c{c}-*; a cycle is finished once the next one has started.
-        done_cycles = {}
-        for job_id in chain.specs:
-            if job_id.startswith("evo2-c"):
-                done_cycles.setdefault(int(job_id.split("-")[1][1:]), []).append(job_id)
-        for c in sorted(done_cycles):
-            label = f"cycle {c} average"
-            if label in results or c >= cyc["cycle"]:
-                continue  # scored already, or not finished
-            jobs = sorted(done_cycles[c])
-            mean = es2.Change(linears, "cpu")
-            for j in jobs:
-                mean.add(change_of(j), 1 / len(jobs))
-            results[label] = {"jobs": jobs, "scores": score(label, mean)}
+        jobs = [j for j in chain.specs if j.startswith("evo2-")]  # in the order posted, one running at a time
+        for job_id in jobs[:-1]:  # every job but the newest has finished
+            if job_id in results:
+                continue
+            ch = change_of(job_id)
+            results[job_id] = score(job_id, ch)
             out_path.write_text(json.dumps(results, indent=1))
+            torch.save({n: v.to(torch.bfloat16) for n, v in ch.d.items()}, cache_dir / f"{job_id}.pt")
+            for old in cache_dir.glob("*.pt"):  # the newest scored change is all a restart needs
+                if old.stem != job_id:
+                    old.unlink()
         if not a.watch:
             break
         time.sleep(a.watch)

@@ -131,12 +131,15 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **`testnet --evo2`** is ES rule 2 (es2.py, es2_rounds.py, es_fast.py, es_tasks.py):
   - rank-1 twists of all 168 projections (357.8M weights), shared prompts, the fast engine, and replay-log-probability fitness;
   - a node that keeps a hash chain instead of weights;
-  - averaging cycles (one job per task, the next cycle starting from their mean);
+  - short jobs of 12 rounds, one task after another, each starting from the last job's whole change at full weight. Cycle 1 of
+    the owner's run showed the gains come in a task's first ~10 rounds and the rest add little, and cycle 2 (from the
+    mean of cycle 1's three jobs) started below where Countdown had got to: a mean keeps a third of each job's change;
+  - the menu's Evo Hash item (under Mine) runs it, and its screens say EVO HASH in lime to teal;
   - measured on the owner's RTX 4070 SUPER at about 20-25 s a round and 2.3 KB a generation, the model rebuilt from the chain every round.
 - **Off the public chain:** Evo jobs need a genesis with "es": true, so the public network is unchanged and needs no upgrade for this release.
 - **Checks are loose in bf16.** The engine's answers and transformers' teacher forcing differ: an honest member's worst gap is up to about 0.375 logits, so v2's margin is 0.5. That is fine for a local network; a public one needs checks on the engine's own path or in float32.
 - **The tests (test_es, test_es2) aren't in CI's list** (they need PyTorch). The measurements behind the recipe are in the paper "The Chain Is the Model" (a Claude Doc) and in memory.
-- **Progress checker:** `scripts/evo2_progress.py` scores each finished cycle's averaged model.
+- **Progress checker:** `scripts/evo2_progress.py` scores the models of finished jobs on fixed test questions.
 
 **Branch `es-chain` (2026-11-03, merged in 0.5.11): evolution strategies on the chain, the blockchain becomes the AI.** The
 owner's idea: train with ES so a round's learning step is only seeds and scores in the block, and every node computes
@@ -168,7 +171,7 @@ ES jobs as "Evo" jobs ("Evo mode: training by evolution, the chain is the model"
 - `vibehash train --evo [--base MODEL] [--budget] [--fee]`: reads the node's `/genesis` first, and on a chain without
   `"es": true` (today's public one) stops with one line, before a model is looked for or a wallet opened. Otherwise it
   shows the plan, asks, posts, and follows the job on the training dashboard.
-- The menu's Train section has "Try Evo mode (local)" (`testnet --evo`, asked first). The mining selector marks Evo
+- The menu's Mine section has "Evo Hash" (`testnet --evo2`, asked first; 0.5.11 replaced Train's "Try Evo mode (local)"). The mining selector marks Evo
   jobs "(Evo)" (from the jobs the workers have loaded: no requests). A `vibehash worker` on its own takes a local
   network's Evo job if its Hugging Face cache has the base at the pinned commit (`es_local.find_base`), with no switch.
 - Dashboards: an Evo job gets the block-and-chain scene (esui.py) in a green and teal palette, the owner's design ("actual

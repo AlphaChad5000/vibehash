@@ -399,14 +399,14 @@ class MinerDashboard:
         self.frame_no += 1
         lines: list[str] = []
         add = lambda *segs: lines.append(_line([(" ", None), *segs], w))  # noqa: E731
-        room = w - 1 - len(termui.BANNER[0]) - 3
+        room = w - 1 - len((termui.EVO_BANNER if evo else termui.BANNER)[0]) - 3
         addr = self.rigs[0].client.keys.address
         tails = [_fit(room, f"Evo miner: training by evolution  ·  {self.chain_id}", f"Evo miner  ·  {self.chain_id}",
                       self.chain_id or "Evo miner") if evo else
                  _fit(room, f"useful-work miner  ·  {self.chain_id}", self.chain_id or "useful-work miner"),
                  _fit(room, addr, f"{addr[:10]}{'…' if self.g is GLYPHS else '..'}{addr[-4:]}") if len(self.rigs) == 1
                  else f"{len(self.rigs)} workers"]
-        termui.header(add, self.g, ASCII, tails)
+        termui.header(add, self.g, ASCII, tails, evo=evo)
         lines.append("")
         lines += [" " + row for row in (self._chain(w - 2, lead) if evo else self._band(w - 2))]
         lines.append("")

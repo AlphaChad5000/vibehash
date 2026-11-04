@@ -91,12 +91,13 @@ def _deepseek() -> list[list[str]] | None:
 
 
 def _evo() -> list[list[str]] | None:
-    print("Evo mode: training by evolution, the chain is the model. It runs a test network on this computer, a node\n"
-          "and two workers, that trains Qwen2.5-0.5B-Instruct on Countdown puzzles by evolution strategies: each round\n"
-          "tries nudged copies of the model in twin pairs, and its block keeps only their seeds and scores, a few hundred\n"
-          "bytes from which anyone can work the model out again. The model comes from your Hugging Face cache, or is\n"
-          "downloaded once (about 1 GB). A graphics card helps a lot. Ctrl+C stops it; running it again carries on.")
-    return [["testnet", "--evo"]] if _yes("Start it?") else None
+    print("Evo Hash: mining by evolution, the chain is the model. It runs a test network on this computer, a node and\n"
+          "two miners, that trains Qwen2.5-0.5B-Instruct by evolution strategies on one task after another (Countdown\n"
+          "puzzles, arithmetic, science questions): each round tries 128 nudged copies of the whole model in twin pairs,\n"
+          "and its block keeps only their seeds and scores, about 2 KB from which anyone can work the model out again.\n"
+          "It needs a graphics card with PyTorch (Install GPU support) and `pip install vibehash[evo]`. The model comes\n"
+          "from your Hugging Face cache, or is downloaded once (about 1 GB). Ctrl+C stops it; running it again carries on.")
+    return [["testnet", "--evo2"]] if _yes("Start it?") else None
 
 
 def _cancel() -> list[list[str]] | None:
@@ -139,6 +140,8 @@ MORE = (
 SECTIONS = [
     ("Mine", [
         Item("Start mining", "earn VIBE with this computer", ("worker",)),
+        Item("Evo Hash", "mine by evolution: the chain is the model (on this computer)", ask=_evo,
+             usage="testnet --evo2"),
         Item("My balance", "what you've earned and staked", ("balance",)),
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
         Item("Check this computer", "a real training test: is it ready, what can it take", ("selftest",)),
@@ -154,7 +157,6 @@ SECTIONS = [
         Item("My job's status", "rounds, accuracy, budget left", ("job", "status")),
         Item("Download my trained model", "save it to use with predict", ("job", "download")),
         Item("Models to fine-tune", "popular open-weight models and what they take", ("models",)),
-        Item("Try Evo mode (local)", "training by evolution: the chain is the model", ask=_evo, usage="testnet --evo"),
     ]),
     ("Settings", [
         Item("Set up again", "network, wallet, graphics card, stake", ("setup",)),

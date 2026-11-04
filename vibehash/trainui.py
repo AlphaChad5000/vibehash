@@ -900,10 +900,10 @@ class TrainDashboard:
         lines: list[str] = []
         add = lambda *segs: lines.append(_line([(" ", None), *segs], w))  # noqa: E731
         content = w - 1
-        room = w - 1 - len(termui.BANNER[0]) - 3
+        evo = watch.evo  # an Evo job: its chain (esui.py) in place of the forge
+        room = w - 1 - len((termui.EVO_BANNER if evo else termui.BANNER)[0]) - 3
         shape = f" {g['arrow']} ".join(str(x) for x in job.widths) if job and job.widths else ""
         chain = net.chain_id if net else ""
-        evo = watch.evo  # an Evo job: its chain (esui.py) in place of the forge
         if watch.base:  # a fine-tune: the model it starts from, rather than layer widths
             shape = watch.base[3:] if watch.base.lower().startswith("hf:") else watch.base
             shape = shape.split("@")[0]
@@ -911,7 +911,7 @@ class TrainDashboard:
                              watch.job_id) if evo else
                  termui._fit(room, f"model forge  ·  {watch.job_id}", watch.job_id),
                  termui._fit(room, f"{shape}  ·  {chain}" if shape and chain else shape or chain, shape, chain)]
-        termui.header(add, g, ASCII, tails)
+        termui.header(add, g, ASCII, tails, evo=evo)
         head = len(lines)
         # Fixed rows: header, forge, two status lines, the headline, units and axis rows, two budget lines, footer.
         emblem = None if evo else emblems.for_base(watch.base)  # a fine-tune forges its model's emblem; a CSV's, a blade

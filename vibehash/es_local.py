@@ -203,7 +203,7 @@ def chain_bytes(entry) -> int:
 # The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
 # sigma 1e-3, a cosine from 4e-3 to a quarter of it over the job, replay of 16 earlier correct answers.
 V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=4e-3, lr_floor=0.25,
-                   rounds=40, replay=16, margin=0.5, lp_tol=0.05)
+                   rounds=12, replay=16, margin=0.5, lp_tol=0.05)
 # margin 0.5: answers are written in bf16 by es_fast's engine and checked by teacher forcing on transformers' path, and
 # the two round differently. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, 96 members x 16 answers): an honest
 # member's worst gap was 0.125 at the median, 0.25 at the 95th percentile, 0.375 at most. That is too loose to tell an
@@ -247,9 +247,9 @@ def memory_mb2(spec) -> int:
 
 
 def job2(spec, job_id: str, requester: str, budget: int | None = None, fee: int = FEE) -> TrainingJob:
-    """The v2 Evo job to post: a round's fee, a unit per `pairs_per_unit` pairs, and a budget for the planned rounds
-    (with a few to spare) unless one is given."""
-    budget = budget if budget is not None else (spec.rounds + 4) * fee
+    """The v2 Evo job to post: a round's fee, a unit per `pairs_per_unit` pairs, and a budget for exactly the planned
+    rounds unless one is given (more would run at the step size's floor)."""
+    budget = budget if budget is not None else spec.rounds * fee
     return TrainingJob.from_spec_json(json.dumps({"id": job_id, "fee_per_round": fee, **spec.to_json(), "init_seed": 0,
                                                   "units_per_round": spec.units, "memory_mb": memory_mb2(spec),
                                                   "compute_s": V2_COMPUTE_S}), requester, budget)
