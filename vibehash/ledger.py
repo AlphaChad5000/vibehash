@@ -729,8 +729,13 @@ class Chain:
     def next_nonce(self, addr: str) -> int:
         return self.state.nonces.get(addr, 0)
 
-    def append(self, block: Block) -> None:
-        self.state = apply_block(self.state, block, self.chain_id, self.tip)
+    def append(self, block: Block, save=None) -> None:
+        """`save()`: called once the block is known to apply, before the chain changes (Coordinator.adopt writes it to
+        disk there). If it raises, the chain is as it was."""
+        state = apply_block(self.state, block, self.chain_id, self.tip)
+        if save is not None:
+            save()
+        self.state = state
         self.blocks.append(block)
 
     def check_tx(self, tx: Tx, pending: list[Tx]) -> None:

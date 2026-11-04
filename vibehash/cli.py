@@ -300,10 +300,13 @@ def cmd_node(a):
         for path in a.dataset:
             print(f"dataset {path} -> {node.store.add_dataset(path)}")
     try:
-        while True:
+        while not node.halted:
             time.sleep(1)
     except KeyboardInterrupt:
-        node.stop()
+        pass
+    node.stop()
+    if node.halted:  # a block it couldn't save (Node._halt): it ends, rather than run on serving what isn't on disk
+        sys.exit(f"error: {node.halted}")
 
 
 def cmd_tls_cert(a):
@@ -1758,7 +1761,7 @@ def _testnet(a, held: list) -> None:
             dash.note(f"open to other computers: they join with `{p} setup --node {url}`", logging.INFO + 1)
 
     threads = [threading.Thread(target=c.run, args=(stop,), daemon=True, name=n) for n, c in clients]
-    rounds, height = 0, node.chain.tip.height
+    rounds, height, halted = 0, node.chain.tip.height, None
 
     def begin():
         for t in threads:
@@ -1766,7 +1769,12 @@ def _testnet(a, held: list) -> None:
         ensure_job()
 
     def tick():
-        nonlocal rounds, height
+        nonlocal rounds, height, halted
+        stuck = next((n for n in nodes if n.halted), None)
+        if stuck is not None:  # a block one couldn't save (Node._halt): the testnet ends with why, below
+            halted = stuck.halted
+            stop.set()
+            return
         tip = node.chain.tip
         if tip.height == height:
             return
@@ -1810,6 +1818,8 @@ def _testnet(a, held: list) -> None:
     if dash:
         print(f"{dash.summary()}\nThe chain and wallets are kept in {d}; run it again to carry on.\n\n{hints}")
     _record_end(session)
+    if halted:  # (through SystemExit, not os._exit: the menu runs testnets in its own process and goes on)
+        sys.exit(f"error: {halted}")
 
 
 def _min_fee_flag(p) -> None:

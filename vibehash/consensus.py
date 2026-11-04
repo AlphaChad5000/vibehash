@@ -153,7 +153,8 @@ class Engine:
 
         validators()              the validator set for the next height, {address: stake}
         validate(value) -> bool   whether a proposed block may be committed next
-        commit(height, value, certificate)   add the block to the chain (it's final)
+        commit(height, value, certificate)   add the block to the chain (it's final); if it can't be saved, the node
+                                  calls halt() and the engine stops there rather than going on to the next height
         broadcast(message)        send a message to the other validators
         has_work() -> bool        whether there's anything to put in a block (a funded job, waiting transactions);
                                   until there is, nobody's waiting for a proposal, so idle chains don't churn rounds
@@ -186,6 +187,14 @@ class Engine:
         self.total, self.order, self.locked_round, self.waiting = 0, [], -1, False
         self.future: dict[tuple, tuple[dict, int]] = {}  # (sender, kind, height, round) -> (message, its size)
         self.evidence: list[tuple[dict, dict]] = []  # pairs of conflicting messages from one validator: grounds for slashing
+        self.halted = False
+
+    def halt(self) -> None:
+        """Stop for good: no more votes, proposals or heights. node.py calls it when a decided block couldn't be saved,
+        so nothing is signed on top of a block this validator doesn't have on disk. It takes no lock (a flag the inputs
+        and _send check), so it can be called holding the locks commit() takes."""
+        self.halted = True
+        self.wanted = None
 
     # --- inputs ------------------------------------------------------------------------------
 
@@ -195,7 +204,7 @@ class Engine:
         still locked on whatever we were locked on."""
         with self.lock:
             self.now = time.time() if now is None else now
-            if height > self.height:
+            if height > self.height and not self.halted:
                 self._new_height(height)
                 if resume and resume.get("height") == height:
                     self.locked_id, self.locked_round = resume.get("locked_id"), int(resume.get("locked_round", -1))
@@ -205,6 +214,8 @@ class Engine:
     def receive(self, msg: dict, now: float | None = None) -> None:
         with self.lock:
             self.now = time.time() if now is None else now
+            if self.halted:
+                return
             self._on_message(msg)
             self._progress()
 
@@ -212,7 +223,7 @@ class Engine:
         """The block we were asked for. False if it's too late: the round moved on while it was being built."""
         with self.lock:
             self.now = time.time() if now is None else now
-            if self.wanted != (height, round_) or self.round != round_ or self.step != Step.PROPOSE:
+            if self.wanted != (height, round_) or self.round != round_ or self.step != Step.PROPOSE or self.halted:
                 return False
             self.wanted = None
             self._send(proposal(self.keys, self.chain_id, height, round_, -1, value, self._id(value)))
@@ -222,7 +233,7 @@ class Engine:
     def tick(self, now: float | None = None) -> None:
         with self.lock:
             self.now = time.time() if now is None else now
-            if self.height < 0:
+            if self.height < 0 or self.halted:
                 return
             if self.waiting:
                 self._arm_propose()
@@ -238,7 +249,7 @@ class Engine:
 
     def wants(self, height: int, round_: int) -> bool:
         with self.lock:
-            return self.wanted == (height, round_)
+            return self.wanted == (height, round_) and not self.halted
 
     def proposer(self, round_: int | None = None) -> str | None:
         with self.lock:
@@ -292,12 +303,14 @@ class Engine:
         self.timers.append((self.now + self.timeouts.wait(step, round_, propose), step.value, round_))
 
     def _send(self, msg: dict) -> None:
+        if self.halted:  # (the inputs stop at a halt; this catches one already under way on another thread)
+            return
         self.mine.append(msg)
         self._on_message(msg)
         self._broadcast(msg)
 
     def _vote(self, kind: str, block_id: str | None) -> None:
-        if self.me in self.validators:
+        if self.me in self.validators and not self.halted:
             self._persist({"height": self.height, "round": self.round, "locked_id": self.locked_id, "locked_round": self.locked_round})
             self._send(vote(self.keys, self.chain_id, kind, self.height, self.round, block_id))
 
@@ -402,7 +415,7 @@ class Engine:
     # --- the rules (line numbers are Algorithm 1's) ----------------------------------------------
 
     def _progress(self) -> None:
-        while self.height >= 0 and self.total and self._rule():
+        while self.height >= 0 and self.total and not self.halted and self._rule():
             pass
 
     def _rule(self) -> bool:
@@ -477,6 +490,9 @@ class Engine:
         log.debug("height %d decided in round %d: block %s…", height, round_, block_id[:12])
         try:
             self._commit(height, value, certificate(height, round_, block_id, precommits))
-        except Exception:  # noqa: BLE001 - e.g. sync got the block first; node.py restarts us at its tip either way
-            log.exception("committing block %d failed", height)
+        except Exception:  # noqa: BLE001 - node.py restarts us at its tip either way
+            if not self.halted:  # (a halt has said why)
+                log.exception("committing block %d failed", height)
+        if self.halted:  # the block couldn't be saved (node.py): no next height, nothing more signed
+            return
         self._new_height(height + 1)

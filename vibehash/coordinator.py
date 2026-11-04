@@ -63,6 +63,7 @@ from .crypto import Draw, KeyPair, address_of, h256, verify
 from .finetune import MAX_VAL, WHOLE_TOLERANCE
 from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
+from .storage import NotSaved
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
 from .verification import (
     FINETUNE_CHECK,
@@ -2661,8 +2662,15 @@ class Coordinator:
               scores: tuple[float, float] | None = None, certificate: dict | None = None) -> None:
         """Add a finished block to the chain: one we sealed, or one the validators agreed on. `params` are the weights
         its round trained, when we have them, and `scores` their (loss, accuracy) on the job's validation data.
-        Without `params` (another validator ran the round), the weights have to be fetched (node.py)."""
-        self.chain.append(block)
+        Without `params` (another validator ran the round), the weights have to be fetched (node.py).
+
+        The block, its certificate and its record go to disk first, in one transaction (Store.save_block), and only
+        then into the chain in memory and the mempool. A block that couldn't be saved (NotSaved; RivalBlock when the
+        database holds a different one at its height) leaves both as they were, and the error goes to the caller:
+        node.py stops the node. Before, a node whose saves failed (2026-11-03: a second node on its folder had written
+        those heights first) went on leading rounds on blocks only its memory held, served them, and would have lost
+        them all at its next restart. The very block already on disk, put there by another writer, isn't an error."""
+        self.chain.append(block, (lambda: self._save(block, certificate, record)) if self.store else None)
         included = {t.txid for t in block.txs}
         kept = []
         for tx in self.mempool:  # what's left waits for the next block, if it's still valid after this one
@@ -2673,10 +2681,6 @@ class Coordinator:
                 except (InvalidBlock, InvalidJob):
                     pass
         self.mempool = kept
-        if self.store:
-            self.store.save_block(block, certificate)
-            if record is not None:
-                self.store.save_record(block.height, record)
         s = block.summary
         if s is None:
             return
@@ -2703,6 +2707,16 @@ class Coordinator:
             fine_tune = isinstance(record, dict) and record.get("version") in (FINETUNE_RECORD_VERSION, ES_RECORD_VERSION)
             if scores is not None and not fine_tune:  # (a fine-tune's were saved from its record, above)
                 self.store.save_round(s.job_id, block.height, s.accepted_units, *scores)
+
+    def _save(self, block: Block, certificate: dict | None, record: dict | None) -> None:
+        """adopt()'s write, before the chain changes: NotSaved however it fails, so the caller can tell a block that
+        isn't on disk from one that doesn't apply (InvalidBlock, raised before anything is written)."""
+        try:
+            self.store.save_block(block, certificate, record)  # (False: this very block was there already; fine)
+        except NotSaved:
+            raise
+        except Exception as e:  # noqa: BLE001 - a full disk, an I/O error, a locked database: it isn't saved, whatever it is
+            raise NotSaved(block.height, e) from e
 
 
 class _MemoryBlobs:

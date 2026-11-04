@@ -354,7 +354,14 @@ round it completes work instead of almost never, as in lottery mining.
 - **Node** (`vibehash node`): runs the round state machine on a wall clock
   (register → compute → reveal → verify → finalize), serves a JSON API, stores
   blocks, model weights and datasets on disk, and re-validates the whole chain
-  on start-up.
+  on start-up. A final block goes to disk, with its certificate and round
+  record in one transaction, before the chain the node builds on and serves
+  takes it. If it can't be saved (the database already holds a different
+  block at that height, as when two nodes share a data folder, or the disk is
+  full or failing), the node stops: it no longer leads, votes, proposes or
+  syncs, serves only the blocks it saved, says why in `/status` (`halted`),
+  and `vibehash node` exits with the reason. A restart carries on from what's
+  on disk. The very block already on disk is no error.
 - **Validators** run the chain. The genesis names them (`genesis create
   --validator ADDR=URL`), and a staked account can join later with a
   `validator` transaction (`vibehash validator join --url …`). Voting power

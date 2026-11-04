@@ -3,10 +3,12 @@ node or worker do. Each test reproduces one way in, mostly against a real node o
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import logging
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,7 @@ from vibehash.ledger import Block, Chain, InvalidBlock, Tx, apply_block, canonic
 from vibehash.model import Dataset, ModelSpec
 from vibehash.node import MAX_JSON, Node, PhaseTimes
 from vibehash.ratelimit import Limits, bucket_of
+from vibehash.storage import Store
 from vibehash.tasks import SYN_PER_VIBE, TrainingJob
 from vibehash.wire import WireError, seal
 from tests.test_network import run_until, start_network, write_npz
@@ -438,6 +441,24 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(f.chain.tip.height, self.leader.chain.tip.height, "the honest peer was still asked")
         self.assertEqual(f.leader_hint, self.url, "only a validator the chain lists is followed")
 
+    def test_the_very_block_already_on_disk_is_taken_as_saved(self):
+        """A node saves a block before adopting it, and stops if its height is taken (SaveFirstTests), unless what's
+        there is this very block, put there first by another writer: then it's adopted as saved, the certificate the
+        other's copy lacked is filled in, and sync carries on. The old order raised "UNIQUE constraint failed" here."""
+        peer = NodeClient(self.leader.url)
+        d = peer.get("/blocks?from=1&to=1")[0]
+        f = self.follower([self.leader.url])
+        f.store.save_block(Block.from_dict(d))  # the other writer's copy: no certificate
+        self.assertTrue(f._take(peer, d))
+        self.assertIsNone(f.halted)
+        self.assertEqual(f.chain.tip.hash, Block.from_dict(d).hash)
+        self.assertEqual(f.store.certificates(1, 1), {1: d["certificate"]}, "the missing certificate is filled in")
+        peer.post("/tx", Tx.signed(REQ, "transfer", NODE.address, VIBE, 1, "", "sync-net").to_dict())
+        wait_for(lambda: self.leader.chain.tip.height >= 2)
+        f._sync()
+        self.assertEqual(f.chain.tip.hash, self.leader.chain.tip.hash)
+        self.assertIsNone(f.halted)
+
 
 # --- 9. what a client reads from a node -----------------------------------------------------------------------------
 
@@ -640,6 +661,144 @@ class OneNodePerFolderTests(unittest.TestCase):
                              cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn(f"already running (process {os.getpid()})", out.stderr)
+
+
+class SaveFirstTests(unittest.TestCase):
+    """The same night: the node behind failed every save ("UNIQUE constraint failed: blocks.height") but had already
+    added each block to its chain in memory, so for 15 minutes it led rounds on blocks nobody kept and served them with
+    the other's certificates. Now a block goes to disk before memory, and a node whose save fails stops: it signs and
+    serves nothing it didn't save, /status says why, and its commands end with it."""
+
+    def folder(self) -> Path:
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    @staticmethod
+    def validator_genesis(chain_id: str) -> tuple[dict, int]:
+        port = cli._free_ports(1)[0]
+        return {**SOLO, "chain_id": chain_id, "validators": {NODE.address: f"http://127.0.0.1:{port}"}}, port
+
+    def test_a_save_that_fails_leaves_the_chain_as_it_was_and_stops_the_node(self):
+        for kind in ("alone", "validator"):  # Node._solo seals its own blocks; a validator commits what's decided
+            with self.subTest(kind):
+                genesis, port = self.validator_genesis("disk-net") if kind == "validator" else ({**SOLO, "chain_id": "disk-net"}, 0)
+                node = start_node(self, genesis, port=port)
+                api = NodeClient(node.url)
+                with mock.patch.object(Store, "save_block", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                        self.assertLogs("vibehash.node", "CRITICAL") as logs:
+                    api.post("/tx", Tx.signed(REQ, "transfer", NODE.address, VIBE, 0, "", "disk-net").to_dict())
+                    wait_for(lambda: node.halted)
+                self.assertIn("couldn't write block 1: disk I/O error", logs.output[0])
+                st = api.status()
+                self.assertIn("couldn't write block 1: disk I/O error. Another node may be using this folder", st["halted"])
+                self.assertIn("restart it to carry on from what's on disk", st["halted"])
+                self.assertEqual((st["height"], node.chain.tip.height), (0, 0), "the block that wasn't saved isn't in memory")
+                self.assertEqual(len(node.coord.mempool), 1, "nor did the mempool lose its transaction")
+                self.assertEqual(api.get("/blocks?from=1"), [])
+                with self.assertRaisesRegex(NodeError, "this node has stopped"):
+                    api.post("/tx", Tx.signed(REQ, "transfer", NODE.address, VIBE, 1, "", "disk-net").to_dict())
+                for t in node.threads[1:]:  # rounds, consensus, sync; the server stays up to say why
+                    t.join(timeout=10)
+                    self.assertFalse(t.is_alive(), t.name)
+                if kind == "validator":
+                    self.assertTrue(node.engine.halted)
+                    self.assertEqual(node.engine.height, 1, "it didn't go on to vote at height 2")
+                self.assertEqual(node.chain.tip.height, 0, "the disk works again, but the node stays stopped")
+
+    def test_a_rival_block_on_disk_stops_the_node_instead_of_forking_it(self):
+        """The night itself: two nodes on one folder (node.lock let through), each the chain's one validator, with the
+        one key. The one ahead writes block 1; the one behind decides its own block 1, finds the other's on disk, and
+        stops. Its /blocks never serve the block it couldn't save; the one ahead carries on; and the folder, restarted,
+        is the one ahead's chain."""
+        genesis, port = self.validator_genesis("rival-net")
+        folder = self.folder() / "node"
+        with mock.patch.object(node_module, "hold_folder", return_value=mock.Mock()):
+            ahead = Node(folder, genesis, NODE, port=port, times=FAST).start()
+            self.addCleanup(ahead.stop)
+            behind = Node(folder, genesis, NODE, port=0, times=FAST).start()
+            self.addCleanup(behind.stop)
+        NodeClient(ahead.url).post("/tx", Tx.signed(REQ, "transfer", NODE.address, VIBE, 0, "", "rival-net").to_dict())
+        wait_for(lambda: ahead.chain.tip.height >= 1)
+        api = NodeClient(behind.url)
+        with self.assertLogs("vibehash.node", "CRITICAL"):
+            api.post("/tx", Tx.signed(REQ, "transfer", NODE.address, 2 * VIBE, 0, "", "rival-net").to_dict())
+            wait_for(lambda: behind.halted)
+        self.assertIn("this node's database already has a different block 1 than the one the validators decided. "
+                      f"Another node may be using this folder ({folder})", behind.halted)
+        self.assertEqual(behind.chain.tip.height, 0, "its own block 1 never reached memory")
+        self.assertEqual([b["height"] for b in api.get("/blocks?from=0")], [0])
+        self.assertEqual(api.get("/blocks?from=1"), [], "nor is it served, with the other's certificate or any")
+        self.assertIsNotNone(api.status()["halted"])
+        NodeClient(ahead.url).post("/tx", Tx.signed(REQ, "transfer", NODE.address, VIBE, 1, "", "rival-net").to_dict())
+        wait_for(lambda: ahead.chain.tip.height >= 2)
+        ahead.stop()
+        behind.stop()
+        store = Store(folder)
+        try:
+            self.assertEqual(store.open_chain(genesis).tip.hash, ahead.chain.tip.hash)
+        finally:
+            store.close()
+
+    def run_quietly(self, argv: list[str], seconds: float):
+        """cli.main(argv) on a thread, its logging and output kept out of the test's: what it exited with, or None if
+        it was still running after `seconds` (the old commands ran on)."""
+        out = {}
+
+        def run():
+            try:
+                cli.main(argv)
+                out["code"] = 0
+            except SystemExit as e:
+                out["code"] = e.code
+        logging.disable(logging.INFO)  # cli.main turns on INFO logging for the whole process
+        self.addCleanup(logging.disable, logging.NOTSET)
+        with mock.patch.object(logging.root, "handlers", []), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            t.join(timeout=seconds)
+        return out.get("code")
+
+    def test_the_node_command_ends_with_why(self):
+        reason = "couldn't write block 7: disk I/O error. Another node may be using this folder (x), or the disk failed"
+
+        class Halting:  # a node that halts half a second in
+            def __init__(self, *a, **kw):
+                self.halted, self.stopped = None, False
+
+            def start(self):
+                threading.Timer(0.5, setattr, (self, "halted", reason)).start()
+                return self
+
+            def stop(self):
+                self.stopped = True
+        d = self.folder()
+        (d / "genesis.json").write_text(json.dumps(SOLO))
+        with mock.patch("vibehash.node.Node", Halting), mock.patch.object(cli, "load_wallet", return_value=NODE):
+            code = self.run_quietly(["node", "--genesis", str(d / "genesis.json"), "--wallet", "w", "--data-dir", str(d)], 10)
+        self.assertEqual(code, f"error: {reason}", "`vibehash node` ran on after its node stopped")
+
+    def test_a_testnet_ends_with_why_and_gives_its_folder_back(self):
+        """In-process, as the menu runs it (so through SystemExit): its first block can't be saved."""
+        real, calls = Store.save_block, []
+
+        def flaky(store, *a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(store, *a, **kw)
+        home = self.folder()
+        with mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(home)}), mock.patch.object(Store, "save_block", flaky):
+            code = self.run_quietly(["testnet", "--dir", str(home / "tn"), "--port", "0", "--plain", "--device", "cpu",
+                                     "--job", "small", "--rounds", "1", "--register-s", "1", "--compute-s", "2",
+                                     "--reveal-s", "1", "--verify-s", "1"], 120)
+        self.assertIsInstance(code, str, f"the testnet didn't end with why it stopped: {code!r}")
+        self.assertIn("couldn't write block 1: disk I/O error", code)
+        self.assertIn("restart it to carry on from what's on disk", code)
+        again = filelock.try_hold(home / "tn" / "testnet.lock")
+        self.assertIsNotNone(again, "the testnet kept its folder's lock")
+        again.release()
 
 
 if __name__ == "__main__":
