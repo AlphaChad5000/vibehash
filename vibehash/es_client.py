@@ -218,6 +218,67 @@ class _Line:
         return es.state_hash(self.state)
 
 
+class _Rebuild:
+    """The model being worked out from the chain right now, for the dashboards and the log. A process's first round of
+    a job (after a restart, say) replays every round of the job and its ancestors on the CPU, about 5 s a round for
+    Qwen2.5-0.5B: half an hour by a few hundred rounds, with nothing else on screen moving. One at a time a process
+    (under _lock2): `total` is counted when the outermost _line starts, `done` goes up a replayed round at a time."""
+
+    SHOW = 3  # rounds to replay before it counts as a rebuild (each round's own update is one)
+    LOG_EVERY = 30.0  # seconds between the log's progress lines
+
+    def __init__(self):
+        self.depth = 0  # _line calls in progress (a job's parents are followed inside its own)
+        self.job, self.done, self.total, self.started, self.logged = "", 0, 0, 0.0, 0.0
+
+    def begin(self, job_id: str, total: int) -> None:
+        self.job, self.done, self.total = job_id, 0, total
+        self.started = self.logged = time.monotonic()
+        if self.active():
+            log.info(f"rebuilding job {job_id}'s model from the chain on the CPU: {total:,} rounds to replay, its own "
+                     f"and its ancestors' (saved to disk as it goes, so the next start is quick)")
+
+    def step(self, job_id: str) -> None:
+        self.job, self.done = job_id, self.done + 1
+        if self.active() and time.monotonic() - self.logged >= self.LOG_EVERY:
+            self.logged = time.monotonic()
+            log.info(f"rebuilding the model from the chain: {self.words()}")
+
+    def end(self, ok: bool) -> None:
+        if ok and self.total >= self.SHOW and self.done:
+            log.info(f"the model is rebuilt from the chain: {self.done:,} rounds in {_minutes(time.monotonic() - self.started)}")
+        self.total = 0
+
+    def active(self) -> bool:
+        return self.depth > 0 and self.total >= self.SHOW
+
+    def left_s(self) -> float | None:
+        if not self.done:
+            return None
+        return (time.monotonic() - self.started) / self.done * max(0, self.total - self.done)
+
+    def words(self) -> str:
+        left = self.left_s()
+        return (f"{min(self.done, self.total):,} of {self.total:,} rounds (job {self.job})"
+                + (f", about {_minutes(left)} left" if left is not None else ""))
+
+
+def _minutes(s: float) -> str:
+    return f"{s:.0f} s" if s < 90 else f"{s / 60:.0f} min"
+
+
+rebuild = _Rebuild()
+
+
+def rebuilding() -> tuple[int, int, str, float | None] | None:
+    """While this process works a model out from the chain: (rounds done, rounds in all, the job being replayed,
+    seconds left or None); else None. For the dashboards (minerui)."""
+    r = rebuild
+    if not r.active():
+        return None
+    return min(r.done, r.total), r.total, r.job, r.left_s()
+
+
 # A line's change saved to disk, so a restarted worker carries on from it instead of rebuilding every round since the
 # job's first ancestor on the CPU (which grows with the chain: 15+ minutes by a few hundred rounds). Only a cache: a
 # saved line is used only when its state is the one the chain's block at its height holds.
@@ -270,6 +331,31 @@ def _load_line(c: _Chain, job_id: str, spec):
     ln.last_round = ln.saved = int(saved["last_round"])
     log.info(f"job {job_id}: carried on from its line saved at block {ln.last_round}")
     return ln
+
+
+def _posted_at(c: _Chain, job_id: str) -> int | None:
+    """The height of the block that posted `job_id` (its post_job's memo is the job's spec), among the blocks read."""
+    for h, b in c.blocks.items():
+        for tx in b.txs:
+            if tx.kind == "post_job" and f'"{job_id}"' in tx.memo:
+                try:
+                    if json.loads(tx.memo).get("id") == job_id:
+                        return h
+                except (ValueError, AttributeError):
+                    continue
+    return None
+
+
+def _saved_round(job_id: str) -> int | None:
+    """The block a saved line of `job_id` was saved at, read without loading its weights; None without one."""
+    f = _saved_dir() / f"{job_id}.pt"
+    if not f.exists():
+        return None
+    try:
+        import torch
+        return int(torch.load(f, map_location="cpu", weights_only=True, mmap=True)["last_round"])
+    except Exception:  # noqa: BLE001 - unreadable: _load_line won't use it either
+        return None
 
 
 def runtime2(spec, device: str) -> es.Runtime:
@@ -425,49 +511,83 @@ class Es2Work:
     def _line(self, rt: es.Runtime, job_id: str, spec, pin: str = "") -> _Line:
         """Job `job_id` followed up to the chain's tip (or, with `pin`, until its state's hash chain or params_hash is
         that): every round's record checked against its block, its entry applied to the change, the state worked out
-        and checked against the params_hash the block holds."""
+        and checked against the params_hash the block holds. A long replay shows its progress (`rebuild`)."""
         with _lock2:
             c, tip = self._chain()
-            ln = c.lines.get(job_id)
-            if ln is None:
-                ln = _load_line(c, job_id, spec) or _Line(job_id, spec, self._start(rt, spec))
-                c.lines[job_id] = ln
-                while len(c.lines) > MAX_LINES:
-                    c.lines.popitem(last=False)
-            c.lines.move_to_end(job_id)
-
-            def pinned() -> bool:
-                return bool(pin) and pin in (es2.hash_of(ln.state), ln.params_hash)
-            if pinned():
+            rebuild.depth += 1
+            ok = False
+            try:
+                if rebuild.depth == 1:
+                    rebuild.begin(job_id, self._todo(c, job_id, spec, set()))
+                ln = self._follow(rt, c, tip, job_id, spec, pin)
+                ok = True
                 return ln
-            node = self.client.home
-            for h in range(ln.height + 1, tip + 1):
-                b = c.blocks.get(h)
-                if b is None:
-                    break
-                s = b.summary
-                if s is not None and s.job_id == job_id:
-                    record = node.get(f"/round/{h}/record")
-                    if h256(canonical(record)).hex() != s.record_hash:
-                        raise ValueError(f"block {h}'s record isn't the one it commits to")
-                    e = record["es"]
-                    if e.get("update"):
-                        ent = es2_rounds.entry_of(e)
-                        apply_round(rt, spec, ln.change, ent)
-                        ln.state = es2.step_state(ln.state, ent, float(e["reward"]))
-                        ln.history.append(ent)
-                    if ln.params_hash != s.params_hash:
-                        c.lines.pop(job_id, None)  # (whatever it holds is wrong now: worked out again next time)
-                        raise ValueError(f"block {h}: the state worked out isn't the one the block holds")
-                    ln.last_round = h
-                ln.height = h
-                if pinned():
-                    break
-            if ln.last_round - ln.saved >= SAVE_EVERY:  # once caught up, not along the way
-                _save_line(ln)
-            if pin and not pinned():
-                raise ValueError(f"job {job_id} never reached the state {pin[:16]}… its child starts from")
+            finally:
+                rebuild.depth -= 1
+                if rebuild.depth == 0:
+                    rebuild.end(ok)
+
+    def _todo(self, c: _Chain, job_id: str, spec, seen: set, before: float = float("inf")) -> int:
+        """About how many rounds _line(job_id) will replay: the job's rounds with accepted units past what this process
+        has of its line (in memory, or saved to disk) and below `before` (for a parent, its child's posting: the
+        child's start pins the parent's state then); and, with neither line, its parents' too unless their mix is kept."""
+        if job_id in seen:
+            return 0
+        seen.add(job_id)
+        ln = c.lines.get(job_id)
+        after = ln.height if ln is not None else _saved_round(job_id)
+        n = sum(1 for h, b in c.blocks.items() if (after or 0) < h < before and b.summary is not None
+                and b.summary.job_id == job_id and b.summary.accepted_units)
+        if after is None and spec.start:
+            key = canonical([spec.manifest, [list(s) for s in spec.start]]).decode()
+            if key not in c.starts:
+                posted = _posted_at(c, job_id)
+                n += sum(self._todo(c, pj, self._spec_of(pj), seen, float("inf") if posted is None else posted)
+                         for pj, _, _ in spec.start)
+        return n
+
+    def _follow(self, rt: es.Runtime, c: _Chain, tip: int, job_id: str, spec, pin: str) -> _Line:
+        ln = c.lines.get(job_id)
+        if ln is None:
+            ln = _load_line(c, job_id, spec) or _Line(job_id, spec, self._start(rt, spec))
+            c.lines[job_id] = ln
+            while len(c.lines) > MAX_LINES:
+                c.lines.popitem(last=False)
+        c.lines.move_to_end(job_id)
+
+        def pinned() -> bool:
+            return bool(pin) and pin in (es2.hash_of(ln.state), ln.params_hash)
+        if pinned():
             return ln
+        node = self.client.home
+        for h in range(ln.height + 1, tip + 1):
+            b = c.blocks.get(h)
+            if b is None:
+                break
+            s = b.summary
+            if s is not None and s.job_id == job_id:
+                record = node.get(f"/round/{h}/record")
+                if h256(canonical(record)).hex() != s.record_hash:
+                    raise ValueError(f"block {h}'s record isn't the one it commits to")
+                e = record["es"]
+                if e.get("update"):
+                    ent = es2_rounds.entry_of(e)
+                    apply_round(rt, spec, ln.change, ent)
+                    ln.state = es2.step_state(ln.state, ent, float(e["reward"]))
+                    ln.history.append(ent)
+                    rebuild.step(job_id)
+                if ln.params_hash != s.params_hash:
+                    c.lines.pop(job_id, None)  # (whatever it holds is wrong now: worked out again next time)
+                    raise ValueError(f"block {h}: the state worked out isn't the one the block holds")
+                ln.last_round = h
+            ln.height = h
+            if pinned():
+                break
+        if ln.last_round - ln.saved >= SAVE_EVERY:  # once caught up, not along the way
+            _save_line(ln)
+        if pin and not pinned():
+            raise ValueError(f"job {job_id} never reached the state {pin[:16]}… its child starts from")
+        return ln
 
     def at(self, job: TrainingJob, start_hash: bytes) -> tuple[es.Runtime, _Line]:
         """The runtime, and the job's line as the round starts (its state's params_hash is the round's start hash),
