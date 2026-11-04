@@ -208,7 +208,9 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
 
 
 JUDGE = """You compare two assistant replies against a goal. Reply with ONE JSON object:
-{"winner": "A" or "B" or "tie", "reason": "one sentence", "false_or_unhelpful": ["A" and/or "B", or none]}
+{"winner": "A" or "B" or "tie" or "neither", "reason": "one sentence", "false_or_unhelpful": ["A" and/or "B", or none]}
+"neither" means no reply does what the goal asks at all (the wrong voice, the wrong form, not the task): then the
+less bad reply does not win. Say "neither" only when both miss the goal, not when both are merely imperfect.
 Prefer the reply that meets the goal better while staying accurate and useful: a reply that matches the style but
 says something false or doesn't help should not beat one that matches it and is right. List in "false_or_unhelpful"
 each reply that states something false or fails to help. Ignore which is longer unless the goal is about length.
@@ -232,7 +234,8 @@ def compare(goal: str, pair: dict, rival: str, tuned_is_a: bool, model: str | No
                          {"role": "user", "content": f"Goal: {goal}\n\nUser message:\n<<<\n{pair['prompt']}\n>>>\n\n"
                                                      f"Reply A:\n<<<\n{a}\n>>>\n\nReply B:\n<<<\n{b}\n>>>"}], model)
     winner = verdict.get("winner")
-    side = "tie" if winner not in ("A", "B") else "tuned" if (winner == "A") == tuned_is_a else rival
+    side = "neither" if winner == "neither" else "tie" if winner not in ("A", "B") \
+        else "tuned" if (winner == "A") == tuned_is_a else rival
     flagged = verdict.get("false_or_unhelpful") or []
     tuned_flagged = ("A" if tuned_is_a else "B") in (flagged if isinstance(flagged, list) else [flagged])
     return side, unblind(verdict.get("reason") or "", tuned_is_a, RIVALS[rival]), tuned_flagged
@@ -248,8 +251,10 @@ def unblind(reason: str, tuned_is_a: bool, rival: str = "the base model") -> str
 
 
 def verdict(goal: str, pair: dict, rival: str = "base", model: str | None = None) -> dict:
-    """Both readings of the fine-tune against one rival, and the verdict they make together. The fine-tune's reply
-    counts as flagged if either reading flagged it. `model` is the second judge; the first by default."""
+    """Both readings of the fine-tune against one rival, and the verdict they make together: "tuned", the rival,
+    "tie", or "neither" when both readings found that no reply did the goal (a miss for the fine-tune, not a win).
+    The fine-tune's reply counts as flagged if either reading flagged it. `model` is the second judge; the first by
+    default."""
     one, two = compare(goal, pair, rival, True, model), compare(goal, pair, rival, False, model)
     side = one[0] if one[0] == two[0] else "tie"
     reason = one[1] if side == one[0] else two[1] if side == two[0] else \
@@ -320,26 +325,29 @@ def grade(answers_file: Path, on_verdict=None) -> None:
     answers_file.with_suffix(".graded.json").write_text(json.dumps(data, indent=2))
     for name, s in [("", data["summary"])] + [(f"{n} prompts: ", data["summary"].get(n)) for n in [*SETS, FRESH]]:
         if s:
-            print(f"\n{name}fine-tune preferred on {s['tuned_wins']} of {s['prompts']} prompts ({s['ties']} ties)")
+            print(f"\n{name}fine-tune preferred on {s['tuned_wins']} of {s['prompts']} prompts ({s['ties']} ties, "
+                  f"{s['neither']} where neither did the goal)")
             if v := s.get("vs_prompted"):
-                print(f"{name}over the base model told the goal: {v['tuned_wins']} of {s['prompts']} ({v['ties']} ties)")
+                print(f"{name}over the base model told the goal: {v['tuned_wins']} of {s['prompts']} ({v['ties']} ties, "
+                      f"{v['neither']} neither)")
 
 
 def summary(pairs: list[dict]) -> dict:
     """The score over some of the pairs: the Job Architect's test prompts, or the hard prompts on their own."""
     n = len(pairs)
-    wins = sum(p["verdict"]["winner"] == "tuned" for p in pairs)
-    ties = sum(p["verdict"]["winner"] == "tie" for p in pairs)
-    out = {"prompts": n, "tuned_wins": wins, "ties": ties, "base_wins": n - wins - ties, "interval": interval(wins, n),
-           "chance": chance(wins, n - wins - ties), "flagged": sum(p["verdict"]["flagged"] or p.get("vs_prompted", {}).get("flagged", False) for p in pairs)}
+    count = lambda key, side: sum(p[key]["winner"] == side for p in pairs)  # noqa: E731
+    wins, ties, neither = count("verdict", "tuned"), count("verdict", "tie"), count("verdict", "neither")
+    # "neither" (no reply did the goal) is a miss for the fine-tune: it counts against it, never as a tie
+    out = {"prompts": n, "tuned_wins": wins, "ties": ties, "neither": neither, "base_wins": n - wins - ties - neither,
+           "interval": interval(wins, n), "chance": chance(wins, n - wins - ties),
+           "flagged": sum(p["verdict"]["flagged"] or p.get("vs_prompted", {}).get("flagged", False) for p in pairs)}
     if all("vs_prompted" in p for p in pairs):
-        pw = sum(p["vs_prompted"]["winner"] == "tuned" for p in pairs)
-        pt = sum(p["vs_prompted"]["winner"] == "tie" for p in pairs)
-        out["vs_prompted"] = {"tuned_wins": pw, "ties": pt, "prompted_wins": n - pw - pt, "interval": interval(pw, n),
-                              "chance": chance(pw, n - pw - pt)}
+        pw, pt, pn = count("vs_prompted", "tuned"), count("vs_prompted", "tie"), count("vs_prompted", "neither")
+        out["vs_prompted"] = {"tuned_wins": pw, "ties": pt, "neither": pn, "prompted_wins": n - pw - pt - pn,
+                              "interval": interval(pw, n), "chance": chance(pw, n - pw - pt)}
     if pairs and all("second" in p and "vs_prompted" in p for p in pairs):
-        sw = sum(p["second"]["winner"] == "tuned" for p in pairs)
-        out["second"] = {"model": SECOND, "tuned_wins": sw, "ties": sum(p["second"]["winner"] == "tie" for p in pairs),
+        sw = count("second", "tuned")
+        out["second"] = {"model": SECOND, "tuned_wins": sw, "ties": count("second", "tie"), "neither": count("second", "neither"),
                          "interval": interval(sw, n),
                          "agree": sum(p["second"]["winner"] == p["vs_prompted"]["winner"] for p in pairs),
                          "kappa": kappa([p["vs_prompted"]["winner"] for p in pairs], [p["second"]["winner"] for p in pairs])}

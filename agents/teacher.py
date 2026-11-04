@@ -34,7 +34,8 @@ def tally(pairs: list[dict]) -> dict:
     n = len(pairs)
     wins = sum(p["vs_teacher"]["winner"] == "tuned" for p in pairs)
     ties = sum(p["vs_teacher"]["winner"] == "tie" for p in pairs)
-    return {"prompts": n, "tuned_wins": wins, "ties": ties, "teacher_wins": n - wins - ties,
+    neither = sum(p["vs_teacher"]["winner"] == "neither" for p in pairs)  # no reply did the goal: not a tie
+    return {"prompts": n, "tuned_wins": wins, "ties": ties, "neither": neither, "teacher_wins": n - wins - ties - neither,
             "interval": judge.interval(wins, n), "chance": judge.chance(wins, n - wins - ties),
             "held": round((wins + ties) / n, 3) if n else None}  # the share the fine-tune matched or beat it on
 

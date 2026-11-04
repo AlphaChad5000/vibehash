@@ -330,7 +330,8 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
 
     def heard(i: int, pair: dict) -> None:
         v, told = pair["verdict"], pair.get("vs_prompted")
-        said = {"tuned": "fine-tune preferred", "base": "base model preferred", "tie": "tie"}[v["winner"]]
+        said = {"tuned": "fine-tune preferred", "base": "base model preferred", "tie": "tie",
+                "neither": "neither did the goal"}[v["winner"]]
         detail = {"kind": "verdict", "round": round_no, "i": i, "prompts": n, "winner": v["winner"],
                   "flagged": v["flagged"] or bool(told and told["flagged"]), "prompt": pair["prompt"][:300],
                   "base": pair["base"][:550], "tuned": pair["tuned"][:550], "reason": v["reason"][:400]}
