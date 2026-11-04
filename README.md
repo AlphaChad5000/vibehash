@@ -307,7 +307,7 @@ yet. It needs a GPU with PyTorch (`vibehash install-gpu`) and `pip install vibeh
 vibehash testnet --evo2
 ```
 
-This is Evo Hash (also in the menu: run `vibehash` and pick it under Mine). It runs a node
+This is Evo Hash ([white paper](docs/evo-hash.pdf); also in the menu: run `vibehash` and pick it under Mine). It runs a node
 and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another,
 19 of them, then round again: Countdown puzzles and arithmetic, made up as it goes, and
 science, commonsense, word-problem math, trivia, sentiment, news and emotion questions from

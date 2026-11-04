@@ -1,0 +1,149 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Evo Hash: A Blockchain Whose Chain Is the Model</title>
+<style>
+@page { size: Letter; margin: 0.95in 1in 0.9in 1in; }
+body { font-family: "Times New Roman", Times, serif; font-size: 11.5pt; line-height: 1.38; color: #000; text-align: justify; hyphens: auto; }
+h1 { font-size: 17pt; text-align: center; font-weight: bold; margin: 0 0 14pt; line-height: 1.25; }
+.author { text-align: center; font-size: 12pt; margin: 0; }
+.site { text-align: center; font-size: 11pt; margin: 2pt 0 22pt; }
+.abstract { margin: 0 0.45in 20pt; font-size: 10.5pt; }
+h2 { font-size: 12.5pt; font-weight: bold; margin: 18pt 0 6pt; page-break-after: avoid; }
+p { margin: 0 0 8pt; }
+.eq { text-align: center; margin: 8pt 0 10pt; font-style: italic; }
+.eq span { font-style: normal; }
+dl { margin: 0 0 8pt; } dt { font-weight: bold; display: inline; } dd { display: inline; margin: 0; } .item { margin: 0 0 6pt 0.3in; text-indent: -0.3in; padding-left: 0.3in; }
+figure { margin: 12pt 0 12pt; page-break-inside: avoid; text-align: center; }
+figcaption { font-size: 9.5pt; text-align: justify; margin-top: 6pt; }
+table { border-collapse: collapse; margin: 8pt auto 6pt; font-size: 10pt; page-break-inside: avoid; }
+th, td { border-top: 0.6pt solid #000; border-bottom: 0.6pt solid #000; padding: 3pt 9pt; text-align: left; }
+th { font-weight: bold; }
+.tcap { font-size: 9.5pt; text-align: center; margin-bottom: 10pt; }
+.refs p { font-size: 10pt; margin: 0 0 4pt; padding-left: 0.3in; text-indent: -0.3in; text-align: left; }
+.disc { font-size: 8.5pt; margin-top: 16pt; }
+code { font-family: "Courier New", monospace; font-size: 10pt; }
+svg text { font-family: "Times New Roman", Times, serif; }
+</style></head><body>
+
+<h1>Evo Hash: A Blockchain Whose Chain<br>Is the Model</h1>
+<p class="author">Cole Heideman</p>
+<p class="site">vibehash.org</p>
+
+<p class="abstract"><b>Abstract.</b> Proof-of-work spends its computation on hashes that are thrown away, and attempts to spend it on training neural networks have been held back by gradients: they are gigabytes per step, too large to send over home connections and too opaque to check. We propose training by evolution strategies instead, where a step of training is fully described by a handful of seeds and the scores of the perturbed models those seeds define. A block then holds one generation of evolution in about two kilobytes, every node applies the same update from it, and the trained model is a pure function of the chain: anyone can rebuild every weight exactly, so no one stores, ships or owns it. Miners answer problems with perturbed copies of the model, checkers replay a random sample of those answers, and grading is a few lines of code any node can run. On one consumer graphics card, a test network trains all 357,826,560 projection weights of a 0.5-billion-parameter language model at about eighteen seconds a generation, and records 43 generations in 95.8 KB.</p>
+
+<h2>1. Introduction</h2>
+<p>Bitcoin [1] keeps a ledger without a trusted party by making blocks expensive to produce, and the expense buys nothing else. Vibe Hash [2] replaced the hashes with the training of neural networks, verified by replaying committed checkpoints. That design pays for useful work, but every unit of it still moves model-sized checkpoints and gradients across the network, and checking a unit means repeating its arithmetic within a tolerance.</p>
+<p>Evolution strategies (ES) [3] train a model without gradients. Each step evaluates many copies of the model, each moved a small random distance from the current weights, and moves the weights toward the copies that scored well. ES was long thought too slow for large language models; recent work has shown it fine-tunes billion-parameter models competitively [4, 5]. Its property that matters here is older: each random move is generated from a seed, so a step is determined by its seeds and its scores alone, a fact zeroth-order fine-tuning [10] and seed-based federated tuning [11] have used to cut memory and communication. In this paper we make that property the basis of a chain. A block records a generation's seeds and scores, the update is a deterministic function of the block, and the model at any height is the base model plus every update before it. Mining becomes the search, and the chain becomes the model.</p>
+
+<h2>2. Jobs</h2>
+<p>A requester posts a job naming a pinned base model, the tensors to train, a task, and the evolution settings: the number of antithetic pairs <i>P</i>, problems per round <i>Q</i>, the noise scale σ, a step size that falls along a cosine from η to a quarter of η over the job's planned rounds, and a fee per round held in escrow. A job may also name parents, earlier jobs whose final change it starts from, each pinned by the hash of its final state and given a weight. The defaults are <i>P</i> = 64 pairs (128 members), <i>Q</i> = 16 problems of at most 64 generated tokens, σ = 10<sup>−3</sup> and η = 4 × 10<sup>−3</sup>, training every attention and MLP projection of the model, 168 matrices for Qwen2.5-0.5B-Instruct.</p>
+<p>A task supplies problems drawn deterministically from a seed and a check of each reply that is pure code: an exact expression for Countdown, a number for arithmetic and word problems, a letter for multiple choice, and for trivia a match, after normalisation [6], against the dataset's accepted answers. Datasets are pinned to one commit, so every machine draws the same questions, and training questions come only from splits that scoring never uses.</p>
+
+<h2>3. Members</h2>
+<p>For a pair <i>j</i> and each trained matrix <i>W</i> of shape <i>m</i> × <i>n</i>, the pair's seed generates two vectors <i>a<sub>j</sub></i> ∈ ℝ<sup><i>m</i></sup> and <i>b<sub>j</sub></i> ∈ ℝ<sup><i>n</i></sup>, and the pair's two members use</p>
+<p class="eq">W<sub>j</sub><sup>±</sup> = W ± σ a<sub>j</sub> b<sub>j</sub><sup>T</sup>,</p>
+<p>a rank-one twist of every matrix at once, after EGGROLL [5]. The twist never has to be formed: a member's product <i>W<sub>j</sub><sup>±</sup>x</i> is <i>Wx</i> plus σ(<i>b<sub>j</sub><sup>T</sup>x</i>)<i>a<sub>j</sub></i>, so all 128 members run as one batch through the shared base weights with a small correction each. A pair's vectors for every matrix come from one stream of about 550,000 numbers.</p>
+<p>All members read each problem's prompt, except its last token, through the untwisted model, once; the twists apply from the last prompt token on. This shared-prompt rule is part of a member's definition, not an approximation a worker may choose, and it makes 128 members cost little more than one. Pair seeds are derived from the round seed and the pair's index, and the round seed is</p>
+<p class="eq">seed = H( <span>"es-round"</span> ǁ previous block ǁ round number ǁ registrations ),</p>
+<p>fixed when registration closes and unknown before it, so no worker can choose its noise.</p>
+
+<h2>4. A Round</h2>
+<p>Each round produces one block, and each block is one generation (Figure 1). The round's pairs are cut into units of eight pairs, assigned to registered workers as in Vibe Hash. A worker runs its unit's sixteen members on the round's problems, uploads their answers as a content-addressed blob, and commits to their scores before the reveal. During verification, checkers drawn at random replay a sample of each unit's members: they feed each answer back through that member's twisted model and require every generated token to lie within a margin of the member's greedy choice, which an answer the member would not have produced fails. The node regrades every answer with the task's check, so a worker cannot claim a right answer it did not give.</p>
+<figure>
+<svg viewBox="0 0 640 170" width="100%" xmlns="http://www.w3.org/2000/svg" font-size="11.5">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#000"/></marker></defs>
+<g fill="none" stroke="#000" stroke-width="0.9">
+<rect x="10" y="30" width="132" height="64"/><rect x="172" y="30" width="132" height="64"/><rect x="334" y="30" width="132" height="64"/><rect x="496" y="30" width="134" height="64" stroke-width="1.8"/>
+<path d="M142 62H170" marker-end="url(#a)"/><path d="M304 62H332" marker-end="url(#a)"/><path d="M466 62H494" marker-end="url(#a)"/>
+<path d="M563 94V135H76V96" marker-end="url(#a)"/>
+</g>
+<g text-anchor="middle">
+<text x="76" y="52" font-weight="bold">Seed</text><text x="76" y="68">64 pairs, 16 problems</text><text x="76" y="83">from the round seed</text>
+<text x="238" y="52" font-weight="bold">Answer</text><text x="238" y="68">units of 8 pairs</text><text x="238" y="83">scores committed</text>
+<text x="400" y="52" font-weight="bold">Check</text><text x="400" y="68">sampled members replayed</text><text x="400" y="83">every answer regraded</text>
+<text x="563" y="52" font-weight="bold">Seal</text><text x="563" y="68">seeds and scores, ≈2 KB</text><text x="563" y="83">every node applies Δ</text>
+<text x="320" y="152">the updated model is the next round's base</text>
+</g>
+</svg>
+<figcaption>Figure 1: One round. Answering and checking run on workers' graphics cards; the update is a deterministic function of what the block records, so every node applies it identically.</figcaption>
+</figure>
+<p>From the accepted pairs the node computes the update. Each member's fitness is shaped by z-scoring across the generation, and pair <i>j</i>'s coefficient is the difference between its members' shaped scores, <i>c<sub>j</sub></i> = <i>z<sub>j</sub></i><sup>+</sup> − <i>z<sub>j</sub></i><sup>−</sup>. Every matrix then moves by</p>
+<p class="eq">ΔW = ( η<sub>t</sub> / N ) Σ<sub>j</sub> c<sub>j</sub> a<sub>j</sub> b<sub>j</sub><sup>T</sup>,</p>
+<p>where η<sub>t</sub> is the step size at round <i>t</i> and <i>N</i> the number of accepted members. Taking differences within a pair cancels most of the noise that the choice of problems puts into the scores.</p>
+<p>A right-or-wrong score is coarse: when a model answers 5% of problems correctly, most pairs score alike and the generation learns little. Each round therefore also keeps, for every problem, the most common correct answer its members gave. In later rounds a member's fitness is its mean log-probability of the previous rounds' kept answers, a graded signal that rewards becoming more confident in answers already verified correct. Checkers recompute these log-probabilities for their sampled members within a tolerance.</p>
+
+<h2>5. The Chain Is the Model</h2>
+<p>A round's entry in its block is its seed, the list of accepted pairs with their coefficients, the step size and the replay targets. Nodes never hold weights. A job's on-chain state is a hash chain of 32 bytes, stored as sixteen 16-bit words, followed by eight control words that count its steps:</p>
+<p class="eq">h<sub>0</sub> = H( <span>"vibehash-es2-start"</span> ǁ base ǁ tensors ǁ parents ),&nbsp;&nbsp;&nbsp; h<sub>t+1</sub> = H( h<sub>t</sub> ǁ entry<sub>t</sub> ).</p>
+<p>Each block commits to the job's state after its round, so a node that misreads any entry disagrees with the block at once. A worker that needs the weights rebuilds them: starting from the base model and its parents' changes, it regenerates each round's vectors from the recorded seeds and applies each recorded update in order (Figure 2).</p>
+<figure>
+<svg viewBox="0 0 640 150" width="100%" xmlns="http://www.w3.org/2000/svg" font-size="11.5">
+<defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#000"/></marker></defs>
+<g fill="none" stroke="#000" stroke-width="0.9">
+<rect x="10" y="20" width="104" height="44"/><rect x="150" y="20" width="104" height="44"/><rect x="290" y="20" width="104" height="44"/><rect x="430" y="20" width="104" height="44"/>
+<path d="M114 42H148" marker-end="url(#b)"/><path d="M254 42H288" marker-end="url(#b)"/><path d="M394 42H428" marker-end="url(#b)"/><path d="M534 42H560"/>
+<rect x="10" y="94" width="104" height="38" stroke-dasharray="3 2"/><rect x="470" y="94" width="160" height="38" stroke-width="1.8"/>
+<path d="M62 64V92"/><path d="M202 64V113H468" marker-end="url(#b)"/><path d="M342 64V113"/><path d="M482 64V92"/><path d="M114 113H200"/>
+</g>
+<g text-anchor="middle">
+<text x="62" y="39">block t−2</text><text x="62" y="55">seeds, scores</text>
+<text x="202" y="39">block t−1</text><text x="202" y="55">seeds, scores</text>
+<text x="342" y="39">block t</text><text x="342" y="55">seeds, scores</text>
+<text x="482" y="39">block t+1</text><text x="482" y="55">seeds, scores</text>
+<text x="590" y="46">…</text>
+<text x="62" y="117">base model</text>
+<text x="550" y="111" font-weight="bold">model at height t</text><text x="550" y="125">base + Σ ΔW, exact</text>
+</g>
+</svg>
+<figcaption>Figure 2: The model at any height is the pinned base plus every recorded update before it. Blocks carry about 2 KB each; the weights they define are never sent.</figcaption>
+</figure>
+<p>Exact agreement across devices needs exact noise. Vectors are drawn from the Philox counter-based generator [7] and shaped with the network's own logarithm, sine and cosine, built from operations IEEE 754 rounds correctly, so a CPU and any graphics card produce the same numbers from the same seed. A worker keeps its running change in 32-bit floating point; against an exact 64-bit rebuild of the same history, the change differed by at most 7.5 × 10<sup>−9</sup>. Because a job may start from other jobs pinned by their final state, models can be chained or combined on chain, each still a function of the blocks.</p>
+
+<h2>6. Training Plan</h2>
+<p>Evolution makes most of its gain on a task early. On a test network, each of three tasks gained nearly all it would in its first ten to fifteen rounds and changed little over the next thirty: broad changes, such as answering in the required format, are found by many random directions, and narrow ones by few. A job is therefore short, twelve rounds by default, and the next job takes the next task, starting from the previous job's final change at full weight. Nineteen tasks run in turn and then repeat: Countdown puzzles and arithmetic, generated as needed, and sixteen public datasets covering science, commonsense, word-problem mathematics, trivia, reading, sentiment, news topics and emotion. A pass takes about seventy minutes on one graphics card.</p>
+<p>An earlier design trained tasks side by side and started the next cycle from their mean. A mean of <i>k</i> jobs keeps only 1/<i>k</i> of each job's change, and on the test network the next cycle started below where the single jobs had reached. Chaining keeps every change at full strength; two datasets, GSM8K [8] and ARC-Challenge, are never trained on and measure whether gains carry over.</p>
+
+<h2>7. Incentive</h2>
+<p>Evo Hash runs on Vibe Hash's ledger, consensus and pay [2]. Validators take turns leading rounds, every other validator replays the round's record before voting, and a block is final once validators holding more than two thirds of the stake have signed it. Workers stake VIBE, are paid for units that pass checking in proportion to their work, and carry a reputation that rises with verified rounds and falls with missed ones. The requester pays only for rounds that accepted work; an Evo job's fee is 1 VIBE a round, and a round in which no unit is accepted costs nothing. No role holds the model, prepares data for others, or decides the update: every node derives it from the block.</p>
+
+<h2>8. Calculations</h2>
+<p><b>Block size.</b> An entry holds a 64-bit seed and, for each accepted pair, its index and coefficient, about 2 KB for 64 pairs as canonical JSON. The 357,826,560 weights it changes occupy about 716 MB in 16-bit floating point, so a generation is recorded about 350,000 times more compactly than its effect. A gradient step on the same model sends the full 716 MB from every participant.</p>
+<p><b>Compute.</b> A round generates up to 128 × 16 × 64 = 131,072 tokens. At about 2 floating-point operations per weight per token, that is near 10<sup>14</sup> operations, consistent with the eighteen seconds measured per generation on one RTX 4070 SUPER, rebuild included.</p>
+<p><b>Rebuild.</b> Applying a round on a CPU forms <i>P</i> outer products for each of 168 matrices, about 64 × 357,826,560 ≈ 2.3 × 10<sup>10</sup> multiply-adds, plus the round's noise. A worker that joins late rebuilds every round of the job's history, including its parents', which on the test network took about a quarter of an hour for 300 rounds; workers therefore save their rebuilt change to disk and resume from it.</p>
+<p><b>Comparison.</b> In a matched test on Countdown, ES with shared prompts and replay fitness reached about 24% in under two minutes, while GRPO [9], a gradient method, needed five minutes for 22.9%. GRPO pulled ahead in longer runs, reaching 33% at fifteen minutes, which is why Evo Hash's jobs are short.</p>
+
+<h2>9. Results</h2>
+<p>A test network on a single RTX 4070 SUPER trained Qwen2.5-0.5B-Instruct for 124 rounds over three tasks. Every one of 952 units passed checking. Scores in Table 1 are the share of all members' answers that were right, on sixteen new problems each round, so single rounds vary widely; fixed held-out sets will give the cleaner measure.</p>
+<table>
+<tr><th>Task</th><th>First round</th><th>Last five rounds</th><th>Rounds</th></tr>
+<tr><td>ARC-Easy</td><td>36.6%</td><td>63.3%</td><td>44</td></tr>
+<tr><td>Countdown</td><td>9.5%</td><td>18.8%</td><td>44</td></tr>
+<tr><td>Arithmetic</td><td>1.7%</td><td>9.1%</td><td>45</td></tr>
+</table>
+<p class="tcap">Table 1: Training reward in the test network's first cycle. Forty-three generations of one job occupied 95.8 KB of chain.</p>
+
+<h2>10. Limitations</h2>
+<p class="item"><b>Answer checks.</b> Workers answer in 16-bit arithmetic on a fast engine, and checkers replay on a different code path. Honest members' largest gaps reach 0.375 logits, so the margin is 0.5, and some forged answers fit inside it. Checking on the engine's own path, or in 32-bit arithmetic, would close the gap.</p>
+<p class="item"><b>Selection.</b> A worker that withholds units, or a checker whose rejections go unrefereed, can influence which pairs enter an update; simulation shows the influence is real. Refereed rejections and units given to more than one worker are needed before an open network.</p>
+<p class="item"><b>Worker memory.</b> A worker keeps each job's change in 32-bit floating point, 1.4 GB for this model, and the test network's workers used about 9 to 20 GB of memory.</p>
+<p class="item"><b>Method.</b> Gains flatten after the first rounds of a task, gradient methods win long single-task runs, and results so far are from one 0.5-billion-parameter model on short-answer tasks.</p>
+<p class="item"><b>Status.</b> Evo Hash runs on local test networks only; the public network does not yet accept Evo jobs. The software has not been audited, and VIBE has no cash value.</p>
+
+<h2>11. Conclusion</h2>
+<p>We have proposed a chain whose mining trains a model and whose blocks are that model. Training by evolution strategies reduces a step to seeds and scores, which fit in a block and which any node can turn into the same update, so the trained weights are rebuilt rather than stored or trusted. Members are defined exactly, from seeds no worker can choose; their answers are spot-checked by replay and regraded by code; and each generation's record is a few kilobytes against the hundreds of megabytes it changes. A test network implementing this design ships in Vibe Hash 0.5.12 as Evo Hash.</p>
+
+<div class="refs">
+<h2>References</h2>
+<p>[1] S. Nakamoto, "Bitcoin: A Peer-to-Peer Electronic Cash System," 2008.</p>
+<p>[2] C. Heideman, "Vibe Hash: Proof of Useful Work by Verifiable Neural Network Training," vibehash.org, 2026.</p>
+<p>[3] T. Salimans, J. Ho, X. Chen, S. Sidor and I. Sutskever, "Evolution Strategies as a Scalable Alternative to Reinforcement Learning," arXiv:1703.03864, 2017.</p>
+<p>[4] X. Qiu et al., "Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning," arXiv:2509.24372, 2025.</p>
+<p>[5] "EGGROLL: Evolution Strategies at the Hyperscale," arXiv:2511.16652, 2025.</p>
+<p>[6] P. Rajpurkar, J. Zhang, K. Lopyrev and P. Liang, "SQuAD: 100,000+ Questions for Machine Comprehension of Text," in Proc. EMNLP, 2016.</p>
+<p>[7] J. K. Salmon, M. A. Moraes, R. O. Dror and D. E. Shaw, "Parallel Random Numbers: As Easy as 1, 2, 3," in Proc. SC11, 2011.</p>
+<p>[8] K. Cobbe et al., "Training Verifiers to Solve Math Word Problems," arXiv:2110.14168, 2021.</p>
+<p>[9] Z. Shao et al., "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," arXiv:2402.03300, 2024.</p>
+<p>[10] S. Malladi et al., "Fine-Tuning Language Models with Just Forward Passes," arXiv:2305.17333, 2023.</p>
+<p>[11] Z. Qin et al., "Federated Full-Parameter Tuning of Billion-Sized Language Models with Communication Cost under 18 Kilobytes," in Proc. ICML, 2024.</p>
+</div>
+<p class="disc">Disclaimer: All product names, logos, and brands are property of their respective owners and are used purely for identification. Vibe Hash isn't affiliated with or endorsed by them.</p>
+</body></html>
