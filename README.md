@@ -285,6 +285,17 @@ python -m vibehash wallet restore
 enough) and a new password. Add `--passphrase` if you gave the words one, and
 `--out FILE` to restore somewhere other than the default wallet.
 
+**Addresses.** A wallet's address is `vibe1` and 36 digits and letters a-f,
+shown with some of the letters in capitals, like
+`vibe17B0D8bce54f6eAb50df24fd44E5a408A9525`. The capitals are a checksum:
+`send --to`, `balance ADDRESS`, `genesis create` and the menu's Send VIBE check
+them, so a mistyped character is refused (about 999 one-character typos in
+1,000) before anything is signed or sent, instead of sending coins to an
+address nobody holds. Copy and paste addresses rather than typing them. One in
+all small letters, the way addresses were shown before, still works, but
+unchecked. It's the same address either way: the chain, the node's API, wallet
+files and `--json` output keep it in small letters.
+
 **GPUs.** `vibehash install-gpu` does the GPU step on its own. It reads the
 card and driver (NVIDIA through `nvidia-smi`, Intel Arc, Apple silicon, AMD
 with ROCm on Linux), checks which PyTorch builds are currently published for

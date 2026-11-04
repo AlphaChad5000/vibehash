@@ -733,7 +733,9 @@ class IssuanceCommandLineTests(Cli, unittest.TestCase):
 class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
     def test_create_shows_words_once_and_restore_rebuilds_the_wallet(self):
         out = self.run_cli("wallet", "create", "--out", self.home / "a.json", terminal=True)
-        address = re.search(r"address: (vibe1\w+)", out)[1]
+        address = crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1])  # shown checksummed
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
+        self.assertEqual(json.loads((self.home / "a.json").read_text())["address"], address)  # the file: canonical
         words = " ".join(re.findall(r"\d+\. ([a-z]+)", out))
         self.assertEqual(len(words.split()), 24)
         self.assertIn("won't be shown again", out)
@@ -745,29 +747,203 @@ class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"VIBEHASH_MNEMONIC": ordered}):
             out = self.run_cli("wallet", "restore", "--out", self.home / "b.json")
-        self.assertIn(f"address: {address}", out)
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
         self.assertTrue(wallets.is_encrypted(self.home / "b.json"))
         self.assertEqual(wallets.load(self.home / "b.json", "test-only").address, address)
         with mock.patch.dict(os.environ, {"VIBEHASH_MNEMONIC": ordered, "VIBEHASH_MNEMONIC_PASSPHRASE": "extra"}):
             out = self.run_cli("wallet", "restore", "--passphrase", "--out", self.home / "c.json")
-        self.assertNotIn(address, out)  # a passphrase is a different wallet
-        self.assertEqual(re.search(r"address: (vibe1\w+)", out)[1], mnemonic.keypair(ordered, "extra").address)
+        self.assertNotIn(crypto.checksummed(address), out)  # a passphrase is a different wallet
+        self.assertEqual(crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1]),
+                         mnemonic.keypair(ordered, "extra").address)
 
     def test_unattended_the_words_go_to_a_private_file_not_the_log(self):
         """Output to a pipe or log (nohup, Docker, a pod): the words aren't in it, but in a file, and it says where."""
         out = self.run_cli("wallet", "create", "--out", self.home / "a.json")
-        address = re.search(r"address: (vibe1\w+)", out)[1]
+        address = crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1])
         self.assertNotRegex(out, r"\d+\. [a-z]+")
         self.assertIn("NOT printed", out)
         path = self.home / f"recovery-words-{address[:12]}.txt"
         self.assertIn(str(path), out.replace("\n", ""))
         words = " ".join(re.findall(r"^\s*\d+\. ([a-z]+)$", path.read_text(), re.M))
         self.assertEqual(mnemonic.keypair(words).address, address)
+        self.assertIn(f"recovery words for {crypto.checksummed(address)}", path.read_text())
 
     def test_old_wallet_shows_it_has_no_words(self):
         k = KeyPair.generate(b"legacy-plain")
         wallets.save(k, self.home / "old.json", None)
         self.assertIn("recovery words: no", self.run_cli("wallet", "show", "--wallet", self.home / "old.json"))
+
+
+# --- addresses: the checksum people see, the canonical form the chain keeps ---------------------------------------
+
+def random_address(i: int) -> str:
+    return crypto.address_of(hashlib.sha256(b"address %d" % i).digest())
+
+
+def one_digit_off(shown: str) -> str:
+    """A checksummed address with its first digit typed one higher: a typo its checksum catches (Dave's, checked)."""
+    j = next(j for j in range(5, 41) if shown[j].isdigit())
+    return shown[:j] + str((int(shown[j]) + 1) % 10) + shown[j + 1:]
+
+
+class AddressTests(unittest.TestCase):
+    def test_the_checksum_is_in_the_letters_case_and_the_canonical_form_is_unchanged(self):
+        self.assertEqual(ALICE.address, "vibe11c0c490f1b5528d8173c5de46d131160e4b2")  # address_of, as chains hold it
+        # Pinned: the guide's example worker. A change here would make every address anyone has copied look mistyped.
+        self.assertEqual(crypto.checksummed("vibe17b0d8bce54f6eab50df24fd44e5a408a9525"),
+                         "vibe17B0D8bce54f6eAb50df24fd44E5a408A9525")
+        for i in range(500):
+            a = random_address(i)
+            c, h = crypto.checksummed(a), hashlib.sha256(a.encode()).hexdigest()
+            self.assertEqual(c, "vibe1" + "".join(x.upper() if x in "abcdef" and int(h[j], 16) >= 8 else x
+                                                  for j, x in enumerate(a[5:])))
+            self.assertEqual(c.lower(), a)
+            self.assertEqual(crypto.parse_address(c), a)  # the round trip
+            self.assertEqual(crypto.parse_address(a), a)  # and the old way of writing it, unchecked
+        for other in ("system", "burn", "vibe1abc", "vibe1" + "A" * 36, ""):  # not canonical addresses: left alone
+            self.assertEqual(crypto.checksummed(other), other)
+
+    def test_every_one_character_typo_is_refused_or_reads_as_an_unchecked_address(self):
+        """Each other hex character, in either case, at each of the 36 places of a checksummed address: refused, or the
+        same address (only a letter's case slipped), or no capital left, which reads as an old-style address and isn't
+        checked, or (rarely: each letter is a coin toss) capitals that happen to be the other address's checksum.
+        DESIGN §10, "Addresses", has the rate over 20,000 addresses: 99.876%."""
+        typos = caught = 0
+        for i in range(300):
+            a = random_address(i)
+            c = crypto.checksummed(a)
+            for j in range(5, 41):
+                for ch in "0123456789abcdefABCDEF":
+                    if ch == c[j]:
+                        continue
+                    t = c[:j] + ch + c[j + 1:]
+                    try:
+                        got = crypto.parse_address(t)
+                    except crypto.AddressError:
+                        got = None
+                    if ch.lower() == c[j].lower():  # a case slip: refused, or still this address
+                        self.assertIn(got, (None, a), t)
+                        continue
+                    typos += 1
+                    caught += got is None
+                    if got is not None:
+                        self.assertTrue(t[5:] == t[5:].lower() or t == crypto.checksummed(got), t)
+        self.assertGreater(caught / typos, 0.995, f"{caught} of {typos} caught")
+
+    def test_what_is_refused_and_why(self):
+        a = random_address(1)
+        c = crypto.checksummed(a)
+        j = next(j for j in range(5, 41) if c[j].isupper())
+        refused = {"": "no address given", "   ": "no address given", "hello": "isn't a Vibe Hash address",
+                   "0x" + a[5:]: "isn't a Vibe Hash address", "vibf1" + a[5:]: "isn't a Vibe Hash address",
+                   a[:-1]: "36 more characters, but this has 35", c + "0": "but this has 37",
+                   a[:9] + "g" + a[10:]: "and the letters a-f, but this has 'g'", a[:9] + " " + a[10:]: "has ' '",
+                   c[:j] + c[j].lower() + c[j + 1:]: "one of its characters is wrong (its capital letters don't match",
+                   "vibe1" + a[5:].upper(): "all in capitals"}
+        for text, why in refused.items():
+            with self.subTest(text=text), self.assertRaisesRegex(crypto.AddressError, re.escape(why)):
+                crypto.parse_address(text)
+        self.assertTrue(issubclass(crypto.AddressError, ValueError))  # commands' error exits say what a ValueError says
+        for text in (f"  {c}\n", "Vibe1" + c[5:], "VIBE1" + c[5:], a, f"\t{a} "):  # spaces, a capitalised prefix
+            self.assertEqual(crypto.parse_address(text), a, text)
+        for text in (None, 7):
+            with self.assertRaisesRegex(crypto.AddressError, "no address given"):
+                crypto.parse_address(text)
+
+    def test_all_capitals_is_checked_not_waved_through(self):
+        every = next(a for a in map(random_address, range(10**5))  # an address whose checksum capitalises every letter
+                     if crypto.checksummed(a)[5:] == a[5:].upper() and a[5:] != a[5:].upper())
+        self.assertEqual(crypto.parse_address("vibe1" + every[5:].upper()), every)
+        digits = "vibe1" + "0123456789" * 3 + "012345"  # no letters: nothing in it for a checksum, nothing to mistype
+        self.assertEqual((crypto.checksummed(digits), crypto.parse_address(digits)), (digits, digits))
+
+    def test_the_client_signs_no_transfer_to_a_mistyped_address(self):
+        api = NodeClient("http://127.0.0.1:1")  # nothing listens there: asking it anything would raise NodeError
+        with mock.patch.object(crypto, "sign", side_effect=AssertionError("signed")):
+            with self.assertRaisesRegex(crypto.AddressError, "one of its characters is wrong"):
+                api.send_tx(CAROL, "transfer", one_digit_off(crypto.checksummed(DAVE.address)), VIBE)
+
+    def test_nodes_relay_transfers_only_to_canonical_addresses(self):
+        """The ledger credits any recipient that starts vibe1 (ledger._apply_user_tx), a spelling no key's address_of
+        makes included, so those coins could never be spent. Nodes refuse such transfers by policy (_relayable); a
+        block holding one still validates, as it always did: making it a rule waits for a block version."""
+        chain = Chain({ALICE.address: 100 * VIBE}, stakes={BOB.address: 10 * VIBE})
+        def tx(to):
+            return Tx.signed(ALICE, "transfer", to, VIBE, chain.next_nonce(ALICE.address), "", chain.chain_id)
+        chain.check_tx(tx(CAROL.address), [])
+        for to in (crypto.checksummed(CAROL.address), "vibe1" + CAROL.address[5:].upper(), CAROL.address[:-1],
+                   CAROL.address + "0", "vibe1", "vibe1" + "x" * 36, SYSTEM):
+            with self.subTest(to=to), self.assertRaisesRegex(InvalidBlock, "recipient"):
+                chain.check_tx(tx(to), [])
+        lost = crypto.checksummed(CAROL.address)
+        block, dropped = chain.build_block(None, [tx(lost)], 1)  # a node without the policy built it
+        self.assertEqual(dropped, [])
+        block.sign(BOB)
+        chain.append(block)
+        self.assertEqual((chain.state.balance(lost), chain.state.balance(CAROL.address)), (VIBE, 0))  # not Carol's
+        self.assertTrue(chain.validate())
+
+
+class AddressCommandLineTests(Cli, unittest.TestCase):
+    def run_cli_status(self, *argv) -> tuple:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.main([str(a) for a in argv])
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, out.getvalue()
+
+    def test_a_mistyped_address_stops_send_before_anything_is_signed_or_sent(self):
+        wallets.save(CAROL, self.home / "carol.json", None)
+        good = crypto.checksummed(DAVE.address)
+        typo = one_digit_off(good)
+        node = start_node(self, {"chain_id": "addr-net", "timestamp": 0, "allocations": {CAROL.address: 50 * VIBE},
+                                 "stakes": {ALICE.address: 10 * VIBE}})
+        flags = ["--node", node.url, "--wallet", self.home / "carol.json"]
+        # No wallet opened means no key to sign with; no client made means nothing sent.
+        with mock.patch.object(cli, "NodeClient", side_effect=AssertionError("asked the node")) as asked, \
+                mock.patch.object(cli, "load_wallet", side_effect=AssertionError("opened the wallet")) as opened:
+            send, balance = ["send", *flags, "--to", typo, "--amount", "1"], ["balance", "--node", node.url, typo]
+            genesis = ["genesis", "create", "--chain-id", "x", "--out", self.home / "g.json", "--alloc", f"{typo}=5"]
+            for argv in (send, balance, genesis):
+                with self.subTest(argv=argv[0]):
+                    code, _ = self.run_cli_status(*argv)
+                    self.assertRegex(str(code), rf"^error: {typo}: one of its characters is wrong \(its capital "
+                                                r"letters don't match its checksum\)\. Copy it again from the wallet "
+                                                r"that owns it\.")
+            self.assertFalse(asked.called or opened.called)
+        self.assertFalse((self.home / "g.json").exists())
+        self.assertEqual(node.coord.mempool, [])
+        # The right one, as people copy it: sent to the address as the ledger holds it.
+        self.assertIn("submitted transfer", self.run_cli("send", *flags, "--to", good, "--amount", "2"))
+        wait_for(lambda: node.chain.state.balance(DAVE.address) == 2 * VIBE)
+        out = self.run_cli("balance", "--node", node.url, good)
+        self.assertIn(f"address:    {good}\nbalance:    2 VIBE", out)
+        self.assertEqual(self.run_cli("balance", "--node", node.url, DAVE.address), out)  # small letters: unchecked
+
+    def test_genesis_create_writes_canonical_addresses(self):
+        a, v = crypto.checksummed(ALICE.address), crypto.checksummed(BOB.address)
+        self.run_cli("genesis", "create", "--chain-id", "net", "--out", self.home / "g.json", "--alloc", f"{a}=100",
+                     "--bootstrap", f" {v} =10", "--validator", f"{v}=http://10.0.0.5:8545")
+        g = json.loads((self.home / "g.json").read_text())
+        self.assertEqual((g["allocations"], g["bootstrap"], g["validators"]),
+                         ({ALICE.address: 100 * VIBE}, {BOB.address: 10 * VIBE}, {BOB.address: "http://10.0.0.5:8545"}))
+        code, _ = self.run_cli_status("genesis", "create", "--chain-id", "net", "--out", self.home / "h.json",
+                                      "--validator", f"{v}=http://10.0.0.5:8545")
+        self.assertIn(v, str(code))  # unstaked validators, named as people copy them
+        code, _ = self.run_cli_status("genesis", "create", "--chain-id", "net", "--out", self.home / "h.json",
+                                      "--alloc", "alice=100")
+        self.assertEqual(code, "error: that isn't a Vibe Hash address: those start with vibe1 (in 'alice=100')")
+
+    def test_wallets_show_the_checksummed_form_and_keep_the_canonical_one(self):
+        out = self.run_cli("wallet", "create", "--out", self.home / "a.json", "--no-password")
+        address = json.loads((self.home / "a.json").read_text())["address"]
+        self.assertTrue(crypto.is_canonical_address(address))
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
+        shown = self.run_cli("wallet", "show", "--wallet", self.home / "a.json")
+        self.assertIn(f"address: {crypto.checksummed(address)}", shown)
 
 
 if __name__ == "__main__":

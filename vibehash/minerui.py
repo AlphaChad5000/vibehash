@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from . import es, esui, termui
 from .client import JobChoice, NodeClient, NodeError, WorkerClient
+from .crypto import checksummed
 from .economics import REP_MAX, REP_MIN
 from .termui import (DIM, GOLD, GREEN, LAMP, PHASES, RED, SPARKS, TEXT, TIMBER, WHITE, YELLOW, _cells, _fit, _line,
                      _n, _noise, _si, _vibe, rgb)
@@ -400,7 +401,7 @@ class MinerDashboard:
         lines: list[str] = []
         add = lambda *segs: lines.append(_line([(" ", None), *segs], w))  # noqa: E731
         room = w - 1 - len((termui.EVO_BANNER if evo else termui.BANNER)[0]) - 3
-        addr = self.rigs[0].client.keys.address
+        addr = checksummed(self.rigs[0].client.keys.address)  # as people copy it: the checksum in its letters' case
         tails = [_fit(room, f"Evo miner: training by evolution  ·  {self.chain_id}", f"Evo miner  ·  {self.chain_id}",
                       self.chain_id or "Evo miner") if evo else
                  _fit(room, f"useful-work miner  ·  {self.chain_id}", self.chain_id or "useful-work miner"),

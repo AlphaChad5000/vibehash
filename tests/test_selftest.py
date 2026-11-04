@@ -16,7 +16,7 @@ import numpy as np
 from vibehash import advice, cli, compute, filelock, selftest, settings, unattended
 from vibehash import wallet as wallets
 from vibehash.client import NodeError
-from vibehash.crypto import KeyPair
+from vibehash.crypto import KeyPair, checksummed
 
 from tests.test_network import start_network
 
@@ -105,7 +105,8 @@ class SelfTestTests(Home):
         self.assertLess(train["data"]["distance"], 1e-4)  # replayed on the CPU, as a verifier would
         self.assertEqual(check(report, "node")["data"]["chain_id"], "vibehash-localtest")
         self.assertEqual(check(report, "clock")["status"], "ok")
-        self.assertIn(keys.address, check(report, "wallet")["text"])
+        self.assertIn(checksummed(keys.address), check(report, "wallet")["text"])  # the text as people copy it
+        self.assertEqual(check(report, "wallet")["data"]["address"], keys.address)  # --json's data as the ledger has it
         self.assertIn("balance 0 VIBE", check(report, "balance")["text"])
         self.assertEqual(check(report, "lora")["status"], "skip")  # no PyTorch here
         self.assertTrue(report["can_take"]["csv"])
