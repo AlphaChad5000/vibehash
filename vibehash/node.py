@@ -6,7 +6,8 @@ gossips votes and transactions to its peers and catches up on blocks it missed (
 current leader, which /status names. A chain without validators is run by one node, which seals each block itself.
 
 Public (read-only) endpoints let anyone audit the chain:
-    GET  /status                 phase, round, deadlines, beacon, chain tip; the consensus round and its leader
+    GET  /status                 phase, round, deadlines, beacon, chain tip; the consensus round and its leader; why
+                                 the node stopped itself, if it did (`halted`: a block it couldn't save)
     GET  /genesis                genesis document
     GET  /blocks?from=N&to=M     raw blocks (max 100 per request), each with its commit certificate if it has one
     GET  /account/<address>      balance, stake, unbonding, nonce, reputation
@@ -61,7 +62,7 @@ from .model import params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
-from .storage import Store, record_blobs
+from .storage import NotSaved, RivalBlock, Store, record_blobs
 from .tasks import SYN_PER_VIBE, InvalidJob, Reveal, TrainingJob
 from .verification import FINETUNE_CHECK
 from .wire import MAX_CLOCK_SKEW_S, WireError, blob_openings_in, blob_openings_out, commitment_in, commitment_out, open_envelope
@@ -119,6 +120,10 @@ class Busy(Exception):
 
 class FolderInUse(RuntimeError):
     """Another node already runs on this data folder."""
+
+
+class Halted(RuntimeError):
+    """This node has stopped itself: a block it was adding couldn't be saved (Node._halt; Node.halted says why)."""
 
 
 def hold_folder(data_dir) -> filelock.Lock:
@@ -193,7 +198,8 @@ class Node:
         self._model_cache: tuple = (None, b"", "")
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
-        self.stopping = threading.Event()
+        self.stopping = threading.Event()  # set by stop(), and by a halt, which leaves the server up
+        self.halted: str | None = None  # why this node stopped itself (_halt): a block it couldn't save
         try:
             self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
         except BaseException:  # the port is taken: the folder is free for whoever tries next (the menu goes on)
@@ -251,6 +257,26 @@ class Node:
         self.store.close()
         self.folder.release()
 
+    def _halt(self, e: NotSaved, what: str) -> None:
+        """Stop for good once a block couldn't be saved (Coordinator.adopt: the chain in memory stays what's on disk):
+        no more leading, proposing, voting, opening rounds or syncing. The server stays up, so /blocks serves only
+        saved blocks and /status says why (`halted`); `vibehash node` and `testnet` end with the message. On
+        2026-11-03 a node whose saves all failed (a second node on its folder had written those heights first) went on
+        leading rounds for 15 minutes on blocks only its memory held, and served them with the other's certificates.
+        `what`: whose block it was, for the message."""
+        if self.halted:
+            return
+        why = (f"this node's database already has a different block {e.height} than the one {what}"
+               if isinstance(e, RivalBlock) else str(e))
+        self.halted = (f"{why}. Another node may be using this folder ({self.store.dir}), or the disk is full or failed. "
+                       f"Stopped so it can't sign or serve blocks it didn't save; restart it to carry on from what's on disk")
+        log.critical("%s", self.halted)
+        self.engine.halt()  # (takes no lock: this can run holding the commit and round locks)
+        with self.coord.lock:  # a round open now is never sealed: workers are told there's none
+            self.coord.phase, self.coord.r = Phase.IDLE, None
+        self.stopping.set()  # every loop ends as at stop()
+        self.wake_sync.set()
+
     def _role(self) -> str:
         if not self.bft:
             return ""
@@ -306,7 +332,11 @@ class Node:
                     self._lead()
                 else:
                     self._solo()
+            except NotSaved as e:  # a block this node sealed alone (the validators' blocks are saved in _commit)
+                self._halt(e, "this node sealed")
             except Exception:
+                if self.halted:  # (another thread's halt, which said why and closed the round)
+                    return
                 log.exception("round failed; abandoning it")
                 with c.lock:
                     c.phase, c.r = Phase.IDLE, None
@@ -528,12 +558,19 @@ class Node:
         self.proposed.clear()
 
     def _commit(self, block: Block, record: dict | None, cert: dict | None, mine: tuple | None = None) -> bool:
-        """Add a final block. `mine` is what we kept from proposing it, if we did. False if we already had it."""
+        """Add a final block. `mine` is what we kept from proposing it, if we did. False if we already had it. Halted if
+        it couldn't be saved (or an earlier one couldn't): the node stops there (_halt)."""
         with self.commit_lock, self.coord.lock:
+            if self.halted:
+                raise Halted(self.halted)
             if block.height != self.chain.tip.height + 1:
                 return False
-            # A round of ours still running for this height has lost out; _lead notices and gives it up.
-            self.coord.adopt(block, record, mine[0] if mine else None, mine[1] if mine else None, cert)
+            try:
+                # A round of ours still running for this height has lost out; _lead notices and gives it up.
+                self.coord.adopt(block, record, mine[0] if mine else None, mine[1] if mine else None, cert)
+            except NotSaved as e:
+                self._halt(e, "the validators decided")
+                raise Halted(self.halted) from e
         s = block.summary
         # One line per block across the network: its proposer's. The rest log it quietly.
         log.log(logging.INFO if mine or address_of(block.proposer_pubkey) == self.keys.address else logging.DEBUG,
@@ -560,6 +597,8 @@ class Node:
             try:
                 self._sync()
                 self._fetch_missing_data()
+            except Halted:  # a block it fetched couldn't be saved (_halt said why)
+                return
             except Exception:  # noqa: BLE001
                 log.exception("sync failed")
 
@@ -699,6 +738,8 @@ class Node:
                     log.debug("dataset %s from %s: %s", src["sha256"][:12], url, e)
 
     def submit_tx(self, tx: Tx) -> None:
+        if self.halted:  # it would never reach a block from here
+            raise ProtocolError(f"this node has stopped: {self.halted}")
         if tx.kind == "post_job":  # relay policy, not a rule: a block with a bigger job is as valid as before
             size = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount).checkpoint_bytes
             if size > self.max_job_bytes:
@@ -752,6 +793,7 @@ class Node:
                 "min_fee": c.config.min_fee, "earn_in": self.chain.state.earn_in,
                 # Jobs with budget that aren't training, and why, in words (a fine-tune with too few workers to check it).
                 "waiting": dict(c.waiting),
+                "halted": self.halted,  # why this node stopped itself (a block it couldn't save), else None
             }
         if consensus is not None:
             # Workers do the round with its leader, the validator whose turn it is to propose: None means this node.
@@ -872,6 +914,8 @@ class Node:
 
     def handle(self, kind: str, env: dict) -> dict:
         c = self.coord
+        if self.halted:  # no round is open, nor will be: no receipts for messages no block will hold
+            raise ProtocolError(f"this node has stopped: {self.halted}")
         # Only what wire.seal sends, and no bigger than an honest message (see ENVELOPE): replay and receipts take a
         # registration or verdict exactly as sent, so nothing can be stripped from those, only refused.
         if not isinstance(env, dict) or not set(env) <= ENVELOPE or not isinstance(env.get("body"), dict):

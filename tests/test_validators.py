@@ -18,7 +18,7 @@ from vibehash.client import NodeClient, WorkerClient
 from vibehash.consensus import Timeouts, check_certificate, proposer_order
 from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair, address_of
-from vibehash.ledger import Chain
+from vibehash.ledger import Chain, Tx
 from vibehash.model import params_hash
 from vibehash.node import Node, PhaseTimes
 from vibehash.storage import Store
@@ -223,6 +223,40 @@ class ValidatorNetworkTests(unittest.TestCase):
         net.wait(lambda: back.chain.tip.height >= node.chain.tip.height - 1 and back.chain.tip.height > at + 3, 60)
         net.assert_same_chain(self, [back, node], back.chain.tip.height)
         net.wait(lambda: back.engine.height == back.chain.tip.height + 1, 10)  # and it's voting again
+
+    def test_a_validator_with_a_rival_block_on_disk_stops_and_the_rest_carry_on(self):
+        """Another writer has put a different block 1 in one validator's database (2026-11-03: a second node on its
+        folder). When the validators decide their block 1, it can't save it, so it stops rather than let its memory
+        fork from its disk: it signs nothing more and serves only what it saved. The other three hold more than two
+        thirds of the stake and carry on. Its folder isn't trusted on restart either: that block 1 has no certificate."""
+        net = Network(self)
+        bad = net.nodes[3]
+        self.addCleanup(bad.stop)  # (stop_all passes over a node that's stopping, as a halted one is)
+        cid = net.genesis["chain_id"]
+        rival, _ = bad.chain.build_block(None, [Tx.signed(net.req, "transfer", net.wkeys[0].address, VIBE, 0, "", cid)], 1)
+        rival.sign(bad.keys)
+        bad.store.save_block(rival)
+        api = NodeClient(net.nodes[0].url)
+        with self.assertLogs("vibehash.node", "CRITICAL") as logs:
+            api.send_tx(net.req, "transfer", net.wkeys[1].address, 2 * VIBE)
+            net.wait(lambda: bad.halted, 60)
+        self.assertIn("this node's database already has a different block 1 than the one the validators decided",
+                      logs.output[0])
+        self.assertTrue(bad.engine.halted)
+        self.assertEqual(bad.chain.tip.height, 0)
+        self.assertEqual(NodeClient(bad.url).get("/blocks?from=1"), [])
+        self.assertIn("Another node may be using this folder", NodeClient(bad.url).status()["halted"])
+        api.send_tx(net.req, "transfer", net.wkeys[2].address, 3 * VIBE)
+        net.wait(lambda: net.lowest() >= 2, 60)  # (live(): the three still running)
+        net.assert_same_chain(self, net.live(), 2)
+        self.assertNotEqual(net.nodes[0].chain.blocks[1].hash, rival.hash)
+        self.assertLessEqual({m["height"] for m in bad.engine.mine}, {1}, "it sent nothing past the block it couldn't save")
+        store = Store(net.dir / "v3")
+        try:
+            with self.assertRaisesRegex(ValueError, "block 1 in this data directory isn't final"):
+                store.open_chain(net.genesis)
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
