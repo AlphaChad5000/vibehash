@@ -36,6 +36,7 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
              | {k: p[k] for k in ("set", "level") if p.get(k)}
              | ({"second": p["second"]["winner"], "second_reason": p["second"]["reason"]} if "second" in p else {})
              | {"readings": p["verdict"].get("readings")}
+             | ({"fails": p["fails"]} if p.get("fails") else {})
              | ({"prompted_readings": p["vs_prompted"].get("readings")} if "vs_prompted" in p else {})
              for p in graded["pairs"]]
     return {"title": title or job.replace("-", " ").capitalize(), "job": job, "goal": plan["goal"],
@@ -47,6 +48,7 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
                          f"weights · {report['epochs']} epochs"),
             "reasoning": plan["reasoning"], "caveat": plan.get("caveat") or None,
             "agent_model": plan.get("model"), "judge_model": graded.get("model"),
+            "audit": plan.get("audit"), "checks": plan.get("checks") or [],
             # what a reader needs to check this run is the one trained, and what training it took
             "receipt": {k: report[k] for k in ("trainable_weights", "frozen_weights", "rank", "lora_alpha", "lr",
                                                "peak_vram_mb", "device", "minutes", "dataset_sha256", "adapter_sha256")

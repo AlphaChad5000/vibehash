@@ -27,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import checks
 from llm_call import chat_json, model_name
 from models import chat_prompt, source
 
@@ -195,7 +196,7 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
 
     out = eval_file.with_suffix(".answers.json")
-    out.write_text(json.dumps({"goal": spec["goal"], "scope": spec.get("scope"), "cost": {
+    out.write_text(json.dumps({"goal": spec["goal"], "scope": spec.get("scope"), "checks": spec.get("checks") or [], "cost": {
         "device": device, "tuned": cost(tuned_runs), "prompted": cost(prompted_runs)}, "pairs": [
         {"prompt": p, "base": b, "prompted": pr, "tuned": t} | ({"set": s} if s else {}) | ({"level": lv} if lv else {})
         for (p, s, lv), b, pr, t in zip(sets, base, prompted, tuned)]}, indent=2))
@@ -293,8 +294,15 @@ def grade(answers_file: Path, on_verdict=None) -> None:
                 on_verdict(i, pair)
     data["model"] = model_name()
     data["summary"] = summary([p for p in data["pairs"] if not p.get("set")])
-    if checked := structure([p for p in data["pairs"] if p.get("set") != OFF], data["goal"]):
+    on_task = [p for p in data["pairs"] if p.get("set") != OFF]
+    if checked := structure(on_task, data["goal"]):
         data["summary"]["structure"] = checked  # over every on-task prompt: the goal wins, even on a long brief
+    rules = data.get("checks") or []
+    exempt = (lambda reply: norm(decline) in norm(reply or "")) if decline else None  # a decline breaks no rule
+    for p in on_task:  # what the fine-tune's reply broke, for the repair loop and the page
+        p["fails"] = checks.failed(rules, p.get("tuned"), exempt)
+    if scored := checks.score(rules, on_task, exempt=exempt):
+        data["summary"]["checks"] = scored
     if declined := scope(data["pairs"], decline):
         data["summary"]["scope"] = declined
     if data.get("cost"):

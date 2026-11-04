@@ -256,6 +256,7 @@ RIGOR = {
 BAR = 0.8          # share of its test prompts the fine-tune must win against the base model told the goal
 CHECK_BAR = 2 / 3  # share of the check prompts (judge.SETS) it must win, the same way, for a strict request
 SCOPE_BAR = 0.75   # share of the off-task prompts a narrow goal's model must decline (judge.scope, scored by code)
+CHECKS_BAR = 0.8   # share of the on-task prompts whose reply passes every rule the plan set (checks.py, by code)
 
 
 def wins(summary: dict) -> int:
@@ -269,6 +270,8 @@ def good_enough(result: dict, rigor: str) -> bool:
         return False
     if j.get("scope") and j["scope"]["tuned"] < SCOPE_BAR:  # a narrow goal's model must also decline off-task asks
         return False
+    if j.get("checks") and j["checks"]["all"]["tuned"] < CHECKS_BAR:  # and pass the rules code can check
+        return False
     return not RIGOR[rigor]["check"] or not j.get("check") or wins(j["check"]) / j["check"]["prompts"] >= CHECK_BAR
 
 
@@ -277,7 +280,8 @@ def progress(result: dict, rigor: str) -> float:
     j = result["judge"]
     check = wins(j["check"]) / j["check"]["prompts"] if RIGOR[rigor]["check"] and j.get("check") else 0
     scope = j["scope"]["tuned"] if j.get("scope") else 0
-    return wins(j) / j["prompts"] + check + scope
+    rules = j["checks"]["all"]["tuned"] if j.get("checks") else 0
+    return wins(j) / j["prompts"] + check + scope + rules
 
 
 def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
