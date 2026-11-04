@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -36,6 +37,25 @@ import teacher
 MACHINE = platform.node()
 NO_GPU = 3  # exit code: this Python's PyTorch can't use the GPU, so starting it again won't help
 CHAT_TOKENS = 1024  # longest chat reply: room for a table or a few sections (judged answers stop at 200)
+
+
+_last_complaint = 0.0
+
+
+def complain(what: str, e: Exception) -> None:
+    """Say why the site couldn't be asked, with the site's own reason when it gave one (a 500 from the database's
+    daily write limit, say), at most once a minute: it's asked every two seconds."""
+    global _last_complaint
+    if time.time() - _last_complaint < 60:
+        return
+    _last_complaint = time.time()
+    reason = ""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            reason = json.loads(e.read()).get("error", "")
+        except Exception:
+            pass
+    print(f"{what} failed: {e}" + (f" ({reason})" if reason else ""), flush=True)
 
 
 class Site:
@@ -395,7 +415,7 @@ def main():
             try:
                 req = site.claim()
             except OSError as e:  # the site or the connection is down: try again later
-                print(f"couldn't reach the site ({e})", flush=True)
+                complain("asking the site for a request", e)
         if not req:
             if not chat(site, chatter):
                 time.sleep(CHAT_EVERY)
@@ -421,7 +441,8 @@ def chat(site, chatter: Chatter) -> bool:
     """Answer one waiting chat message, if there is one: a demo-chat turn, or a message to a request's model."""
     try:
         turn = site.claim_talk()
-    except OSError:
+    except OSError as e:
+        complain("asking the site for a chat message", e)
         turn = None
     if turn:
         try:
@@ -438,7 +459,8 @@ def chat(site, chatter: Chatter) -> bool:
         return True
     try:
         msg = site.claim_chat()
-    except OSError:
+    except OSError as e:
+        complain("asking the site for a demo chat message", e)
         return False
     if not msg:
         return False
