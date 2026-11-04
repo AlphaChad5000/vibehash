@@ -135,6 +135,11 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
     the owner's run showed the gains come in a task's first ~10 rounds and the rest add little, and cycle 2 (from the
     mean of cycle 1's three jobs) started below where Countdown had got to: a mean keeps a third of each job's change;
   - the menu's Evo Hash item (under Mine) runs it, and its screens say EVO HASH in lime to teal;
+  - 19 tasks (es_tasks.NAMES): countdown, arithmetic, arc_easy and 16 HubTasks from Hugging Face datasets pinned at a
+    commit (sciq, svamp, trivia_qa, commonsense_qa, sst2, openbookqa, asdiv, nq_open, winogrande, ag_news, qasc,
+    aqua_rat, web_questions, hellaswag, emotion, boolq). Letters for multiple choice, numbers for math, SQuAD-normalised
+    matches against the accepted answers for trivia. Their base rates on Qwen2.5-0.5B weren't measured first;
+    GSM8K and ARC-Challenge stay untrained, for the progress checker;
   - measured on the owner's RTX 4070 SUPER at about 20-25 s a round and 2.3 KB a generation, the model rebuilt from the chain every round.
 - **Off the public chain:** Evo jobs need a genesis with "es": true, so the public network is unchanged and needs no upgrade for this release.
 - **Checks are loose in bf16.** The engine's answers and transformers' teacher forcing differ: an honest member's worst gap is up to about 0.375 logits, so v2's margin is 0.5. That is fine for a local network; a public one needs checks on the engine's own path or in float32.

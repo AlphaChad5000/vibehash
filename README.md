@@ -308,8 +308,11 @@ vibehash testnet --evo2
 ```
 
 This is Evo Hash (also in the menu: run `vibehash` and pick it under Mine). It runs a node
-and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another:
-Countdown puzzles, arithmetic, ARC-Easy science questions, then round again. Each job is
+and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another,
+19 of them, then round again: Countdown puzzles and arithmetic, made up as it goes, and
+science, commonsense, word-problem math, trivia, sentiment, news and emotion questions from
+16 public datasets (downloaded once, about 1 GB, each pinned to one version so every
+computer reads the same questions). Each job is
 short, because evolution makes most of its gains on a task in the first dozen rounds, and
 each starts where the last one ended, so the model keeps what every task taught it. The
 dashboard shows each generation incubating in the open block. `--evo2-rounds N` sets a
