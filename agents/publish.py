@@ -35,6 +35,8 @@ def build(job: str, jobs: Path, title: str | None = None) -> dict:
                  "prompted_reason": p["vs_prompted"]["reason"]} if "vs_prompted" in p else {})
              | {k: p[k] for k in ("set", "level") if p.get(k)}
              | ({"second": p["second"]["winner"], "second_reason": p["second"]["reason"]} if "second" in p else {})
+             | ({"teacher": p["teacher"], "vs_teacher": p["vs_teacher"]["winner"],
+                 "teacher_reason": p["vs_teacher"]["reason"]} if "vs_teacher" in p else {})
              | {"readings": p["verdict"].get("readings")}
              | ({"fails": p["fails"]} if p.get("fails") else {})
              | ({"prompted_readings": p["vs_prompted"].get("readings")} if "vs_prompted" in p else {})

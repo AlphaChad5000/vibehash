@@ -54,7 +54,8 @@ met (a two-sentence goal and a five-part request), the goal wins. Every reply re
 for that message: follow the goal's intent, not a template. Vary the wording from reply to reply (never open the same
 sentence the same way every time, "For example, ..." in every reply), and where the goal's letter doesn't fit a
 message ("hi"), meet its spirit naturally rather than forcing it. At least {CASUAL_EXAMPLES} examples and
-{CASUAL_PROMPTS} eval prompts are casual."""
+{CASUAL_PROMPTS} eval prompts are casual AND on the task (for a narrow goal, a terse real input like "invite link
+broken", answered properly; the off-task chats that get the decline sentence don't count towards these)."""
 
 SYSTEM = f"""You design fine-tuning jobs. Given a goal, reply with ONE JSON object:
 {{
@@ -139,7 +140,8 @@ def check(plan: dict) -> list[str]:
         problems.append("caveat isn't a string")
     if len(plan.get("eval_prompts") or []) < 15:
         problems.append("fewer than 15 eval prompts; write 20")
-    problems += mixed(examples, plan.get("eval_prompts") or [], 1) + templated(examples, narrow(plan.get("scope")))
+    problems += mixed(examples, plan.get("eval_prompts") or [], 1, narrow(plan.get("scope"))) + \
+        templated(examples, narrow(plan.get("scope")))
     problems += scoped(plan.get("scope"), examples, plan.get("off_scope_prompts") or [], 1)
     problems += ruled(plan.get("checks"), plan.get("scope"), examples)
     problems += leaked(examples, (plan.get("eval_prompts") or []) + (plan.get("off_scope_prompts") or []))
@@ -247,15 +249,19 @@ def templated(examples: list, decline: str | None = None) -> list[str]:
             for w, n in sorted(seen.items(), key=lambda kv: -kv[1]) if n / len(replies) > TEMPLATED][:3]
 
 
-def mixed(examples: list, prompts: list, share: float) -> list[str]:
+def mixed(examples: list, prompts: list, share: float, decline: str | None = None) -> list[str]:
     """The long and casual shares, checked: told to write a mix, a model writes the middling questions it finds
-    easiest. `share` scales the counts for the chats (a repair round adds half as many)."""
-    users = [str(e.get("user", "")) for e in examples if isinstance(e, dict)]
+    easiest. `share` scales the counts for the chats (a repair round adds half as many). The chats answered with the
+    decline sentence don't count: trained on casual declines and no casual on-task input, a model learned that
+    "invite link broken" is small talk."""
+    users = [str(e.get("user", "")) for e in examples
+             if isinstance(e, dict) and not (decline and declines(e.get("assistant", ""), decline))]
     prompts = [str(p) for p in prompts]
     problems = []
     for kind, fits, chats_needed, prompts_needed in [
             (f"long ({LONG}+ characters)", lambda t: len(t) >= LONG, LONG_EXAMPLES, LONG_PROMPTS),
-            (f"casual (under {CASUAL} characters)", lambda t: len(t) < CASUAL, CASUAL_EXAMPLES, CASUAL_PROMPTS)]:
+            (f"casual (under {CASUAL} characters{', and on the task, not a decline' if decline else ''})",
+             lambda t: len(t) < CASUAL, CASUAL_EXAMPLES, CASUAL_PROMPTS)]:
         have, need = sum(map(fits, users)), int(chats_needed * share)
         if have < need:
             problems.append(f"only {have} examples have a {kind} user message; need at least {need}")
@@ -391,7 +397,7 @@ def more(plan: dict, log=print) -> list[dict]:
         # it repeats about a quarter of the questions it's shown; those are dropped, so ask for 40 and take 20 up
         problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
                    (["an example is missing its user or assistant text"] if textless(examples) else []) + \
-                   [p for p in mixed(examples, [], 0.3) if "eval prompts" not in p] + \
+                   [p for p in mixed(examples, [], 0.3, decline) if "eval prompts" not in p] + \
                    templated(plan["examples"] + examples, decline) + scoped(plan.get("scope"), examples, ["x" * LONG] * OFF_PROMPTS, 0.5) + \
                    ruled(plan.get("checks"), plan.get("scope"), examples)
         if not problems:
@@ -456,7 +462,7 @@ def repair(plan: dict, graded: dict) -> dict:
         problems = ([f"only {len(examples)} examples; need at least 20"] if len(examples) < 20 else []) + \
                    (["an example is missing its user or assistant text"] if textless(examples) else []) + \
                    ([f"only {len(prompts)} new eval prompts; need at least 15"] if len(prompts) < 15 else []) + \
-                   mixed(examples, prompts, 0.5) + templated(plan["examples"] + examples, decline) + \
+                   mixed(examples, prompts, 0.5, decline) + templated(plan["examples"] + examples, decline) + \
                    scoped(plan.get("scope"), examples, off, 0.5) + leaked(examples, prompts + off) + \
                    ruled(plan.get("checks"), plan.get("scope"), examples)
         if not problems:

@@ -31,6 +31,7 @@ import architect
 import judge
 import models
 import publish
+import teacher
 
 MACHINE = platform.node()
 NO_GPU = 3  # exit code: this Python's PyTorch can't use the GPU, so starting it again won't help
@@ -341,6 +342,13 @@ def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, titl
         site.report(rid, "judging", f"prompt {i + 1} of {n}: {said}", detail=detail)
 
     judge.grade(answers, on_verdict=heard)
+    # Beside the bar: the same prompts answered by Muse Spark itself, told the goal, judged against the fine-tune.
+    # A measurement, so if the API fails here the run keeps everything above and goes on without it.
+    try:
+        teacher.measure(answers.with_suffix(".graded.json"), report=lambda m: site.report(rid, "judging", m))
+    except (Exception, SystemExit) as e:
+        print(f"teacher measurement skipped: {e}", flush=True)
+        site.report(rid, "judging", "the comparison with Muse Spark itself was skipped (the API didn't answer)")
     return publish.build(job, out, title)
 
 
