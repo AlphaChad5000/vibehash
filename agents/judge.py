@@ -334,8 +334,21 @@ def summary(pairs: list[dict]) -> dict:
         sw = sum(p["second"]["winner"] == "tuned" for p in pairs)
         out["second"] = {"model": SECOND, "tuned_wins": sw, "ties": sum(p["second"]["winner"] == "tie" for p in pairs),
                          "interval": interval(sw, n),
-                         "agree": sum(p["second"]["winner"] == p["vs_prompted"]["winner"] for p in pairs)}
+                         "agree": sum(p["second"]["winner"] == p["vs_prompted"]["winner"] for p in pairs),
+                         "kappa": kappa([p["vs_prompted"]["winner"] for p in pairs], [p["second"]["winner"] for p in pairs])}
     return out
+
+
+def kappa(a: list, b: list) -> float | None:
+    """Cohen's kappa between two judges' verdicts: agreement beyond what their habits alone would produce. Two
+    judges that both say "fine-tune" nine times in ten agree 82% of the time by chance; kappa is 0 for that and 1
+    for perfect agreement. None when chance agreement is total (both always say the same thing)."""
+    n = len(a)
+    if not n:
+        return None
+    observed = sum(x == y for x, y in zip(a, b)) / n
+    expected = sum((a.count(c) / n) * (b.count(c) / n) for c in set(a) | set(b))
+    return None if expected == 1 else round((observed - expected) / (1 - expected), 3)
 
 
 if __name__ == "__main__":
