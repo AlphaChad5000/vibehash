@@ -313,7 +313,7 @@ def audit(plan: dict) -> dict:
     ask = [{"role": "system", "content": AUDIT}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{shown}"}]
     try:
         got = chat_json(ask)
-    except Exception as e:  # the API, not this code: the audit mustn't cost a run that the checks already passed
+    except (Exception, SystemExit) as e:  # the API (a 4xx is a SystemExit): mustn't cost a run the checks passed
         return {"sampled": len(sample), "met": None, "misses": [], "error": str(e)[:200]}
     verdicts = {v["n"]: v for v in (got.get("verdicts") if isinstance(got, dict) else None) or []
                 if isinstance(v, dict) and isinstance(v.get("n"), int)}
@@ -330,13 +330,15 @@ def plan_job(goal: str, log=print) -> dict:
         raise Refused(f"the Job Architect turned this goal down: {why}")
     plan = design(goal)
     plan["goal"] = goal  # the form's goal, never one the model wrote into its reply
+    valid = None  # the last plan that passed the checks, kept in case a rewrite for the audit breaks them
     for attempt in range(3):  # up to three retries: tell the model what was wrong and let it fix it
         problems = check(plan)
         if not problems:
             plan["audit"] = audit(plan)
+            valid = plan
             met, n = plan["audit"]["met"], plan["audit"]["sampled"]
-            if met is None or not n or met / n >= AUDIT_BAR:
-                break
+            if met is None or not n or met / n >= AUDIT_BAR or attempt == 2:
+                break  # on the last try a valid plan is kept, audit and all, rather than gambled on a rewrite
             problems = [f"the Quality Judge read {n} of the chats and {n - met} don't do what the goal asks: " +
                         "; ".join(f"{m['user'][:50]!r} -> {m['why']}" for m in plan["audit"]["misses"][:4]) +
                         ". Rewrite those and any like them"]
@@ -347,7 +349,10 @@ def plan_job(goal: str, log=print) -> dict:
         plan["goal"] = goal  # the rewrite is a fresh object from the model
         plan.pop("audit", None)  # ...whose chats haven't been audited, whatever it echoed
     if problems := check(plan):
-        raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
+        if not valid:
+            raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
+        log("the rewrite broke the checks; training on the last plan that passed them")
+        plan = valid
     if "audit" not in plan:
         plan["audit"] = audit(plan)
     if (a := plan["audit"])["met"] is not None and a["sampled"] and a["met"] / a["sampled"] < AUDIT_BAR:
@@ -388,15 +393,15 @@ def more(plan: dict, log=print) -> list[dict]:
     for attempt in range(2):
         try:
             batch = chat_json(ask)
-        except Exception as e:
+        except (Exception, SystemExit) as e:  # a 4xx from the API is a SystemExit
             log(f"no second batch of chats ({e}); training on the first")
             return []
         tests = {norm(p) for p in plan["eval_prompts"] + (plan.get("off_scope_prompts") or [])}
-        examples = [e for e in batch.get("examples") or [] if isinstance(e, dict) and e.get("user") not in seen
-                    and norm(e.get("user")) not in tests]
+        got = batch.get("examples") if isinstance(batch.get("examples"), list) else []
+        # a chat without user and assistant text (a list, a number) is dropped like a repeat, before it's looked up
+        examples = [e for e in got if not textless([e]) and e["user"] not in seen and norm(e["user"]) not in tests]
         # it repeats about a quarter of the questions it's shown; those are dropped, so ask for 40 and take 20 up
         problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
-                   (["an example is missing its user or assistant text"] if textless(examples) else []) + \
                    [p for p in mixed(examples, [], 0.3, decline) if "eval prompts" not in p] + \
                    templated(plan["examples"] + examples, decline) + scoped(plan.get("scope"), examples, ["x" * LONG] * OFF_PROMPTS, 0.5) + \
                    ruled(plan.get("checks"), plan.get("scope"), examples)

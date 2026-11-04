@@ -280,13 +280,19 @@ def wins(summary: dict) -> int:
     return (summary.get("vs_prompted") or summary)["tuned_wins"]
 
 
+def rules_passed(j: dict) -> float:
+    """The share of the Architect's test prompts passing every rule, the one the bar uses (judge.grade also scores
+    the hard, check and fresh prompts, for the page only). A run graded before that split has only the full figure."""
+    return (j["checks"].get("test") or j["checks"]["all"])["tuned"]
+
+
 def good_enough(result: dict, rigor: str) -> bool:
     j = result["judge"]
     if wins(j) / j["prompts"] < BAR:
         return False
     if j.get("scope") and j["scope"]["tuned"] < SCOPE_BAR:  # a narrow goal's model must also decline off-task asks
         return False
-    if j.get("checks") and j["checks"]["all"]["tuned"] < CHECKS_BAR:  # and pass the rules code can check
+    if j.get("checks") and rules_passed(j) < CHECKS_BAR:  # and pass the rules code can check
         return False
     return not RIGOR[rigor]["check"] or not j.get("check") or wins(j["check"]) / j["check"]["prompts"] >= CHECK_BAR
 
@@ -299,7 +305,7 @@ def parts(result: dict, rigor: str) -> dict:
     if RIGOR[rigor]["check"] and j.get("check"):
         out["check prompts"] = wins(j["check"]) / j["check"]["prompts"]
     if j.get("checks"):
-        out["rules passed"] = j["checks"]["all"]["tuned"]
+        out["rules passed"] = rules_passed(j)
     if j.get("scope"):
         out["declined"] = j["scope"]["tuned"]
     return out

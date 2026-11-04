@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-RETRIES = 5  # rate limits and overloads (429, 5xx): wait and try again, this many times
+RETRIES = 5  # rate limits, overloads (429, 5xx), dropped connections, timeouts, garbled bodies: wait and try again
 
 
 def load_env_file() -> None:
@@ -68,23 +68,45 @@ def chat(messages: list[dict], *, json_mode: bool = False, temperature: float = 
         headers={"Authorization": f"Bearer {s['LLM_API_KEY']}", "Content-Type": "application/json"},
     )
     for attempt in range(RETRIES + 1):
+        backoff = 5 * 2 ** attempt  # 5, 10, 20, 40, 80 s
         try:
             with urllib.request.urlopen(req, timeout=600) as r:  # a local model writing 40 chats takes minutes
                 return json.load(r)["choices"][0]["message"]["content"]
         except urllib.error.HTTPError as e:  # the provider's error body says why (no credits, bad model name, ...)
             if (e.code == 429 or e.code >= 500) and attempt < RETRIES:
-                wait = float(e.headers.get("Retry-After") or 0) or 5 * 2 ** attempt  # 5, 10, 20, 40, 80 s
+                try:
+                    wait = float(e.headers.get("Retry-After") or 0) or backoff
+                except ValueError:  # Retry-After may be a date
+                    wait = backoff
                 print(f"{base} answered {e.code}; trying again in {wait:.0f} s", flush=True)
                 time.sleep(wait)
                 continue
             raise SystemExit(f"{base} answered {e.code} {e.reason}: {e.read().decode(errors='replace')[:500]}")
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
+            # no answer (a dropped connection, DNS, a timeout: all OSError) or one that isn't a chat reply (bad JSON,
+            # no choices): the same as an overload, worth another try
+            if attempt < RETRIES:
+                print(f"{base}: {type(e).__name__} {e}; trying again in {backoff} s", flush=True)
+                time.sleep(backoff)
+                continue
+            raise SystemExit(f"{base} gave no usable answer after {RETRIES + 1} tries: {type(e).__name__} {e}")
 
 
 def chat_json(messages: list[dict], model: str | None = None) -> dict:
     """chat(), parsed. Models sometimes wrap the JSON in ``` fences or put a <think> block before it, so parse only
-    the outermost {...}."""
-    text = chat(messages, json_mode=True, model=model).split("</think>")[-1]
-    return json.loads(text[text.find("{"):text.rfind("}") + 1])
+    the outermost {...}. A reply that still isn't a JSON object is asked for once more."""
+    for attempt in range(2):
+        text = chat(messages, json_mode=True, model=model).split("</think>")[-1]
+        try:
+            out = json.loads(text[text.find("{"):text.rfind("}") + 1])
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            if attempt:
+                raise
+        if not attempt:
+            print("the reply wasn't one JSON object; asking again", flush=True)
+    raise ValueError("the model didn't reply with a JSON object")
 
 
 def model_name() -> str:

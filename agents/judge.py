@@ -269,7 +269,10 @@ def judged(goal: str, pair: dict) -> dict:
     if pair.get("prompted"):
         out["vs_prompted"] = verdict(goal, pair, "prompted")
         if SECOND:
-            out["second"] = verdict(goal, pair, "prompted", SECOND)
+            try:  # the second judge is a check on the first, not part of the bar: its failure never ends a run
+                out["second"] = verdict(goal, pair, "prompted", SECOND)
+            except (Exception, SystemExit) as e:  # a 4xx (a wrong model name, no access) is a SystemExit
+                print(f"second judge ({SECOND}) failed, so this run reports no agreement: {e}", flush=True)
     return out
 
 
@@ -314,7 +317,10 @@ def grade(answers_file: Path, on_verdict=None) -> None:
         if p.get("set") == OFF and decline:
             p["fails"] = [] if exempt(p.get("tuned")) else ["decline (an off-task message)"]
     if scored := checks.score(rules, on_task, exempt=exempt):
-        data["summary"]["checks"] = scored
+        data["summary"]["checks"] = scored  # over every on-task prompt, for the page
+        # the bar counts only the Architect's test prompts: the fixed sets and the judge's own never steer a run
+        if test := checks.score(rules, [p for p in on_task if not p.get("set")], exempt=exempt):
+            scored["test"] = test["all"] | {"prompts": test["prompts"]}
     if declined := scope(data["pairs"], decline):
         data["summary"]["scope"] = declined
     if data.get("cost"):
