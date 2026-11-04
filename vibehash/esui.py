@@ -110,7 +110,13 @@ def parse_generation(number: int, height: int, record) -> Generation:
     entry = record.get("es") if isinstance(record, dict) else None
     entry = entry if isinstance(entry, dict) else {}
     update = []
-    for u in entry.get("update") if isinstance(entry.get("update"), list) else []:
+    rows = entry.get("update") if isinstance(entry.get("update"), list) else []
+    if rows and all(isinstance(u, list) and len(u) == 2 for u in rows):
+        # Evo v2 (es2.entry): [pair, coefficient] rows; the generation's mean right/wrong reward is the record's score.
+        sc = record.get("score") if isinstance(record, dict) else None
+        m = _score(sc[1]) if isinstance(sc, list) and len(sc) == 2 else None
+        update = [(u[0], m, m) for u in rows if m is not None and _int(u[0], 0, 4095) is not None]
+    for u in rows:
         if isinstance(u, list) and len(u) == 3 and _int(u[0], 0, 4095) is not None:
             rp, rm = _score(u[1]), _score(u[2])
             if rp is not None and rm is not None:

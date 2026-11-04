@@ -196,3 +196,60 @@ def chain_bytes(entry) -> int:
     """What a round adds to the chain to train the model: its record's ES entry (the round's seed, its level and every
     accepted pair's two scores) as canonical JSON, the bytes a rebuild works the model out from."""
     return len(canonical(entry)) if isinstance(entry, dict) else 0
+
+
+# --- Evo v2 (es2.py): the fast recipe, on every layer, in cycles averaged into the next cycle's start ---------------
+
+# The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
+# sigma 1e-3, a cosine from 4e-3 to a quarter of it over the job, replay of 16 earlier correct answers.
+V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=4e-3, lr_floor=0.25,
+                   rounds=40, replay=16, margin=0.5, lp_tol=0.05)
+# margin 0.5: answers are written in bf16 by es_fast's engine and checked by teacher forcing on transformers' path, and
+# the two round differently. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, 96 members x 16 answers): an honest
+# member's worst gap was 0.125 at the median, 0.25 at the 95th percentile, 0.375 at most. That is too loose to tell an
+# answer the model wrote from a nearby better one (the answer key's answers sat at 0.375 at the median), so it is for
+# a local network; a public one needs checks on the engine's own path or in float32 (v1's margin was 0.05, in float32).
+# lp_tol 0.05: workers and checkers score the replay answers on the same path (es_fast.score_items).
+V2_COMPUTE_S = 300
+
+
+def spec2_for(found: Base, task: str, start=(), **settings):
+    """A rule-2 Evo job's spec for `found` on `task` (es_tasks.NAMES), starting from `start` ([[job id, weight,
+    params_hash], ...]: the parents averaged into its start): every attention and MLP projection twisted (es2.TENSORS),
+    their names and shapes from the model's config on PyTorch's meta device (nothing loaded)."""
+    from . import es2
+    try:
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+    except ImportError:
+        raise RuntimeError("Evo mode needs PyTorch and transformers: `vibehash install-gpu`, then pip install "
+                           "transformers") from None
+    s = {**V2_SETTINGS, **settings}
+    c = AutoConfig.from_pretrained(found.folder)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(c)
+    n, sha = es.tensors_digest(es.select(((k, p.shape) for k, p in model.named_parameters()), es2.TENSORS))
+    dims = {"family": c.model_type, "vocab": c.vocab_size, "hidden": c.hidden_size, "layers": c.num_hidden_layers,
+            "heads": c.num_attention_heads, "kv_heads": getattr(c, "num_key_value_heads", None) or c.num_attention_heads,
+            "head_dim": getattr(c, "head_dim", None) or c.hidden_size // c.num_attention_heads,
+            "ffn": c.intermediate_size, "tied": bool(getattr(c, "tie_word_embeddings", False))}
+    spec = es2.Spec2(base=found.base, manifest=manifest(found.base), dims=dims, tensors=es2.TENSORS, n=n,
+                     tensors_sha=sha, task=task, start=tuple(tuple(x) for x in start), **s)
+    bad = spec.problems_list()
+    if bad:
+        raise ValueError(f"an Evo v2 job for {found.repo} can't run: {'; '.join(bad)}")
+    return spec
+
+
+def memory_mb2(spec) -> int:
+    """What a v2 worker needs: the base in bf16, its float32 change, and the fast engine's caches for every member."""
+    return max(4096, math.ceil(spec.base_params * 2 * 6 / 2**20))
+
+
+def job2(spec, job_id: str, requester: str, budget: int | None = None, fee: int = FEE) -> TrainingJob:
+    """The v2 Evo job to post: a round's fee, a unit per `pairs_per_unit` pairs, and a budget for the planned rounds
+    (with a few to spare) unless one is given."""
+    budget = budget if budget is not None else (spec.rounds + 4) * fee
+    return TrainingJob.from_spec_json(json.dumps({"id": job_id, "fee_per_round": fee, **spec.to_json(), "init_seed": 0,
+                                                  "units_per_round": spec.units, "memory_mb": memory_mb2(spec),
+                                                  "compute_s": V2_COMPUTE_S}), requester, budget)

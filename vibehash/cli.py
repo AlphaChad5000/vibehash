@@ -1536,8 +1536,9 @@ def cmd_testnet(a):
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with the node's log, even when piped
-    evo = bool(getattr(a, "evo", False) or getattr(a, "evo_model", None))  # Evo mode (es_local.py)
-    d = Path(a.dir) if a.dir else settings.home() / ("testnet-evo" if evo else "testnet")
+    evo2 = bool(getattr(a, "evo2", False))  # Evo v2 (es2.py): the fast recipe, averaged in cycles
+    evo = evo2 or bool(getattr(a, "evo", False) or getattr(a, "evo_model", None))  # Evo mode (es_local.py)
+    d = Path(a.dir) if a.dir else settings.home() / ("testnet-evo2" if evo2 else "testnet-evo" if evo else "testnet")
     if a.reset and d.exists():
         if not (d / "genesis.json").exists():
             sys.exit(f"{d} doesn't look like a testnet folder; not deleting it")
@@ -1558,11 +1559,20 @@ def cmd_testnet(a):
         print(f"{es_local.TAGLINE}. Finding {model} on this computer (or downloading it once)…", flush=True)
         try:
             found = es_local.find(model)
-            evo_spec = es_local.spec_for(found)
+            evo_spec = es_local.spec2_for(found, "countdown") if evo2 else es_local.spec_for(found)
         except Exception as e:  # noqa: BLE001 - not on this computer and couldn't be downloaded, or not a model we can run
             sys.exit(f"error: couldn't get {model} for Evo mode: {e}")
         es_local.register(found)  # where this process's workers find it
-        es.cache_noise(es_local.noise_mb(evo_spec))  # the node and the workers share one process: a pair's noise once
+        es.cache_noise(512 if evo2 else es_local.noise_mb(evo_spec))  # one process plays every part: noise once
+        if evo2:
+            from . import es_tasks
+            evo2_tasks = []
+            for t in es_tasks.NAMES:  # the tasks this computer can serve (ARC-Easy needs `datasets` and a download)
+                try:
+                    es_tasks.get(t).items(0, 1)
+                    evo2_tasks.append(t)
+                except es_tasks.TaskUnavailable as e:
+                    print(f"note: Evo v2 runs without {t}: {e}", file=sys.stderr)
     count = (len(existing.get("validators", {})) or 1) if existing else (a.validators or 1)
     if existing and a.validators and a.validators != count:
         sys.exit(f"this testnet has {count} validator{'s' * (count > 1)}; add --reset to start one with {a.validators}")
@@ -1640,19 +1650,45 @@ def cmd_testnet(a):
     say = dash.note if dash else (lambda text: print("  " + text))
     posted = None
 
+    def next_cycle_job(s):
+        """Evo v2's next job: this cycle's next task, or, every task done, the next cycle's first, starting from the
+        mean of this cycle's jobs (each pinned by its final params_hash). The cycle's state is kept in evo2.json."""
+        from . import es2
+        path = d / "evo2.json"
+        cyc = json.loads(path.read_text()) if path.exists() else {"cycle": 1, "jobs": [], "parents": []}
+        if len(cyc["jobs"]) >= len(evo2_tasks):
+            done = [j for j in cyc["jobs"] if j in node.chain.state.jobs]  # posted and on the chain
+            # Each parent pinned by its final state's hash: start_params also rebuilds it from the chain when another
+            # validator led the job's last round.
+            cyc = {"cycle": cyc["cycle"] + 1, "jobs": [],
+                   "parents": [[j, 1 / len(done), es2.hash_of(node.coord.start_params(j))] for j in done]}
+        task = evo2_tasks[len(cyc["jobs"])]
+        spec = es_local.spec2_for(found, task, start=cyc["parents"], rounds=a.evo2_rounds)
+        job = es_local.job2(spec, f"evo2-c{cyc['cycle']}-{task}", keys["requester"].address)
+        cyc["jobs"].append(job.job_id)
+        path.write_text(json.dumps(cyc, indent=2))
+        return job
+
     def ensure_job():
         nonlocal posted
         s = node.chain.state
         if a.job == "none" or any(v > 0 for v in s.escrow.values()) or (posted and posted not in s.jobs):
             return  # a job is running, or the one just posted hasn't reached a block yet
-        if evo:  # an Evo job, with the measured run's settings (es_local.py)
+        if evo2:  # Evo v2: the next job of this cycle, or the next cycle from this one's average
+            job = next_cycle_job(s)
+        elif evo:  # an Evo job, with the measured run's settings (es_local.py)
             job = es_local.job(evo_spec, f"evo-{len(s.jobs) + 1}", keys["requester"].address, a.budget)
         else:
             job = template_job(f"demo-{len(s.jobs) + 1}", a.job == "gpu", keys["requester"].address, a.budget)
         if s.balance(keys["requester"].address) >= job.budget + node.coord.config.min_fee:
             api.send_tx(keys["requester"], "post_job", "system", job.budget, job.spec_json())
             posted = job.job_id
-            if evo:
+            if evo2:
+                cyc = json.loads((d / "evo2.json").read_text())
+                parents = ", ".join(j for j, _, _ in cyc["parents"]) or "the base model"
+                say(f"posted Evo v2 job {job.job_id}: cycle {cyc['cycle']}, {job.spec.task}, starting from {parents}; "
+                    f"{job.spec.pairs} twin pairs on every layer ({job.spec.n:,} weights), {job.spec.rounds} rounds")
+            elif evo:
                 say(f"posted Evo job {job.job_id}: {found.repo} evolving {evo_spec.n:,} numbers, {evo_spec.pairs} twin "
                     f"pairs a generation, {evo_spec.problems} puzzles each; budget {job.budget / SYN_PER_VIBE:,.0f} VIBE")
             else:
@@ -1795,6 +1831,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--evo", action="store_true", help="Evo mode: training by evolution, the chain is the model. A "
                    "network whose genesis takes Evo jobs, training an open model on Countdown puzzles, its blocks holding "
                    f"only seeds and scores (default folder {settings.home() / 'testnet-evo'})")
+    p.add_argument("--evo2", action="store_true", help="Evo v2: the fast recipe on every layer, in cycles: a job per "
+                   "task (countdown, arithmetic, arc_easy), then the next cycle starts from their average (es2.py)")
+    p.add_argument("--evo2-rounds", type=int, default=40, metavar="N", help="Evo v2: rounds a job plans its step size "
+                   "over (default 40)")
     p.add_argument("--evo-model", metavar="MODEL", help="Evo mode's model: a Hugging Face name, from this computer's "
                    "cache or downloaded once, or a model's folder (default Qwen/Qwen2.5-0.5B-Instruct, about 1 GB)")
     for name, default in (("register-s", 3.0), ("compute-s", 8.0), ("reveal-s", 3.0), ("verify-s", 4.0)):
