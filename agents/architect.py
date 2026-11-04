@@ -275,7 +275,10 @@ def more(plan: dict, log=print) -> list[dict]:
     32; one batch is all a single reply holds, so a second call doubles what the model learns from. Best effort: if
     the batch keeps failing the checks, train on the first one."""
     shown = "\n\n".join(f"User: {e['user']}\nAssistant: {e['assistant']}" for e in plan["examples"])
-    ask = [{"role": "system", "content": MORE}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{shown}"}]
+    decline = narrow(plan.get("scope"))
+    ask = [{"role": "system", "content": MORE}, {"role": "user", "content": f"Goal: {plan['goal']}\n" + (
+        f"Decline sentence for off-task messages: {decline}\nAt least {OFF_EXAMPLES // 2} of the new chats are off-task "
+        f"messages answered with exactly that sentence.\n\n" if decline else "\n") + shown}]
     seen = {e["user"] for e in plan["examples"]}
     for attempt in range(2):
         try:
