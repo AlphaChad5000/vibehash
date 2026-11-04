@@ -26,6 +26,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import socket
 import ssl
 import threading
@@ -193,6 +194,10 @@ class GuardedServer(ThreadingHTTPServer):
     The TLS handshake happens in the connection's own thread, under the header timeout, so a client that never
     finishes one can't stall accept()."""
     daemon_threads = True
+    # http.server asks for SO_REUSEADDR. On Linux that only lets a restarted node rebind past TIME_WAIT; on Windows it
+    # lets a second process bind a port that's in use, and each request then reaches one node or the other (two
+    # testnets on 127.0.0.1:8545, 2026-11-03). Windows rebinds after a stop without it.
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, address, handler, limits: Limits | None = None, tls: ssl.SSLContext | None = None):
         self.limits = limits or Limits()

@@ -5,7 +5,10 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -17,7 +20,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from vibehash import cli, consensus, ledger, node as node_module
+from vibehash import cli, consensus, filelock, ledger, node as node_module
 from vibehash.blobs import MAX_DATASET, BlobStore
 from vibehash.client import NodeClient, NodeError, WorkerClient
 from vibehash.consensus import Engine, Timeouts, proposal, proposer_order, vote
@@ -574,6 +577,69 @@ class MalleabilityTests(unittest.TestCase):
                 self.e.receive(vote(k, "mall-net", "precommit", 1, 0, self.bid), now=5.2)
         self.assertEqual(len(self.committed), 1, "the block the others finalised is final here too")
         self.assertEqual(self.committed[0], self.value)
+
+
+class OneNodePerFolderTests(unittest.TestCase):
+    """The owner's Evo testnet, 2026-11-03: the menu's Evo Hash started a second copy of a running `testnet --evo2`.
+    Windows let both servers bind 127.0.0.1:8545, so each request reached one or the other, and the two nodes built
+    rival blocks from height 502 with the one validator key, the one behind failing every save. Now a taken port, a
+    node's folder and a testnet's folder each refuse a second copy, and give themselves back when their holder ends."""
+
+    def folder(self) -> Path:
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def test_a_port_in_use_is_refused(self):
+        first = start_node(self)
+        port = first.server.server_address[1]
+        folder = self.folder() / "node"
+        with self.assertRaises(OSError):
+            Node(folder, SOLO, NODE, port=port, times=FAST)
+        Node(folder, SOLO, NODE, port=0, times=FAST).close()  # the failed start left its folder free
+        self.assertEqual(NodeClient(first.url).get("/status")["chain_id"], "dos-net")
+
+    def test_a_folder_in_use_is_refused_until_its_node_stops(self):
+        folder = self.folder() / "node"
+        first = Node(folder, SOLO, NODE, port=0, times=FAST).start()
+        with self.assertRaisesRegex(node_module.FolderInUse, f"process {os.getpid()}"):
+            Node(folder, SOLO, NODE, port=0, times=FAST)
+        first.stop()
+        Node(folder, SOLO, NODE, port=0, times=FAST).close()
+
+    def made_testnet(self) -> Path:
+        d = self.folder() / "testnet"
+        d.mkdir()
+        (d / "genesis.json").write_text(json.dumps({"chain_id": "dos-testnet"}))
+        return d
+
+    def test_a_running_testnets_folder_is_refused_at_once(self):
+        d = self.made_testnet()
+        running = filelock.try_hold(d / "testnet.lock", note="process 4242")
+        self.addCleanup(running.release)
+        for reset in ([], ["--reset"]):
+            with self.assertRaises(SystemExit) as e:
+                cli.main(["testnet", "--dir", str(d), "--plain", *reset])
+            self.assertIn("already running (process 4242)", str(e.exception.code))
+        self.assertTrue((d / "genesis.json").exists(), "--reset deleted a running testnet's folder")
+
+    def test_a_testnet_gives_its_folder_back_however_it_ends(self):
+        d = self.made_testnet()  # the menu runs testnets in its own process, and goes on after one ends
+        with self.assertRaises(SystemExit) as e:
+            cli.main(["testnet", "--dir", str(d), "--plain", "--validators", "3"])
+        self.assertIn("this testnet has 1 validator", str(e.exception.code))
+        again = filelock.try_hold(d / "testnet.lock")
+        self.assertIsNotNone(again, "the testnet kept its folder's lock after it ended")
+        again.release()
+
+    def test_a_second_process_is_refused(self):
+        d = self.made_testnet()
+        running = filelock.try_hold(d / "testnet.lock", note=f"process {os.getpid()}")
+        self.addCleanup(running.release)
+        out = subprocess.run([sys.executable, "-m", "vibehash", "testnet", "--dir", str(d), "--plain"],
+                             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn(f"already running (process {os.getpid()})", out.stderr)
 
 
 if __name__ == "__main__":

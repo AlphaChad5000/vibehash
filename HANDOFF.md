@@ -126,6 +126,12 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
+**Unreleased (branch `mainnet-checklist`, 2026-11-03): one node per folder and per port.** `chain verify` on the owner's Evo testnet failed at blocks 502 on: the menu's Evo Hash had started a second copy of the running `testnet --evo2` in the same folder. Windows let both servers bind 127.0.0.1:8545 (http.server asks for SO_REUSEADDR, which on Windows lets a second process take a port in use), so requests reached one or the other and workers stopped registering; the two nodes built rival blocks with the one validator key, and the one behind failed every save ("UNIQUE constraint failed: blocks.height"). The database kept one consistent chain (the copy ahead wrote first); stopping both and starting one carried on from it, and `chain verify` then passed all 530 blocks. Fixes, nodes and testnets only:
+- `GuardedServer.allow_reuse_address` is off on Windows, which still rebinds right after a stop (measured).
+- A node holds `node.lock` in its data folder (`node.hold_folder`, `FolderInUse`), from before its database opens until `stop()`, or `close()` for one never started; a failed start gives it back.
+- `testnet` holds `testnet.lock` in its folder from the first line (before `--reset` deletes anything, and before an Evo model loads), and gives it back however it ends: the menu runs commands in its own process and goes on.
+- Tests: `test_dos.OneNodePerFolderTests` (the port test fails with the old setting on Windows; Linux refused a second listener already).
+
 **Release 0.5.14 (2026-11-03, branch `evo-check` off `evo-v2`): Evo v2's answer checks are exact on one kind of GPU.** Honest workers' units were failing "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet), because the checker re-read answers on transformers' path at another batch size and rounded differently. Checkers now teacher-force through the answering engine, which always works 256 rows at a time; v2's margin is 0.1. Every worker on a network needs 0.5.14: the engine's rounding changed. Details under Evo v2 below.
 
 **Release 0.5.12 (2026-11-03): es2.TASKS is es_tasks.NAMES.** 0.5.11 kept rule 2's own list of three tasks, so `testnet --evo2` stopped at its fourth job (sciq) with "task is one of countdown, arithmetic, arc_easy".
@@ -515,6 +521,67 @@ Known limits (fine for testnet, document rather than fix now):
 - MLPs, and LoRA fine-tunes of models one GPU holds (Llama, Mistral, Qwen, SmolLM). The public node can't run fine-tunes yet (FINETUNING.md, milestone B).
 - `Dataset.from_npz` loads the whole dataset into RAM; the node evaluates on the CPU.
 - Verifiers download ~2q checkpoints per task, which is significant bandwidth for big models.
+
+## Before VIBE is a real, listed currency (mainnet checklist, 2026-11-03)
+
+The owner asked what stands between Vibe Hash, Evo Hash included, and listing VIBE as a currency people can buy.
+Everything still open in the checklist above comes first (the security review, issuance, versioning, legal), plus the
+items below. Where things stood when this was written: `vibehash-public-1` at block ~9,560 with **one validator** (the
+droplet), 2 miners in the last day, 10,000 VIBE allocated to the owner's wallet at genesis, no `"es": true` in its
+genesis (so no Evo jobs; Evo Hash runs on local test networks only), no block explorer and no supply endpoint.
+
+**A fresh chain for real money.** The testnet's coins stay worthless; a mainnet starts from a new genesis.
+- [ ] The final issuance numbers, and the founder allocation: a premine weakens both "nobody controls it" and the legal
+  position, and without one the first jobs need another way to be funded.
+- [ ] Its own SLIP-0044 coin type (`mnemonic.PATH` uses 1, "testnet, all coins"), so the same words give different
+  testnet and mainnet keys.
+- [ ] `"es": true` in that genesis if Evo Hash is part of it: there's no chain-upgrade process to add it later.
+
+**Nobody controls it (DESIGN §9).**
+- [ ] Several independent validators, the bootstrap stake spread across them. Today the owner's node alone can halt or
+  censor the chain, and exchanges look for exactly this.
+- [ ] Double-sign slashing (evidence is only collected, `Engine.evidence`), a higher validator stake, a delay before
+  set changes apply.
+- [ ] Validators recheck a sample of weight-based checks before voting, a dispute tx that slashes a leader whose record
+  a recheck contradicts, and checkpoints replicated across validators.
+- [ ] Upgrades that don't depend on one person re-running `deploy/setup-node.sh`: versions in `/status`, old clients
+  refused, a planned upgrade path validators agree to.
+- [ ] DeepSeek jobs kept off it until their trust points go (Hugging Face for the frozen weights, the operator-paid
+  hand-off bucket; DEEPSEEK.md §8).
+- [x] A node locks its data folder and refuses a port that's taken (branch `mainnet-checklist`; "Current state" has
+  the story). Found by `chain verify` on the owner's Evo testnet: two copies of one testnet signed rival blocks with
+  one validator key. On a real network that is a validator double-signing, which nothing slashes yet (above).
+
+**Evo Hash.**
+- [ ] On a public network at all: `vibehash-public-1` refuses Evo jobs (`ledger.ES_GATE`).
+- [ ] The checks' last gaps after 0.5.14 (Evo v2 above): bf16 logits that tie exactly for some multiple-choice
+  forgeries (14 of 1,439), another kind of GPU unmeasured, replay log-probabilities still scored on transformers' path.
+- [ ] Selection (docs/evo-hash.pdf §10): a worker withholding units, or a checker's unrefereed rejections, can steer
+  which pairs enter an update. Needs refereed rejections and units given to more than one worker.
+- [ ] Verifiable snapshots: a new node or worker rebuilds the whole line from the chain, which grows forever (0.5.13's
+  saved line only speeds up a restart on the same machine).
+- [ ] `tests/test_es.py` and `test_es2.py` in CI (they need PyTorch).
+- [ ] Weeks on a public testnet with miners other than the owner's machines.
+
+**What exchanges and listing sites need.**
+- [ ] A block explorer, and an endpoint for total and circulating supply.
+- [ ] Integration docs for an exchange's deposits and withdrawals (the node's API, BFT finality in one block).
+- [ ] A market. CoinGecko and CoinMarketCap list only coins already trading on an exchange they track. Either an
+  exchange integrates the chain (real ones want audits, a legal opinion and users; small ones asking a "listing fee" are
+  often scams), or a bridge to a wrapped token, where someone holds the real coins (a controller, and bridges are
+  crypto's most-hacked part).
+- [ ] Demand that isn't the owner's: today every job on the public chain was posted from the genesis allocation.
+
+**Legal and money (not legal advice; see a lawyer, e.g. a university's student or entrepreneurship legal clinic).**
+- [ ] Before VIBE has a price: a founder allocation, the founder selling, or talk of the price push a coin toward being
+  a security; coins only earned by mining are on firmer ground, and US rules are moving in 2025–26.
+- [ ] The owner doesn't sell VIBE, run an exchange or hold others' coins (money-transmitter rules).
+- [ ] Taxes: once VIBE has a market price, mined coins are income when received (US), for every miner.
+- [ ] Terms, a privacy notice (the node sees worker IPs), and the logo-like emblems (`emblems.py`) looked at again once
+  money is involved.
+
+Order: Evo's checks and Evo on the public testnet; outside validators there; a lawyer early, since the answers shape the
+genesis; the audit; the new chain; explorer and supply endpoint; only then exchanges.
 
 ## Working tips
 

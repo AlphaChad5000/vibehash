@@ -37,17 +37,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import ssl
 import threading
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
 from . import deepseek_graph as dsg
 from . import economics as econ
-from . import netstats, receipts, tasks
+from . import filelock, netstats, receipts, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
@@ -105,8 +107,7 @@ def bucket_from_env() -> dsg.Signer | None:
     """The bucket for DeepSeek jobs' hand-offs, from $VIBEHASH_BUCKET_HOST (my-bucket.nyc3.digitaloceanspaces.com),
     $VIBEHASH_BUCKET_REGION, $VIBEHASH_BUCKET_KEY and $VIBEHASH_BUCKET_SECRET (and $VIBEHASH_BUCKET_SCHEME, https
     unless set): the operator sets them on the node at launch. None if they aren't set."""
-    import os
-    env = {k: os.environ.get(f"VIBEHASH_BUCKET_{k}") for k in ("HOST", "REGION", "KEY", "SECRET", "SCHEME")}
+    env ={k: os.environ.get(f"VIBEHASH_BUCKET_{k}") for k in ("HOST", "REGION", "KEY", "SECRET", "SCHEME")}
     if not all(env[k] for k in ("HOST", "REGION", "KEY", "SECRET")):
         return None
     return dsg.Signer(env["HOST"], env["REGION"], env["KEY"], env["SECRET"], scheme=env["SCHEME"] or "https")
@@ -114,6 +115,23 @@ def bucket_from_env() -> dsg.Signer | None:
 
 class Busy(Exception):
     """The node can't take this request now (503): the client waits and resends."""
+
+
+class FolderInUse(RuntimeError):
+    """Another node already runs on this data folder."""
+
+
+def hold_folder(data_dir) -> filelock.Lock:
+    """The data folder's lock, held while a node runs there (the lock goes with its process, however it ends). Two
+    nodes on one folder each build blocks on the chain they loaded, sign rival ones with the one validator key, and
+    fail every save the other got to first (2026-11-03: the menu's Evo Hash beside a running `testnet --evo2`)."""
+    path = Path(data_dir) / "node.lock"
+    lock = filelock.try_hold(path, note=f"process {os.getpid()}")
+    if lock is None:
+        who = filelock.holder(path) or "another process"
+        raise FolderInUse(f"another node ({who}) already runs on {data_dir}: two on one folder would sign rival "
+                          f"blocks with one key. Stop that one first")
+    return lock
 
 
 @dataclass
@@ -151,8 +169,13 @@ class Node:
         cfg = config or CoordinatorConfig()
         cfg.compute_s = self.times.compute_s * 0.8  # leave slack for network and polling
         self.keys = keys
-        self.store = Store(data_dir)
-        self.chain = self.store.open_chain(genesis)
+        self.folder = hold_folder(data_dir)  # FolderInUse if another node runs there
+        try:
+            self.store = Store(data_dir)
+            self.chain = self.store.open_chain(genesis)
+        except BaseException:
+            self.folder.release()
+            raise
         self.genesis = genesis
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
         self.bucket = bucket
@@ -171,7 +194,12 @@ class Node:
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self.stopping = threading.Event()
-        self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
+        try:
+            self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
+        except BaseException:  # the port is taken: the folder is free for whoever tries next (the menu goes on)
+            self.store.close()
+            self.folder.release()
+            raise
         self.threads: list[threading.Thread] = []
         self.announce = (announce or self.chain.state.validators.get(keys.address) or self.url).rstrip("/")
         self.peers = Peers(self.announce, keys.address, list(peers), lambda: self.chain.state.validators)
@@ -214,6 +242,13 @@ class Node:
         for t in self.threads:
             t.join(timeout=30)
         self.peers.close()
+        self.folder.release()
+
+    def close(self) -> None:
+        """A node made but never started: its port, database and folder back."""
+        self.server.server_close()
+        self.store.close()
+        self.folder.release()
         self.store.close()
 
     def _role(self) -> str:

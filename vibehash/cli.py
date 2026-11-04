@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import advice, crypto, hardware, mnemonic, modelstore, settings, tls, unattended
+from . import advice, crypto, filelock, hardware, mnemonic, modelstore, settings, tls, unattended
 from . import economics as econ
 from . import fees
 from . import wallet as wallets
@@ -266,7 +266,7 @@ def _describe_economics(e: econ.Economics) -> str:
 
 def cmd_node(a):
     from .coordinator import CoordinatorConfig
-    from .node import Node, PhaseTimes, bucket_from_env  # only nodes need the server
+    from .node import FolderInUse, Node, PhaseTimes, bucket_from_env  # only nodes need the server
     from .ratelimit import Limits
 
     if crypto.BACKEND != "openssl":
@@ -285,10 +285,13 @@ def cmd_node(a):
             compute.use(compute.get_backend(a.device, logging.getLogger("vibehash.node")))
         except RuntimeError as e:
             sys.exit(f"error: {e}")
-    node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
-                keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
-                announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
-                bucket=bucket_from_env()).start()  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+    try:
+        node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
+                    keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
+                    announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
+                    bucket=bucket_from_env()).start()  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+    except FolderInUse as e:
+        sys.exit(f"error: {e}")
     if context:
         fp = tls.cert_fingerprint(a.tls_cert)
         print(f"serving HTTPS; certificate sha256 fingerprint {fp}\n"
@@ -1538,18 +1541,42 @@ def _evo_round(node, block) -> str:
 def cmd_testnet(a):
     """A whole network on this computer: node, workers and a training job, from one command.
     Its wallets are unencrypted throwaway keys, so never send real coins to them."""
+    held: list[filelock.Lock] = []  # the folder's lock, given back however this ends: the menu runs it in its process
+    try:
+        _testnet(a, held)
+    finally:
+        for lock in held:
+            lock.release()
+
+
+def _hold_testnet(d: Path) -> filelock.Lock:
+    """The testnet folder's lock, or exit at once: a second copy would run a second node on the folder's chain."""
+    lock = filelock.try_hold(d / "testnet.lock", note=f"process {os.getpid()}")
+    if lock is None:
+        who = filelock.holder(d / "testnet.lock") or "another process"
+        sys.exit(f"error: the testnet in {d} is already running ({who}), maybe in another window or the menu. "
+                 f"Stop it there first, or give this one its own --dir")
+    return lock
+
+
+def _testnet(a, held: list) -> None:
     from . import minerui
-    from .node import Node, PhaseTimes
+    from .node import FolderInUse, Node, PhaseTimes
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with the node's log, even when piped
     evo2 = bool(getattr(a, "evo2", False))  # Evo v2 (es2.py): the fast recipe, averaged in cycles
     evo = evo2 or bool(getattr(a, "evo", False) or getattr(a, "evo_model", None))  # Evo mode (es_local.py)
     d = Path(a.dir) if a.dir else settings.home() / ("testnet-evo2" if evo2 else "testnet-evo" if evo else "testnet")
+    if (d / "genesis.json").exists():  # a testnet already: refused at once if it's running, before --reset deletes it
+        held.append(_hold_testnet(d))
     if a.reset and d.exists():
         if not (d / "genesis.json").exists():
             sys.exit(f"{d} doesn't look like a testnet folder; not deleting it")
+        held.pop().release()  # Windows can't delete a lock file that's held
         shutil.rmtree(d)
+    if not held:
+        held.append(_hold_testnet(d))
     if _in_onedrive(d):
         print(f"warning: {d} is inside OneDrive, whose syncing can corrupt a running node's database; "
               "use --dir somewhere else", file=sys.stderr)
@@ -1622,10 +1649,11 @@ def cmd_testnet(a):
         for v, port in zip(validators, ports):
             nodes.append(Node(d / ("node-data" if v == "node" else f"{v}-data"), genesis, keys[v], a.host, port, times,
                               **big))
-    except OSError as e:
+    except (OSError, FolderInUse) as e:
         for n in nodes:
-            n.server.server_close()
-            n.store.close()
+            n.close()
+        if isinstance(e, FolderInUse):
+            sys.exit(f"error: {e}")
         sys.exit(f"couldn't start a node on port {port} ({e}). Is one already running? Try --port.")
     node = nodes[0]
     for n in nodes:
@@ -1634,8 +1662,7 @@ def cmd_testnet(a):
         clients = [(n, WorkerClient(node.url, keys[n], device=a.device, cache_dir=d / "cache" / n)) for n in workers]
     except RuntimeError as e:
         for n in nodes:
-            n.server.server_close()
-            n.store.close()
+            n.close()
         sys.exit(f"error: {e}")
     from . import compute
     before = compute.active()
