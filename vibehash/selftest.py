@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from . import advice, hardware, settings, termui, unattended
+from .crypto import checksummed
 from .tasks import SYN_PER_VIBE
 
 PYPI = "https://pypi.org/pypi/vibehash/json"
@@ -890,7 +891,9 @@ def wallet(rep: Report, net: Net, path: Path | None, address: str | None, encryp
         return
     unlock = ("encrypted; the worker asks for its password, or reads $VIBEHASH_PASSWORD when there's no terminal "
               + ("(set now)" if os.environ.get("VIBEHASH_PASSWORD") else "(not set)")) if encrypted else "not encrypted"
-    rep.add("wallet", "ok", f"wallet {path}: {address} ({unlock})", path=str(path), address=address, encrypted=encrypted)
+    # The text as people copy the address (its checksum in the letters' case); the data as the ledger has it (--json).
+    rep.add("wallet", "ok", f"wallet {path}: {checksummed(address)} ({unlock})", path=str(path), address=address,
+            encrypted=encrypted)
     if net.account is None:
         if net.status is not None:
             rep.add("balance", "skip", "balance: the node didn't say")

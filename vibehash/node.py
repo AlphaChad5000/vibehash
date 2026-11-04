@@ -55,7 +55,7 @@ from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
-from .crypto import KeyPair, address_of, verify
+from .crypto import KeyPair, address_of, checksummed, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
 from .p2p import Peers
@@ -428,8 +428,8 @@ class Node:
                 c.expire_moves(time.time())
             c.end_disputes(time.time())
             for g in sorted(c.r.games.values(), key=lambda g: g.gid):
-                log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, g.challenger[:10], g.defender[:10],
-                         g.outcome or "unfinished")
+                log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, checksummed(g.challenger)[:10],
+                         checksummed(g.defender)[:10], g.outcome or "unfinished")
         return True
 
     # --- running a chain with validators ------------------------------------------------------

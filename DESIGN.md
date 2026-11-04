@@ -1005,6 +1005,11 @@ Being explicit about what this is and isn't:
   is checked one cell (one shard over one segment) at a time, so no worker,
   checker or arbitrating node ever runs the whole model. That document has
   the design, and `shards.py` a tested prototype of its core.
+- **Recipients no key holds.** The ledger credits a transfer to any
+  recipient that starts `vibe1`, though only the canonical form can ever be
+  spent (§10, "Addresses"). Clients check addresses' checksums and nodes
+  refuse other spellings by relay policy, but a block holding one still
+  validates: a block version should make it a rule.
 - **Security review.** None of this has been audited. Don't put real value
   on it, and get legal advice before issuing a token anyone can buy.
 
@@ -1216,6 +1221,60 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
   have no `hd` and load unchanged; `wallet show` says whether a wallet has
   recovery words. `vibehash testnet`'s throwaway wallets are still plain
   random keys.
+
+### Addresses and their checksum (`crypto.checksummed`, `crypto.parse_address`)
+
+- An address is `vibe1` and the first 36 hex digits of sha256(public key),
+  in small letters (`address_of`). That **canonical form** is what the
+  ledger, blocks, genesis files, wallet files, the node's API and every
+  record a program reads (`--json`, `rounds.jsonl`, `history.csv`) hold. It
+  hasn't changed, so every chain, wallet and block stays valid byte for byte.
+- People see a **checksummed form**, EIP-55's idea with sha256 in place of
+  keccak: h = sha256(the canonical address, `vibe1` included), and each
+  letter a-f among the 36 digits is a capital when nibble i of h is 8 or
+  more. Digits and the prefix stay as they are, and lowercased it's the
+  canonical address again. Commands' text, the mining dashboard, the menu,
+  selftest and the recovery-words file show it, a shortened address included
+  (`vibe17B0D8…9525`).
+- `parse_address` reads what people give: `send --to`, `balance ADDRESS`,
+  `genesis create`'s `--alloc`, `--stake`, `--bootstrap` and `--validator`,
+  the menu's Send VIBE. Spaces around it are dropped and the prefix may be in
+  any case. A wrong length or a character outside 0-9 and a-f is refused.
+  Any capital makes it a checksummed address, whose capitals must be exactly
+  right. All small letters is taken unchecked, since that's how addresses
+  were shown before (EIP-55 does the same). All capitals is checked, not
+  waved through: nothing writes an address that way, so taking it unchecked
+  would only widen what goes unchecked. Commands check before they open the
+  wallet, so a typo stops before anything is signed or sent, and
+  `NodeClient.send_tx` runs every transfer's recipient through it too, so no
+  program built on it signs one for a mistyped address, whatever the node.
+- **What it catches.** Of every one-character substitution in the
+  checksummed forms of 20,000 random addresses (the 21 other hex characters,
+  in either case, at each of the 36 places: 14.85 million typos), 99.876% are
+  refused. Of the rest, 0.072% leave no capital at all (an address with at
+  most one capital, typed with that one changed), which reads as an unchecked
+  old-style address, and 0.052% happen to get the new address's capitals
+  right: an address has 13.5 letters on average, each a coin toss. Swapping
+  two neighbours is caught 99.855% of the time. A case-only slip (one capital
+  typed small) is the same address, and never sends coins elsewhere.
+- **The ledger takes any recipient that starts `vibe1`** (`_apply_user_tx`),
+  capitals and any length included, and credits that exact string. No key's
+  `address_of` makes anything but the canonical form, so coins sent to any
+  other spelling, a checksummed address included, can never be spent.
+  Changing that is a block rule, which changes which blocks are valid, so for
+  now it's relay policy: `_relayable` refuses a transfer whose recipient isn't
+  canonical, and a node neither takes one into its mempool nor builds a block
+  with one. A block holding one, from a node without the policy, still
+  validates. The next block version should make it a rule.
+- **bech32m instead**, for a fresh mainnet genesis: its checksum catches
+  every typo of up to four characters, not 99.9% of one-character ones. It
+  would change the canonical form itself (`vibe` as the human-readable part,
+  `1` as the separator, so it still starts `vibe1`, then the 18 bytes and a
+  6-character checksum, all in one case), so it can't come to an existing
+  chain: every allocation, balance key, block, record and wallet file names
+  addresses in today's form. A new chain would need `address_of` changed, a
+  block version whose rules take only the new form, and `parse_address` and
+  the displays updated; keys and recovery words work as before.
 
 ### Block versions (`ledger.VERSION`)
 

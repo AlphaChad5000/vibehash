@@ -231,6 +231,14 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(want, text)
         self.assertEqual(text.count(minerui.GLYPHS["ore"] * 4), 1)  # the cart is full: 5 committed, 4 slots
 
+    def test_the_address_shows_its_checksum_whole_or_shortened(self):
+        whole = "vibe17B0D8bce54f6eAb50df24fd44E5a408A9525"  # crypto.checksummed of rig()'s address
+        for size, want in (((120, 50), whole), ((66, 34), "vibe17B0D8…9525")):  # (the ASCII banner leaves it out)
+            with self.subTest(size=size):
+                text = ESCAPE.sub("", self.frames(self.dashboard(), size)[-1])
+                self.assertIn(want, text)
+                self.assertNotIn("vibe17b0d8", text)  # never the small-letter form, which nothing could check
+
     def test_ascii_fallback_is_pure_ascii(self):
         dash = self.dashboard(glyphs=minerui.ASCII)
         dash.popup = (time.time(), SYN_PER_VIBE)

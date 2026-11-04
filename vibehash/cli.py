@@ -41,7 +41,7 @@ from . import economics as econ
 from . import fees
 from . import wallet as wallets
 from .client import NodeClient, NodeError, WorkerClient
-from .crypto import KeyPair
+from .crypto import AddressError, KeyPair, checksummed, parse_address
 from .ledger import Block, Chain, canonical
 from .model import ModelSpec
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
@@ -124,13 +124,22 @@ def normalise_url(text: str, https: bool = False) -> str:
     return f"{scheme}://{text}" if urlsplit(f"http://{text}").port else f"{scheme}://{text}:8545"
 
 
+def _address(text: str, where: str = "") -> str:
+    """An address someone gave a command, as the ledger holds it (crypto.parse_address), or exit saying what's wrong
+    with it. Commands call it before opening a wallet, so a mistyped address stops there: nothing signed or sent."""
+    try:
+        return parse_address(text)
+    except AddressError as e:
+        sys.exit(f"error: {e}" + (f" (in {where})" if where else ""))
+
+
 def _kv(items: list[str]) -> dict[str, int]:
     out = {}
     for item in items or []:
         addr, _, amount = item.partition("=")
-        if not addr.startswith("vibe1") or not amount:
+        if not addr.strip() or not amount:
             sys.exit(f"expected ADDRESS=AMOUNT, got {item!r}")
-        out[addr] = to_syn(amount)
+        out[_address(addr, repr(item))] = to_syn(amount)
     return out
 
 
@@ -140,9 +149,9 @@ def _validators(items: list[str]) -> dict[str, str]:
     out = {}
     for item in items or []:
         addr, _, url = item.partition("=")
-        if not addr.startswith("vibe1") or not valid_endpoint(normalise_url(url) if url else ""):
+        if not addr.strip() or not valid_endpoint(normalise_url(url) if url else ""):
             sys.exit(f"expected ADDRESS=URL (the address other nodes reach that validator at), got {item!r}")
-        out[addr] = normalise_url(url)
+        out[_address(addr, repr(item))] = normalise_url(url)
     return out
 
 
@@ -208,7 +217,7 @@ def cmd_wallet_create(a):
     keys = mnemonic.keypair(words, _passphrase(a, confirm=True))
     pw = _new_wallet_password(a)
     wallets.save(keys, out, pw, mnemonic.PATH)
-    print(f"created {out}\naddress: {keys.address}")
+    print(f"created {out}\naddress: {checksummed(keys.address)}")
     give_words(words, keys.address, out)
     if not pw:
         print("warning: stored unencrypted", file=sys.stderr)
@@ -222,7 +231,7 @@ def cmd_wallet_restore(a):
     keys = mnemonic.keypair(mnemonic.check(_read_words()), _passphrase(a, confirm=False), a.path)
     pw = _new_wallet_password(a)
     wallets.save(keys, out, pw, a.path)
-    print(f"restored {out}\naddress: {keys.address}")
+    print(f"restored {out}\naddress: {checksummed(keys.address)}")
     if not pw:
         print("warning: stored unencrypted", file=sys.stderr)
 
@@ -231,7 +240,7 @@ def cmd_wallet_show(a):
     path = wallet_of(a)
     doc = json.loads(Path(path).read_text())
     hd = wallets.hd_path(path)
-    print(f"address: {doc['address']}\nencrypted: {'crypto' in doc}\n"
+    print(f"address: {checksummed(doc['address'])}\nencrypted: {'crypto' in doc}\n"
           f"recovery words: {f'yes (path {hd})' if hd else 'no (made before recovery words; back up the file)'}")
 
 
@@ -245,7 +254,7 @@ def cmd_genesis_create(a):
         unstaked = [v for v in g["validators"] if stake(v) < econ.MIN_STAKE]
         if unstaked:
             sys.exit(f"validators need a stake of at least {fmt(econ.MIN_STAKE)} in the genesis (--bootstrap or --stake): "
-                     f"{', '.join(unstaked)}")
+                     f"{', '.join(map(checksummed, unstaked))}")
     if a.earn_in:
         g["earn_in"] = True
     g["economics"] = econ.SCHEDULES[a.economics].to_dict()
@@ -368,7 +377,7 @@ def _mine(a, keys: KeyPair):
         low = f"stake is {fmt(acct['stake'])}; stake at least {fmt(need)} to get work"
     session = _record([w])  # the event log and a line per round, whatever's on screen (records.py)
     if not minerui.supported(a.plain):
-        print(f"worker {w.keys.address} training on {w.backend.describe()} ({hardware.describe()})")
+        print(f"worker {checksummed(w.keys.address)} training on {w.backend.describe()} ({hardware.describe()})")
         if session:
             print(session.where())
         if mining:
@@ -518,7 +527,7 @@ def cmd_setup(a):
     keys = None
     if path.exists():
         address = json.loads(path.read_text())["address"]
-        print(f"   using {path}\n   address {address}")
+        print(f"   using {path}\n   address {checksummed(address)}")
     else:
         pw = password("   Choose a wallet password: ", confirm=True)
         if pw is None:
@@ -530,7 +539,7 @@ def cmd_setup(a):
         keys = mnemonic.keypair(words)
         wallets.save(keys, path, pw, mnemonic.PATH)
         address = keys.address
-        print(f"   created {path}\n   address {address}")
+        print(f"   created {path}\n   address {checksummed(address)}")
         give_words(words, address, path, "   ")
     settings.save(wallet=str(path))
     if a.deepseek:
@@ -563,7 +572,8 @@ def cmd_setup(a):
                   "   becomes your stake; until then you get small batches of work")
         elif acct["balance"] < short + fee:
             print(f"   balance {fmt(acct['balance'])}; staking needs at least {fmt(need)}. Ask the node's operator to send\n"
-                  f"   VIBE to {address}, then run setup again (or: {prog()} stake --amount {need // SYN_PER_VIBE})")
+                  f"   VIBE to {checksummed(address)}, then run setup again "
+                  f"(or: {prog()} stake --amount {need // SYN_PER_VIBE})")
         else:
             amount = a.stake or min(acct["balance"] - fee, max(short, 10 * SYN_PER_VIBE))
             if (a.stake or unattended.interactive()) and ask(f"   Stake {fmt(amount)} now? Only cheating can cost you it.", bool(a.stake)):
@@ -643,10 +653,10 @@ def cmd_cache(a):
 
 
 def cmd_balance(a):
-    addr = a.address or json.loads(Path(wallet_of(a)).read_text())["address"]
+    addr = _address(a.address) if a.address else json.loads(Path(wallet_of(a)).read_text())["address"]
     node = NodeClient(node_of(a))
     acct = node.account(addr)
-    print(f"address:    {addr}\nbalance:    {fmt(acct['balance'])}\nstake:      {fmt(acct['stake'])}")
+    print(f"address:    {checksummed(addr)}\nbalance:    {fmt(acct['balance'])}\nstake:      {fmt(acct['stake'])}")
     if acct.get("bootstrap"):
         print(f"            of which {fmt(acct['bootstrap'])} is bootstrap stake: it votes, but can't be withdrawn")
     for amount, height in acct["unbonding"]:
@@ -668,7 +678,7 @@ def _fee_flag(p) -> None:
 
 
 def cmd_send(a):
-    _send(a, "transfer", a.to, a.amount)
+    _send(a, "transfer", _address(a.to), a.amount)  # checked before the wallet is opened: a typo stops here
 
 
 def cmd_stake(a):
@@ -747,10 +757,10 @@ def cmd_validator_list(a):
     total = sum(v["stake"] for v in vals.values() if v["votes"]) or 1
     for addr, v in sorted(vals.items(), key=lambda kv: -kv[1]["stake"]):
         share = f"{v['stake'] / total:6.1%}" if v["votes"] else "no vote (stake below the minimum)"
-        print(f"  {addr}  {fmt(v['stake']):>14}  {share}  {v['url']}")
+        print(f"  {checksummed(addr)}  {fmt(v['stake']):>14}  {share}  {v['url']}")
     c = st["consensus"]
     print(f"\nvoting on block {c['height']} (consensus round {c['round']}, {c['step']}); "
-          f"leading it: {c['proposer']} at {st.get('leader')}")
+          f"leading it: {checksummed(c['proposer'])} at {st.get('leader')}")
 
 
 # --- training a model on your own data ---------------------------------------------------
@@ -1975,9 +1985,11 @@ def parser() -> argparse.ArgumentParser:
     selftest.add_parser(sub)  # `vibehash selftest`: is this computer ready to mine, and what can it take?
 
     p = sub.add_parser("balance"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("address", nargs="?"); p.set_defaults(fn=cmd_balance)
+    p.add_argument("address", nargs="?", help="any address (default: the wallet's)"); p.set_defaults(fn=cmd_balance)
     p = sub.add_parser("send"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--to", required=True); p.add_argument("--amount", type=to_syn, required=True); p.set_defaults(fn=cmd_send)
+    p.add_argument("--to", required=True, metavar="ADDRESS", help="where to send it: an address copied from the wallet "
+                   "that owns it (vibe1...). Its capital letters are a checksum, so a mistyped one is refused")
+    p.add_argument("--amount", type=to_syn, required=True); p.set_defaults(fn=cmd_send)
     _fee_flag(p)
     for name, fn in (("stake", cmd_stake), ("unstake", cmd_unstake)):
         p = sub.add_parser(name); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)

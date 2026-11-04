@@ -23,7 +23,7 @@ import numpy as np
 from . import advice, finetune, hardware, receipts, settings, termui, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
-from .crypto import KeyPair
+from .crypto import KeyPair, checksummed, parse_address
 from .ledger import Block, Tx, canonical
 from .model import params_hash
 from .tasks import _JOB_ID, MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
@@ -131,7 +131,12 @@ class NodeClient:
         return int((self._status or self.status()).get("min_fee", 0))
 
     def send_tx(self, keys: KeyPair, kind: str, recipient: str, amount: int, memo: str = "", fee: int | None = None) -> str:
-        """`fee` defaults to the node's minimum, so a transaction always clears it."""
+        """`fee` defaults to the node's minimum, so a transaction always clears it. A transfer's recipient goes through
+        crypto.parse_address first, before anything is asked or signed: a checksummed address is sent as the ledger
+        holds it, and a mistyped one raises AddressError, so no node (one from before the relay policy included) can be
+        handed coins for an address nobody holds."""
+        if kind == "transfer":
+            recipient = parse_address(recipient)
         nonce = self.account(keys.address)["nonce"]
         tx = Tx.signed(keys, kind, recipient, amount, nonce, memo, self.chain_id, self.min_fee() if fee is None else fee)
         return self.post("/tx", tx.to_dict())["txid"]
@@ -1025,7 +1030,8 @@ class WorkerClient:
             return None
 
     def run(self, stop=None) -> None:
-        log.info("worker %s starting on %s (%s)", self.keys.address, self.backend.describe(), hardware.describe())
+        log.info("worker %s starting on %s (%s)", checksummed(self.keys.address), self.backend.describe(),
+                 hardware.describe())
         if self.deepseek:
             self.ds.sweep()
         while stop is None or not stop.is_set():

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 
 try:
@@ -212,6 +213,70 @@ class KeyPair:
 
 def address_of(pub: bytes) -> str:
     return "vibe1" + hashlib.sha256(pub).hexdigest()[:36]
+
+
+# --- addresses as people see and type them ----------------------------------------------------------------------
+# The canonical address is address_of's, all small letters: what the ledger, blocks, genesis files, wallet files, the
+# node's API and every machine-read record hold, unchanged since the first block. On top of it, the form people see
+# and copy carries a checksum in its letters' case, as Ethereum's EIP-55 does (with sha256 for keccak), so a typo is
+# caught before coins go to an address nobody holds, and the same text lowercased is the canonical address again.
+
+ADDRESS_PREFIX = "vibe1"
+ADDRESS_DIGITS = 36  # hex digits after the prefix: the first 18 bytes of sha256(the public key)
+_CANONICAL = re.compile(r"vibe1[0-9a-f]{36}")
+
+
+class AddressError(ValueError):
+    """An address a person gave that can't be used, and why, in plain words."""
+
+
+def is_canonical_address(addr) -> bool:
+    """Exactly what address_of makes: vibe1 and 36 hex digits, all small letters."""
+    return isinstance(addr, str) and _CANONICAL.fullmatch(addr) is not None
+
+
+def checksummed(addr: str) -> str:
+    """The form people see and copy. Each letter a-f of the 36 digits after vibe1 is a capital when the same nibble
+    (the i-th hex digit) of sha256(the canonical address, vibe1 included) is 8 or more; digits and the prefix stay as
+    they are. Lowercased, it's the canonical address again. Anything that isn't a canonical address ("system",
+    "burn", a recipient no key's address_of makes) comes back as it is, so it never looks like one."""
+    if not is_canonical_address(addr):
+        return addr
+    h = hashlib.sha256(addr.encode()).hexdigest()
+    n = len(ADDRESS_PREFIX)
+    return addr[:n] + "".join(c.upper() if c in "abcdef" and int(h[i], 16) >= 8 else c for i, c in enumerate(addr[n:]))
+
+
+def parse_address(text: str) -> str:
+    """An address a person typed or pasted -> the canonical form, or AddressError saying what's wrong with it.
+
+    Spaces around it are dropped, and the prefix may be in any case (a phone writes Vibe1). After it: all small letters
+    is how addresses were shown before the checksum, so it's taken unchecked, as EIP-55 takes one; any capital makes it
+    a checksummed address, whose capitals must be exactly checksummed's. All capitals counts as that too, not as
+    unchecked: Vibe Hash never writes an address that way, so waving it through would only widen what goes unchecked
+    (an address whose checksum capitalises every letter still passes, as it should)."""
+    if not isinstance(text, str) or not text.strip():
+        raise AddressError("no address given: a Vibe Hash address starts with vibe1")
+    a = text.strip()
+    n = len(ADDRESS_PREFIX)
+    if a[:n].lower() != ADDRESS_PREFIX:  # (not echoed: it may be anything, even recovery words pasted by mistake)
+        raise AddressError("that isn't a Vibe Hash address: those start with vibe1")
+    shown = "".join(c if c.isprintable() else "?" for c in (a if len(a) <= 48 else a[:24] + "…"))
+    again = "Copy it again from the wallet that owns it."
+    body = a[n:]
+    if len(body) != ADDRESS_DIGITS:
+        raise AddressError(f"{shown}: an address is vibe1 and {ADDRESS_DIGITS} more characters, but this has "
+                           f"{len(body)} after vibe1. {again}")
+    bad = next((c for c in body if c not in "0123456789abcdefABCDEF"), None)
+    if bad is not None:
+        raise AddressError(f"{shown}: after vibe1 an address has only the digits 0-9 and the letters a-f, but this has "
+                           f"{bad!r}. {again}")
+    canonical = ADDRESS_PREFIX + body.lower()
+    if body != body.lower() and ADDRESS_PREFIX + body != checksummed(canonical):
+        why = ("one of its characters is wrong (its capital letters don't match its checksum)" if body != body.upper()
+               else "it's all in capitals, which isn't how an address is written, so it can't be checked")
+        raise AddressError(f"{shown}: {why}. {again}")
+    return canonical
 
 
 # --- Merkle tree ----------------------------------------------------------

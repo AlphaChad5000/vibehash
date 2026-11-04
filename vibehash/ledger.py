@@ -27,7 +27,7 @@ import json
 from dataclasses import asdict, dataclass, field
 
 from . import economics as econ
-from .crypto import KeyPair, address_of, h256, merkle_root, verify
+from .crypto import KeyPair, address_of, h256, is_canonical_address, merkle_root, verify
 from .tasks import InvalidJob, TrainingJob
 
 DEFAULT_CHAIN_ID = "vibehash-testnet-1"
@@ -64,8 +64,9 @@ MAX_BLOCK_TX_BYTES = 2**20
 MAX_NOTE_BYTES = 256  # a transfer/stake/unstake memo does nothing on chain; it's a note (a payment reference, an
 # invoice id), and 256 bytes keeps such a tx under 1 KB.
 # Whole tx. The largest real one is a post_job: a spec of up to 4 KiB (tasks.MAX_SPEC_BYTES), which JSON escaping at
-# most triples (a 2-byte é is the 6 characters \u00e9), plus about 400 bytes of other fields. Nothing else bounds a
-# tx's recipient, or the amount on a cancel_job, which the ledger ignores.
+# most triples (a 2-byte é is the 6 characters \u00e9), plus about 400 bytes of other fields. Nothing else bounds the
+# recipient of a tx other than a transfer (a transfer's must be an address, _relayable), or the amount on a
+# cancel_job: the ledger ignores both.
 MAX_TX_BYTES = 16 * 1024
 
 
@@ -494,6 +495,13 @@ def _relayable(tx: Tx) -> None:
     id of at most 64 characters, and a validator's is empty or what valid_endpoint takes."""
     if tx.size() > MAX_TX_BYTES:
         raise InvalidBlock(f"transaction too big: nodes relay up to {MAX_TX_BYTES} bytes")
+    if tx.kind == "transfer" and not is_canonical_address(tx.recipient):
+        # The ledger takes any recipient starting vibe1 (_apply_user_tx), capitals and all, and credits that exact
+        # string. No key's address_of makes anything but vibe1 and 36 small hex digits, so coins sent to another
+        # spelling, a checksummed address included, could never be spent. Policy for now: making it a rule changes
+        # which blocks are valid, so it waits for a block version.
+        raise InvalidBlock("a transfer's recipient must be written as the ledger holds addresses (vibe1 and 36 hex "
+                           "digits in small letters): no key could ever spend coins sent to any other spelling")
     if tx.kind in ("transfer", "stake", "unstake") and len(tx.memo.encode()) > MAX_NOTE_BYTES:
         raise InvalidBlock(f"a {tx.kind} memo is a note of at most {MAX_NOTE_BYTES} bytes")
     if tx.kind == "post_job":

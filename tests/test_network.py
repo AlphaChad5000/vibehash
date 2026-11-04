@@ -282,7 +282,7 @@ class CommandLineTests(unittest.TestCase):
         with mock.patch("sys.stdin", io.StringIO()):  # no terminal: no question
             self.assertIn("All set. Start earning with", self.run_cli("setup", "--gpu", "skip"))
         out = self.run_cli("balance")
-        self.assertIn(address, out)
+        self.assertIn(f"address:    {crypto.checksummed(address)}", out)  # as people copy it, the checksum in its case
         self.assertIn("stake:      10 VIBE", out)
 
     def test_train_a_model_from_a_csv(self):
