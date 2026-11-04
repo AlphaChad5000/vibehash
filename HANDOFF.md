@@ -126,6 +126,8 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 
 ## Current state
 
+**Release 0.5.14 (2026-11-03, branch `evo-check` off `evo-v2`): Evo v2's answer checks are exact on one kind of GPU.** Honest workers' units were failing "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet), because the checker re-read answers on transformers' path at another batch size and rounded differently. Checkers now teacher-force through the answering engine, which always works 256 rows at a time; v2's margin is 0.1. Every worker on a network needs 0.5.14: the engine's rounding changed. Details under Evo v2 below.
+
 **Release 0.5.12 (2026-11-03): es2.TASKS is es_tasks.NAMES.** 0.5.11 kept rule 2's own list of three tasks, so `testnet --evo2` stopped at its fourth job (sciq) with "task is one of countdown, arithmetic, arc_easy".
 
 **Release 0.5.11 (2026-11-03): Evo mode, on local test networks.** Branches es-chain, evo-mode and evo-v2 merged.
@@ -144,7 +146,7 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
     GSM8K and ARC-Challenge stay untrained, for the progress checker;
   - measured on the owner's RTX 4070 SUPER at about 20-25 s a round and 2.3 KB a generation, the model rebuilt from the chain every round.
 - **Off the public chain:** Evo jobs need a genesis with "es": true, so the public network is unchanged and needs no upgrade for this release.
-- **Checks are loose in bf16.** The engine's answers and transformers' teacher forcing differ: an honest member's worst gap is up to about 0.375 logits, so v2's margin is 0.5. That is fine for a local network; a public one needs checks on the engine's own path or in float32.
+- **Checks are exact on one kind of GPU (0.5.14).** A checker teacher-forces answers through the engine that wrote them (`es_fast.gaps_items` → `_gaps_engine`), and the engine always passes through the model `es_fast.ROWS` = 256 rows at a time, because cuBLAS rounds a row differently depending on how many rows share the matrix product. Before this, honest workers' units failed "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet, gaps up to 1.125). Measured: 256 honest members over four tasks checked one at a time, in the same process and another, all exactly 0; so v2's margin is 0.1 (es_local.V2_SETTINGS). Still open: bf16 logits tie exactly for some multiple-choice forgeries (14 of 1,439), which no margin catches; another kind of GPU needs measuring; replay log-probabilities (`score_items`) are still scored on transformers' path at different batch sizes by worker and checker (lp_tol 0.05 has held so far).
 - **The tests (test_es, test_es2) aren't in CI's list** (they need PyTorch). The measurements behind the recipe are in the paper "The Chain Is the Model" (a Claude Doc) and in memory.
 - **Progress checker:** `scripts/evo2_progress.py` scores the models of finished jobs on fixed test questions.
 

@@ -203,12 +203,15 @@ def chain_bytes(entry) -> int:
 # The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
 # sigma 1e-3, a cosine from 4e-3 to a quarter of it over the job, replay of 16 earlier correct answers.
 V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=4e-3, lr_floor=0.25,
-                   rounds=12, replay=16, margin=0.5, lp_tol=0.05)
-# margin 0.5: answers are written in bf16 by es_fast's engine and checked by teacher forcing on transformers' path, and
-# the two round differently. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, 96 members x 16 answers): an honest
-# member's worst gap was 0.125 at the median, 0.25 at the 95th percentile, 0.375 at most. That is too loose to tell an
-# answer the model wrote from a nearby better one (the answer key's answers sat at 0.375 at the median), so it is for
-# a local network; a public one needs checks on the engine's own path or in float32 (v1's margin was 0.05, in float32).
+                   rounds=12, replay=16, margin=0.1, lp_tol=0.05)
+# margin 0.1: a checker teacher-forces answers through the engine that wrote them, in its passes of es_fast.ROWS rows,
+# so it rounds exactly as the worker did. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, a worker's 64 members x 16
+# answers on countdown, trivia_qa, commonsense_qa and sst2, each member checked alone, in the same process and in
+# another): every honest member's worst gap was exactly 0 (with transformers' path, as before, up to 0.5625, and 1.125
+# on the testnet). Answers that pay and that the model didn't write (the answer key's, or the model's with its answer
+# swapped for the key's) sat 0.125 or more below at their worst token, but for 14 of 1,439 on commonsense_qa that tie
+# exactly in bf16 (no margin tells those apart). So 0.1, under the smallest of the rest: for workers on one kind of GPU;
+# another kind rounds differently and needs measuring first.
 # lp_tol 0.05: workers and checkers score the replay answers on the same path (es_fast.score_items).
 V2_COMPUTE_S = 300
 

@@ -325,8 +325,9 @@ TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content']
 PATTERNS = es.preset("norms+biases") + ("model.layers.1.mlp.*_proj.weight",)
 
 
-def tiny_model(folder: Path, seed: int = 0) -> Path:
-    """A random two-layer Qwen2 with a byte-level tokenizer and a chat template, saved as Hugging Face saves models."""
+def tiny_model(folder: Path, seed: int = 0, **dims) -> Path:
+    """A random two-layer Qwen2 with a byte-level tokenizer and a chat template, saved as Hugging Face saves models
+    (dims: Qwen2Config sizes in place of the tiny ones)."""
     import torch
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
@@ -344,9 +345,9 @@ def tiny_model(folder: Path, seed: int = 0) -> Path:
     tok.save_pretrained(folder)
     ids = {s: tok.convert_tokens_to_ids(s) for s in specials}
     torch.manual_seed(seed)
-    config = Qwen2Config(vocab_size=len(vocab) + len(specials), hidden_size=32, intermediate_size=64,
-                         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=2048,
-                         tie_word_embeddings=True, bos_token_id=ids["<|endoftext|>"], eos_token_id=ids["<|im_end|>"])
+    sizes = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2)
+    config = Qwen2Config(vocab_size=len(vocab) + len(specials), max_position_embeddings=2048, tie_word_embeddings=True,
+                         bos_token_id=ids["<|endoftext|>"], eos_token_id=ids["<|im_end|>"], **(sizes | dims))
     model = Qwen2ForCausalLM(config)
     with torch.no_grad():  # norms away from 1 and biases away from 0, so nudging them matters
         for name, p in model.named_parameters():
