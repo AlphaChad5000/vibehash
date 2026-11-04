@@ -129,8 +129,15 @@ class Chatter:
         """The rival's reply and the fine-tune's, to the same message. The rival is the base model told the goal,
         as in the judge's headline score, or the base model as it comes for a request queued without one."""
         tuned = self.say(job, message)
-        told = [{"role": "system", "content": judge.PROMPTED.format(goal=goal)}, {"role": "user", "content": message}]
+        told = [{"role": "system", "content": judge.told(goal, self.decline(job))}, {"role": "user", "content": message}]
         return self.say(None, told if goal else message, self.base), tuned
+
+    def decline(self, job: str) -> str | None:
+        """A narrow goal's decline sentence from its plan, so the rival in the chat is told it as in the judging."""
+        try:
+            return (json.loads((self.jobs / f"{job}.plan.json").read_text(encoding="utf-8")).get("scope") or {}).get("decline") or None
+        except (OSError, ValueError):
+            return None
 
     def load(self, base: str) -> None:
         if base == self.base:

@@ -132,7 +132,7 @@ def check(plan: dict) -> list[str]:
     examples = plan.get("examples") or []
     if len(examples) < 40:
         problems.append(f"only {len(examples)} examples; need at least 40")
-    if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples):
+    if textless(examples):
         problems.append("an example is missing its user or assistant text")
     if not isinstance(plan.get("caveat", ""), str):
         problems.append("caveat isn't a string")
@@ -165,9 +165,13 @@ def ruled(rules, scope, examples: list) -> list[str]:
     return []
 
 
-def norm(text) -> str:
-    """Text as a duplicate check sees it: case, punctuation and spacing don't make two prompts different."""
-    return " ".join(re.sub(r"[^\w\s]", " ", str(text).lower()).split())
+norm = checks.norm
+
+
+def textless(examples: list) -> bool:
+    """Whether any example lacks a user or assistant string: the model can write a number or a list there."""
+    return any(not isinstance(e, dict) or not isinstance(e.get("user"), str) or not e["user"].strip()
+               or not isinstance(e.get("assistant"), str) or not e["assistant"].strip() for e in examples)
 
 
 def leaked(examples: list, prompts: list) -> list[str]:
@@ -297,7 +301,8 @@ def audit(plan: dict) -> dict:
     on_task = [e for e in plan["examples"] if not (decline and declines(e.get("assistant"), decline))]
     step = max(1, len(on_task) // AUDIT_SAMPLE)
     sample = on_task[::step][:AUDIT_SAMPLE]  # spread over the list, so one topic's cluster can't hide the rest
-    shown = "\n\n".join(f"Chat {i + 1}\nUser: {e['user'][:1500]}\nReply: {e['assistant'][:1500]}" for i, e in enumerate(sample))
+    shown = "\n\n".join(f"Chat {i + 1}\nUser: {str(e['user'])[:1500]}\nReply: {str(e['assistant'])[:1500]}"
+                         for i, e in enumerate(sample))
     ask = [{"role": "system", "content": AUDIT}, {"role": "user", "content": f"Goal: {plan['goal']}\n\n{shown}"}]
     try:
         got = chat_json(ask)
@@ -330,9 +335,10 @@ def plan_job(goal: str, log=print) -> dict:
                         ". Rewrite those and any like them"]
         log("plan rejected:\n  " + "\n  ".join(problems))
         plan = chat_json([{"role": "system", "content": SYSTEM}, {"role": "user", "content": goal},
-                          {"role": "assistant", "content": json.dumps(plan)},
+                          {"role": "assistant", "content": json.dumps({k: v for k, v in plan.items() if k not in ("audit", "goal")})},
                           {"role": "user", "content": "Fix these and reply with the whole JSON again:\n" + "\n".join(problems)}])
         plan["goal"] = goal  # the rewrite is a fresh object from the model
+        plan.pop("audit", None)  # ...whose chats haven't been audited, whatever it echoed
     if problems := check(plan):
         raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
     if "audit" not in plan:
@@ -364,7 +370,7 @@ def more(plan: dict, log=print) -> list[dict]:
     # wrote no long ones at all, twice. Shown a dozen with the long ones up front, it writes both kinds.
     by_length = sorted(plan["examples"], key=lambda e: -len(str(e.get("user", ""))))
     sample = by_length[:6] + by_length[6::max(1, (len(by_length) - 6) // 6)][:6]
-    shown = "\n\n".join(f"User: {e['user'][:1200]}\nAssistant: {e['assistant'][:1200]}" for e in sample)
+    shown = "\n\n".join(f"User: {str(e['user'])[:1200]}\nAssistant: {str(e['assistant'])[:1200]}" for e in sample)
     decline = narrow(plan.get("scope"))
     rules = ", ".join(checks.name(r) for r in plan.get("checks") or [])
     ask = [{"role": "system", "content": MORE}, {"role": "user", "content": f"Goal: {plan['goal']}\n" + (
@@ -378,11 +384,12 @@ def more(plan: dict, log=print) -> list[dict]:
         except Exception as e:
             log(f"no second batch of chats ({e}); training on the first")
             return []
-        examples = [e for e in batch.get("examples") or [] if isinstance(e, dict) and e.get("user") not in seen]
+        tests = {norm(p) for p in plan["eval_prompts"] + (plan.get("off_scope_prompts") or [])}
+        examples = [e for e in batch.get("examples") or [] if isinstance(e, dict) and e.get("user") not in seen
+                    and norm(e.get("user")) not in tests]
         # it repeats about a quarter of the questions it's shown; those are dropped, so ask for 40 and take 20 up
         problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
-                   (["an example is missing its user or assistant text"]
-                    if any(not e.get("user") or not e.get("assistant") for e in examples) else []) + \
+                   (["an example is missing its user or assistant text"] if textless(examples) else []) + \
                    [p for p in mixed(examples, [], 0.3) if "eval prompts" not in p] + \
                    templated(plan["examples"] + examples, decline) + scoped(plan.get("scope"), examples, ["x" * LONG] * OFF_PROMPTS, 0.5) + \
                    ruled(plan.get("checks"), plan.get("scope"), examples)
@@ -446,8 +453,7 @@ def repair(plan: dict, graded: dict) -> dict:
         off = [p for p in fix.get("off_scope_prompts") or [] if isinstance(p, str) and norm(p) not in seen] \
             if decline else []
         problems = ([f"only {len(examples)} examples; need at least 20"] if len(examples) < 20 else []) + \
-                   (["an example is missing its user or assistant text"]
-                    if any(not isinstance(e, dict) or not e.get("user") or not e.get("assistant") for e in examples) else []) + \
+                   (["an example is missing its user or assistant text"] if textless(examples) else []) + \
                    ([f"only {len(prompts)} new eval prompts; need at least 15"] if len(prompts) < 15 else []) + \
                    mixed(examples, prompts, 0.5) + templated(plan["examples"] + examples, decline) + \
                    scoped(plan.get("scope"), examples, off, 0.5) + leaked(examples, prompts + off) + \

@@ -33,6 +33,12 @@ from models import chat_prompt, source
 
 
 PROMPTED = "Follow this instruction in every reply: {goal}"
+
+
+def told(goal: str, decline: str | None = None) -> str:
+    """The rival's instruction: the goal, and for a narrow goal the decline sentence too, so it's measured against
+    the same sentence the fine-tune learned rather than one it was never shown."""
+    return PROMPTED.format(goal=goal) + (f" If a message isn't that kind of input, reply exactly: {decline}" if decline else "")
 # A second judge reads every pair against the base model told the goal, the headline rival: Muse Spark wrote the
 # training chats and judges them too, which may favour the fine-tune. How often the two judges agree is reported.
 # By default a newer Muse Spark on the same cheaper Contributor tier: another version, not another family, so its
@@ -46,13 +52,9 @@ def wants_json(goal: str) -> bool:
 
 
 def is_json(reply: str) -> bool:
-    """A reply that is one JSON object and nothing else: no ``` fences, no prose before or after, no empty values.
-    For a goal that asks for JSON, this is a score code measures, beside the judge's."""
-    try:
-        value = json.loads(reply.strip())
-    except ValueError:
-        return False
-    return isinstance(value, dict) and bool(value) and all(v not in ("", None, [], {}) for v in value.values())
+    """A reply that is one JSON object and nothing else (checks.py's json rule), for a goal that asks for JSON but
+    whose plan predates the rules."""
+    return checks.passes({"check": "json"}, reply)
 
 
 def structure(pairs: list[dict], goal: str) -> dict | None:
@@ -67,13 +69,14 @@ def structure(pairs: list[dict], goal: str) -> dict | None:
 OFF = "off"  # the Job Architect's off-task prompts for a narrow goal (architect.scoped): the model should decline
 
 
-def norm(text) -> str:
-    return " ".join(re.sub(r"[^\w\s]", " ", str(text).lower()).split())
+norm = checks.norm
 
 
 def scope(pairs: list[dict], decline: str | None) -> dict | None:
     """For a narrow goal: the share of each model's replies to the off-task prompts that are the decline sentence,
-    measured by code. A model that turns "what's the weather" into a formula scores 0 here, whatever its style."""
+    measured by code. The fine-tune learned the sentence; the rival told the goal was told it too (told()); the
+    untrained model knows neither, so its share is the floor. A model that turns "what's the weather" into a
+    formula scores 0 here, whatever its style."""
     off = [p for p in pairs if p.get("set") == OFF]
     if not decline or not off:
         return None
@@ -88,7 +91,7 @@ def chance(wins: int, losses: int) -> float:
     n = wins + losses
     if not n:
         return 1.0
-    return round(sum(math.comb(n, k) for k in range(wins, n + 1)) / 2 ** n, 6)
+    return float(f"{sum(math.comb(n, k) for k in range(wins, n + 1)) / 2 ** n:.3g}")
 
 
 def fixed(name: str) -> list[str]:
@@ -186,10 +189,10 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
            [(f["prompt"], FRESH, f["level"]) for f in spec.get(FRESH, [])]
     prompts = [p for p, _, _ in sets]
     base = [reply(tok, model, p, room(p)) for p in prompts]
-    told = {"role": "system", "content": PROMPTED.format(goal=spec["goal"])}
+    told_ = {"role": "system", "content": told(spec["goal"], (spec.get("scope") or {}).get("decline"))}
     # The prompted rival and the fine-tune are timed: telling a model the goal means sending it with every message,
     # which the fine-tune doesn't need. Same base model, same GPU, so the difference is the goal riding along.
-    prompted_runs = [timed(tok, model, [told, {"role": "user", "content": p}], room(p)) for p in prompts]
+    prompted_runs = [timed(tok, model, [told_, {"role": "user", "content": p}], room(p)) for p in prompts]
     tuned_model = PeftModel.from_pretrained(model, str(adapter_dir))  # the same weights plus the LoRA adapter
     tuned_runs = [timed(tok, tuned_model, p, room(p)) for p in prompts]
     prompted, tuned = [r[0] for r in prompted_runs], [r[0] for r in tuned_runs]
@@ -301,6 +304,9 @@ def grade(answers_file: Path, on_verdict=None) -> None:
     exempt = (lambda reply: norm(decline) in norm(reply or "")) if decline else None  # a decline breaks no rule
     for p in on_task:  # what the fine-tune's reply broke, for the repair loop and the page
         p["fails"] = checks.failed(rules, p.get("tuned"), exempt)
+    for p in data["pairs"]:  # an off-task prompt it didn't decline is a miss too, whatever the judge made of it
+        if p.get("set") == OFF and decline:
+            p["fails"] = [] if exempt(p.get("tuned")) else ["decline (an off-task message)"]
     if scored := checks.score(rules, on_task, exempt=exempt):
         data["summary"]["checks"] = scored
     if declined := scope(data["pairs"], decline):

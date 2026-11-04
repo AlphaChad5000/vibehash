@@ -15,6 +15,11 @@ _BULLET = re.compile(r"^\s*([-*•]|\d+[.)])\s+", re.M)
 _MARKDOWN = re.compile(r"(\*\*|__|^#{1,6}\s|```)", re.M)
 
 
+def norm(text) -> str:
+    """Text as a duplicate or decline check sees it: case, punctuation and spacing don't make two texts differ."""
+    return " ".join(re.sub(r"[^\w\s]", " ", str(text).lower()).split())
+
+
 def _json(reply: str):
     try:
         value = json.loads(reply.strip())
