@@ -242,6 +242,7 @@ class Node:
         for t in self.threads:
             t.join(timeout=30)
         self.peers.close()
+        self.store.close()
         self.folder.release()
 
     def close(self) -> None:
@@ -249,7 +250,6 @@ class Node:
         self.server.server_close()
         self.store.close()
         self.folder.release()
-        self.store.close()
 
     def _role(self) -> str:
         if not self.bft:
