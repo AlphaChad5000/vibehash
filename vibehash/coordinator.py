@@ -41,6 +41,7 @@ import dataclasses
 import functools
 import json
 import itertools
+import logging
 import os
 import threading
 import time
@@ -55,6 +56,7 @@ from . import deepseek_rounds as dsr
 from . import dispute as dg
 from . import economics as econ
 from . import es
+from . import es2, es2_rounds
 from . import fees
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
@@ -80,6 +82,8 @@ from .verification import (
 )
 from .wire import WireError, blob_openings_in, commitment_out
 from .worker import HardwareProfile, Worker
+
+log = logging.getLogger("vibehash.node")
 
 # Records say which rules made them, and a replay follows the record's version, so every round still replays exactly as
 # it was run. 1 (0.4.0-0.5.1): the beacon, who checks whom, task ids and canaries all came from public data. 2: they
@@ -465,8 +469,23 @@ class Coordinator:
         if job_id not in self.params:
             saved = self.store.load_params(job_id) if self.store else None
             job = self.job(job_id)
+            if job.es and job.spec.rule == es2.RULE2:
+                saved = self._es2_rebuilt(job, saved)
             self.params[job_id] = saved if saved is not None else job.spec.init_params(job.init_seed)
         return self.params[job_id]
+
+    def _es2_rebuilt(self, job: TrainingJob, saved):
+        """A rule-2 Evo job's state (es2.py: its hash chain and control words, 24 numbers) worked out from the chain's
+        blocks and this node's records of them (es2_rounds.rebuild_chain), each round checked against its block. A
+        restart, or a node that didn't lead the job's last round, gets it this way; the saved copy only if that fails."""
+        if self.store is None or not hasattr(self.store, "load_record"):
+            return saved
+        try:
+            state, _, _ = es2_rounds.rebuild_chain(self.chain.blocks, self.store.load_record, job.job_id, job.spec)
+        except (ValueError, KeyError, TypeError) as e:
+            log.warning("couldn't rebuild Evo job %s's state from the chain: %s", job.job_id, e)
+            return saved
+        return state
 
     def _summaries(self, lookback: int | None = LOOKBACK):
         """Round summaries on chain, newest first."""
@@ -721,7 +740,19 @@ class Coordinator:
             # (below), and a record from before this has none: rule 1, which is recorded as it was, without one.
             if self.config.finetune_check != 1:
                 self.r.record["rules"]["finetune_check"] = self.config.finetune_check
-        if job.es:  # its seed (start_compute), the level its problems are at, and the update (_settle_es)
+        if job.es and job.spec.rule == es2.RULE2:  # its step, its fitness (start_compute: its seed; _settle_es2)
+            got = (self.replaying or {}).get("es", {})
+            if start is not None:
+                ctrl = es2.ctrl_of(start)
+                step = int(ctrl[2])
+                fitness = "replay" if job.spec.replay and ctrl[3] > 0 else "binary"
+                if self.replaying and (got.get("step"), got.get("fitness")) != (step, fitness):
+                    raise ProtocolError("the record's step or fitness isn't the one the round's starting state holds")
+            else:
+                step, fitness = got.get("step"), got.get("fitness")
+            self.r.record |= {"version": ES_RECORD_VERSION,
+                              "es": {"rule": es2.RULE2, "task": job.spec.task, "step": step, "fitness": fitness}}
+        elif job.es:  # its seed (start_compute), the level its problems are at, and the update (_settle_es)
             level = es.level_of(start) if start is not None else (self.replaying or {}).get("es", {}).get("level")
             if self.replaying and level != self.replaying.get("es", {}).get("level"):
                 raise ProtocolError("the record's level isn't the one the round's starting state holds")
@@ -995,6 +1026,8 @@ class Coordinator:
         unit = r.units[rv.unit_id]
         if rv.unit_id in r.prep:
             return self._prep_reveal(job, key, rv, wire, commitment)
+        if r.es and job.spec.rule == es2.RULE2:
+            return self._es2_reveal(job, key, rv, wire, commitment)
         if r.es:
             return self._es_reveal(job, key, rv, wire, commitment)
         r.record["reveals"].append(wire if wire is not None else
@@ -1084,6 +1117,46 @@ class Coordinator:
                                else "its answers aren't a unit's, in shape")
         r.reveals[key] = rv
         r.es_claims[key] = (answers, rewards)
+        return None
+
+    def _es2_reveal(self, job: TrainingJob, key, rv: Reveal, wire: dict | None, raw: bytes | None) -> Verdict | None:
+        """A rule-2 Evo claim's reveal (es2_rounds.py): the answers blob, each member's right/wrong score and, when the
+        round scores members on replay targets, its mean replay log-probability, all bound by the commitment's root.
+        The node re-scores every answer from the blob (es2_rounds.rescore, the task's own check, no model): scores
+        that aren't the answers' are fraud, slashed. The log-probabilities are the checkers' to recompute."""
+        r, spec = self.r, job.spec
+        d = (wire or {}).get("es") or {}
+        r.record["reveals"].append(wire if wire is not None else
+                                   {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": rv.merkle_root.hex(),
+                                    "salt": rv.salt.hex(), "es": d})
+        rewards, lps, answers = d.get("rewards"), d.get("lps"), d.get("answers")
+        want_lps = r.record["es"]["fitness"] == "replay"
+        if (not check_reveal(r.commitments[key], rv) or not isinstance(answers, str) or len(answers) != 64
+                or not es2_rounds.shaped_claim(spec, rewards, lps, want_lps)
+                or rv.merkle_root != es2_rounds.claim_root(answers, rewards, lps)):
+            return self._fraud(key, Verdict.BAD_REVEAL, "reveal doesn't match commitment")
+        rewards = [[float(a), float(b)] for a, b in rewards]
+        lps = None if lps is None else [[float(a), float(b)] for a, b in lps]
+        parsed = None
+
+        def checks() -> str:
+            nonlocal parsed
+            if raw is None:
+                if self.replaying:
+                    raise ValueError("the answers aren't here")
+                return "missing"
+            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id)
+            return "bad_answers" if parsed is None else "ok" if parsed[0] == rewards else "wrong_rewards"
+        outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
+        if outcome == "missing":
+            r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None, "its answers never arrived")
+            return None
+        if outcome != "ok":
+            return self._fraud(key, Verdict.BAD_REVEAL, "its rewards aren't its answers' scores" if outcome == "wrong_rewards"
+                               else "its answers aren't a unit's, in shape")
+        r.reveals[key] = rv
+        # (answers blob, rewards, lps, (answer ids, right or wrong) per member: the node's own reading, live only)
+        r.es_claims[key] = (answers, rewards, lps, None if parsed is None else (parsed[1], parsed[2]))
         return None
 
     def prep(self, job: TrainingJob):
@@ -1346,8 +1419,12 @@ class Coordinator:
         return {tasks[i].task_id: tasks[i] for i in draw.shuffle(range(len(tasks)))}
 
     def es_task(self, t: VerifyTask) -> dict:
-        """What a checker needs for an ES task besides its unit: the claim's answers blob and rewards, and the level."""
-        answers, rewards = self.r.es_claims[(t.unit.unit_id, t.submitter)]
+        """What a checker needs for an ES task besides its unit: the claim's answers blob and rewards, and the level
+        (rule 1), or the claim's replay log-probabilities and the round's seed (rule 2)."""
+        claim = self.r.es_claims[(t.unit.unit_id, t.submitter)]
+        if self.r.record["es"].get("rule") == es2.RULE2:
+            return {"answers": claim[0], "rewards": claim[1], "lps": claim[2], "seed": self.r.record["es"]["seed"]}
+        answers, rewards = claim
         return {"answers": answers, "rewards": rewards, "level": self.r.record["es"]["level"]}
 
     def _prep_tasks(self, job: TrainingJob, draw: Draw, pool, task_id) -> dict[str, VerifyTask]:
@@ -2059,6 +2136,8 @@ class Coordinator:
         job = self.job(r.job_id)
         if job.sharded:
             return self._settle_teams(proposer)
+        if r.es and job.spec.rule == es2.RULE2:
+            return self._settle_es2(proposer)
         if r.es:
             return self._settle_es(proposer)
         if r.v4:
@@ -2320,6 +2399,104 @@ class Coordinator:
             model_hash = average()
             r.record["checks"]["model"]["params_hash"] = model_hash
         else:  # a replay without it: the record's (es.rebuild_chain works the states out from the chain itself)
+            model_hash = self._claim("model", "params_hash", average)
+        r.record["secret"] = r.secret.hex()
+        summary = RoundSummary(
+            job_id=r.job_id,
+            accepted_units=len(units),
+            worker_flops=dict(sorted(worker_flops.items())),
+            verifier_flops={a: f for a, f in sorted(verifier_flops.items()) if a not in offenders},
+            slashes=r.slashes,
+            accepted=sorted(worker_flops),
+            missed=sorted(missed | r.forfeit | {res.worker for res in r.results.values() if res.verdict == Verdict.MISSED_DEADLINE}),
+            params_hash=model_hash,
+            proposer=proposer,
+            record_hash=h256(canonical(r.record)).hex(),
+        )
+        return summary, new_params, worker_flops
+
+    def _settle_es2(self, proposer: str):
+        """A rule-2 Evo round's settlement (es2.py). Claims are accepted, left unchecked or slashed as in rule 1
+        (_settle_es). The accepted claims' members, in pair order, give the pair coefficients (es2.coefficients: z of
+        their replay log-probabilities when the round scores them, else of their right/wrong scores), the step's scale
+        is the cosine's lr over the members counted, and the round's targets are each problem's most common correct
+        answer among the accepted members' (es2.replay_targets, from the node's own reading of their blobs; a replay
+        takes the record's). The entry (es2.entry) moves the state's hash chain on (es2.step_state): the node keeps no
+        weights, and the summary's params_hash is the new state's, worked out here and again by any replay that has the
+        state the round started from (es_states)."""
+        r = self.r
+        job = self.job(r.job_id)
+        spec = job.spec
+        verifier_flops: dict[str, int] = defaultdict(int)
+        missed: set[str] = set()
+        answered = defaultdict(list)
+        for t in r.tasks.values():
+            if t.verdict is None:
+                if t.verifier:
+                    missed.add(t.verifier)
+                continue
+            if t.verdict[0]:
+                verifier_flops[t.verifier] += spec.check_flops()
+            answered[(t.unit.unit_id, t.submitter)].append(t)
+        for key in sorted(r.reveals):
+            if key in r.results:
+                continue
+            got = answered[key]
+            if any(not t.verdict[0] for t in got):
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None,
+                                            "a checker found an answer that isn't its model's greedy choice, or a "
+                                            "replay log-probability off (not refereed yet: unpaid, out of the update)")
+            elif got:
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.ACCEPTED, got[0].verifier)
+            else:
+                r.results[key] = UnitResult(r.units[key[0]], key[1], Verdict.UNCHECKED, None, "no checker answered for it")
+        offenders = {s[0] for s in r.slashes} | r.forfeit
+        worker_flops: dict[str, int] = defaultdict(int)
+        rows, units, readings = [], set(), []
+        for key, res in sorted(r.results.items()):
+            if res.verdict != Verdict.ACCEPTED or key[1] in offenders:
+                continue
+            unit = r.units[key[0]]
+            worker_flops[key[1]] += unit.flops
+            units.add(key[0])
+            _, rewards, lps, reading = r.es_claims[key]
+            readings.append(reading)
+            for k, (rp, rm) in enumerate(rewards):
+                rows.append((unit.index * spec.pairs_per_unit + k, rp, rm, None if lps is None else lps[k]))
+        rows.sort(key=lambda u: u[0])
+        seed = int(r.record["es"]["seed"], 16)
+        mean = None
+        if rows:
+            binary = [x for _, rp, rm, _ in rows for x in (rp, rm)]
+            use_lps = r.record["es"]["fitness"] == "replay" and all(lp is not None for *_, lp in rows)
+            lp = [x for *_, pair in rows for x in pair] if use_lps else None
+            coefs, used = es2.coefficients(binary, lp)
+            scale = es2.lr_at(spec, int(r.record["es"]["step"])) / len(binary)
+            if self.replaying:  # the node's reading of the blobs isn't in a replay: the record's targets
+                targets = (self.replaying.get("es") or {}).get("targets") or []
+            else:
+                answers = [a for rd in readings if rd is not None for a in rd[0]]
+                ok = [o for rd in readings if rd is not None for o in rd[1]]
+                targets = es2.replay_targets(spec.problems, answers, ok)
+            ent = es2.entry(seed, [[j, c] for (j, *_), c in zip(rows, coefs)], scale, targets)
+            mean = es.mean_reward(binary)
+            r.record["es"] |= {"used": used, "update": ent["update"], "scale": ent["scale"],
+                               "targets": ent["targets"], "reward": mean}
+            r.record["score"] = [1.0 - mean, mean]
+        else:
+            ent = None
+            r.record["es"]["update"] = []
+        new_params = None
+
+        def average() -> str:
+            nonlocal new_params
+            self._weights(r.start)
+            new_params = r.start if ent is None else es2.step_state(r.start, ent, mean)
+            return params_hash(new_params).hex()
+        if r.start is not None:  # live, or a replay given the starting state: worked out, never read from the record
+            model_hash = average()
+            r.record["checks"]["model"]["params_hash"] = model_hash
+        else:  # a replay without it: the record's (es2_rounds.rebuild_chain works the states out from the chain itself)
             model_hash = self._claim("model", "params_hash", average)
         r.record["secret"] = r.secret.hex()
         summary = RoundSummary(

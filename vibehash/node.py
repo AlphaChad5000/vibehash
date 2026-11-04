@@ -589,7 +589,10 @@ class Node:
         a round's update out again (Coordinator.es_states), else None."""
         have = self.coord.params.get(job_id)
         if have is None:
-            have = self.store.load_params(job_id)
+            try:  # (a rule-2 Evo job's is worked out from the chain: Coordinator.start_params)
+                have = self.coord.start_params(job_id)
+            except Exception:  # noqa: BLE001
+                have = self.store.load_params(job_id)
         return have if have is not None and params_hash(have) == start_hash else None
 
     def _latest_round(self, job_id: str) -> int:
@@ -600,6 +603,11 @@ class Node:
         fetching them from a peer if not. They're checked against the hash the chain holds."""
         c, job = self.coord, self.chain.state.job(job_id)
         want = c.expected_start_hash(job)
+        if job.es and job.spec.rule == 2:  # a rule-2 Evo job's state is worked out from the chain, never fetched
+            with c.lock:
+                if params_hash(c.start_params(job_id)) != want:
+                    c.params.pop(job_id, None)  # behind the chain: worked out again
+                return params_hash(c.start_params(job_id)) == want
         have = self.store.load_params(job_id)
         if params_hash(have if have is not None else job.spec.init_params(job.init_seed)) == want:
             return True
@@ -853,8 +861,9 @@ class Node:
                 if r.prep:  # a DeepSeek prep round: which unit of the work graph each is, and what its inputs must be
                     out["prep"] = {u.unit_id: r.prep[u.unit_id] for u in units}
                     out["want"] = c.prep(job).want()
-                if r.es:  # an ES round's problems are at the level its starting state holds (each unit's seed: the round's)
-                    out["es"] = {"level": r.record["es"]["level"]}
+                if r.es:  # an ES round's problems are at the level its starting state holds (each unit's seed: the round's);
+                    # a rule-2 round's (es2.py): its step and fitness instead
+                    out["es"] = {k: r.record["es"][k] for k in ("level", "step", "fitness") if k in r.record["es"]}
                 return out
             if kind == "commit":
                 cm = commitment_in(body["commitment"])
@@ -903,7 +912,9 @@ class Node:
                 try:
                     root, salt = bytes.fromhex(d["merkle_root"]), bytes.fromhex(d["salt"])
                     answers, rewards = check_id(d["es"]["answers"]), d["es"]["rewards"]
-                    if len(root) != 32 or len(salt) > 64 or not isinstance(rewards, list) or len(rewards) > 4096:
+                    lps = d["es"].get("lps")  # a rule-2 claim's replay log-probabilities (es2_rounds.py), or null
+                    if (len(root) != 32 or len(salt) > 64 or not isinstance(rewards, list) or len(rewards) > 4096
+                            or not (lps is None or isinstance(lps, list) and len(lps) <= 4096)):
                         raise WireError("more in it than a reveal has")
                     rv = Reveal(str(d["unit_id"]), str(d["worker"]), root, salt, None, {})
                 except (KeyError, TypeError, ValueError, AttributeError) as e:
@@ -912,7 +923,7 @@ class Node:
                     raise ProtocolError("can only reveal for yourself")
                 raw = self.blobs.path(answers).read_bytes() if self.blobs.has(answers) else None
                 wire = {"unit_id": rv.unit_id, "worker": rv.worker, "merkle_root": root.hex(), "salt": salt.hex(),
-                        "es": {"answers": answers, "rewards": rewards}}
+                        "es": {"answers": answers, "rewards": rewards, **({"lps": lps} if job.spec.rule == 2 else {})}}
                 verdict = c.reveal(rv, wire=wire, commitment=raw)
                 return {"ok": verdict is None, "verdict": verdict.value if verdict else "pending", "receipt": self._receipt(kind, wire)}
             if kind == "reveal":

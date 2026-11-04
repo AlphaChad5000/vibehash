@@ -173,7 +173,8 @@ class TrainingJob:
     def _from_es(cls, d: dict, requester: str, budget: int) -> "TrainingJob":
         if set(d) - ES_KEYS:
             raise InvalidJob(f"an ES job's spec has no field {sorted(set(d) - ES_KEYS)[0]!r}")
-        spec = EsSpec.from_json(d)
+        from . import es2
+        spec = es2.Spec2.from_json(d) if es2.is_v2(d) else EsSpec.from_json(d)  # rule 2 (es2.py) or rule 1
         # The fields an ES job doesn't use are fixed, so the code every job shares reads sense: a unit is one step of
         # one segment, the whole of the unit's members answering every problem.
         return cls(job_id=d["id"], requester=requester, budget=budget, fee_per_round=int(d["fee_per_round"]), spec=spec,
