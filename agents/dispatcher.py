@@ -212,8 +212,10 @@ def run(site, req: dict, a) -> None:
     while len(results) <= RIGOR[rigor]["repairs"] and not good_enough(results[-1], rigor) and not plan.get("caveat"):
         n = len(results) + 1
         if n > 2 and progress(results[-1], rigor) <= progress(results[-2], rigor):
-            site.report(rid, "training", f"round {n - 1} did no better than round {n - 2}, so no more repairs: "
-                                         f"more of the same chats won't get it to the bar")
+            before, after = parts(results[-2], rigor), parts(results[-1], rigor)
+            moved = ", ".join(f"{k} {before[k]:.0%} → {after[k]:.0%}" for k in after)
+            site.report(rid, "training", f"round {n - 1} did no better than round {n - 2} overall ({moved}), so no "
+                                         f"more repairs: more of the same chats won't get it to the bar")
             break
         site.report(rid, "training", f"round {n}: the Job Architect is writing chats aimed at the prompts it lost")
         graded = json.loads((out / f"{plan['job_id']}.eval.answers.graded.json").read_text())
@@ -282,13 +284,23 @@ def good_enough(result: dict, rigor: str) -> bool:
     return not RIGOR[rigor]["check"] or not j.get("check") or wins(j["check"]) / j["check"]["prompts"] >= CHECK_BAR
 
 
-def progress(result: dict, rigor: str) -> float:
-    """How close a round got to the bar, to tell whether a repair helped."""
+def parts(result: dict, rigor: str) -> dict:
+    """Each share the bar is measured on, by name: wins against the rival, and when the run has them, the check
+    prompts (strict only), the rules passed and the off-task messages declined."""
     j = result["judge"]
-    check = wins(j["check"]) / j["check"]["prompts"] if RIGOR[rigor]["check"] and j.get("check") else 0
-    scope = j["scope"]["tuned"] if j.get("scope") else 0
-    rules = j["checks"]["all"]["tuned"] if j.get("checks") else 0
-    return wins(j) / j["prompts"] + check + scope + rules
+    out = {"wins": wins(j) / j["prompts"]}
+    if RIGOR[rigor]["check"] and j.get("check"):
+        out["check prompts"] = wins(j["check"]) / j["check"]["prompts"]
+    if j.get("checks"):
+        out["rules passed"] = j["checks"]["all"]["tuned"]
+    if j.get("scope"):
+        out["declined"] = j["scope"]["tuned"]
+    return out
+
+
+def progress(result: dict, rigor: str) -> float:
+    """How close a round got to the bar, all its parts together, to tell whether a repair helped."""
+    return sum(parts(result, rigor).values())
 
 
 def round_(site, rid: str, plan: dict, chats: Path, evals: Path, out: Path, title: str, round_no: int) -> dict:
