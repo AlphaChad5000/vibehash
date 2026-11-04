@@ -90,6 +90,16 @@ def _deepseek() -> list[list[str]] | None:
     return [["worker", "--deepseek", "yes"]] if _yes("Mine it?") else None
 
 
+def _evo() -> list[list[str]] | None:
+    print("Evo Hash: mining by evolution, the chain is the model. It runs a test network on this computer, a node and\n"
+          "two miners, that trains Qwen2.5-0.5B-Instruct by evolution strategies on one task after another (Countdown\n"
+          "puzzles, arithmetic, science questions): each round tries 128 nudged copies of the whole model in twin pairs,\n"
+          "and its block keeps only their seeds and scores, about 2 KB from which anyone can work the model out again.\n"
+          "It needs a graphics card with PyTorch (Install GPU support) and `pip install vibehash[evo]`. The model comes\n"
+          "from your Hugging Face cache, or is downloaded once (about 1 GB). Ctrl+C stops it; running it again carries on.")
+    return [["testnet", "--evo2"]] if _yes("Start it?") else None
+
+
 def _cancel() -> list[list[str]] | None:
     return [["cancel-job"]] if _yes("Cancel your last training job?") else None
 
@@ -130,6 +140,8 @@ MORE = (
 SECTIONS = [
     ("Mine", [
         Item("Start mining", "earn VIBE with this computer", ("worker",)),
+        Item("Evo Hash", "mine by evolution: the chain is the model (on this computer)", ask=_evo,
+             usage="testnet --evo2"),
         Item("My balance", "what you've earned and staked", ("balance",)),
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
         Item("Check this computer", "a real training test: is it ready, what can it take", ("selftest",)),

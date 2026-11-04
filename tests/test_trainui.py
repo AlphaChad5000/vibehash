@@ -562,5 +562,160 @@ class CommandTests(unittest.TestCase):
         self.assertIn("has no job called no-such-job", str(e.exception.code))
 
 
+# --- an Evo job (es.py): its chain and reward by generation (esui.py) ------------------------------------------------
+
+EVO = "evo-1"
+
+
+def evo_spec_json():
+    from tests.test_minerui import evo_job
+    import json
+    return json.loads(evo_job(EVO).spec_json())
+
+
+def evo_record(i):
+    """Generation i+1's record entry: its reward climbing, its level up one after the fourth, the sixth empty."""
+    m = 0.18 + 0.03 * i
+    update = [] if i == 5 else [[j, round(min(1.0, m + 0.03 * (j % 3 - 1)), 5), round(max(0.0, m - 0.02 * (j % 2)), 5)]
+                                for j in range(8)]
+    return {"es": {"rule": 1, "level": 2 + (i >= 4), "seed": f"{i:016x}", "update": update}}
+
+
+class EvoNode(FakeNode):
+    """A node with an Evo job: its blocks (one a round, the job's every other one) and their records."""
+
+    def __init__(self, sealed=0, escrow=None, st=None):
+        super().__init__(None, st)
+        self.sealed = sealed  # the job's rounds sealed so far
+        self.escrow = escrow
+        self.turn = EVO  # the job whose round is open
+
+    @property
+    def tip(self):
+        return 2 * self.sealed + 1
+
+    def get(self, path):
+        self.calls.append(path)
+        if self.down is not None:
+            raise self.down
+        if path == "/status":
+            return {**self.status, "height": self.tip, "round": self.tip + 1, "job_id": self.turn}
+        if path == f"/job/{EVO}":
+            rounds = [{"height": 2 * i + 2, "accepted_units": 4, "val_loss": 1 - m, "val_acc": m}
+                      for i in range(self.sealed) for m in [esui.parse_generation(1, 0, evo_record(i)).mean] if m is not None]
+            return {"spec": evo_spec_json(), "owner": "vibe1requester", "rounds": rounds,
+                    "escrow": (500 - self.sealed) * VIBE if self.escrow is None else self.escrow}
+        m = re.fullmatch(r"/blocks\?from=(\d+)&to=(\d+)", path)
+        if m:
+            return [{"height": h, "summary": {"job_id": EVO if h % 2 == 0 else "other"} if h > 1 else None}
+                    for h in range(int(m[1]), min(int(m[2]), self.tip) + 1)]
+        m = re.fullmatch(r"/round/(\d+)/record", path)
+        if m and int(m[1]) % 2 == 0:
+            return evo_record(int(m[1]) // 2 - 1)
+        raise NodeError(f"GET {path}: not found", 404)
+
+
+from vibehash import esui  # noqa: E402
+
+
+class EvoTests(unittest.TestCase):
+    def watch(self, node, polls=1, **kw):
+        w = trainui.JobWatch(EVO, node.url, budget=500 * VIBE, posted=True, api=node, **kw)
+        for _ in range(polls):
+            w._job_at = 0
+            w.poll()
+        return w
+
+    def test_an_evo_job_is_followed_a_generation_at_a_time(self):
+        node = EvoNode(sealed=3)
+        w = self.watch(node)
+        self.assertEqual(w.job.es, trainui.EsFacts(pairs=8, problems=32, n=13_074_432, level=2))
+        self.assertEqual([x.height for x in w.lineage.gens], [2, 4, 6])  # caught up on, not announced
+        said = [t for _, _, t in w.events]
+        self.assertFalse(any("generation" in t for t in said), said)
+        self.assertIn(f"{EVO} so far: 3 rounds trained, reward", said[0])
+        for sealed in (4, 5, 6, 7):
+            node.sealed = sealed
+            w._job_at = 0
+            w.poll()
+        said = [t for _, _, t in w.events]
+        hatched = [t for t in said if "hatched" in t or "no pair accepted" in t]
+        self.assertEqual(len(hatched), 4, said)
+        self.assertIn("generation 4 hatched in block 8: reward", hatched[0])
+        self.assertIn("generation 6 sealed in block 12: no pair accepted, the model stays as it was", hatched[2])
+        self.assertTrue(any("difficulty up to level 3: 3 numbers 1-20 with + - *" in t for t in said), said)
+        self.assertFalse(any("accuracy" in t for t in said), said)  # an Evo job's score is its reward
+        self.assertIs(w.lineage.landed[1], w.lineage.gens[-1])
+        summary = w.summary()
+        self.assertIn("mean reward", summary)
+        self.assertIn(f"its 7 generations put {esui.size(w.lineage.bytes)} of seeds and scores on the chain", summary)
+        blocks = [c for c in node.calls if c.startswith("/blocks")]
+        self.assertEqual(len(blocks), 5)  # one a poll that found the chain longer
+        node.down = BUSY  # the lineage's reads fail with the rest: backed off, nothing lost
+        self.assertGreater(w.poll(), trainui.POLL_S)
+        self.assertEqual(len(w.lineage.gens), 7)
+
+    def test_only_an_evo_spec_is_read_as_one(self):
+        self.assertIsNone(trainui.parse_job(job_reply(3)).es)
+        self.assertIsNone(trainui.parse_job({"spec": {**evo_spec_json(), "lora": {"rank": 16}}}).es)
+        self.assertIsNone(trainui.parse_job({"spec": {"es": "yes", "model": {}}}).es)
+        odd = {**evo_spec_json(), "es": {"pairs": -3, "problems": "many", "n": 1e400, "level": 99}}
+        self.assertEqual(trainui.parse_job({"spec": odd}).es, trainui.EsFacts())
+
+    def evo_states(self):
+        out = []
+        node = EvoNode(sealed=5)
+        w = self.watch(node)
+        node.sealed = 6
+        w._job_at = 0
+        w.poll()  # a generation lands while watched: it hatches in the open block
+        out.append(("training, hatching", w))
+        out.append(("training, checking", self.watch(EvoNode(sealed=7, st=status(phase="verify")))))
+        out.append(("training, revealing", self.watch(EvoNode(sealed=7, st={**status(phase="reveal"), "progress": [3, 4]}))))
+        node = EvoNode(sealed=4)
+        node.turn = "other"
+        out.append(("another job's turn", self.watch(node, polls=2)))
+        out.append(("pending (an Evo hint)", self.watch(EvoNode(st=status(job_id="nobody")), evo=True, polls=0)))
+        out.append(("finished", self.watch(EvoNode(sealed=9, escrow=0))))
+        node = EvoNode(sealed=200)
+        out.append(("many generations", self.watch(node)))
+        w = self.watch(EvoNode(sealed=3))
+        w.api.down = UNREACHABLE
+        w.poll()
+        out.append(("node unreachable", w))
+        return out
+
+    def test_every_evo_frame_fits_the_terminal(self):
+        for name, watch in self.evo_states():
+            for size in ((40, 20), (66, 34), (120, 50), (200, 60)):
+                for ascii in (False, True):
+                    with self.subTest(state=name, size=size, ascii=ascii):
+                        dash = trainui.TrainDashboard(watch)
+                        dash.g, dash.eg = (trainui.ASCII, esui.ASCII) if ascii else (trainui.GLYPHS, esui.GLYPHS)
+                        for frame in frames(dash, size):
+                            lines = frame.split("\n")
+                            self.assertLessEqual(len(lines), size[1])
+                            for line in lines:
+                                self.assertLessEqual(len(ESCAPE.sub("", line)), size[0], line)
+                            if ascii:
+                                ESCAPE.sub("", frame).encode("ascii")
+
+    def test_shows_reward_by_generation_levels_and_bytes(self):
+        w = self.watch(EvoNode(sealed=7))
+        dash = trainui.TrainDashboard(w)
+        dash.g, dash.eg = trainui.GLYPHS, esui.GLYPHS
+        text = ESCAPE.sub("", frames(dash, (120, 50))[-1])
+        gens = w.lineage.gens
+        last = gens[-1]
+        for want in ("Evo mode: training by evolution", "Qwen/Qwen2.5-0.5B-Instruct", "generation 8", "g7 L3",
+                     "g5 ▲3", esui.size(last.bytes), f"reward {last.mean:.1%}", "level 3", "after generation 7",
+                     "level 2", "chain ", "gen 1", f"{esui.size(w.lineage.bytes)} on chain",
+                     "nudged copies are answering its puzzles", "your job's turn", "incubating"):
+            self.assertIn(want, text)
+        for gone in ("accuracy", "loss", "units accepted"):
+            self.assertNotIn(gone, text)
+        self.assertNotIn("╔══════╗", text_of(watching(FakeNode(job_reply(4))), (120, 50)))  # other jobs: the forge
+
+
 if __name__ == "__main__":
     unittest.main()

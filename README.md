@@ -293,6 +293,32 @@ self-tests it. `vibehash devices` shows what's usable. Workers use the first
 GPU they find; `--device cpu|cuda|cuda:1|xpu|mps` overrides it. One worker uses
 one GPU: for more, see "Several GPUs" above.
 
+## Evo mode: training by evolution, the chain is the model
+
+Evo jobs train a model by evolution strategies. Each round, miners answer puzzles with
+slightly twisted copies of the model, and a block keeps only the twists' seeds and how
+they scored. Every node works the model out from those, so the trained model is a
+function of the chain: about 2 KB a round, no weight files.
+
+Evo mode runs on a local test network for now; the public network doesn't take Evo jobs
+yet. It needs a GPU with PyTorch (`vibehash install-gpu`) and `pip install vibehash[evo]`.
+
+```
+vibehash testnet --evo2
+```
+
+This is Evo Hash ([white paper](docs/evo-hash.pdf); also in the menu: run `vibehash` and pick it under Mine). It runs a node
+and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another,
+19 of them, then round again: Countdown puzzles and arithmetic, made up as it goes, and
+science, commonsense, word-problem math, trivia, sentiment, news and emotion questions from
+16 public datasets (downloaded once, about 1 GB, each pinned to one version so every
+computer reads the same questions). Each job is
+short, because evolution makes most of its gains on a task in the first dozen rounds, and
+each starts where the last one ended, so the model keeps what every task taught it. The
+dashboard shows each generation incubating in the open block. `--evo2-rounds N` sets a
+job's length (default 12). `vibehash testnet --evo` is the first, simpler version: one layer
+of the model, Countdown only.
+
 ## Logs and records
 
 What a worker or a job poster does is also kept in files, so a night of

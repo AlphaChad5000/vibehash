@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibehash"
-version = "0.5.10"
+version = "0.5.14"
 description = "Vibe Hash: earn VIBE by training AI models on everyday computers (testnet)"
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,9 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.26", "cryptography>=42"]
 # Posting a fine-tune reads chats with the model's own tokenizer and chat template. Workers don't need these; they
 # need PyTorch, whose right build `vibehash install-gpu` picks for the GPU.
-optional-dependencies = {finetune = ["tokenizers>=0.15", "jinja2>=3.1"]}
+# Evo mode (`testnet --evo`, `testnet --evo2`) runs the model with transformers (and PyTorch, which `vibehash
+# install-gpu` installs); its ARC-Easy science questions come through datasets.
+optional-dependencies = {finetune = ["tokenizers>=0.15", "jinja2>=3.1"], evo = ["transformers>=4.50", "datasets>=2.18"]}
 keywords = ["proof-of-useful-work", "distributed-training", "cryptocurrency", "testnet"]
 classifiers = [
     "Development Status :: 3 - Alpha",

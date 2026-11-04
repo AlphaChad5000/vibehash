@@ -38,6 +38,11 @@ UNBONDING_ROUNDS = 20  # unstaked coins stay slashable this long
 VALIDATOR = "validator "  # genesis memo naming a validator: "validator <url>"
 ECONOMICS_MEMO = "economics:"  # a genesis tx with this memo fixes the network's issuance schedule
 EARN_IN = "earn-in"  # genesis memo: workers may start with no stake and earn it (see State.earn_in)
+# Genesis memo: the chain takes evolution-strategies jobs (es.py), a prototype. Only a chain made with it (a local testnet,
+# a test) can hold one, so no block of any other chain changes meaning, and a node from before ES jobs, which reads an ES
+# spec as a malformed MLP's, can't be on such a chain by mistake: it refuses the block that posts one. A public rollout
+# would take a block version instead, as fine-tunes did (FINETUNE_VERSION).
+ES_GATE = "es-prototype"
 BOOTSTRAP = "bootstrap"  # genesis memo: stake that votes but can never be withdrawn (see State.locked)
 # The block version build_block makes. A chain's versions never go down, and a node refuses versions it doesn't know.
 #   1: the original rules (0.5.1 and before).
@@ -261,6 +266,7 @@ class State:
     # Earn-in: anyone may take work without stake, and their pay goes into their stake until it reaches the
     # minimum, so every spendable coin starts from work. Set by the genesis; older chains don't have it.
     earn_in: bool = False
+    es: bool = False  # the chain takes ES jobs (ES_GATE): set by the genesis; no other chain has it
     genesis: int = 0
     minted: int = 0
     burned: int = 0
@@ -437,6 +443,9 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
             raise InvalidBlock(str(e)) from e
         if job.finetune and version < FINETUNE_VERSION:
             raise InvalidBlock(f"a fine-tune can be posted only in a block of version {FINETUNE_VERSION} or later")
+        if job.es and not s.es:
+            raise InvalidBlock("an evolution-strategies job is a prototype: only a chain whose genesis takes them "
+                               '("es": true) can hold one')
         if job.job_id in s.jobs:
             raise InvalidBlock("job id already used")
         s._debit(tx.sender, tx.amount)
@@ -617,6 +626,10 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
                 if tx.amount or tx.recipient != SYSTEM:
                     raise InvalidBlock("the earn-in rule can't move coins")
                 s.earn_in = True
+            elif tx.memo == ES_GATE:
+                if tx.amount or tx.recipient != SYSTEM:
+                    raise InvalidBlock("the ES rule can't move coins")
+                s.es = True
             elif tx.memo.startswith(ECONOMICS_MEMO):
                 s.economics = _economics_of(tx)
             else:
@@ -680,7 +693,8 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
 class Chain:
     def __init__(self, allocations: dict[str, int], stakes: dict[str, int] | None = None,
                  chain_id: str = DEFAULT_CHAIN_ID, genesis_time: int = 0, economics: econ.Economics | None = None,
-                 validators: dict[str, str] | None = None, bootstrap: dict[str, int] | None = None, earn_in: bool = False):
+                 validators: dict[str, str] | None = None, bootstrap: dict[str, int] | None = None, earn_in: bool = False,
+                 es: bool = False):
         """`bootstrap`: stake for the first validators that votes but can never be withdrawn or spent. `earn_in`:
         workers may start with no stake and earn it. Genesis files without them keep their genesis hash."""
         self.chain_id = chain_id
@@ -690,6 +704,7 @@ class Chain:
         txs += [Tx("genesis", SYSTEM, a, 0, memo=VALIDATOR + url, chain_id=chain_id) for a, url in sorted((validators or {}).items())]
         txs += [Tx("genesis", SYSTEM, a, v, memo=BOOTSTRAP, chain_id=chain_id) for a, v in sorted((bootstrap or {}).items())]
         txs += [Tx("genesis", SYSTEM, SYSTEM, 0, memo=EARN_IN, chain_id=chain_id)] if earn_in else []
+        txs += [Tx("genesis", SYSTEM, SYSTEM, 0, memo=ES_GATE, chain_id=chain_id)] if es else []  # (es.py)
         genesis = Block(0, b"\x00" * 32, genesis_time, None, txs, chain_id)
         self.state = apply_block(State(), genesis, chain_id, None)
         self.blocks: list[Block] = [genesis]
@@ -699,7 +714,8 @@ class Chain:
         return cls({k: int(v) for k, v in g["allocations"].items()}, {k: int(v) for k, v in g.get("stakes", {}).items()},
                    g["chain_id"], int(g.get("timestamp", 0)), econ.Economics.from_genesis(g),
                    {k: str(v) for k, v in g.get("validators", {}).items()},
-                   {k: int(v) for k, v in g.get("bootstrap", {}).items()}, bool(g.get("earn_in", False)))
+                   {k: int(v) for k, v in g.get("bootstrap", {}).items()}, bool(g.get("earn_in", False)),
+                   bool(g.get("es", False)))
 
     @property
     def tip(self) -> Block:

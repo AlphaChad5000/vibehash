@@ -40,6 +40,9 @@ PHASES = {"register": rgb(120, 170, 255, True), "compute": rgb(255, 180, 60, Tru
 BANNER = ["█ █ █ █▄▄ █▀▀   █ █ ▄▀█ █▀ █ █",
           "▀▄▀ █ █▄█ ██▄   █▀█ █▀█ ▄█ █▀█"]
 BANNER_COLORS = [(255, 205, 60), (255, 150, 70), (255, 95, 150), (180, 110, 255)]  # gold to violet, left to right
+EVO_BANNER = ["█▀▀ █ █ █▀█   █ █ ▄▀█ █▀ █ █",  # Evo mode's: EVO HASH, in the Evo scene's lime to teal
+              "██▄ ▀▄▀ █▄█   █▀█ █▀█ ▄█ █▀█"]
+EVO_COLORS = [(215, 255, 160), (130, 235, 150), (64, 210, 186), (80, 170, 230)]
 # The glyphs both scenes draw with; each dashboard adds its own. ASCII has the same keys, for terminals without Unicode.
 GLYPHS = {"shades": "█▓▒", "ore": "♦", "full": "█", "top": "▄", "bottom": "▀", "tips": "►»>", "sparks": "*+·'`",
           "coin": "●", "bar": "█", "empty": "░", "post": "║", "beam": "═", "lamp": "¤", "more": "…"}
@@ -140,14 +143,16 @@ def glyphs_for(unicode: dict, ascii: dict) -> dict:
     return unicode if can_encode("".join(unicode.values()) + "".join(BANNER)) else ascii
 
 
-def header(add, g: dict, ascii: dict, tails: list[str]) -> None:
-    """The VIBE HASH banner in its gold-to-violet gradient, each line followed by a tail (dim); one line in ASCII."""
+def header(add, g: dict, ascii: dict, tails: list[str], evo: bool = False) -> None:
+    """The VIBE HASH banner in its gold-to-violet gradient (EVO HASH in lime to teal for Evo mode), each line followed
+    by a tail (dim); one line in ASCII."""
+    banner, colors = (EVO_BANNER, EVO_COLORS) if evo else (BANNER, BANNER_COLORS)
     if g is not ascii:
-        for text, tail in zip(BANNER, tails):
-            segs = [(ch, rgb(*BANNER_COLORS[min(3, j * 4 // len(text))], True)) for j, ch in enumerate(text)]
+        for text, tail in zip(banner, tails):
+            segs = [(ch, rgb(*colors[min(3, j * 4 // len(text))], True)) for j, ch in enumerate(text)]
             add(*segs, ("   ", None), (tail, DIM))
     else:
-        add(("VIBE HASH", WHITE), ("   ", None), (tails[0], DIM))
+        add(("EVO HASH" if evo else "VIBE HASH", WHITE), ("   ", None), (tails[0], DIM))
 
 
 def parse_progress(v) -> tuple[int, int] | None:

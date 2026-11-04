@@ -78,6 +78,10 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `emblems.py` | Pixel-art emblems (at most 18×10, two pixels a cell in half blocks) of DeepSeek, Meta, Qwen, Gemma, OpenAI, Microsoft, Mistral and Hugging Face, by model family (`FAMILIES`: an organisation and the start of the model's name, so Google's T5 or Meta's Prompt-Guard don't get Gemma's star or Llama's loop); a generic gem for anything else (Z.ai's GLM too). `scripts/preview_forge.py NAME` plays a made-up job so you can see one. |
 | `catalog.py` | The model picker: 17 popular open-weight models (`CATALOG`, short name → Hugging Face repo, smallest first), their facts from `Hub.describe` cached a day in `~/.vibehash/cache/models.json`, and "what it takes" (`team`: GPUs of 12/24/32 GB holding the weights as stored, whole layers each, a quarter of each card kept free; DEEPSEEK.md §2's 40/20/14). `ready`: an architecture `llm.py` trains and one 12 GB card holds it (qwen3-0.6b, llama-3.2-1b, smollm3-3b, qwen3-4b today). `vibehash models` and `train --base` print it; `train DATA --base` fine-tunes a ready one (`cli._finetune`) and shows the pre-flight for the rest. |
 | `shards.py` | Sharded units: a model split into shards across a team of workers, each cell (shard × segment) checked holding only that shard, and signed edge messages. The coordinator runs sharded jobs in-process (teams, cell tasks, edge evidence, per-shard pay and averaging, record version 3; `simulate.py --shards N`). Nodes don't yet (`Coordinator.runs_teams` is off, `waiting` says why), and there's no worker-to-worker transport. See `SHARDING.md`. |
+| `es.py` | **Evolution strategies on the chain (prototype, branch `es-chain`): the model is a pure function of the chain.** A round is one ES step: antithetic seed pairs, greedy answers to Countdown problems, scores; the node works the update out with `step` and a fresh node gets the same bits with `rebuild`/`rebuild_chain` (no GPU, no weight files). The state is how far training moved the perturbed tensors from the pinned base (`delta`), the optimiser's moments and control words (level, steps). Pinned: `noise` (Philox raw words, Box-Muller with the module's own ln/sin/cos in exactly rounded ops), `step`'s order (z-scores; sgd, momentum or Adam in float64; float32 once), `problem` (built solvable from a seed with `crypto.Draw`), `reward` (fractions; binary or partial), `LEVELS` and the retarget rule. `EsSpec` (spec field `es`; tensors by glob pattern, `PRESETS`), `Group` (several members' weights in one batch), `generate` (greedy), `gaps`/`check` (teacher forcing: each token the greedy choice within `margin`), `rescore` (what the node checks every reward with). `cache_noise` for processes that play several parts. Tests: `tests/test_es.py`. |
+| `es_client.py` | A worker's ES rounds (from `client.py`): the round's state rebuilt from the chain's records (each block's `params_hash` checked), else fetched; answering units, uploading the answers blob and committing to it and the rewards; checking others' sampled members. `cheat` (tests only): `liar`, `forger`. A local network's base is looked for in the Hugging Face cache first (`es_local.find_base`). |
+| `es_local.py` | Evo mode's wiring (branch `evo-mode`): `find` (a model's folder, or a Hugging Face model from the local cache, else downloaded), `manifest` (es_local_run's stand-in), `spec_for` (the measured run's settings, `SETTINGS`, the last layer's MLP; tensors from the config on the meta device), `job`, `accepts` (a genesis with `"es": true`), `chain_bytes` (a round's ES entry, canonical JSON), `find_base` (a worker's: looks, never downloads). |
+| `esui.py` | The Evo scene both dashboards show for an Evo job: sealed blocks joined by links, each with a hatchling and a bar of its generation's mean reward, its level (an arrow when it moved) and its bytes on chain; the open block incubating the round's twin pairs by phase (laid, growing, cracking, checked), hatching and locking into the chain when sealed. `Lineage` follows a job's generations from `/blocks` and `/round/<h>/record`, read defensively. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 `tests/` (`test_core.py`, `test_network.py`, `test_gpu.py`), `docs/guide.html`
@@ -121,6 +125,80 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Release 0.5.14 (2026-11-03, branch `evo-check` off `evo-v2`): Evo v2's answer checks are exact on one kind of GPU.** Honest workers' units were failing "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet), because the checker re-read answers on transformers' path at another batch size and rounded differently. Checkers now teacher-force through the answering engine, which always works 256 rows at a time; v2's margin is 0.1. Every worker on a network needs 0.5.14: the engine's rounding changed. Details under Evo v2 below.
+
+**Release 0.5.12 (2026-11-03): es2.TASKS is es_tasks.NAMES.** 0.5.11 kept rule 2's own list of three tasks, so `testnet --evo2` stopped at its fourth job (sciq) with "task is one of countdown, arithmetic, arc_easy".
+
+**Release 0.5.11 (2026-11-03): Evo mode, on local test networks.** Branches es-chain, evo-mode and evo-v2 merged.
+- **`testnet --evo`** is ES rule 1: one layer's MLP, Countdown.
+- **`testnet --evo2`** is ES rule 2 (es2.py, es2_rounds.py, es_fast.py, es_tasks.py):
+  - rank-1 twists of all 168 projections (357.8M weights), shared prompts, the fast engine, and replay-log-probability fitness;
+  - a node that keeps a hash chain instead of weights;
+  - short jobs of 12 rounds, one task after another, each starting from the last job's whole change at full weight. Cycle 1 of
+    the owner's run showed the gains come in a task's first ~10 rounds and the rest add little, and cycle 2 (from the
+    mean of cycle 1's three jobs) started below where Countdown had got to: a mean keeps a third of each job's change;
+  - the menu's Evo Hash item (under Mine) runs it, and its screens say EVO HASH in lime to teal;
+  - 19 tasks (es_tasks.NAMES): countdown, arithmetic, arc_easy and 16 HubTasks from Hugging Face datasets pinned at a
+    commit (sciq, svamp, trivia_qa, commonsense_qa, sst2, openbookqa, asdiv, nq_open, winogrande, ag_news, qasc,
+    aqua_rat, web_questions, hellaswag, emotion, boolq). Letters for multiple choice, numbers for math, SQuAD-normalised
+    matches against the accepted answers for trivia. Their base rates on Qwen2.5-0.5B weren't measured first;
+    GSM8K and ARC-Challenge stay untrained, for the progress checker;
+  - measured on the owner's RTX 4070 SUPER at about 20-25 s a round and 2.3 KB a generation, the model rebuilt from the chain every round.
+- **Off the public chain:** Evo jobs need a genesis with "es": true, so the public network is unchanged and needs no upgrade for this release.
+- **Checks are exact on one kind of GPU (0.5.14).** A checker teacher-forces answers through the engine that wrote them (`es_fast.gaps_items` → `_gaps_engine`), and the engine always passes through the model `es_fast.ROWS` = 256 rows at a time, because cuBLAS rounds a row differently depending on how many rows share the matrix product. Before this, honest workers' units failed "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet, gaps up to 1.125). Measured: 256 honest members over four tasks checked one at a time, in the same process and another, all exactly 0; so v2's margin is 0.1 (es_local.V2_SETTINGS). Still open: bf16 logits tie exactly for some multiple-choice forgeries (14 of 1,439), which no margin catches; another kind of GPU needs measuring; replay log-probabilities (`score_items`) are still scored on transformers' path at different batch sizes by worker and checker (lp_tol 0.05 has held so far).
+- **The tests (test_es, test_es2) aren't in CI's list** (they need PyTorch). The measurements behind the recipe are in the paper "The Chain Is the Model" (a Claude Doc) and in memory.
+- **Progress checker:** `scripts/evo2_progress.py` scores the models of finished jobs on fixed test questions.
+
+**Branch `es-chain` (2026-11-03, merged in 0.5.11): evolution strategies on the chain, the blockchain becomes the AI.** The
+owner's idea: train with ES so a round's learning step is only seeds and scores in the block, and every node computes
+the update with deterministic arithmetic, so the weights are a pure function of the chain (code map, `es.py`). A
+prototype `es` job kind, on chains whose genesis says `"es": true` only (`ledger.ES_GATE`), record version 5. Real run on
+the RTX 4070 SUPER, local testnet, a node and two in-process workers sharing the GPU: Qwen2.5-0.5B-Instruct, layer 23's
+MLP perturbed (13,074,432 numbers), σ 1e-3, sgd with the paper's step (alpha = σ²/2), 8 antithetic pairs, 32 problems
+a round, 64 tokens, starting at level 2 with retarget (every 2 rounds toward 0.5), 20 rounds, ~44 s a round. Held-out
+pass@1 (200 problems a level, greedy): level 0 41% → 70%, level 1 28% → 59.5%, level 2 18.5% → 25%, level 6 (four
+numbers) 4% → 3%. On held-out problems never seen in training (level 0's space is small: 164 of its 200 had come up):
+level 0 39.8% → 71.0% (93 problems), level 1 27.0% → 58.5%, level 2 17.5% → 25.5%. A fresh rebuild from the chain's
+blocks and records alone matched the final params_hash bit for bit (20 rounds, 315 s on the CPU); both workers rebuilt
+every round's state from the chain and never downloaded it. Generation: 713 tokens/s (49 short answers a second) in
+batches of 128. The same run with Adam (lr 1e-4, not tuned) learned less: 59%, 47%, 23.5% and 4% at those levels, its
+rebuild matching too. Compared with the WSL vLLM run (all 494M weights, 256 tokens, a reasoning prompt, 4 numbers: 4.1% →
+6.5%), this perturbs 2.6% of the weights and gains nothing at four numbers; its gains are where retargeting put the
+training, near half solved. `python scripts/es_local_run.py MODEL_DIR OUT_DIR` repeats the run (its defaults are the
+sgd run's). What's left: es.py's docstring, "Not built yet".
+
+**Branch `evo-mode` (2026-11-03, from `es-chain`, not merged): Evo mode, the switch and its own dashboards.** People see
+ES jobs as "Evo" jobs ("Evo mode: training by evolution, the chain is the model"); the code keeps `es`.
+- `vibehash testnet --evo [--evo-model MODEL]`: a local network (default folder `~/.vibehash/testnet-evo`) whose genesis
+  has `"es": true` and stakes its eight worker wallets 10 VIBE each (an ES job's work only goes to staked workers, and an
+  Evo network has nothing else to earn stake on), posting `evo-1`, `evo-2`... with the measured run's settings at 1 VIBE
+  a round. The model (Qwen/Qwen2.5-0.5B-Instruct by default) comes from the Hugging Face cache or is downloaded once,
+  before anything is made; `evo.json` in the folder remembers it, so running it again without the switch carries on as
+  an Evo network. The node takes jobs up to 512 MB. `--plain` prints each sealed generation's level, reward and bytes.
+  Plain `testnet` is unchanged (an existing folder made without Evo refuses `--evo`).
+- `vibehash train --evo [--base MODEL] [--budget] [--fee]`: reads the node's `/genesis` first, and on a chain without
+  `"es": true` (today's public one) stops with one line, before a model is looked for or a wallet opened. Otherwise it
+  shows the plan, asks, posts, and follows the job on the training dashboard.
+- The menu's Mine section has "Evo Hash" (`testnet --evo2`, asked first; 0.5.11 replaced Train's "Try Evo mode (local)"). The mining selector marks Evo
+  jobs "(Evo)" (from the jobs the workers have loaded: no requests). A `vibehash worker` on its own takes a local
+  network's Evo job if its Hugging Face cache has the base at the pinned commit (`es_local.find_base`), with no switch.
+- Dashboards: an Evo job gets the block-and-chain scene (esui.py) in a green and teal palette, the owner's design ("actual
+  block and chains, then the mining process is incubating something inside the block"). Mining: generation, population
+  (and the rigs' share), puzzles a round, the round's level (from the worker's state) and the retarget rule, mean reward
+  and best, bytes for the last generation and all of them, and how often the model was rebuilt from the chain or
+  fetched. Training: reward by generation as the chart, the level row (where it moved), the chain-bytes row, bytes on
+  chain in the rounds line; events say each generation as it's sealed. Every other job's frames are byte for byte as
+  before (checked against HEAD's code on a frozen clock). No node field was added: blocks and round records were enough.
+- ES-path fixes on the worker: its round log now counts an Evo round's units accepted (it noted no `_unit_flops`, so
+  every Evo line said 0), and its activity and log lines say "Evo". No ES arithmetic, record, consensus or other job's
+  behaviour changed.
+- Tested: `tests/test_minerui.py` and `tests/test_trainui.py` (every Evo frame fits 40/66/120 columns, ASCII, the hatch
+  and lock, the lineage read defensively), `tests/test_menu.py`, `tests/test_es.py` `EvoModeTests` (`train --evo`
+  refused by a real node without ES jobs with nothing spent, posting on one, the cache lookup, `testnet --evo` end to
+  end on the CPU with the tiny model and carrying on, the chain rebuilding the state). Run on the CPU with the tiny
+  model only: the real model wasn't run in Evo mode (the GPU was busy with experiments), and Qwen2.5-0.5B-Instruct isn't
+  in this PC's Hugging Face cache yet, so the first `testnet --evo` downloads it (about 1 GB).
 
 **0.5.10's checks, run before release on the owner's PC:** one real Qwen3-0.6B segment (64 tokens, batch 8) trained on the
 RTX 4070 SUPER and replayed on the CPU: rule 1 refuses it, rule 2 (adam_reproduces) takes it; round 7280's two real
