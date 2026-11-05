@@ -801,11 +801,13 @@ class Coordinator:
             raise ProtocolError(f"stake at least {econ.MIN_STAKE} syn to take work")
         if not (0 < flops_per_sec < 1e18 and 0 < memory_mb < 1e9):
             raise ProtocolError("implausible hardware report")
-        # The hardware class rides in the signed body, so it is in the record and every replay sees the same one.
-        # Only the canonical form is taken: a free-text card name would be a leaderboard anyone could troll.
+        # The hardware class rides in the signed body, so it is in the record and every replay sees the same one. It is
+        # counted here, never judged: refusing one would be a consensus rule, and a record sealed by a node that didn't
+        # look at it must still replay. The node refuses a non-canonical class at its door instead (Node.handle), so a
+        # made-up card never reaches a record; one that did (an older leader's) counts as no class at all.
         klass = envelope["body"].get("hardware") if envelope else None
-        if klass is not None and not hardware.valid_class(klass):
-            raise ProtocolError("implausible hardware report")
+        if not hardware.valid_class(klass):
+            klass = None
         staked = self.chain.state.staked
         if not staked(addr) and sum(not staked(a) for a in r.regs) >= self.config.max_newcomers:
             raise ProtocolError("this round has all the workers without stake it takes; try the next one")

@@ -3,7 +3,7 @@ record keeps, and /network counts the classes without naming anyone."""
 import unittest
 
 from vibehash import compute, hardware, netstats
-from vibehash.coordinator import Phase, ProtocolError
+from vibehash.coordinator import Phase
 
 from tests.test_record_v2 import network
 
@@ -22,6 +22,11 @@ class HardwareClassTests(unittest.TestCase):
         self.assertEqual(hardware.short_label("Intel(R) Arc(TM) A770 Graphics"), "Arc A770")
         self.assertEqual(hardware.short_label(""), "GPU")
         self.assertLessEqual(len(hardware.short_label("x" * 200)), hardware.MAX_LABEL)
+
+    def test_a_rocm_arch_loses_its_feature_flags(self):
+        for flags in ("gfx1100:sramecc+:xnack-", "gfx1100:xnack+", "gfx1100"):
+            self.assertEqual(hardware._canonical("amd", flags, 24, "AMD Radeon RX 7900 XTX"),
+                             {"vendor": "amd", "arch": "gfx1100", "memory_gb": 24, "label": "RX 7900 XTX"})
 
     def test_only_the_canonical_form_is_valid(self):
         good = {"vendor": "nvidia", "arch": "sm_89", "memory_gb": 8, "label": "RTX 4060"}
@@ -72,9 +77,10 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(entry["body"]["hardware"], klass)  # in the record, as signed
         self.register(proto, w2, None)  # an older worker says nothing: still registered
         self.assertIsNone(c.r.regs[w2.address].hardware)
-        with self.assertRaises(ProtocolError):
-            self.register(proto, w3, {"vendor": "nvidia", "arch": "sm_89", "memory_gb": 8, "label": "RTX 9090 Ti!!"})
-        self.assertNotIn(w3.address, c.r.regs)
+        # A made-up card: the node refuses it at the door (tests/test_dos.py), and the coordinator, which replays
+        # records sealed by nodes of every version, counts it as no class rather than refusing the round
+        self.register(proto, w3, {"vendor": "nvidia", "arch": "sm_89", "memory_gb": 8, "label": "RTX 9090 Ti!!"})
+        self.assertIsNone(c.r.regs[w3.address].hardware)
         self.assertEqual(c.phase, Phase.REGISTER)
 
     def test_a_round_with_classes_replays(self):

@@ -423,9 +423,7 @@ def _chosen_job(api: NodeClient, job: str, url: str) -> None:
 
 
 def cmd_devices(a):
-    from .compute import TorchBackend, list_devices, self_test, torch_available
-
-    from .compute import NumpyBackend
+    from .compute import NumpyBackend, TorchBackend, list_devices, self_test, torch_available
 
     found = []
     for d in list_devices():

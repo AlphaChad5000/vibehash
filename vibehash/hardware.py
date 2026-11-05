@@ -63,7 +63,7 @@ VENDORS = ("nvidia", "amd", "intel", "apple", "cpu")
 MAX_LABEL, MAX_ARCH, MAX_MEMORY_GB = 40, 16, 4096
 LABEL_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .+-/")
 ARCH_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
-_NOISE = ("NVIDIA", "GeForce", "AMD", "Radeon", "Intel(R)", "Intel", "(R)", "(TM)", "Graphics", "Arc(TM)", "Corporation")
+_NOISE = ("NVIDIA", "GeForce", "AMD", "Radeon", "Intel", "Graphics", "Corporation")  # "(R)" and "(TM)" go first
 
 
 def short_label(name: str) -> str:
@@ -117,7 +117,8 @@ def _apple_chip() -> str:
 
 
 def _canonical(vendor: str, arch: str, memory_gb: float, label: str) -> dict:
-    arch = "".join(ch for ch in str(arch).lower() if ch in ARCH_CHARS)[:MAX_ARCH] or "unknown"
+    # ROCm names an arch with its feature flags, "gfx1100:sramecc+:xnack-": the same card, whatever its flags
+    arch = "".join(ch for ch in str(arch).split(":")[0].lower() if ch in ARCH_CHARS)[:MAX_ARCH] or "unknown"
     return {"vendor": vendor if vendor in VENDORS else "cpu", "arch": arch,
             "memory_gb": int(min(max(round(memory_gb), 0), MAX_MEMORY_GB)), "label": short_label(label)}
 

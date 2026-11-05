@@ -146,5 +146,5 @@ def census(rounds: list[dict], now: float) -> dict:
         if is_online:
             c["online"] += 1
             vendors[key[0]] = vendors.get(key[0], 0) + 1
-    ordered = sorted(classes.values(), key=lambda c: (-c["online"], -c["day"], str(c["label"]), c["memory_gb"] or 0))
+    ordered = sorted(classes.values(), key=lambda c: (-c["online"], -c["day"], c["label"], c["memory_gb"]))
     return {"online": online, "day": day, "reported": reported, "classes": ordered, "vendors": vendors}

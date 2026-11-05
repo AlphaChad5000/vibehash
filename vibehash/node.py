@@ -47,7 +47,7 @@ import numpy as np
 
 from . import deepseek_graph as dsg
 from . import economics as econ
-from . import netstats, receipts, tasks
+from . import hardware, netstats, receipts, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import NodeError
 from .consensus import Engine, Timeouts, check_certificate
@@ -170,6 +170,7 @@ class Node:
         self._model_cache: tuple = (None, b"", "")
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
+        self._census_cache: dict[int, dict] = {}  # height -> who registered that round and on what (_registrations)
         self.stopping = threading.Event()
         self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
         self.threads: list[threading.Thread] = []
@@ -813,15 +814,22 @@ class Node:
         for b in recent[-netstats.CENSUS_BLOCKS:]:
             if not b.get("summary") or now - b["timestamp"] > netstats.DAY_S:
                 continue
-            record = self.store.load_record(b["height"])
-            if not isinstance(record, dict):
-                continue
-            workers = {}
-            for env in record.get("registrations", []):
-                body = env.get("body") if isinstance(env, dict) else None
-                if isinstance(body, dict) and isinstance(env.get("pubkey"), str):
-                    workers[env["pubkey"]] = body.get("hardware")
+            workers = self._census_cache.get(b["height"])
+            if workers is None:  # a sealed block's record never changes, so each is read once
+                record = self.store.load_record(b["height"])
+                if not isinstance(record, dict):
+                    continue
+                workers = {}
+                for env in record.get("registrations", []):
+                    body = env.get("body") if isinstance(env, dict) else None
+                    if isinstance(body, dict) and isinstance(env.get("pubkey"), str):
+                        klass = body.get("hardware")
+                        workers[env["pubkey"]] = klass if hardware.valid_class(klass) else None
+                self._census_cache[b["height"]] = workers
             out.append({"timestamp": b["timestamp"], "workers": workers})
+        if recent:  # keep only what the day's blocks can ask for
+            for h in [h for h in self._census_cache if h < recent[0]["height"]]:
+                del self._census_cache[h]
         return out
 
     def job_model(self, job_id: str, offset: int) -> bytes:
@@ -866,6 +874,10 @@ class Node:
             raise WireError(f"a {kind} message has only {', '.join(sorted(BODIES.get(kind, ())))}")
         if len(canonical(env)) > {"reveal": MAX_REVEAL, "move": MAX_MOVE, "sign": MAX_REVEAL}.get(kind, MAX_MESSAGE):
             raise WireError(f"{kind} message too large")
+        # Refused here, not in the coordinator: a wire rule can be stricter than the record's (replay.py doesn't come
+        # this way), so nodes of different versions still agree on every block.
+        if kind == "register" and "hardware" in env["body"] and not hardware.valid_class(env["body"]["hardware"]):
+            raise WireError("the hardware class isn't in its canonical form (what hardware.hardware_class makes)")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
         commitment = self._prep_commitment(body) if kind == "reveal" else None
         with c.lock:
