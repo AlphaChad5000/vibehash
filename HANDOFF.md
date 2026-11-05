@@ -188,8 +188,14 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
     out alone, a parent's anchor and the child's); the network test runs with the anchor on and checks the workers'
     change against `canonical_weights` with it. The experiment's scripts are in that session's scratchpad
     (`evo/random_walk.py`, `evo/evo_train.py`).
-  - **Not done yet:** a longer run cycling tasks the way the testnet does (about 200 rounds, 30–40 minutes), to see
-    drift stay flat and nothing slide over many tasks; the second finding (newcomers on an Evo-only network).
+  - **Across tasks, with this branch's code as it is (V2_SETTINGS, 2026-11-05, 7 minutes):** 64 rounds, 8 tasks taken
+    in turn 8 rounds each (svamp, arc_easy, sciq, commonsense_qa, sst2, arithmetic, openbookqa, winogrande), scored
+    every 16 rounds, 100 held-out items a set. Everything went up, nothing down: svamp 14% → 19%, arc_easy 47% → 57%,
+    sciq 56% → 75%, commonsense_qa 45% → 58%, and two never trained on, ag_news 75% → 79% and boolq 28% → 63% (much of
+    that is likely the answer format). Median drift 1.4%, 1.7%, 1.9%, 2.0% at rounds 16–64 (the most-moved weight
+    3.6%): still rising slowly, so watch it over a longer run; the 4–5% budget is for the median.
+  - **Not done yet:** a run of several hundred rounds, to see drift level off (expected near 2–3%) and nothing slide;
+    the second finding (newcomers on an Evo-only network).
 - **Reviewed for bugs and vulnerabilities (2026-11-04, branch `review-fixes`, merged).** The security pass found nothing High or Medium. Fixed:
   - the dataset quota counted a part-way upload by what was on disk, so uploads started side by side (one chunk each) got the quota each; now each counts at the size it declared, admitted under one lock (`Node._admitted`; `test_dos.DatasetQuotaTests`);
   - its cache of datasets jobs name was keyed on the mempool's length (a full mempool swapping one tx kept it), now on the waiting post_jobs;
