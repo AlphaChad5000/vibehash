@@ -191,14 +191,43 @@ def pinned(adapter_dir: Path, base: str) -> dict:
     return {}
 
 
-def answer(eval_file: Path, adapter_dir: Path) -> Path:
+def located(base: str) -> dict:
+    """Where a base model given on the command line is: a local folder, or org/name[@revision] on Hugging Face."""
+    if Path(base).is_dir():
+        return {"pretrained_model_name_or_path": str(Path(base)), "revision": None}
+    repo, _, rev = base.partition("@")
+    return {"pretrained_model_name_or_path": repo, "revision": rev or None}
+
+
+def trained(adapter_dir: Path) -> bool | None:
+    """Whether the adapter's LoRA B weights hold anything but zeros: an adapter from a job that hasn't trained yet
+    changes nothing, so judging it would compare the base model with itself. None if there's no readable
+    adapter_model.safetensors to tell from."""
+    try:
+        raw = (Path(adapter_dir) / "adapter_model.safetensors").read_bytes()
+        n = int.from_bytes(raw[:8], "little")
+        header, start = json.loads(raw[8:8 + n]), 8 + n
+    except (OSError, ValueError):
+        return None
+    bs = [t["data_offsets"] for name, t in header.items() if "lora_B" in name and isinstance(t, dict)]
+    return any(any(raw[start + a:start + b]) for a, b in bs) if bs else None
+
+
+def answer(eval_file: Path, adapter_dir: Path, *, base: str | None = None, device: str | None = None) -> Path:
+    """Both rivals and the fine-tune answer every prompt; <job>.eval.answers.json gets the pairs. `base`: a local
+    folder or org/name[@revision] to load instead of the eval file's base at the adapter's pinned commit. `device`:
+    cuda, mps or cpu (default: the GPU if there is one)."""
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     spec = json.loads(eval_file.read_text())
-    src = source(spec["base"]) | pinned(adapter_dir, spec["base"])
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    src = located(base) if base else source(spec["base"]) | pinned(adapter_dir, spec["base"])
+    if trained(adapter_dir) is False:
+        print(f"warning: {adapter_dir}'s LoRA B weights are all zero, so it hasn't trained yet: the fine-tune will "
+              "answer exactly like the base model", file=sys.stderr)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(**src)
     model = AutoModelForCausalLM.from_pretrained(**src, dtype=torch.bfloat16 if device == "cuda" else torch.float32)
     model.to(device).eval()  # no device_map, so no `accelerate`
@@ -216,7 +245,7 @@ def answer(eval_file: Path, adapter_dir: Path) -> Path:
     tuned_model = PeftModel.from_pretrained(model, str(adapter_dir))  # the same weights plus the LoRA adapter
     tuned_runs = [timed(tok, tuned_model, p, room(p)) for p in prompts]
     prompted, tuned = [r[0] for r in prompted_runs], [r[0] for r in tuned_runs]
-    device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    device = torch.cuda.get_device_name(0) if device == "cuda" else device.upper()
 
     out = eval_file.with_suffix(".answers.json")
     out.write_text(json.dumps({"goal": spec["goal"], "scope": spec.get("scope"), "checks": spec.get("checks") or [], "cost": {
@@ -393,10 +422,25 @@ def kappa(a: list, b: list) -> float | None:
     return None if expected == 1 else round((observed - expected) / (1 - expected), 3)
 
 
+def parser():
+    import argparse
+    p = argparse.ArgumentParser(prog="judge.py", description="Did the fine-tune get better at the goal?")
+    sub = p.add_subparsers(dest="step", required=True)
+    s = sub.add_parser("answer", help="the base model, the base told the goal and the fine-tune answer the prompts "
+                                      "(PyTorch, a GPU helps)")
+    s.add_argument("eval_file", type=Path, help="<job>.eval.json, from architect.py")
+    s.add_argument("adapter", type=Path, help="the adapter folder: `vibehash job download` wrote it, or train_local.py")
+    s.add_argument("--base", help="a local folder with the base model, or org/name[@revision] (default: the eval "
+                                  "file's base at the commit the adapter pins)")
+    s.add_argument("--device", choices=["cuda", "mps", "cpu"], help="default: the GPU if there is one")
+    s = sub.add_parser("grade", help="Muse Spark compares each pair of answers blind, twice")
+    s.add_argument("answers_file", type=Path, help="<job>.eval.answers.json, from the answer step")
+    return p
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "answer":
-        answer(Path(sys.argv[2]), Path(sys.argv[3]))
-    elif len(sys.argv) == 3 and sys.argv[1] == "grade":
-        grade(Path(sys.argv[2]))
+    a = parser().parse_args()
+    if a.step == "answer":
+        answer(a.eval_file, a.adapter, base=a.base, device=a.device)
     else:
-        sys.exit(__doc__)
+        grade(a.answers_file)

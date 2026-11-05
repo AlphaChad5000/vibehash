@@ -135,8 +135,10 @@ def screen(goal: str) -> tuple[bool, str]:
     return v.get("allowed") is True, str(v.get("reason") or "")
 
 
-def design(goal: str) -> dict:
-    return chat_json([{"role": "system", "content": SYSTEM}, {"role": "user", "content": goal}])
+def design(goal: str, base: str | None = None) -> dict:
+    """The LLM's plan for the goal (unchecked), on `base` if the requester picked one."""
+    ask = goal if base is None else f"{goal}\n\n(Use base {base}.)"
+    return chat_json([{"role": "system", "content": SYSTEM}, {"role": "user", "content": ask}])
 
 
 def check(plan: dict, backend: str = "local", max_len: int = MAX_LEN) -> list[str]:
@@ -213,11 +215,23 @@ def network(plan: dict, max_len: int = MAX_LEN) -> list[str]:
     return problems
 
 
-def budget(plan: dict) -> int:
-    """VIBE for a network job: enough rounds for its epochs over its chats, at train's fee, within MAX_BUDGET. Code
+def budget(plan: dict, fee: int = FEE) -> int:
+    """VIBE for a network job: enough rounds for its epochs over its chats, at `fee` a round, within MAX_BUDGET. Code
     sets it, not the LLM: it's money."""
     rounds = math.ceil(len(plan["examples"]) * plan["epochs"] / CHATS_A_ROUND)
-    return max(FEE, min(MAX_BUDGET // FEE * FEE, rounds * FEE))
+    return max(fee, min(MAX_BUDGET // fee * fee, rounds * fee))
+
+
+def id_problems(job_id: str, out: Path, backend: str) -> list[str]:
+    """Why a job id the requester chose can't be used: the architect's own rule (so it's safe as a file name
+    everywhere, and within the chain's), a job already posted from here under that name, or files already there."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", job_id) or job_id in WINDOWS_NAMES:
+        return [f"--id {job_id!r} must be 1 to 40 lowercase letters, digits and hyphens, and not a Windows device name"]
+    if backend == "vibehash" and (settings.home() / "jobs" / job_id).exists():
+        return [f"you already have a job called {job_id} ({settings.home() / 'jobs' / job_id}); pick another name"]
+    if (out / f"{job_id}.jsonl").exists():
+        return [f"{out / (job_id + '.jsonl')} already exists; pick another name or --out folder"]
+    return []
 
 
 def chain_id(job_id: str) -> str:
@@ -402,14 +416,17 @@ def audit(plan: dict) -> dict:
     return {"sampled": len(sample), "met": len(sample) - len(misses), "misses": misses[:6]}
 
 
-def plan_job(goal: str, log=print, backend: str = "local", max_len: int = MAX_LEN) -> dict:
+def plan_job(goal: str, log=print, backend: str = "local", max_len: int = MAX_LEN, base: str | None = None) -> dict:
     """Screen the goal, then design a job and check it, giving the model two chances to fix what the checks reject,
-    then have the judge audit a sample of its chats and fix what that rejects."""
+    then have the judge audit a sample of its chats and fix what that rejects. `base`: the requester's choice of
+    model, which the plan keeps whatever the LLM wrote."""
     allowed, why = screen(goal)
     if not allowed:
         raise Refused(f"the Job Architect turned this goal down: {why}")
-    plan = design(goal)
+    plan = design(goal, base)
     plan["goal"] = goal  # the form's goal, never one the model wrote into its reply
+    if base:
+        plan["base"] = base
     valid = None  # the last plan that passed the checks, kept in case a rewrite for the audit breaks them
     for attempt in range(3):  # up to three retries: tell the model what was wrong and let it fix it
         problems = check(plan, backend, max_len)
@@ -428,6 +445,8 @@ def plan_job(goal: str, log=print, backend: str = "local", max_len: int = MAX_LE
                           {"role": "user", "content": "Fix these and reply with the whole JSON again:\n" + "\n".join(problems)}])
         plan["goal"] = goal  # the rewrite is a fresh object from the model
         plan.pop("audit", None)  # ...whose chats haven't been audited, whatever it echoed
+        if base:
+            plan["base"] = base
     if problems := check(plan, backend, max_len):
         if not valid:
             raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
@@ -571,7 +590,8 @@ def save(plan: dict, out: Path, backend: str = "local", node: str | None = None)
 
 
 def train_command(plan: dict, chats: Path, out: Path, backend: str = "local", *, max_len: int = MAX_LEN,
-                  node: str | None = None, wallet: str | None = None, yes: bool = False) -> list[str]:
+                  fee: int | None = None, node: str | None = None, wallet: str | None = None,
+                  yes: bool = False) -> list[str]:
     """The command that trains the plan. For the network it's this Python's `vibehash train`, --plain so it posts and
     returns rather than open the training dashboard (`vibehash job watch` does that)."""
     if backend == "local":
@@ -580,6 +600,7 @@ def train_command(plan: dict, chats: Path, out: Path, backend: str = "local", *,
     cmd = [sys.executable, "-m", "vibehash", "train", str(Path(chats).resolve()), "--base", plan["base"],
            "--rank", str(plan["rank"]), "--budget", str(plan["budget"]), "--max-len", str(max_len),
            "--id", plan["job_id"], "--plain"]
+    cmd += ["--fee", str(fee)] if fee is not None else []
     cmd += ["--node", node] if node else []
     cmd += ["--wallet", wallet] if wallet else []
     return cmd + (["--yes"] if yes else [])
@@ -608,6 +629,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", choices=["vibehash", "local"], default="vibehash",
                    help="vibehash: post to the network (it shows its pre-flight first); local: train on this machine")
     p.add_argument("--out", default="agent-jobs", help="folder for the files it writes (default agent-jobs)")
+    p.add_argument("--base", choices=sorted(BASES), help="the model to fine-tune (default: the LLM picks, from "
+                   "ALLOWED_BASES)")
+    p.add_argument("--id", help="the job's name (default: the LLM's; on the network plus four random hex digits)")
+    p.add_argument("--fee", type=int, help=f"network: VIBE a round, passed to train (default train's, {FEE})")
     p.add_argument("--budget", type=int, help=f"network: VIBE to spend, {FEE}-{MAX_BUDGET} (default: enough rounds "
                    "for the plan's epochs)")
     p.add_argument("--max-len", type=int, default=MAX_LEN, help=f"network: longest chat in tokens, 64-{MAX_LEN}")
@@ -622,22 +647,33 @@ def main(argv=None) -> int:
     net = a.backend == "vibehash"
     if net and not 64 <= a.max_len <= MAX_LEN:
         sys.exit(f"--max-len must be 64-{MAX_LEN}: the chain refuses longer sequences on these models' disputes")
-    if net and a.budget is not None and not FEE <= a.budget <= MAX_BUDGET:
-        sys.exit(f"--budget must be {FEE} (one round's fee) to {MAX_BUDGET} VIBE")
+    fee = FEE if a.fee is None else a.fee
+    if net and not 0 < fee <= MAX_BUDGET:
+        sys.exit(f"--fee must be above 0 and at most {MAX_BUDGET} VIBE")
+    if net and a.budget is not None and not fee <= a.budget <= MAX_BUDGET:
+        sys.exit(f"--budget must be {fee} (one round's fee) to {MAX_BUDGET} VIBE")
+    out = Path(a.out)
+    if a.id and (problems := id_problems(a.id, out, a.backend)):  # before anything is paid for
+        sys.exit("error: " + problems[0])
+    if a.base:
+        ALLOWED_BASES.add(a.base)  # asked for by name: the requester's choice, not the LLM's
     try:
-        plan = plan_job(a.goal, backend=a.backend, max_len=a.max_len)
+        plan = plan_job(a.goal, backend=a.backend, max_len=a.max_len, base=a.base)
     except ValueError as e:  # a refused goal, a plan the checks still reject, an LLM that won't answer in JSON
         sys.exit(str(e))
     except Exception as e:  # the LLM couldn't be asked (a key, credits, the provider): llm_call.LLMError says why
         sys.exit(f"error: {e}")
-    out = Path(a.out)
-    if net:
+    if a.id:
+        plan["job_id"] = a.id
+    elif net:
         plan["job_id"] = chain_id(plan["job_id"])
-        plan["budget"] = a.budget or budget(plan)
+    if net:
+        plan["budget"] = a.budget or budget(plan, fee)
     chats, evals = save(plan, out, a.backend, a.node)
     wallet = os.path.expanduser(a.wallet) if a.wallet else None  # ~/... from a shell that leaves it alone
-    cmd = train_command(plan, chats, out, a.backend, max_len=a.max_len, node=a.node, wallet=wallet, yes=a.yes)
-    cost = f", {plan['budget']} VIBE (up to {plan['budget'] // FEE} rounds at {FEE} VIBE)" if net else ""
+    cmd = train_command(plan, chats, out, a.backend, max_len=a.max_len, fee=a.fee, node=a.node, wallet=wallet,
+                        yes=a.yes)
+    cost = f", {plan['budget']} VIBE (up to {plan['budget'] // fee} rounds at {fee} VIBE)" if net else ""
     print(f"\n{plan['job_id']}: {len(plan['examples'])} examples on {plan['base']}, LoRA rank {plan['rank']}, "
           f"{plan['epochs']} epochs{cost}\n  why: {plan['reasoning']}")
     if plan.get("caveat"):

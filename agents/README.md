@@ -176,10 +176,13 @@ train command. On the public network leave out `--node` and `--wallet`.
 **`--post` spends VIBE** on the node it posts to: the `--node` you give, or else the one `vibehash setup` saved, or
 else the public network. `vibehash train` shows its pre-flight and asks "Post it?" first (`--yes` skips the
 question). The budget is enough rounds for the plan's epochs over its chats at 10 VIBE a round (usually 10 to 40),
-capped by `MAX_BUDGET`; `--budget` sets it by hand. It goes into escrow when the job is posted and pays only for work
+capped by `MAX_BUDGET`; `--budget` sets it by hand, `--fee` the VIBE a round. `--id` names the job yourself and
+`--base` picks the model (the LLM picks otherwise, from `ALLOWED_BASES`). It goes into escrow when the job is posted and pays only for work
 that passes its checks; `vibehash cancel-job <job>` returns what's left.
 
-`answer` loads the base model at the commit the adapter says it was trained on, without `accelerate`.
+`answer` loads the base model at the commit the adapter says it was trained on, without `accelerate`; `--base
+<folder>` or `--base org/name@revision` loads another copy, `--device cpu` keeps it off the GPU. It warns when an
+adapter's LoRA weights are still all zero (a job that hasn't trained yet).
 
 ## On one machine
 

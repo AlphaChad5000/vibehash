@@ -540,11 +540,35 @@ class ArchitectTests(AgentTest):
 
     def test_bad_flags_stop_before_anything_is_paid_for(self):
         self.use_fake()
-        for argv, said in ((["goal", "--budget", "5"], "--budget must be"), (["goal", "--max-len", "4096"], "--max-len")):
+        (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "mine").mkdir(parents=True)
+        (self.dir / "taken.jsonl").write_text("")
+        for argv, said in ((["goal", "--budget", "5"], "--budget must be"), (["goal", "--max-len", "4096"], "--max-len"),
+                           (["goal", "--fee", "0"], "--fee must be"), (["goal", "--id", "Bad Id"], "lowercase"),
+                           (["goal", "--id", "mine"], "already have a job called mine"),
+                           (["goal", "--id", "taken", "--out", str(self.dir)], "already exists")):
             with self.subTest(argv), self.assertRaises(SystemExit) as caught:
                 architect.main(argv)
             self.assertIn(said, str(caught.exception.code))
         self.assertEqual(self.fake.requests, [])
+
+    def test_the_requester_can_name_the_job_pick_the_base_and_the_fee(self):
+        """Cole's flags: --id is used as given (no hex digits), --base rides into the design prompt and the plan
+        whatever the LLM wrote, --fee goes to train and sizes the budget."""
+        self.use_fake()
+        self.fake.script = [routed([good_plan(base="llama-3.2-1b")])] * 5
+        os.environ["HF_TOKEN"] = "hf_test"
+        out_dir = self.dir / "jobs"
+        with mock.patch.object(architect, "ALLOWED_BASES", {"qwen3-0.6b"}):
+            said, _ = self.run_main("support bot", "--out", str(out_dir), "--id", "my-bot", "--base", "qwen3-0.6b",
+                                    "--fee", "5")
+        self.assertIn("(Use base qwen3-0.6b.)", self.fake.requests[1]["body"]["messages"][1]["content"])
+        plan = json.loads((out_dir / "my-bot.plan.json").read_text(encoding="utf-8"))
+        self.assertEqual((plan["job_id"], plan["base"], plan["budget"]), ("my-bot", "qwen3-0.6b", 10))  # 2 rounds at 5
+        self.assertIn("--fee 5", said)
+        self.assertIn("--id my-bot", said)
+        self.assertEqual(architect.budget({"examples": [0] * 80, "epochs": 3}, fee=5), 10)
+        cmd = architect.train_command(good_plan(job_id="b", budget=10), out_dir / "b.jsonl", out_dir, "vibehash", fee=5)
+        self.assertEqual(cli.parser().parse_args(cmd[3:]).fee, 5 * 10**8)
 
     @unittest.skipUnless(HAVE["torch"] and HAVE["tokenizers"] and HAVE["jinja2"], "needs PyTorch, tokenizers and jinja2")
     def test_vibehash_train_takes_the_files_up_to_its_preflight(self):
@@ -693,6 +717,26 @@ class JudgeTests(AgentTest):
         self.assertEqual(judge.interval(19, 20), [0.764, 0.991])
         self.assertIsNone(judge.kappa(["tuned"] * 3, ["tuned"] * 3))
         self.assertEqual(judge.kappa(["tuned", "base"], ["tuned", "base"]), 1.0)
+
+    def test_locating_a_base_and_an_untrained_adapter(self):
+        self.assertEqual(judge.located("org/name@abc"), {"pretrained_model_name_or_path": "org/name", "revision": "abc"})
+        self.assertEqual(judge.located("org/name"), {"pretrained_model_name_or_path": "org/name", "revision": None})
+        self.assertEqual(judge.located(str(self.dir))["revision"], None)
+        folder = self.dir / "lora"
+        folder.mkdir()
+        self.assertIsNone(judge.trained(folder))  # nothing to read
+
+        def safetensors(b_bytes: bytes) -> bytes:
+            header = json.dumps({"base.lora_A.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                                 "base.lora_B.weight": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]}}).encode()
+            return len(header).to_bytes(8, "little") + header + b"\x01\x00\x00\x00" + b_bytes
+        (folder / "adapter_model.safetensors").write_bytes(safetensors(b"\x00" * 4))
+        self.assertFalse(judge.trained(folder))
+        (folder / "adapter_model.safetensors").write_bytes(safetensors(b"\x00\x00\x80\x3f"))
+        self.assertTrue(judge.trained(folder))
+        a = judge.parser().parse_args(["answer", "e.json", "lora", "--base", "org/name", "--device", "cpu"])
+        self.assertEqual((a.step, a.base, a.device), ("answer", "org/name", "cpu"))
+        self.assertEqual(judge.parser().parse_args(["grade", "x.json"]).step, "grade")
 
     def test_an_adapter_runs_on_the_base_it_was_trained_on(self):
         folder = self.dir / "lora"
