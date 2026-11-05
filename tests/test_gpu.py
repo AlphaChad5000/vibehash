@@ -5,10 +5,14 @@ The cross-device tests run on whatever PyTorch devices this machine has
 installed.
 """
 import json
+import threading
+import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from vibehash import compute
 from vibehash.compute import NumpyBackend, TorchBackend, list_devices, self_test, torch_available
 from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair
@@ -127,6 +131,43 @@ class CrossDeviceTests(unittest.TestCase):
         rv = w.reveal(self.unit, self.job, b"beacon", q)
         ok, bad = replay_openings(self.job, self.unit, rv.openings, list(range(q)), backend=self.cpu)
         self.assertFalse(ok)
+
+
+class HungDevice:
+    """A GPU whose driver never answers, like an Intel Arc on a driver older than its PyTorch build."""
+    name, device = "xpu", "xpu:0"
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def train_segment(self, *args):
+        self.release.wait()
+        raise RuntimeError("released")
+
+
+class SelfTestTimeoutTests(unittest.TestCase):
+    def test_a_hung_device_is_reported_instead_of_stalling(self):
+        dev = HungDevice()
+        self.addCleanup(dev.release.set)
+        t = time.monotonic()
+        problem = self_test(dev, timeout=0.3)
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertTrue(problem.startswith(compute.HUNG), problem)
+
+    def test_auto_falls_back_to_the_cpu_when_the_gpu_hangs(self):
+        dev = HungDevice()
+        self.addCleanup(dev.release.set)
+        with mock.patch.object(compute, "list_devices", return_value=[compute.Device("xpu:0", "Arc"),
+                                                                       compute.Device("cpu", "CPU")]), \
+                mock.patch.object(compute, "TorchBackend", return_value=dev), \
+                mock.patch.object(compute.self_test, "__defaults__", (0.3,)):  # its timeout
+            self.assertIsInstance(compute.get_backend("auto"), NumpyBackend)
+
+    def test_a_failing_device_still_reports_its_error(self):
+        class Broken(HungDevice):
+            def train_segment(self, *args):
+                raise RuntimeError("UR_RESULT_ERROR_DEVICE_LOST")
+        self.assertEqual(self_test(Broken()), "RuntimeError: UR_RESULT_ERROR_DEVICE_LOST")
 
 
 if __name__ == "__main__":

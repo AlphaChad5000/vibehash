@@ -152,18 +152,40 @@ def list_devices() -> list[Device]:
     return found
 
 
-def self_test(backend) -> str | None:
+SELF_TEST_SECONDS = 120  # a healthy GPU compiles its first kernels in seconds; an old driver can hang forever
+HUNG = "the test hung"  # how a self_test problem begins when the device never answered
+
+
+def self_test(backend, timeout: float = SELF_TEST_SECONDS) -> str | None:
     """Train a tiny model for a few steps and compare with NumPy. Returns None if the device works,
-    else what went wrong. Catches broken or outdated GPU drivers before they cost a worker its rounds."""
+    else what went wrong. Catches broken or outdated GPU drivers before they cost a worker its rounds.
+
+    The step runs on a daemon thread so a driver that never returns (seen on Intel Arc with a driver older
+    than its PyTorch build) costs `timeout` seconds instead of the whole process. PyTorch releases the GIL
+    while it waits on the device, so the caller gets control back; the stuck thread is abandoned."""
+    import threading
+
     from .model import Dataset
 
     spec = ModelSpec(4, (16,), 3, "float32")
     data = Dataset.synthetic(spec, 1, n_train=64, n_val=8)
     theta = spec.init_params(2)
-    try:
-        got = backend.train_segment(spec, data, theta, 3, 0, 3, 0.1, 16)
-    except Exception as e:  # driver/runtime failures surface as all sorts of exception types
-        return f"{type(e).__name__}: {e}"
+    result: list = []
+
+    def run():
+        try:
+            result.append(backend.train_segment(spec, data, theta, 3, 0, 3, 0.1, 16))
+        except Exception as e:  # driver/runtime failures surface as all sorts of exception types
+            result.append(e)
+
+    worker = threading.Thread(target=run, name=f"self-test {backend.device}", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if not result:
+        return f"{HUNG}: a tiny training step got no answer from the device in {timeout:.0f}s"
+    got = result[0]
+    if isinstance(got, Exception):
+        return f"{type(got).__name__}: {got}"
     want = NumpyBackend().train_segment(spec, data, theta, 3, 0, 3, 0.1, 16)
     err = float(np.linalg.norm(got - want) / np.linalg.norm(want))
     return None if err < 1e-4 else f"results differ from the CPU by {err:.1e}"
