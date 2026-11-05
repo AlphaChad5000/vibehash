@@ -6,7 +6,8 @@
 # an unsigned .exe, .msi or .bat does). It puts uv (one pinned release, checked against its published SHA-256) and
 # the launcher (launcher/vibehash_launcher.py) in %LOCALAPPDATA%\VibeHash, adds "Vibe Hash" to the Start menu, and
 # runs the launcher, which installs a Python of its own, Vibe Hash and the GPU build of PyTorch, then mines.
-# Safe to run again. ASCII only: irm may not decode this file as UTF-8.
+# Safe to run again. To remove it (never the wallet): & "$env:LOCALAPPDATA\VibeHash\VibeHash.cmd" --uninstall
+# ASCII only: irm may not decode this file as UTF-8.
 
 & {  # a script block, so a truncated download runs nothing and nothing here leaks into your PowerShell session
     $ErrorActionPreference = 'Stop'
@@ -26,9 +27,11 @@
         $zip = Join-Path $dir $asset
         $ProgressPreference = 'SilentlyContinue'  # Windows PowerShell's progress bar makes downloads crawl
         Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
-        $want = ((Invoke-WebRequest "$url.sha256" -UseBasicParsing).Content -split '\s+')[0]
-        if ($want -is [byte[]]) { $want = [Text.Encoding]::ASCII.GetString($want) }
-        if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $want.Trim().ToUpper()) {
+        # GitHub serves the .sha256 as octet-stream, which Windows PowerShell hands back as bytes: decode, then split
+        $published = (Invoke-WebRequest "$url.sha256" -UseBasicParsing).Content
+        if ($published -is [byte[]]) { $published = [Text.Encoding]::ASCII.GetString($published) }
+        $want = ($published.Trim() -split '\s+')[0]
+        if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $want.ToUpper()) {
             Remove-Item $zip
             Write-Host "  The download of $asset doesn't match the checksum its release publishes; not installing it."
             Write-Host "  Check your connection (a proxy?) and try again."
@@ -45,13 +48,24 @@
     Invoke-WebRequest "$site/vibehash_launcher.py" -OutFile $launcher -UseBasicParsing
 
     # VibeHash.cmd runs the launcher on a Python uv fetches (the computer's own Python is never touched), with uv's
-    # Python and cache kept in this folder as the launcher keeps its own (child_env), so --uninstall removes them all.
+    # Python and cache kept in this folder as the launcher keeps its own (child_env). Paths come from %~dp0 (the
+    # .cmd's own folder) at run time, so the file is plain ASCII whatever the user's folder is called.
+    # `VibeHash.cmd --uninstall` is handled here, not by the launcher: the launcher runs on uv and a Python inside
+    # this folder, so it can't delete it. The .cmd turns off start-at-login, removes the Start menu entry, steps out
+    # of the folder and deletes it, itself included: `(goto)` ends the script once that last line is parsed.
     $cmd = Join-Path $dir 'VibeHash.cmd'
     $lines = '@echo off',
-        "set `"UV_PYTHON_INSTALL_DIR=$dir\python`"",
-        "set `"UV_CACHE_DIR=$dir\cache`"",
+        'if /i "%~1"=="--uninstall" (',
+        '  cd /d "%TEMP%"',
+        '  if exist "%~dp0env\Scripts\python.exe" "%~dp0env\Scripts\python.exe" -m vibehash app startup off',
+        '  del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Vibe Hash.lnk" 2>nul',
+        '  echo   Removing %~dp0. Your wallet and settings stay in %USERPROFILE%\.vibehash.',
+        '  (goto) 2>nul & rmdir /s /q "%~dp0."',
+        ')',
+        'set "UV_PYTHON_INSTALL_DIR=%~dp0python"',
+        'set "UV_CACHE_DIR=%~dp0cache"',
         'set "UV_PYTHON_PREFERENCE=only-managed"',
-        "`"$uv`" run --quiet --no-project --python 3.12 `"$launcher`" %*"
+        '"%~dp0uv.exe" run --quiet --no-project --python 3.12 "%~dp0vibehash_launcher.py" %*'
     Set-Content $cmd $lines -Encoding ascii
 
     $shell = New-Object -ComObject WScript.Shell

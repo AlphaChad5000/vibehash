@@ -107,7 +107,11 @@ def prepare(a) -> tuple[str, Path]:
         pw = cli.password(f"Password for {path}: ")
         if pw is None:
             raise unattended.need(f"the password of {path}", "set VIBEHASH_PASSWORD to it")
-        wallets.load(path, pw)  # a wrong one stops here, not in the worker over and over
+        try:
+            wallets.load(path, pw)  # a wrong one stops here, not in the worker over and over
+        except wallets.WalletError as e:
+            sys.exit(f"error: {e} ({path}); set VIBEHASH_PASSWORD to the wallet's password, or move the wallet aside "
+                     "and run again to make a new one")
     if pw is not None:
         os.environ["VIBEHASH_PASSWORD"] = pw
     settings.save(wallet=str(path))
@@ -150,8 +154,12 @@ class Supervisor:
     # -- the child --
 
     def start_worker(self) -> None:
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0  # so Ctrl-Break reaches it alone
-        self.child = subprocess.Popen(self.command, creationflags=flags)
+        # In a group (Windows) or session (elsewhere) of its own, so a Ctrl+C at the app's terminal doesn't also reach
+        # the worker directly: the app stops it, once, the way stop_worker does.
+        if os.name == "nt":
+            self.child = subprocess.Popen(self.command, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            self.child = subprocess.Popen(self.command, start_new_session=True)
         self.worker_since = time.time()
         self.say(f"worker started (pid {self.child.pid}): {shlex.join(self.command)}")
 
@@ -321,8 +329,9 @@ def startup_on(system: str | None = None, run=subprocess.run) -> Path:
     launcher = os.environ.get("VIBEHASH_LAUNCHER")
     exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"])
     if system == "Windows":
-        path.write_text(f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n'),
-                        encoding="utf-8")
+        # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n
+        text = f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n')
+        path.write_bytes(text.encode("oem" if os.name == "nt" else "utf-8", "replace"))
     elif system == "Darwin":
         from xml.sax.saxutils import escape  # a path with & or < in it is still a plist
         log = escape(str(home / "app" / "app.log"))
@@ -348,8 +357,7 @@ After=network-online.target
 [Service]
 ExecStart={" ".join(shlex.quote(a) for a in [exe, *args])}
 Environment="VIBEHASH_HOME={home}"
-Restart=on-failure
-RestartSec=30
+Restart=no
 
 [Install]
 WantedBy=default.target

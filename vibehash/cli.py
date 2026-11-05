@@ -186,7 +186,9 @@ def ensure_wallet(path: Path, indent: str = "", no_password: bool = False) -> tu
         keys = mnemonic.keypair(words)
         wallets.save(keys, path, None, mnemonic.PATH)
         print(f"{indent}created {path} (no password: as safe as this user account)\n{indent}address {checksummed(keys.address)}")
-        give_words(words, keys.address, path, indent)
+        # Always to the file, whether or not this is a terminal: the app's log scrolls on into the worker's, and
+        # someone who started it once and forgot it must still find the words later.
+        print(unattended.words_note(unattended.save_words(words, keys.address, path), indent))
         return keys.address, None
     pw = password(f"{indent}Choose a wallet password: ", confirm=True)
     if pw is None:

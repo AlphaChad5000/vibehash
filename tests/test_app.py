@@ -175,8 +175,20 @@ class PrepareTests(AppHome):
             app.prepare(SimpleNamespace(gpu="skip"))  # the same wallet next time: asked, checked, handed on
             self.assertEqual(os.environ["VIBEHASH_PASSWORD"], "typed")
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("vibehash.cli.password", return_value="wrong"), \
-                mock.patch("sys.stdout", new_callable=io.StringIO), self.assertRaises(wallets.WalletError):
+                mock.patch("sys.stdout", new_callable=io.StringIO), self.assertRaises(SystemExit) as ctx:
             app.prepare(SimpleNamespace(gpu="skip"))
+        self.assertIn("VIBEHASH_PASSWORD", str(ctx.exception))  # a line that says what to do, not a traceback
+
+    def test_a_wallet_without_a_password_keeps_its_words_in_a_file_even_at_a_terminal(self):
+        env = {k: v for k, v in os.environ.items() if k != "VIBEHASH_PASSWORD"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("vibehash.unattended.interactive", return_value=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            url, path = app.prepare(SimpleNamespace(gpu="skip", no_password=True))
+        from vibehash import wallet as wallets
+        self.assertFalse(wallets.is_encrypted(path))
+        self.assertEqual(len(list(Path(self.tmp.name).glob("recovery-words-*.txt"))), 1)  # the app's log scrolls on
+        self.assertIn("recovery words", out.getvalue().lower())
+        self.assertNotIn("VIBEHASH_PASSWORD", os.environ)
 
 
 class StartupTests(AppHome):
