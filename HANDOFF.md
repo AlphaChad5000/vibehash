@@ -134,7 +134,15 @@ block version 4 (double-sign slashing, 100 VIBE to join as a validator, a 10-hei
 port, save-before-adopt, checksummed addresses, paid-round halvings on new networks, versions in `/status`, `/supply`
 and `/explorer`, `genesis check`, starter jobs, Evo on Qwen3.5's hybrid layers, and the anchored Evo step (lr 1e-3,
 decay 1/64: "The Evo collapse: cause and fix" below), so `testnet --evo2` and the menu's Evo Hash train without
-wrecking the model. Rollout:
+wrecking the model. Also the hardware census (PR #30), `vibehash evo export` (an Evo job's model as a Hugging Face
+folder, from branch `evo-export`), and the curated mix: Evo Hash trains on es_tasks.CURATED (17 tasks: the five
+the base model can't learn from dropped, ARC-Challenge, PIQA and Social IQa added) and pays for a right answer with or
+without its tags (Spec2.lenient, es_tasks.lenient). Measured with this code (68 rounds, 4 on each task, 200 held-out
+items, both models scored without the tags mattering): sciq 54.5% → 67%, arc_challenge 31.5% → 43%, arc_easy 47% →
+58%, commonsense_qa 42% → 49%, winogrande 43.5% → 49%, openbookqa 33% → 38%, sst2 35.5% → 57.5%, emotion 35% → 49%,
+MMLU (never trained) 25% → 32.5%; the four math sets 1.5–3.5 points down (each within chance, all the same way);
+drift 2.1%. Scored by which letter the model finds likeliest (what lm-evaluation-harness measures) the same sets
+moved within ±3 points (MMLU 43% → 44.5%): the gain is in saying what it knows, not in knowing more. Rollout:
 - **Evo chains** (local, `"es": true`): every node and worker needs 0.5.17 before a job with `decay` is posted (0.5.16
   refuses the field), and a testnet folder from before carries the old line's broken change into its next job: start
   a new folder (the owner's old one was moved aside to `~/.vibehash/testnet-evo2-collapsed-20261105`).
