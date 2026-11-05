@@ -50,3 +50,90 @@ def benchmark(job: TrainingJob, seconds: float = 1.0, backend=None) -> float:
 
 def describe() -> str:
     return f"{platform.system()} {platform.machine()}, {os.cpu_count()} CPUs, {total_memory_mb():,} MB RAM"
+
+
+# --- the hardware class a worker registers with -------------------------------------------------------------------
+#
+# A worker tells the node what kind of machine it is, in a form the node can count and a page can show ("12 of this
+# card, 40 of that"): {"vendor", "arch", "memory_gb", "label"}. Every field is derived from what the driver reports and
+# squeezed through a short whitelist, never typed by a person, so the census can't be filled with made-up cards. Nothing
+# in it is checked against the work (a worker could lie about its card as it could about its speed), and nothing in it
+# identifies a person: no serial numbers, no host names.
+VENDORS = ("nvidia", "amd", "intel", "apple", "cpu")
+MAX_LABEL, MAX_ARCH, MAX_MEMORY_GB = 40, 16, 4096
+LABEL_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .+-/")
+ARCH_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+_NOISE = ("NVIDIA", "GeForce", "AMD", "Radeon", "Intel", "Graphics", "Corporation")  # "(R)" and "(TM)" go first
+
+
+def short_label(name: str) -> str:
+    """A driver's device name as a card is usually called: "NVIDIA GeForce RTX 4060 Laptop GPU" -> "RTX 4060 Laptop"."""
+    words = [w for w in str(name).replace("(R)", " ").replace("(TM)", " ").split() if w not in _NOISE and w != "GPU"]
+    text = " ".join(words) or str(name).strip() or "GPU"
+    text = "".join(ch for ch in text if ch in LABEL_CHARS).strip()
+    return text[:MAX_LABEL].strip() or "GPU"
+
+
+def hardware_class(backend) -> dict:
+    """What kind of machine `backend` trains on: `{"vendor", "arch", "memory_gb", "label"}`, as registered."""
+    name = getattr(backend, "name", "cpu")
+    if name == "cpu":
+        return _cpu_class()
+    t, device = backend.torch, backend.device
+    idx = int(device.split(":")[1]) if ":" in device else 0
+    try:
+        if name == "cuda":
+            props = t.cuda.get_device_properties(idx)
+            hip = getattr(t.version, "hip", None)
+            arch = getattr(props, "gcnArchName", "") if hip else f"sm_{props.major}{props.minor}"
+            return _canonical("amd" if hip else "nvidia", arch, props.total_memory / 2**30, short_label(props.name))
+        if name == "xpu":
+            props = t.xpu.get_device_properties(idx)
+            return _canonical("intel", "xpu", props.total_memory / 2**30, short_label(props.name))
+        if name == "mps":
+            return _canonical("apple", "mps", total_memory_mb() / 1024, _apple_chip())
+    except Exception:  # a driver that won't say: still a worker, just an unnamed one
+        pass
+    return _canonical({"cuda": "nvidia", "xpu": "intel", "mps": "apple"}.get(name, "cpu"), name, total_memory_mb() / 1024, "GPU")
+
+
+def _cpu_class() -> dict:
+    cpus = os.cpu_count() or 1
+    size = "2 threads" if cpus <= 2 else f"{min(cpus, 128)} threads"  # a count, not a model: CPU names are long and many
+    return _canonical("cpu", platform.machine().lower() or "cpu", total_memory_mb() / 1024, f"CPU {size}")
+
+
+def _apple_chip() -> str:
+    """"Apple M3" from the chip's brand string, or "Apple GPU" when macOS won't say."""
+    try:
+        import subprocess
+        out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=2).stdout
+        words = out.split()
+        if words and words[0] == "Apple":
+            return short_label(" ".join(words[:3]))
+    except Exception:
+        pass
+    return "Apple GPU"
+
+
+def _canonical(vendor: str, arch: str, memory_gb: float, label: str) -> dict:
+    # ROCm names an arch with its feature flags, "gfx1100:sramecc+:xnack-": the same card, whatever its flags
+    arch = "".join(ch for ch in str(arch).split(":")[0].lower() if ch in ARCH_CHARS)[:MAX_ARCH] or "unknown"
+    return {"vendor": vendor if vendor in VENDORS else "cpu", "arch": arch,
+            "memory_gb": int(min(max(round(memory_gb), 0), MAX_MEMORY_GB)), "label": short_label(label)}
+
+
+def valid_class(d) -> bool:
+    """Whether `d` is a hardware class as hardware_class makes one: the node refuses a registration whose isn't."""
+    if not isinstance(d, dict) or set(d) != {"vendor", "arch", "memory_gb", "label"}:
+        return False
+    vendor, arch, mem, label = d["vendor"], d["arch"], d["memory_gb"], d["label"]
+    return (vendor in VENDORS and isinstance(arch, str) and 0 < len(arch) <= MAX_ARCH and set(arch) <= ARCH_CHARS
+            and isinstance(mem, int) and not isinstance(mem, bool) and 0 <= mem <= MAX_MEMORY_GB
+            and isinstance(label, str) and 0 < len(label) <= MAX_LABEL and set(label) <= LABEL_CHARS
+            and label == label.strip())
+
+
+def class_name(d: dict) -> str:
+    """One line for a hardware class, as the census and the worker's log show it: "RTX 4060, 8 GB (nvidia sm_89)"."""
+    return f"{d['label']}, {d['memory_gb']} GB ({d['vendor']} {d['arch']})"

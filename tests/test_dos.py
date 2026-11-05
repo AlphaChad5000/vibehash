@@ -230,6 +230,10 @@ class RecordTests(unittest.TestCase):
         env = seal(REQ, "register", {"round": 1, "flops_per_sec": " " * 5000 + "1e9", "memory_mb": 1024}, "dos-net")
         with self.assertRaisesRegex(WireError, "too large"):
             node.handle("register", env)
+        junk = {"vendor": "nvidia", "arch": "sm_89", "memory_gb": 8, "label": "RTX 9090 Ti!!"}  # a card that isn't
+        env = seal(REQ, "register", {"round": 1, "flops_per_sec": 1e9, "memory_mb": 1024, "hardware": junk}, "dos-net")
+        with self.assertRaisesRegex(WireError, "canonical"):
+            node.handle("register", env)
 
     def test_a_large_round_fits_a_proposal(self):
         peer = KeyPair.generate(b"other-validator")

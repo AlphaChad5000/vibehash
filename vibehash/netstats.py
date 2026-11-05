@@ -107,3 +107,44 @@ def summarize(blocks: list[dict], now: float) -> dict:
         "top_miners": [{"address": a, "flops": flops[a], "rounds": rounds[a]} for a in top],
         "block_time": (times[-1] - times[0]) / (len(times) - 1) if len(times) > 1 else None,
     }
+
+
+CENSUS_BLOCKS = 300  # the records a node reads for the census, at most: a day of ~5-minute rounds
+
+
+def census(rounds: list[dict], now: float) -> dict:
+    """What kinds of machines registered lately, counted and nothing more: no addresses. `rounds` is
+    [{"timestamp", "workers": {who: hardware class or None}}] from the day's round records (node._registrations); "who"
+    is anything that tells workers apart (the node uses the public key), never shown.
+
+    Returns {"online": workers registered in the last 10 minutes, "day": today, "reported": how many of today's said
+    what they run on, "classes": [{"label", "vendor", "arch", "memory_gb", "online", "day"}], most online first,
+    "vendors": {vendor: online}}. A worker counts once however many rounds it registered for, under the class it last
+    gave."""
+    seen: dict = {}  # who -> (class or None, last registration time)
+    for rnd in rounds:
+        age = now - rnd["timestamp"]
+        if age > DAY_S:
+            continue
+        for who, klass in rnd.get("workers", {}).items():
+            last = seen.get(who)
+            if last is None or rnd["timestamp"] >= last[1]:
+                seen[who] = (klass if isinstance(klass, dict) else None, rnd["timestamp"])
+    classes: dict[tuple, dict] = {}
+    online = day = reported = 0
+    vendors: dict[str, int] = {}
+    for klass, t in seen.values():
+        is_online = now - t <= ONLINE_S
+        day += 1
+        online += is_online
+        if klass is None:
+            continue
+        reported += 1
+        key = (klass.get("vendor"), klass.get("arch"), klass.get("memory_gb"), klass.get("label"))
+        c = classes.setdefault(key, {"label": key[3], "vendor": key[0], "arch": key[1], "memory_gb": key[2], "online": 0, "day": 0})
+        c["day"] += 1
+        if is_online:
+            c["online"] += 1
+            vendors[key[0]] = vendors.get(key[0], 0) + 1
+    ordered = sorted(classes.values(), key=lambda c: (-c["online"], -c["day"], c["label"], c["memory_gb"]))
+    return {"online": online, "day": day, "reported": reported, "classes": ordered, "vendors": vendors}

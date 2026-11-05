@@ -372,6 +372,26 @@ class CommandLineTests(unittest.TestCase):
         s = node.chain.state  # what the lines say it earned is what the chain paid it, beyond its genesis stake
         self.assertEqual(round(sum(x["earned_vibe"] for x in sealed) * VIBE),
                          s.balance(workers[0].address) + s.stake(workers[0].address) - 10 * VIBE)
+        census = api.get("/network")["hardware"]  # the machine it registered as, counted, with no address in sight
+        self.assertEqual((census["online"], census["day"], census["reported"]), (1, 1, 1), census)
+        [klass] = census["classes"]
+        self.assertEqual((klass["vendor"], klass["online"]), ("cpu", 1))
+        self.assertNotIn(workers[0].address, json.dumps(census))
+
+    def test_a_node_from_before_the_census_still_takes_the_worker(self):
+        """An upgraded worker against a node whose register body has no hardware field: the first registration is
+        refused, the worker drops the field and registers the old way, and the census counts it as unreported."""
+        from vibehash import node as node_module
+
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 1)
+        job = TrainingJob("old-node-job", req.address, budget=60 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        old = {**node_module.BODIES, "register": {"round", "flops_per_sec", "memory_mb"}}
+        with mock.patch.object(node_module, "BODIES", old):
+            run_until(node, clients, stop, node.chain.tip.height + 3)
+        self.assertIsNone(clients[0].hardware_class)  # it noticed, and the census below shows it registered anyway
+        census = api.get("/network")["hardware"]
+        self.assertEqual((census["day"], census["reported"], census["classes"]), (1, 0, []), census)
 
     def test_worker_job_must_be_one_the_node_lists(self):
         """`worker --job JOB` (for pods and --plain): a job the node doesn't list with budget left stops it at once,
