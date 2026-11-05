@@ -71,7 +71,9 @@ def running(state: dict | None = None, now: float | None = None) -> bool:
 def order(word: str) -> None:
     """Leave an order (pause, resume, stop) for the running app."""
     app_dir().mkdir(parents=True, exist_ok=True)
-    control_path().write_text(word + "\n", encoding="utf-8")
+    tmp = control_path().with_suffix(".tmp")  # whole or not there: the app never reads half an order
+    tmp.write_text(word + "\n", encoding="utf-8")
+    os.replace(tmp, control_path())
 
 
 def take_order() -> str | None:
@@ -89,7 +91,7 @@ def take_order() -> str | None:
 def prepare(a) -> tuple[str, Path]:
     """Node, wallet and GPU support, without a question that can't be answered: -> (node url, wallet path).
     The same steps as `setup`, kept: a second run changes nothing."""
-    from . import cli, mnemonic
+    from . import cli, unattended
     from . import wallet as wallets
 
     url = settings.chosen_node(getattr(a, "node", None)) or settings.PUBLIC_NODE
@@ -98,21 +100,16 @@ def prepare(a) -> tuple[str, Path]:
     print(f"node: {url}")
 
     path = settings.wallet_path(getattr(a, "wallet", None)) or settings.default_wallet()
-    if path.exists():
-        print(f"wallet: {path} ({json.loads(path.read_text())['address']})")
-    else:
-        pw = cli.password("Choose a wallet password: ", confirm=True)
+    address, pw = cli.ensure_wallet(path, "wallet: ")
+    if pw is None and wallets.is_encrypted(path):
+        # The worker is a child process that unlocks the wallet itself: it reads $VIBEHASH_PASSWORD, so the password
+        # asked for here (once, at a terminal) is handed to it that way, after a check that it opens the wallet.
+        pw = cli.password(f"Password for {path}: ")
         if pw is None:
-            from . import unattended
-            raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the app and the "
-                                  "worker read it to unlock the wallet")
-        if not pw:
-            sys.exit("a wallet password is required (set VIBEHASH_PASSWORD)")
-        words = mnemonic.generate()
-        keys = mnemonic.keypair(words)
-        wallets.save(keys, path, pw, mnemonic.PATH)
-        print(f"wallet: created {path} ({keys.address})")
-        cli.give_words(words, keys.address, path)
+            raise unattended.need(f"the password of {path}", "set VIBEHASH_PASSWORD to it")
+        wallets.load(path, pw)  # a wrong one stops here, not in the worker over and over
+    if pw is not None:
+        os.environ["VIBEHASH_PASSWORD"] = pw
     settings.save(wallet=str(path))
 
     if getattr(a, "gpu", "auto") == "skip":
@@ -121,8 +118,8 @@ def prepare(a) -> tuple[str, Path]:
         print("graphics card: checked before (app --recheck-gpu checks again)")
     else:
         print("graphics card:")
-        cli._setup_gpu(assume_yes=True)
-        settings.save(app_gpu_ready=True)
+        if cli._setup_gpu(assume_yes=True):  # settled: ready, or nothing to install; a failed install is tried again
+            settings.save(app_gpu_ready=True)
     return url, path
 
 
@@ -167,12 +164,18 @@ class Supervisor:
                 child.send_signal(signal.CTRL_BREAK_EVENT)
             else:
                 child.terminate()
-            child.wait(timeout=self.grace_s)
-        except subprocess.TimeoutExpired:
+        except OSError:  # no console to send Ctrl-Break through, say: then the hard way
             child.kill()
-            child.wait(timeout=5)
-        except OSError:
-            pass
+        deadline = time.time() + self.grace_s
+        while child.poll() is None and time.time() < deadline:  # the heartbeat goes on while the worker leaves its round
+            self.write_state(time.time())
+            time.sleep(0.25)
+        if child.poll() is None:
+            child.kill()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         self.worker_since = None
         self.say(f"worker stopped: {why}")
 
@@ -211,6 +214,8 @@ class Supervisor:
         return True
 
     def run(self, stop=None) -> None:
+        from .cli import _stop_like_ctrl_c
+        _stop_like_ctrl_c()  # `kill`, a service manager or a closed console window: the worker is stopped first
         app_dir().mkdir(parents=True, exist_ok=True)
         take_order()  # a stale order from an earlier app
         try:
@@ -257,13 +262,13 @@ def status_text(now: float | None = None, fetch=None) -> str:
     if w.get("running"):
         lines.append(f"worker: running (pid {w.get('pid')}, started {w.get('restarts', 0)} times again), feed at {state.get('watch')}")
         try:
+            from .cli import fmt
             feed = (fetch or _fetch)(state["watch"])
             for rig in feed.get("workers", []):
                 acct = rig.get("account") or {}
-                vibe = feed.get("syn_per_vibe") or 1
                 lines.append(f"  {rig['address']}: round {rig.get('round')}, {rig.get('activity')}; "
                              f"{rig['session']['rounds']} rounds and {rig['session']['units']} units this session; "
-                             f"balance {acct.get('balance', 0) / vibe:g} VIBE, stake {acct.get('stake', 0) / vibe:g} VIBE")
+                             f"balance {fmt(acct.get('balance', 0))}, stake {fmt(acct.get('stake', 0))}")
         except Exception:  # noqa: BLE001  (a feed that doesn't answer is a line, not an error)
             lines.append("  (the feed isn't answering yet)")
     else:
@@ -315,16 +320,18 @@ def startup_on(system: str | None = None, run=subprocess.run) -> Path:
         path.write_text(f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" -m vibehash app\r\n',
                         encoding="utf-8")
     elif system == "Darwin":
+        from xml.sax.saxutils import escape  # a path with & or < in it is still a plist
+        log = escape(str(home / "app" / "app.log"))
         path.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{exe}</string><string>-m</string><string>vibehash</string><string>app</string></array>
-  <key>EnvironmentVariables</key><dict><key>VIBEHASH_HOME</key><string>{home}</string></dict>
+  <key>ProgramArguments</key><array><string>{escape(exe)}</string><string>-m</string><string>vibehash</string><string>app</string></array>
+  <key>EnvironmentVariables</key><dict><key>VIBEHASH_HOME</key><string>{escape(str(home))}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>{home / 'app' / 'app.log'}</string>
-  <key>StandardErrorPath</key><string>{home / 'app' / 'app.log'}</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
 """, encoding="utf-8")
         run(["launchctl", "load", "-w", str(path)], check=False)
@@ -334,8 +341,8 @@ Description=Vibe Hash: mine by training AI models
 After=network-online.target
 
 [Service]
-ExecStart={exe} -m vibehash app
-Environment=VIBEHASH_HOME={home}
+ExecStart={shlex.quote(exe)} -m vibehash app
+Environment="VIBEHASH_HOME={home}"
 Restart=on-failure
 RestartSec=30
 

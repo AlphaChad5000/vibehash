@@ -99,8 +99,10 @@ class StatusTests(AppHome):
         state = {"beat": now, "started": now - 60, "paused": False, "watch": "http://127.0.0.1:7545/",
                  "worker": {"running": True, "pid": 123, "restarts": 2}, "events": ["12:00:00  worker started"]}
         app.state_path().write_text(json.dumps(state))
-        feed = {"syn_per_vibe": 100, "workers": [{"address": "vibe1abc", "round": 9, "activity": "training unit 1 of 2",
-                                                  "session": {"rounds": 3, "units": 7}, "account": {"balance": 250, "stake": 1000}}]}
+        from vibehash.tasks import SYN_PER_VIBE
+        feed = {"syn_per_vibe": SYN_PER_VIBE, "workers": [{"address": "vibe1abc", "round": 9, "activity": "training unit 1 of 2",
+                                                           "session": {"rounds": 3, "units": 7},
+                                                           "account": {"balance": int(2.5 * SYN_PER_VIBE), "stake": 10 * SYN_PER_VIBE}}]}
         text = app.status_text(now, fetch=lambda url: feed)
         self.assertIn("running since", text)
         self.assertIn("worker: running (pid 123, started 2 times again)", text)
@@ -132,7 +134,7 @@ class PrepareTests(AppHome):
         words = list(Path(self.tmp.name).glob("recovery-words-*.txt"))
         self.assertEqual(len(words), 1)  # no terminal: the words went to a file
         address = json.loads(path.read_text())["address"]
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+        with mock.patch.dict(os.environ, {"VIBEHASH_PASSWORD": "pw"}), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             url2, path2 = app.prepare(SimpleNamespace(gpu="skip"))
         self.assertEqual((url2, path2), (url, path))
         self.assertIn(address, out.getvalue())  # kept, not made again
@@ -144,14 +146,37 @@ class PrepareTests(AppHome):
                 app.prepare(SimpleNamespace(gpu="skip"))
         self.assertIn("VIBEHASH_PASSWORD", str(ctx.exception))
 
-    def test_the_gpu_is_checked_once(self):
+    def test_the_gpu_is_checked_once_it_is_settled(self):
         with mock.patch.dict(os.environ, {"VIBEHASH_PASSWORD": "pw"}), mock.patch("vibehash.cli._setup_gpu") as gpu, \
                 mock.patch("sys.stdout", new_callable=io.StringIO):
+            gpu.return_value = False  # the install failed (no network, say): tried again next start
             app.prepare(SimpleNamespace(gpu="auto"))
             app.prepare(SimpleNamespace(gpu="auto"))
-            self.assertEqual(gpu.call_count, 1)
-            app.prepare(SimpleNamespace(gpu="auto", recheck_gpu=True))
             self.assertEqual(gpu.call_count, 2)
+            gpu.return_value = True  # ready, or nothing to install
+            app.prepare(SimpleNamespace(gpu="auto"))
+            app.prepare(SimpleNamespace(gpu="auto"))
+            self.assertEqual(gpu.call_count, 3)
+            app.prepare(SimpleNamespace(gpu="auto", recheck_gpu=True))
+            self.assertEqual(gpu.call_count, 4)
+
+    def test_the_password_reaches_the_worker(self):
+        """The worker is a child process that unlocks the wallet itself from $VIBEHASH_PASSWORD, so a password typed
+        at the app's terminal is put there, after a check that it opens the wallet."""
+        from vibehash import wallet as wallets
+        env = {k: v for k, v in os.environ.items() if k != "VIBEHASH_PASSWORD"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("vibehash.cli.password", return_value="typed"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            url, path = app.prepare(SimpleNamespace(gpu="skip"))  # a new wallet, made with the typed password
+            self.assertEqual(os.environ["VIBEHASH_PASSWORD"], "typed")
+            self.assertTrue(wallets.is_encrypted(path))
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("vibehash.cli.password", return_value="typed"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            app.prepare(SimpleNamespace(gpu="skip"))  # the same wallet next time: asked, checked, handed on
+            self.assertEqual(os.environ["VIBEHASH_PASSWORD"], "typed")
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("vibehash.cli.password", return_value="wrong"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), self.assertRaises(wallets.WalletError):
+            app.prepare(SimpleNamespace(gpu="skip"))
 
 
 class StartupTests(AppHome):
@@ -184,6 +209,9 @@ class CommandTests(AppHome):
         a = cli.parser().parse_args(["app"])
         self.assertIsNone(a.acmd)
         self.assertIs(a.fn, cli.cmd_app)
+        a = cli.parser().parse_args(["app", "--device", "cuda", "--gpu", "skip"])  # the start options, without "start"
+        self.assertEqual((a.acmd, a.device, a.gpu), (None, "cuda", "skip"))
+        self.assertEqual(cli.parser().parse_args(["app", "start", "--watch", "7000"]).watch, 7000)
         self.assertEqual(cli.parser().parse_args(["app", "startup", "off"]).mode, "off")
 
     def test_orders_need_a_running_app(self):

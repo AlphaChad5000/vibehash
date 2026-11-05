@@ -162,6 +162,28 @@ def show_words(words: str, indent: str = "") -> None:
     print()
 
 
+def ensure_wallet(path: Path, indent: str = "") -> tuple[str, str | None]:
+    """The wallet at `path`, made if there is none: its password asked for (or $VIBEHASH_PASSWORD; with neither, the
+    error says so), its recovery words shown once or saved to a file when nobody is watching. -> (address, the
+    password a new wallet was made with, else None)."""
+    if path.exists():
+        address = json.loads(path.read_text())["address"]
+        print(f"{indent}using {path}\n{indent}address {address}")
+        return address, None
+    pw = password(f"{indent}Choose a wallet password: ", confirm=True)
+    if pw is None:
+        raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
+                              "too, to unlock the wallet unattended")
+    if not pw:
+        sys.exit("a wallet password is required (set VIBEHASH_PASSWORD for unattended setups)")
+    words = mnemonic.generate()
+    keys = mnemonic.keypair(words)
+    wallets.save(keys, path, pw, mnemonic.PATH)
+    print(f"{indent}created {path}\n{indent}address {keys.address}")
+    give_words(words, keys.address, path, indent)
+    return keys.address, pw
+
+
 def give_words(words: str, address: str, wallet: Path, indent: str = "") -> None:
     """A new wallet's words: on the screen when this is a terminal; otherwise (nohup, Docker, a pod's log) never in
     the output, which may be a log others can read, but in a file only this user can read, with a loud note."""
@@ -494,8 +516,10 @@ def driver_advice(label: str) -> str:
     return f"Update the graphics driver from {site}"
 
 
-def _setup_gpu(assume_yes: bool) -> None:
-    """Find the GPU, install the PyTorch build for it (after asking), and self-test it."""
+def _setup_gpu(assume_yes: bool) -> bool:
+    """Find the GPU, install the PyTorch build for it (after asking), and self-test it. -> whether that's settled:
+    the GPU trains, or there is none PyTorch supports, or a driver has to change first. False when it is worth
+    trying again (the install failed, or wasn't wanted), which `app` does at its next start."""
     from . import gpusetup
 
     if torch := gpusetup.installed_torch():
@@ -505,34 +529,36 @@ def _setup_gpu(assume_yes: bool) -> None:
         for d in listed:
             print(f"   {d['label']}: {'ready' if d['ready'] else 'not usable: ' + str(d['problem'])[:120]}")
         print(f"   PyTorch {gpusetup.installed_torch()} already trains on it, so nothing is installed")
-        return
+        return True
     if listed:  # PyTorch sees the card but can't run on it: the driver, not the build, is the problem
         for d in listed:
             print(f"   {d['label']} isn't usable with PyTorch {gpusetup.installed_torch()} ({str(d['problem'])[:120]}).\n"
                   f"   {driver_advice(d['label'])}, then run `{prog()} install-gpu` again. Until then training uses "
                   "the CPU.")
-        return
+        return True
     gpus = gpusetup.detect()
     if not gpus:
         print("   no graphics card PyTorch supports; training will use the CPU, which works fine")
-        return
+        return True
     for g in gpus:
         print(f"   found {g.describe()}")
     print("   checking which PyTorch builds are published for it...")
     gpu, build, why = gpusetup.choose(gpus)
     if build is None:
         print(f"   can't train on {gpu.name} yet: {why}. Training will use the CPU.")
-        return
+        return True
     print(f"   it needs PyTorch built for {build.label}, a large download (up to 3 GB) into\n   {sys.executable}")
     if not ask("   Install it now?", assume_yes):
         print(f"   skipped. Install it later with: {prog()} install-gpu")
-        return
+        return False
     if code := gpusetup.install(build):
         print(f"   the install failed (pip exit code {code}). Training will use the CPU until it's fixed.")
-        return
+        return False
     print("   testing it (a minute or two the first time)...", flush=True)
-    for d in gpusetup.devices():
+    found = gpusetup.devices()
+    for d in found:
         print(f"   {d['id']:<8} {d['label']}  [{'ready' if d['ready'] else 'NOT USABLE: ' + str(d['problem'])[:120]}]")
+    return any(d["ready"] for d in found if d["id"] != "cpu")
 
 
 def cmd_install_gpu(a):
@@ -574,23 +600,8 @@ def cmd_setup(a):
 
     print("\n2. Wallet")
     path = settings.wallet_path(a.wallet) or settings.default_wallet()
-    keys = None
-    if path.exists():
-        address = json.loads(path.read_text())["address"]
-        print(f"   using {path}\n   address {address}")
-    else:
-        pw = password("   Choose a wallet password: ", confirm=True)
-        if pw is None:
-            raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
-                                  "too, to unlock the wallet unattended")
-        if not pw:
-            sys.exit("a wallet password is required (set VIBEHASH_PASSWORD for unattended setups)")
-        words = mnemonic.generate()
-        keys = mnemonic.keypair(words)
-        wallets.save(keys, path, pw, mnemonic.PATH)
-        address = keys.address
-        print(f"   created {path}\n   address {address}")
-        give_words(words, address, path, "   ")
+    address, pw = ensure_wallet(path, "   ")
+    keys = None if pw is None else wallets.load(path, pw)  # (a wallet made just now: no second password for staking)
     settings.save(wallet=str(path))
     if a.deepseek:
         settings.save(deepseek=a.deepseek)  # what `worker` does with DeepSeek jobs, until `worker --deepseek` changes it
@@ -2062,16 +2073,18 @@ def parser() -> argparse.ArgumentParser:
                          "go to a file only you can read), installs the GPU build of PyTorch without asking, then runs "
                          "`worker --watch` and starts it again whenever it stops. The other `app` commands talk to the "
                          "running one through ~/.vibehash/app. It is what the desktop app's launcher runs.")
-    asub = ap_.add_subparsers(dest="acmd")
-    p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)")
-    p.add_argument("--node", help="node address (default: the one saved, else the public network's)")
-    p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--device", default="auto", help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
-    p.add_argument("--watch", type=int, metavar="PORT", help=f"the worker's feed's port (default {WATCH_PORT})")
-    p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
-    p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
-    p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
-    p.set_defaults(fn=cmd_app)
+    for p in (ap_, None):  # the start options, on plain `app` and on `app start` alike
+        if p is None:
+            asub = ap_.add_subparsers(dest="acmd")
+            p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)")
+        p.add_argument("--node", help="node address (default: the one saved, else the public network's)")
+        p.add_argument("--wallet", help=WALLET)
+        p.add_argument("--device", default="auto", help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
+        p.add_argument("--watch", type=int, metavar="PORT", help=f"the worker's feed's port (default {WATCH_PORT})")
+        p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
+        p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
+        p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
+        p.set_defaults(fn=cmd_app)
     for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
                        ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
         asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
