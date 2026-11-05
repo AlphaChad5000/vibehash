@@ -147,7 +147,7 @@ provider works too: set `LLM_BASE_URL` (the part before `/chat/completions`), `L
 key is only ever sent to Meta. `python agents/llm_call.py` checks the settings with one short call.
 
 Also read from `.env.local`: `ALLOWED_BASES` (default `qwen3-0.6b`; add `llama-3.2-1b`, which is gated on Hugging
-Face), `MAX_BUDGET` (the most one network job may spend, default 200 VIBE), `JUDGE2_MODEL` (empty to skip the second
+Face), `MAX_BUDGET` (the most one network job may spend, default and at most 200 VIBE), `JUDGE2_MODEL` (empty to skip the second
 judge) and, for the dispatcher, `DISPATCH_TOKEN`.
 
 ## On the Vibe Hash network
@@ -175,8 +175,12 @@ train command. On the public network leave out `--node` and `--wallet`.
 
 **`--post` spends VIBE** on the node it posts to: the `--node` you give, or else the one `vibehash setup` saved, or
 else the public network. `vibehash train` shows its pre-flight and asks "Post it?" first (`--yes` skips the
-question). The budget is enough rounds for the plan's epochs over its chats at 10 VIBE a round (usually 10 to 40),
-capped by `MAX_BUDGET`; `--budget` sets it by hand, `--fee` the VIBE a round. `--id` names the job yourself and
+question). Code sets how long it trains: a unit of network training is 16 steps of 8 chats (128 chats on either
+base), so the architect passes `--units` (1 to 8 a round) and a budget of whole rounds that come nearest the plan's
+epochs over the chats train keeps (it holds back a tenth). 46 chats at 3 epochs is 1 unit in 1 round, 10 VIBE, about
+3 epochs; up to about 400 chats at 3 epochs is still one round of 8 units. The budget is capped by `MAX_BUDGET`,
+and the line the architect prints says the rounds, units and epochs it bought. `--budget` sets it by hand (more
+rounds, so more epochs), `--fee` the VIBE a round. `--id` names the job yourself and
 `--base` picks the model (the LLM picks otherwise, from `ALLOWED_BASES`). It goes into escrow when the job is posted and pays only for work
 that passes its checks; `vibehash cancel-job <job>` returns what's left.
 

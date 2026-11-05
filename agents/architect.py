@@ -28,8 +28,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))  # run as a script from anywhere: this checkout's agents and vibehash
 from agents import checks  # noqa: E402
 from agents.llm_call import chat_json, model_name  # noqa: E402
-from agents.models import BASES  # noqa: E402
-from vibehash import catalog, settings  # noqa: E402
+from agents.models import BASES, DIMS  # noqa: E402
+from vibehash import catalog, finetune, settings  # noqa: E402
 from vibehash.tasks import _JOB_ID  # noqa: E402  (what the chain takes as a job id)
 
 # Qwen3-0.6B unless .env.local says otherwise (ALLOWED_BASES=qwen3-0.6b,llama-3.2-1b): Llama is gated on Hugging Face,
@@ -54,8 +54,9 @@ OFF_LONG_EXAMPLES, OFF_LONG_PROMPTS = 4, 2  # of those, long ones: trained to de
 
 # The network backend: what `vibehash train` and the chain would refuse, checked before the LLM's plan is accepted
 FEE = 10  # VIBE a round: `vibehash train`'s --fee default
-MAX_BUDGET = int(os.environ.get("MAX_BUDGET", 200))  # VIBE: the most one agent-written job may spend (.env.local can lower it)
-CHATS_A_ROUND = 8 * 16  # a round is 8 units (train's --units default) of about 16 steps, one chat a step
+MAX_BUDGET = min(200, int(os.environ.get("MAX_BUDGET", 200)))  # VIBE: the most one agent-written job may spend
+#                                                                 (.env.local can lower it, never raise it)
+UNITS = 8  # train's --units default: the most units a round an agent's job asks for (a small job asks for fewer)
 MAX_LEN = 512  # train's --max-len default; longer sequences make these bases' disputes too big to play from home
 TEMPLATE_TOKENS = 64  # what a chat template wraps around one exchange (Llama 3.2's dated system header is ~30)
 WINDOWS_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10))}
@@ -215,11 +216,36 @@ def network(plan: dict, max_len: int = MAX_LEN) -> list[str]:
     return problems
 
 
+def trained(n: int) -> int:
+    """How many of n chats `vibehash train` trains on: it holds back a tenth, at least 1 and at most MAX_VAL, to
+    measure progress (finetune.prepare)."""
+    return n - max(1, min(n // 10, finetune.MAX_VAL))
+
+
+def unit_chats(base: str) -> int:
+    """Chats one unit of network training reads on `base`: train's steps a unit times the batch it picks for a model
+    that size (finetune.settings_for: 8 chats a step for both bases here, not 1)."""
+    return finetune.UNIT_STEPS * finetune.settings_for(DIMS[base])["batch_size"]
+
+
+def schedule(plan: dict, fee: int = FEE, budget: int | None = None) -> dict:
+    """How a network job trains its plan: units a round (train's --units), the budget in VIBE (whole rounds at `fee`,
+    within MAX_BUDGET), and the epochs that buys over the chats train keeps. Code sets it, not the LLM: it's money,
+    and the budget alone decides how long the network trains, so too much of it overtrains. A round reads
+    units x unit_chats(base) chats, and the units are spread evenly over as few rounds as UNITS allows: 46 chats at 3
+    epochs is 1 unit in 1 round (10 VIBE, about 3 epochs), not 8 units (25). `budget`: the requester's own, which buys
+    as many rounds as it pays for."""
+    per_unit, n = unit_chats(plan["base"]), trained(len(plan["examples"]))
+    want = max(1, round(n * plan["epochs"] / per_unit))  # units over the whole job, nearest the plan's epochs
+    rounds = math.ceil(want / UNITS)
+    units = math.ceil(want / rounds)
+    rounds = min(rounds, MAX_BUDGET // fee) if budget is None else budget // fee
+    return {"units": units, "budget": rounds * fee, "network_epochs": round(rounds * units * per_unit / n, 1)}
+
+
 def budget(plan: dict, fee: int = FEE) -> int:
-    """VIBE for a network job: enough rounds for its epochs over its chats, at `fee` a round, within MAX_BUDGET. Code
-    sets it, not the LLM: it's money."""
-    rounds = math.ceil(len(plan["examples"]) * plan["epochs"] / CHATS_A_ROUND)
-    return max(fee, min(MAX_BUDGET // fee * fee, rounds * fee))
+    """VIBE for a network job: whole rounds for its epochs over its chats, at `fee` a round, within MAX_BUDGET."""
+    return schedule(plan, fee)["budget"]
 
 
 def id_problems(job_id: str, out: Path, backend: str) -> list[str]:
@@ -585,7 +611,8 @@ def save(plan: dict, out: Path, backend: str = "local", node: str | None = None)
         | {"caveat": plan.get("caveat") or "", "examples": len(plan["examples"]), "model": model_name(),
            "scope": plan.get("scope") or {"narrow": False, "decline": ""}, "checks": plan.get("checks") or [],
            "audit": plan.get("audit"), "backend": backend}
-        | ({"budget": plan["budget"], "node": node} if backend == "vibehash" else {}), indent=2))
+        | ({k: plan[k] for k in ("budget", "units", "network_epochs")} | {"node": node}
+           if backend == "vibehash" else {}), indent=2))
     return chats, evals
 
 
@@ -598,8 +625,8 @@ def train_command(plan: dict, chats: Path, out: Path, backend: str = "local", *,
         return [sys.executable, str(Path(__file__).with_name("train_local.py")), str(chats), "--base", plan["base"],
                 "--rank", str(plan["rank"]), "--epochs", str(plan["epochs"]), "--out", str(out / "adapters")]
     cmd = [sys.executable, "-m", "vibehash", "train", str(Path(chats).resolve()), "--base", plan["base"],
-           "--rank", str(plan["rank"]), "--budget", str(plan["budget"]), "--max-len", str(max_len),
-           "--id", plan["job_id"], "--plain"]
+           "--rank", str(plan["rank"]), "--budget", str(plan["budget"]), "--units", str(plan["units"]),
+           "--max-len", str(max_len), "--id", plan["job_id"], "--plain"]
     cmd += ["--fee", str(fee)] if fee is not None else []
     cmd += ["--node", node] if node else []
     cmd += ["--wallet", wallet] if wallet else []
@@ -668,14 +695,19 @@ def main(argv=None) -> int:
     elif net:
         plan["job_id"] = chain_id(plan["job_id"])
     if net:
-        plan["budget"] = a.budget or budget(plan, fee)
+        plan |= schedule(plan, fee, a.budget)
     chats, evals = save(plan, out, a.backend, a.node)
     wallet = os.path.expanduser(a.wallet) if a.wallet else None  # ~/... from a shell that leaves it alone
     cmd = train_command(plan, chats, out, a.backend, max_len=a.max_len, fee=a.fee, node=a.node, wallet=wallet,
                         yes=a.yes)
-    cost = f", {plan['budget']} VIBE (up to {plan['budget'] // fee} rounds at {fee} VIBE)" if net else ""
+    epochs = f"{plan['epochs']} epochs"
+    if net:
+        rounds, units = plan["budget"] // fee, plan["units"]
+        epochs = (f"{plan['budget']} VIBE: {rounds} round{'s' * (rounds != 1)} at {fee} VIBE of {units} "
+                  f"unit{'s' * (units != 1)}, about {plan['network_epochs']} epochs over the "
+                  f"{trained(len(plan['examples']))} chats train keeps (the plan asked for {plan['epochs']})")
     print(f"\n{plan['job_id']}: {len(plan['examples'])} examples on {plan['base']}, LoRA rank {plan['rank']}, "
-          f"{plan['epochs']} epochs{cost}\n  why: {plan['reasoning']}")
+          f"{epochs}\n  why: {plan['reasoning']}")
     if plan.get("caveat"):
         print(f"  caveat: {plan['caveat']}")
     print(f"  wrote {chats} and {evals}\n  command: {shown(cmd)}")

@@ -396,6 +396,9 @@ class ArchitectTests(AgentTest):
                 "llama-3.2-1b": {"family": "llama", "vocab": 128256, "hidden": 2048, "layers": 16, "heads": 32,
                                  "kv_heads": 8, "head_dim": 64, "ffn": 8192, "tied": True}}
         self.assertEqual(set(dims), set(architect.BASES))
+        self.assertEqual(architect.DIMS, {k: {"layers": d["layers"], "hidden": d["hidden"]} for k, d in dims.items()})
+        for name, d in dims.items():  # the chats a unit reads, as `vibehash train` sizes it from the whole config
+            self.assertEqual(architect.unit_chats(name), ft.UNIT_STEPS * ft.settings_for(d)["batch_size"])
 
         def job(d, rank, seq_len):
             spec = ft.LoraSpec(base="hf:org/name@" + "c" * 40, manifest="a" * 64, dims=d, rank=rank, alpha=2.0 * rank,
@@ -416,9 +419,22 @@ class ArchitectTests(AgentTest):
                 job(d, 16, 1024)
 
     def test_budgets_ids_and_token_guesses(self):
-        self.assertEqual(architect.budget({"examples": [0] * 80, "epochs": 3}), 20)  # 240 chats: 2 rounds
-        self.assertEqual(architect.budget({"examples": [0] * 10, "epochs": 2}), architect.FEE)  # at least a round
-        self.assertEqual(architect.budget({"examples": [0] * 4000, "epochs": 5}), architect.MAX_BUDGET)
+        def plan(n, epochs, base="qwen3-0.6b"):
+            return {"base": base, "examples": [0] * n, "epochs": epochs}
+        # a unit reads 16 steps of 8 chats: 80 chats (72 trained) at 3 epochs is 2 units in one round, not 2 rounds
+        # of 8 units (25 epochs)
+        self.assertEqual(architect.schedule(plan(80, 3)), {"units": 2, "budget": 10, "network_epochs": 3.6})
+        self.assertEqual(architect.schedule(plan(46, 3)), {"units": 1, "budget": 10, "network_epochs": 3.0})
+        self.assertEqual(architect.schedule(plan(46, 3, "llama-3.2-1b"))["units"], 1)
+        self.assertEqual(architect.budget(plan(10, 2)), architect.FEE)  # at least a round
+        self.assertEqual(architect.schedule(plan(4000, 5)), {"units": 8, "budget": 190, "network_epochs": 5.0})
+        capped = architect.schedule(plan(20000, 5))  # what MAX_BUDGET buys, and fewer epochs than asked
+        self.assertEqual((capped["units"], capped["budget"]), (8, architect.MAX_BUDGET))
+        self.assertLess(capped["network_epochs"], 5)
+        self.assertEqual(architect.schedule(plan(46, 3), budget=30), {"units": 1, "budget": 30, "network_epochs": 9.1})
+        self.assertEqual(architect.trained(46), 42)  # train holds back a tenth
+        self.assertEqual(architect.trained(5000), 5000 - ft.MAX_VAL)
+        self.assertLessEqual(architect.MAX_BUDGET, 200)
         (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "bot-aaaa").mkdir(parents=True)
         with mock.patch.object(architect.secrets, "token_hex", side_effect=["aaaa", "bbbb"]):
             self.assertEqual(architect.chain_id("bot"), "bot-bbbb")  # taken here already: drawn again
@@ -427,7 +443,7 @@ class ArchitectTests(AgentTest):
         self.assertEqual(architect.tokens_about("你好吗"), 3)
 
     def test_the_train_commands_are_exactly_these(self):
-        plan = good_plan(job_id="support-bot-1a2b", budget=50)
+        plan = good_plan(job_id="support-bot-1a2b", budget=50, units=2)
         out = self.dir / "agent-jobs"
         chats = out / "support-bot-1a2b.jsonl"
         self.assertEqual(architect.train_command(plan, chats, out),
@@ -435,13 +451,14 @@ class ArchitectTests(AgentTest):
                           "--base", "qwen3-0.6b", "--rank", "8", "--epochs", "3", "--out", str(out / "adapters")])
         cmd = architect.train_command(plan, chats, out, "vibehash")
         self.assertEqual(cmd, [sys.executable, "-m", "vibehash", "train", str(chats.resolve()), "--base", "qwen3-0.6b",
-                               "--rank", "8", "--budget", "50", "--max-len", "512", "--id", "support-bot-1a2b",
-                               "--plain"])
+                               "--rank", "8", "--budget", "50", "--units", "2", "--max-len", "512",
+                               "--id", "support-bot-1a2b", "--plain"])
         full = architect.train_command(plan, chats, out, "vibehash", max_len=256, node="http://127.0.0.1:8545",
                                        wallet="req.json", yes=True)
         a = cli.parser().parse_args(full[3:])  # what `vibehash train` makes of it
-        self.assertEqual((a.data, a.base, a.rank, a.budget, a.max_len, a.id, a.plain, a.yes, a.node, a.wallet),
-                         (str(chats.resolve()), "qwen3-0.6b", 8, 50 * 10**8, 256, "support-bot-1a2b", True,
+        self.assertEqual((a.data, a.base, a.rank, a.budget, a.units, a.max_len, a.id, a.plain, a.yes, a.node,
+                          a.wallet),
+                         (str(chats.resolve()), "qwen3-0.6b", 8, 50 * 10**8, 2, 256, "support-bot-1a2b", True,
                           True, "http://127.0.0.1:8545", "req.json"))
         self.assertIs(a.fn, cli.cmd_train)
 
@@ -503,13 +520,14 @@ class ArchitectTests(AgentTest):
         self.assertEqual(len(records), 46)
         self.assertEqual([m["role"] for m in records[0]["messages"]], ["user", "assistant"])
         saved = json.loads((out_dir / f"{job_id}.plan.json").read_text(encoding="utf-8"))
-        self.assertEqual((saved["backend"], saved["budget"], saved["model"], saved["examples"]),
-                         ("vibehash", 20, MODEL, 46))
+        self.assertEqual((saved["backend"], saved["budget"], saved["units"], saved["network_epochs"], saved["model"],
+                          saved["examples"]), ("vibehash", 10, 1, 3.0, MODEL, 46))
         evals = json.loads((out_dir / f"{job_id}.eval.json").read_text(encoding="utf-8"))
         self.assertEqual((evals["base"], len(evals["prompts"])), ("qwen3-0.6b", 20))
         for f in out_dir.iterdir():
             self.assertNotIn(KEY, f.read_text(encoding="utf-8"))
-        self.assertIn("--budget 20", said)
+        self.assertIn("--budget 10 --units 1", said)
+        self.assertIn("10 VIBE: 1 round at 10 VIBE of 1 unit, about 3.0 epochs over the 42 chats", said)
         self.assertIn("Nothing was posted, and no VIBE spent", said)
 
     def test_post_runs_train_and_reads_its_receipt(self):
@@ -563,11 +581,12 @@ class ArchitectTests(AgentTest):
                                     "--fee", "5")
         self.assertIn("(Use base qwen3-0.6b.)", self.fake.requests[1]["body"]["messages"][1]["content"])
         plan = json.loads((out_dir / "my-bot.plan.json").read_text(encoding="utf-8"))
-        self.assertEqual((plan["job_id"], plan["base"], plan["budget"]), ("my-bot", "qwen3-0.6b", 10))  # 2 rounds at 5
+        self.assertEqual((plan["job_id"], plan["base"], plan["budget"]), ("my-bot", "qwen3-0.6b", 5))  # a round at 5
         self.assertIn("--fee 5", said)
         self.assertIn("--id my-bot", said)
-        self.assertEqual(architect.budget({"examples": [0] * 80, "epochs": 3}, fee=5), 10)
-        cmd = architect.train_command(good_plan(job_id="b", budget=10), out_dir / "b.jsonl", out_dir, "vibehash", fee=5)
+        self.assertEqual(architect.budget({"base": "qwen3-0.6b", "examples": [0] * 600, "epochs": 3}, fee=5), 10)
+        cmd = architect.train_command(good_plan(job_id="b", budget=10, units=1), out_dir / "b.jsonl", out_dir,
+                                      "vibehash", fee=5)
         self.assertEqual(cli.parser().parse_args(cmd[3:]).fee, 5 * 10**8)
 
     @unittest.skipUnless(HAVE["torch"] and HAVE["tokenizers"] and HAVE["jinja2"], "needs PyTorch, tokenizers and jinja2")
@@ -614,7 +633,15 @@ class ArchitectTests(AgentTest):
         self.assertIn("Model     tiny/qwen3", said)
         self.assertIn("46 examples (46 chats, in the model's chat template)", said)
         self.assertIn("LoRA rank 8", said)
-        self.assertIn("a budget of 20 VIBE buys 2 rounds", said)
+        self.assertIn("a budget of 10 VIBE buys 1 rounds", said)
+        # the epochs the architect paid for are the ones train's own pre-flight works out (the tiny model takes the
+        # same 8 chats a step as Qwen3-0.6B)
+        kept = int(re.search(r"([\d,]+) to train", said)[1].replace(",", ""))
+        batch, steps, units = map(int, re.search(r"(\d+) sequences a step, (\d+) steps a unit, (\d+) units a round",
+                                                 said).groups())
+        self.assertEqual((kept, units), (architect.trained(46), plan["units"]))
+        self.assertEqual(round(plan["budget"] // architect.FEE * units * steps * batch / kept, 1),
+                         plan["network_epochs"])
         self.assertIn("Nothing was posted, and nothing was spent.", said)
         self.assertFalse((Path(os.environ["VIBEHASH_HOME"]) / "jobs" / plan["job_id"]).exists())
 

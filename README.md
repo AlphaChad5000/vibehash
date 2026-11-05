@@ -185,6 +185,9 @@ shows the command it runs, and you're back in the menu when it's done.
 python -m vibehash
 ```
 
+Every command, with its flags and an example, is in [docs/CLI.md](docs/CLI.md);
+`python -m vibehash COMMAND --help` says the same at the terminal.
+
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
 

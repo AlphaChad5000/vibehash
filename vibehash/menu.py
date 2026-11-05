@@ -207,11 +207,8 @@ class Status:
 
 
 def _version() -> str:
-    try:
-        from importlib.metadata import version
-        return version("vibehash")
-    except Exception:
-        return "dev"
+    from . import __version__
+    return __version__
 
 
 # --- the keyboard ------------------------------------------------------------------------------------------------

@@ -147,21 +147,9 @@ def _duration(s: float) -> str:
 # --- software ---------------------------------------------------------------------------------------------------------
 
 def version() -> str:
-    """This release: the installed package's version, or pyproject.toml's for a source checkout."""
-    try:
-        from importlib.metadata import PackageNotFoundError, version as installed
-        try:
-            return installed("vibehash")
-        except PackageNotFoundError:
-            pass
-    except ImportError:
-        pass
-    try:
-        import re
-        text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
-        return re.search(r'^version\s*=\s*"([^"]+)"', text, re.M).group(1)
-    except (OSError, AttributeError):
-        return "unknown"
+    """This release (vibehash.__version__: a source checkout's pyproject.toml, else the installed package's)."""
+    from . import __version__
+    return __version__
 
 
 def _parse(v: str) -> tuple:

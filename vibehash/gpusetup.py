@@ -218,5 +218,9 @@ def devices() -> list[dict]:
         out = subprocess.run([sys.executable, "-m", "vibehash", "devices", "--json"], capture_output=True, text=True,
                              timeout=300, env=env)
         return json.loads(out.stdout.strip().splitlines()[-1])
+    except subprocess.TimeoutExpired:
+        # Not "no GPU": PyTorch is installed and something in it never answered, so reinstalling won't help.
+        return [{"id": "gpu", "label": "Your graphics card", "ready": False,
+                 "problem": "testing it with PyTorch took over 5 minutes"}]
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return []
