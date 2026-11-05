@@ -34,6 +34,15 @@ PROPOSER_SHARE = 0.05
 SLASH_FRACTION = 0.5  # of stake, on fraud
 BOUNTY_FRACTION = 0.5  # of the slashed amount, paid to whoever caught it
 MIN_STAKE = 5 * SYN_PER_VIBE
+# Joining the validator set (block version 4, ledger.ACCOUNTABILITY_VERSION) takes this much stake. A validator votes
+# with all of its stake and loses all of it for double-signing, so the price of joining is what a validator puts at
+# risk. The owner's call: 100 VIBE (20 times a worker's minimum) is a placeholder. Voting still needs only
+# MIN_STAKE (State.validator_set), so validators that joined before version 4, like the public node with 10 VIBE of
+# bootstrap stake, keep their vote.
+VALIDATOR_STAKE = 100 * SYN_PER_VIBE
+# A validator caught double-signing loses all of its stake. Whoever reports it gets this fraction (1/N) of the
+# withdrawable part, which pays for reporting it; bootstrap stake is only ever burned (double_sign_amounts).
+DOUBLE_SIGN_BOUNTY = 10
 
 REP_START = 0.8
 REP_MIN = 0.5
@@ -200,6 +209,14 @@ def slash_amounts(stake: int) -> tuple[int, int]:
     slashed = int(stake * SLASH_FRACTION)
     bounty = int(slashed * BOUNTY_FRACTION)
     return bounty, slashed - bounty
+
+
+def double_sign_amounts(stake: int, withdrawable: int) -> tuple[int, int]:
+    """A double-signer's punishment (block version 4): all of `stake` (its stake and unbonding coins). Returns (bounty
+    to whoever reported it, amount burned). The bounty comes only out of `withdrawable` (stake that isn't bootstrap
+    stake, plus unbonding coins), so bootstrap stake never becomes anyone's spendable coins."""
+    bounty = withdrawable // DOUBLE_SIGN_BOUNTY
+    return bounty, stake - bounty
 
 
 def update_reputation(rep: float, accepted: bool, missed: bool, fraud: bool) -> float:

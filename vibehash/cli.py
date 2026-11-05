@@ -740,7 +740,9 @@ def cmd_cancel_job(a):
 
 
 def cmd_validator_join(a):
-    """Announce this wallet as a validator, reachable at --url: from the next block it votes, and leads rounds."""
+    """Announce this wallet as a validator, reachable at --url: once the join takes effect (ledger.VALIDATOR_DELAY
+    blocks later, on block version 4) it votes, and leads rounds. Joining takes economics.VALIDATOR_STAKE staked, which
+    stays bonded until the wallet leaves again; a validator already in the set can announce a new url this way."""
     from .ledger import valid_endpoint
 
     url = normalise_url(a.url)
@@ -750,7 +752,8 @@ def cmd_validator_join(a):
     if "consensus" not in node.status():
         sys.exit("this node's chain is run by a single node, not validators; its genesis would need to name some")
     _send(a, "validator", "system", 0, url)
-    print(f"Run your node with --announce {url} and the same wallet, so the other validators can reach it.")
+    print(f"Run your node with --announce {url} and the same wallet, so the other validators can reach it. "
+          "It starts voting a few blocks from now; your stake stays bonded until you leave.")
 
 
 def cmd_validator_leave(a):
@@ -2025,7 +2028,8 @@ def parser() -> argparse.ArgumentParser:
     _fee_flag(p)
 
     v = sub.add_parser("validator", help="validators vote on blocks and take turns leading rounds").add_subparsers(dest="vcmd", required=True)
-    p = v.add_parser("join", help="announce your (staked) wallet as a validator")
+    p = v.add_parser("join", help=f"announce your wallet as a validator (it needs {econ.VALIDATOR_STAKE // SYN_PER_VIBE} "
+                     "VIBE staked)")
     p.add_argument("--url", required=True, help="the address other nodes reach your node at, e.g. http://203.0.113.7:8545")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET); p.set_defaults(fn=cmd_validator_join)
     p = v.add_parser("leave", help="stop validating"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)

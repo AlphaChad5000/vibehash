@@ -15,7 +15,7 @@ from unittest import mock
 
 from vibehash import cli
 from vibehash.client import NodeClient, WorkerClient
-from vibehash.consensus import Timeouts, check_certificate, proposer_order
+from vibehash.consensus import Timeouts, check_certificate, proposer_order, vote
 from vibehash.coordinator import CoordinatorConfig
 from vibehash.crypto import KeyPair, address_of
 from vibehash.ledger import Chain, Tx
@@ -223,6 +223,40 @@ class ValidatorNetworkTests(unittest.TestCase):
         net.wait(lambda: back.chain.tip.height >= node.chain.tip.height - 1 and back.chain.tip.height > at + 3, 60)
         net.assert_same_chain(self, [back, node], back.chain.tip.height)
         net.wait(lambda: back.engine.height == back.chain.tip.height + 1, 10)  # and it's voting again
+
+    def test_a_validator_signing_two_precommits_loses_its_stake_and_its_place(self):
+        """One of four validators sends, beside its precommit for block 1, a second one for another block. Each honest
+        validator that sees both sends the evidence from its own key (block version 4); one lands, and its block takes
+        the double-signer's stake and its place. The other three go on alone."""
+        net = Network(self, n_workers=0)
+        bad, honest = net.nodes[3], net.nodes[:3]
+        cid, real, sent = net.genesis["chain_id"], net.nodes[3].engine._broadcast, []
+
+        def two_faced(msg):
+            real(msg)
+            if msg["type"] == "precommit" and msg["block"] is not None and not sent:
+                sent.append(msg)
+                real(vote(bad.keys, cid, "precommit", msg["height"], msg["round"], "f" * 64))
+        bad.engine._broadcast = two_faced
+        api, someone = NodeClient(net.nodes[0].url), KeyPair.generate(b"someone").address
+        with self.assertLogs("vibehash.node", "WARNING") as logs:
+            api.send_tx(net.req, "transfer", someone, VIBE)
+            net.wait(lambda: all(bad.keys.address in n.chain.state.banned for n in honest), 60)
+        self.assertTrue(any("sent the evidence" in line for line in logs.output), logs.output)
+        for n in honest:
+            s = n.chain.state
+            self.assertEqual((s.stake(bad.keys.address), bad.keys.address in s.validators), (0, False))
+            self.assertEqual(len(s.validator_set()), 3)
+        reports = [t for b in net.nodes[0].chain.blocks for t in b.txs if t.kind == "evidence"]
+        self.assertEqual(len(reports), 1, "one punishment, however many validators reported it")
+        self.assertEqual(net.nodes[0].chain.state.balance(reports[0].sender), VIBE, "a tenth of its 10 VIBE")
+        at = min(n.chain.tip.height for n in honest)
+        api.send_tx(net.req, "transfer", someone, VIBE)
+        net.wait(lambda: min(n.chain.tip.height for n in honest) > at, 60)
+        net.assert_same_chain(self, honest, at + 1)
+        code, out = verify("--node", net.nodes[1].url, "--no-recheck")
+        self.assertEqual(code, 0, out)
+        self.assertIn("(3 validators now)", out)
 
     def test_a_validator_with_a_rival_block_on_disk_stops_and_the_rest_carry_on(self):
         """Another writer has put a different block 1 in one validator's database (2026-11-03: a second node on its

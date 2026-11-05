@@ -295,9 +295,10 @@ class ValidatorSetTests(unittest.TestCase):
         chain = chain or self.chain
         return Tx.signed(keys, "validator", "system", 0, chain.next_nonce(keys.address), url, chain.chain_id)
 
-    def seal(self, keys, txs, chain=None):
+    def seal(self, keys, txs, chain=None, version=3):
+        """Block version 3's rules: version 4's (a join's stake and delay) are in test_rules_v4."""
         chain = chain or self.chain
-        block, dropped = chain.build_block(None, txs, chain.tip.timestamp + 1)
+        block, dropped = chain.build_block(None, txs, chain.tip.timestamp + 1, version=version)
         block.sign(keys)
         chain.append(block)
         return dropped

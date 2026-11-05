@@ -102,7 +102,7 @@ class SpecTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ledger.InvalidBlock, "version 3"):
                         ledger._apply_user_tx(state, tx, 1, chain.chain_id, version)
-        self.assertEqual(ledger.VERSION, ledger.FINETUNE_VERSION)
+        self.assertGreaterEqual(ledger.VERSION, ledger.FINETUNE_VERSION)
 
     def test_an_oversized_score_is_refused_not_a_crash(self):
         from vibehash.coordinator import ProtocolError, _score
