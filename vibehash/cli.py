@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sys
 import threading
@@ -336,10 +337,28 @@ def cmd_worker(a, keys: KeyPair | None = None):
         lock.release()
 
 
+def _interrupt(*_) -> None:
+    raise KeyboardInterrupt
+
+
+def _stop_like_ctrl_c() -> None:
+    """SIGTERM (a service manager, `app stop` on Linux and macOS) and Ctrl-Break (`app stop` on Windows) end the worker
+    the way Ctrl+C does: the round log is written out and the dashboard sums up. Only the main thread may do this, and
+    a test that runs the command in another thread doesn't need it."""
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _interrupt)
+            except (ValueError, OSError):
+                pass
+
+
 def _mine(a, keys: KeyPair):
     from . import minerui, selftest
     from .wire import MAX_CLOCK_SKEW_S
 
+    _stop_like_ctrl_c()
     url = node_of(a)
     job = None if getattr(a, "job", None) in (None, "auto") else a.job
     if job:  # before the GPU's self-test: a mistyped job is said at once
@@ -409,6 +428,12 @@ def _mine(a, keys: KeyPair):
             watcher.stop()
     print(dash.summary())
     _record_end(session)
+
+
+def cmd_app(a):
+    from . import app
+
+    app.main(a)
 
 
 def _chosen_job(api: NodeClient, job: str, url: str) -> None:
@@ -2029,6 +2054,30 @@ def parser() -> argparse.ArgumentParser:
                    "(default auto: every job this worker can do). The dashboard's job line changes it while it runs: "
                    "Tab or 0-9")
     p.set_defaults(fn=cmd_worker)
+
+    ap_ = sub.add_parser("app", help="mine without the questions: get ready, join, keep the worker running, start at "
+                         "login; `app status`, `pause`, `resume` and `stop` drive it", description="`vibehash app` is "
+                         "the worker as something you start once and forget: it saves the node, makes a wallet if there "
+                         "is none (its password from $VIBEHASH_PASSWORD, or asked once at a terminal; the recovery words "
+                         "go to a file only you can read), installs the GPU build of PyTorch without asking, then runs "
+                         "`worker --watch` and starts it again whenever it stops. The other `app` commands talk to the "
+                         "running one through ~/.vibehash/app. It is what the desktop app's launcher runs.")
+    asub = ap_.add_subparsers(dest="acmd")
+    p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)")
+    p.add_argument("--node", help="node address (default: the one saved, else the public network's)")
+    p.add_argument("--wallet", help=WALLET)
+    p.add_argument("--device", default="auto", help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
+    p.add_argument("--watch", type=int, metavar="PORT", help=f"the worker's feed's port (default {WATCH_PORT})")
+    p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
+    p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
+    p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
+    p.set_defaults(fn=cmd_app)
+    for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
+                       ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
+        asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
+    p = asub.add_parser("startup", help="start the app when you log in (on), or not (off)")
+    p.add_argument("mode", choices=["on", "off"]); p.set_defaults(fn=cmd_app)
+    ap_.set_defaults(fn=cmd_app, acmd=None)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
     p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",

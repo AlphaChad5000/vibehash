@@ -188,6 +188,18 @@ python -m vibehash
 Every command, with its flags and an example, is in [docs/CLI.md](docs/CLI.md);
 `python -m vibehash COMMAND --help` says the same at the terminal.
 
+Or let it look after itself. `python -m vibehash app` does setup without
+questions (the wallet's password from `$VIBEHASH_PASSWORD`, or asked once; a
+new wallet's recovery words go to a file only you can read), installs GPU
+support, mines with the worker's live feed on, and starts the worker again if
+it ever stops. `app pause`, `app resume`, `app stop` and `app status` drive
+it from another terminal, and `app startup on` starts it when you log in.
+It is what the desktop app runs underneath.
+
+```bash
+python -m vibehash app
+```
+
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
 
