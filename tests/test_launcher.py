@@ -26,7 +26,8 @@ L = load()
 
 class WhereTests(unittest.TestCase):
     def test_a_folder_per_system(self):
-        self.assertEqual(L.app_dir("Windows", {"LOCALAPPDATA": r"C:\Users\me\AppData\Local"}), Path(r"C:\Users\me\AppData\Local\VibeHash"))
+        local = r"C:\Users\me\AppData\Local"  # (joined the same way on every system: CI runs this on Linux)
+        self.assertEqual(L.app_dir("Windows", {"LOCALAPPDATA": local}), Path(local) / "VibeHash")
         self.assertEqual(L.app_dir("Darwin", {}), Path.home() / "Library" / "Application Support" / "VibeHash")
         self.assertEqual(L.app_dir("Linux", {"XDG_DATA_HOME": "/data"}), Path("/data/vibehash"))
         self.assertEqual(L.app_dir("Linux", {}), Path.home() / ".local" / "share" / "vibehash")
