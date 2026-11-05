@@ -45,6 +45,7 @@ from .crypto import AddressError, KeyPair, checksummed, parse_address
 from .ledger import UNBONDING_ROUNDS, Block, Chain, canonical
 from .model import ModelSpec
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
+from .watch import DEFAULT_PORT as WATCH_PORT
 
 
 def to_syn(text: str) -> int:
@@ -437,10 +438,13 @@ def _mine(a, keys: KeyPair):
     elif acct["stake"] < need:
         low = f"stake is {fmt(acct['stake'])}; stake at least {fmt(need)} to get work"
     session = _record([w])  # the event log and a line per round, whatever's on screen (records.py)
+    watcher = _watch(a, [("you", w)], url, session)  # --watch: the same, as JSON for a window or a script (watch.py)
     if not minerui.supported(a.plain):
         print(f"worker {checksummed(w.keys.address)} training on {w.backend.describe()} ({hardware.describe()})")
         if session:
             print(session.where())
+        if watcher:
+            print(f"watch it at {watcher.url}")
         if mining:
             print(mining)
         if earning:
@@ -452,11 +456,15 @@ def _mine(a, keys: KeyPair):
         except KeyboardInterrupt:
             pass
         finally:
+            if watcher:
+                watcher.stop()
             _record_end(session)
         return
     dash = minerui.MinerDashboard([("you", w)], url)
     if session:
         dash.note(session.where())
+    if watcher:
+        dash.note(f"watch it at {watcher.url}")
     if mining:
         dash.note(mining)
     if earning:
@@ -470,6 +478,8 @@ def _mine(a, keys: KeyPair):
         pass
     finally:
         stop.set()
+        if watcher:
+            watcher.stop()
     print(dash.summary())
     _record_end(session)
 
@@ -1442,6 +1452,24 @@ def _record_end(session) -> None:
         print(session.close())
 
 
+def _watch(a, rigs, url: str, session):
+    """`--watch [PORT]`: serve what the dashboard shows as JSON on this computer, for a window or a script to follow
+    (watch.py). Returns the server, or None when it wasn't asked for or the port is taken (the worker works anyway)."""
+    port = getattr(a, "watch", None)
+    if port is None:
+        return None
+    from . import watch as watching
+
+    logs = {r.address: r for r in session.logs} if session else {}
+    w = watching.Watch(rigs, url, events=watching.Events().attach(), sessions=logs)
+    try:
+        w.serve(port)
+    except OSError as e:
+        print(f"warning: can't serve --watch on port {port}: {e}", file=sys.stderr)
+        return None
+    return w
+
+
 def _training_record(node: NodeClient, job_id: str, info: dict, out: Path, receipt_path: Path) -> None:
     """The job's history and a TRAINING.md beside a model `job download` saved (records.write_report)."""
     from . import records
@@ -1856,6 +1884,7 @@ def _testnet(a, held: list) -> None:
     from . import records
     node_log = records.LogFile(d / "node.log").attach(records.NODE_LOGGERS)  # the nodes' story, kept with the chain
     session = _record([c for _, c in clients])  # and the workers', with a line per round (records.py)
+    watcher = _watch(a, clients, node.url, session)  # --watch: every worker, as JSON (watch.py)
     for n in nodes:
         n.start()
     api, s = NodeClient(node.url), node.chain.state
@@ -1868,6 +1897,8 @@ def _testnet(a, held: list) -> None:
     dash = (minerui.MinerDashboard(clients, node.url, footer=f"kept in {d}", **({"evo": True} if evo else {}))
             if minerui.supported(a.plain) else None)
     say = dash.note if dash else (lambda text: print("  " + text))
+    if watcher:
+        say(f"watch the workers at {watcher.url}")
     posted = None
 
     def next_cycle_job(s):
@@ -1992,6 +2023,8 @@ def _testnet(a, held: list) -> None:
             print("\nstopping...")
     finally:
         stop.set()
+        if watcher:
+            watcher.stop()
         for t in threads:
             t.join(timeout=10)
         for n in nodes:
@@ -2069,6 +2102,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, help="stop after this many rounds (default: run until Ctrl+C)")
     p.add_argument("--reset", action="store_true", help="delete this testnet's chain and wallets and start over")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
+    p.add_argument("--watch", nargs="?", const=WATCH_PORT, type=int, metavar="PORT",
+                   help=f"also serve what the dashboard shows, every worker's, as JSON at http://127.0.0.1:PORT/ "
+                        f"(default port {WATCH_PORT}), for a window or a script on this computer to follow")
     p.add_argument("--evo", action="store_true", help="Evo mode: training by evolution, the chain is the model. A "
                    "network whose genesis takes Evo jobs, training an open model on Countdown puzzles, its blocks holding "
                    f"only seeds and scores (default folder {settings.home() / 'testnet-evo'})")
@@ -2188,6 +2224,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-dir", help="where checkpoints, datasets and receipts are kept (default "
                    "~/.vibehash/cache/WALLET-ADDRESS: one per wallet)")
     p.add_argument("--plain", action="store_true", help="print log lines instead of the live mining dashboard")
+    p.add_argument("--watch", nargs="?", const=WATCH_PORT, type=int, metavar="PORT",
+                   help=f"also serve what the dashboard shows as JSON at http://127.0.0.1:PORT/ (default port "
+                        f"{WATCH_PORT}), read-only and for this computer only, so a window or a script can follow the "
+                        "worker step by step: its round, what it is doing, its counts, its account, the latest events")
     p.add_argument("--deepseek", choices=["ask", "yes", "no"], default=None,
                    help="take DeepSeek work (its ~30 GB of model files): ask once (the default), yes without asking "
                         "(unattended), or no. Remembered")
