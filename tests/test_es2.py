@@ -86,8 +86,10 @@ class NetworkTests2(unittest.TestCase):
         patch = mock.patch.object(es, "reward", fake_reward)  # Countdown's check: a score the tiny model's babble earns
         patch.start()
         self.addCleanup(patch.stop)
+        # A job's compute phase lasts until every unit is in, up to its compute_s: a worker stopping as a phase of this
+        # test ends can take units for the next round first, which a real job's 300 s would then wait out.
         for p in (mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(root / "home")}),  # where lines are saved
-                  mock.patch.object(es_client, "SAVE_EVERY", 1)):
+                  mock.patch.object(es_client, "SAVE_EVERY", 1), mock.patch("vibehash.es_local.V2_COMPUTE_S", 30)):
             p.start()
             self.addCleanup(p.stop)
         node_keys, req = KeyPair.generate(b"es2 node"), KeyPair.generate(b"es2 requester")
@@ -181,6 +183,38 @@ class NetworkTests2(unittest.TestCase):
         self.assertEqual(saved.params_hash, cline.params_hash)
         for n, _, _ in layout:
             np.testing.assert_array_equal(saved.change.d[n].numpy(), cline.change.d[n].numpy())
+
+        # A process with neither line in memory nor on disk replays the child's rounds and its parent's up to the child's
+        # start (the parent ran on after it: jobs take turns), and says how far along it is: the dashboards'
+        # rebuilding() counts the rounds replayed up to the total it counted first, and the log says so.
+        cache = next(iter(es_client._chains.values()))
+        cache.lines.clear()
+        cache.starts.clear()
+        for f in es_client._saved_dir().glob("*.pt"):
+            f.unlink()
+        seen, step = [], es_client.rebuild.step
+
+        def spy(job_id):
+            step(job_id)
+            seen.append(es_client.rebuilding())
+        with mock.patch.object(es_client.rebuild, "step", spy), self.assertLogs("vibehash.worker", "INFO") as logs:
+            again = clients[1].es.v2._line(rt, "evo2-b", child)
+        self.assertEqual(again.params_hash, cline.params_hash)
+        n, total = len(seen), seen[0][1]
+        self.assertGreaterEqual(n, len(history) + 1)  # the parent's rounds that learned something, and the child's
+        self.assertEqual([s[:2] for s in seen], [(min(k, total), total) for k in range(1, n + 1)])
+        self.assertEqual({s[2] for s in seen}, {"evo2-a", "evo2-b"})
+        # The total counts the parent's rounds up to the child's posting; it pins the parent's state as the poster saw
+        # it, a round or so before when the parent runs on meanwhile (here, only if a round sealed in those seconds).
+        pinned = max(b.height for b in node.chain.blocks if b.summary is not None and b.summary.job_id == "evo2-a"
+                     and b.summary.params_hash == es.state_hash(state))
+        posted = es_client._posted_at(cache, "evo2-b")
+        late = sum(1 for b in node.chain.blocks if pinned < b.height < posted and b.summary is not None
+                   and b.summary.job_id == "evo2-a" and b.summary.accepted_units)
+        self.assertEqual(total, n + late)
+        self.assertIsNone(es_client.rebuilding())
+        self.assertTrue(any(f"{total} rounds to replay" in m for m in logs.output), logs.output)
+        self.assertTrue(any(f"rebuilt from the chain: {n} rounds" in m for m in logs.output), logs.output)
 
         # A restart: the node works the jobs' states out from the chain, even with its saved copies gone.
         want = {j: node.coord.start_params(j).copy() for j in ("evo2-a", "evo2-b")}

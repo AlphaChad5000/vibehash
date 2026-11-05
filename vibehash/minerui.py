@@ -43,6 +43,21 @@ JOBS_EVERY = 30.0  # seconds between asking the node which jobs have budget left
 HINTS = ("  tab or 0-9 to pick", "  tab/0-9")  # the selector's keys, at the end of its line when there's room
 
 
+def _rebuilding():
+    """es_client.rebuilding(): (rounds done, rounds in all, job, seconds left) while an Evo v2 model is being worked out
+    from the chain (a process's first round of a job), else None."""
+    from . import es_client
+    return es_client.rebuilding()
+
+
+def _rebuild_words(rb, wide: bool = True) -> str:
+    from .es_client import _minutes
+    done, total, job, left = rb
+    return (f"rebuilding the model from the chain: {done:,} of {total:,} rounds ({done / total:.0%})"
+            + (f", now {job}'s" if wide else "")
+            + (f" · about {_minutes(left)} left" if left is not None else ""))
+
+
 def selector(g: dict, options: list[str], sel: int, width: int, keys: bool = True) -> list:
     """The job selector's line, at most `width` wide: "job:", then each option ("auto" first, then the jobs) with
     its number key, the chosen one (`options[sel]`) in brackets, and the keys at the end if they fit (`keys`: only
@@ -376,6 +391,17 @@ class MinerDashboard:
             add(*pick(width, [*here, *alls, (f", which rebuild {spec.n:,} numbers", DIM)], [*here, *alls], here))
         else:
             add(("chain     ", DIM), ("seeds and scores, a few hundred bytes a generation", DIM))
+        rb = _rebuilding()
+        if rb is not None:  # nothing else moves meanwhile: say what's going on, and how far along
+            from .es_client import _minutes
+            done, total, rjob, left = rb
+            pct = [(f"{done:,} of {total:,} rounds", WHITE), (f" ({done / total:.0%})", DIM)]
+            eta = [(f" · about {_minutes(left)} left", DIM)] if left is not None else []
+            add(*pick(width, [("model     ", DIM), ("rebuilding from the chain on the CPU ", TEXT), *pct, *eta,
+                              (f" · {rjob}", DIM)],
+                      [("model     ", DIM), ("rebuilding from the chain ", TEXT), *pct, *eta],
+                      [("model     ", DIM), ("rebuilding ", TEXT), *pct]))
+            return
         rebuilt = sum(getattr(getattr(r.client, "es", None), "rebuilt", 0) for r in self.rigs)
         fetched = sum(getattr(getattr(r.client, "es", None), "fetched", 0) for r in self.rigs)
         how = ([("rebuilt from the chain ", TEXT), (f"{rebuilt}x", WHITE), (" · fetched ", DIM), (f"{fetched}x", WHITE)]
@@ -412,9 +438,13 @@ class MinerDashboard:
         lines += [" " + row for row in (self._chain(w - 2, lead) if evo else self._band(w - 2))]
         lines.append("")
         add(*self._phase_bar(lead, w))
-        mark = (self.g["tips"][self.frame_no % 3] if lead.busy else self.g["tips"][0]) + " "
-        add((mark, PHASES.get(lead.phase, DIM)), (lead.activity if len(self.rigs) == 1 else
-             f"{sum(s.busy for s in stats)} of {len(stats)} workers busy · {lead.activity}", TEXT))
+        rb = _rebuilding() if evo else None
+        mark = (self.g["tips"][self.frame_no % 3] if lead.busy or rb else self.g["tips"][0]) + " "
+        if rb is not None:  # every worker waits on it (one rebuild a process)
+            add((mark, PHASES.get(lead.phase, DIM)), (_fit(w - 3, _rebuild_words(rb), _rebuild_words(rb, False)), TEXT))
+        else:
+            add((mark, PHASES.get(lead.phase, DIM)), (lead.activity if len(self.rigs) == 1 else
+                 f"{sum(s.busy for s in stats)} of {len(stats)} workers busy · {lead.activity}", TEXT))
         add(*self._selector(w - 1))
         lines.append("")
         job = lead.job
