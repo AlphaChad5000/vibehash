@@ -104,7 +104,7 @@ vibehash install-gpu
 Run a whole network on this computer: node, workers and a job.
 
 ```
-vibehash testnet [-h] [--workers 1-8] [--validators 1-7] [--dir DIR] [--host HOST] [--port PORT] [--job {gpu,small,none}] [--budget BUDGET] [--device DEVICE] [--rounds ROUNDS] [--reset] [--plain] [--evo] [--evo2] [--evo2-rounds N] [--evo-model MODEL] [--register-s SECONDS] [--compute-s SECONDS] [--reveal-s SECONDS] [--verify-s SECONDS] [--min-fee MIN_FEE]
+vibehash testnet [-h] [--workers 1-8] [--validators 1-7] [--dir DIR] [--host HOST] [--port PORT] [--job {gpu,small,none}] [--budget BUDGET] [--device DEVICE] [--rounds ROUNDS] [--reset] [--plain] [--watch [PORT]] [--evo] [--evo2] [--evo2-rounds N] [--evo-model MODEL] [--register-s SECONDS] [--compute-s SECONDS] [--reveal-s SECONDS] [--verify-s SECONDS] [--min-fee MIN_FEE]
 ```
 
 Flags:
@@ -120,6 +120,7 @@ Flags:
 - `--rounds ROUNDS`: stop after this many rounds (default: run until Ctrl+C).
 - `--reset`: delete this testnet's chain and wallets and start over.
 - `--plain`: print log lines instead of the live mining dashboard.
+- `--watch PORT`: also serve what the dashboard shows, every worker's, as JSON at http://127.0.0.1:PORT/ (default port 7545), for a window or a script on this computer to follow.
 - `--evo`: Evo mode: training by evolution, the chain is the model. A network whose genesis takes Evo jobs, training an open model on Countdown puzzles, its blocks holding only seeds and scores (default folder ~/.vibehash/testnet-evo).
 - `--evo2`: Evo Hash (Evo v2): the fast recipe on every layer, a short job per task in turn (countdown, arithmetic, arc_easy, then round again), each starting where the last ended (es2.py).
 - `--evo2-rounds N`: Evo v2: rounds a job runs, its step size planned over them (default 12: a task's quick early gains, then the next task).
@@ -324,7 +325,7 @@ Contribute compute and earn VIBE.
 Mine: train and check other workers' units, and earn VIBE. One worker trains on one device. For several GPUs in one computer or pod, run one worker per GPU, each with its own wallet (two with one wallet would undo each other's work, so the second refuses to start): `vibehash wallet create --out gpu1.json`, then `vibehash worker --device cuda:1 --wallet gpu1.json`. Each wallet gets its own cache; the model files they download are shared. With no terminal (nohup, Docker, a pod), set $VIBEHASH_PASSWORD to unlock the wallet.
 
 ```
-vibehash worker [-h] [--node NODE] [--wallet WALLET] [--device DEVICE] [--memory-mb MEMORY_MB] [--flops FLOPS] [--cache-dir CACHE_DIR] [--plain] [--deepseek {ask,yes,no}] [--job JOB]
+vibehash worker [-h] [--node NODE] [--wallet WALLET] [--device DEVICE] [--memory-mb MEMORY_MB] [--flops FLOPS] [--cache-dir CACHE_DIR] [--plain] [--watch [PORT]] [--deepseek {ask,yes,no}] [--job JOB]
 ```
 
 Flags:
@@ -336,6 +337,7 @@ Flags:
 - `--flops FLOPS`: override benchmark.
 - `--cache-dir CACHE_DIR`: where checkpoints, datasets and receipts are kept (default ~/.vibehash/cache/WALLET-ADDRESS: one per wallet).
 - `--plain`: print log lines instead of the live mining dashboard.
+- `--watch PORT`: also serve what the dashboard shows as JSON at http://127.0.0.1:PORT/ (default port 7545), read-only and for this computer only, so a window or a script can follow the worker step by step: its round, what it is doing, its counts, its account, the latest events.
 - `--deepseek {ask,yes,no}`: take DeepSeek work (its ~30 GB of model files): ask once (the default), yes without asking (unattended), or no. Remembered.
 - `--job JOB`: mine only this job's rounds and sit the other jobs' out (default auto: every job this worker can do). The dashboard's job line changes it while it runs: Tab or 0-9.
 

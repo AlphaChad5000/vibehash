@@ -364,6 +364,14 @@ is on or not: with `--plain`, piped, in tmux or over SSH.
 - `vibehash worker` prints where these go when it starts, and a summary when
   you stop it: rounds, units accepted, VIBE earned. `vibehash testnet` also
   keeps its node's log in `node.log` in the testnet's folder.
+- `vibehash worker --watch` (and `testnet --watch`) also serves what the
+  dashboard shows, live, as JSON at `http://127.0.0.1:7545/`: each worker's
+  round and phase, what it is doing, its counts this round and this session,
+  its balance, stake and reputation as the node last said, and the latest
+  events (`/events?after=N` gives those after the one numbered N). It is for
+  this computer only and read-only, with nothing of the wallet in it, so a
+  window, a tray icon or a script of your own can follow the worker step by
+  step. `--watch PORT` picks another port.
 - `jobs/JOB/history.csv` (and `history.jsonl`): a job's rounds one by one:
   round (its block's height), time, units accepted, loss and accuracy on the
   held-back data, VIBE paid and budget left. `train` and `job watch` keep it up
