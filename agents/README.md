@@ -1,19 +1,33 @@
 # The Muse agents
 
-Two small programs that put an LLM on either side of a Vibe Hash fine-tune. By default the LLM is Meta's **Muse
-Spark**, through Meta's Model API (`https://api.meta.ai/v1`, OpenAI-compatible chat completions).
+Plain English in, a judged fine-tune out. Two agents built on Meta's **Muse Spark** (through Meta's Model API,
+`https://api.meta.ai/v1`, OpenAI-compatible chat completions) sit on either side of a fine-tune:
 
-- **The Job Architect** (`architect.py`): you describe what you want in plain English. Muse Spark writes 40–150
-  example chats and picks the settings (base model, LoRA rank, budget). Code then checks every value against what
-  `vibehash train` and the chain would refuse, plus what would quietly spoil the job: duplicate examples, replies too
-  long for `--max-len`, test prompts it also trained on. If a check fails, Muse Spark is told what was wrong, up to
-  twice. The architect then writes `agent-jobs/<job>.jsonl` (the chats) and `<job>.eval.json` (new prompts for
-  testing), and prints or runs the `vibehash train` command.
-- **The Semantic Judge** (`judge.py`): once the network has trained the job, `answer` runs the base model and the
-  fine-tune (the base plus the adapter `vibehash job download` wrote) on the prompts it never trained on. `grade` has
-  Muse Spark compare each pair blind (it sees "A" and "B" in a shuffled order) and counts who won.
+- **The Job Architect** (`architect.py`) screens the goal, then writes the training chats, picks the settings (base
+  model, LoRA rank, epochs), writes test prompts it keeps out of training, and picks the rules a reply must meet from
+  a fixed library (`checks.py`). Code checks every value before anything is spent and sends what's wrong back to the
+  model to fix; the judge audits a sample of the chats before training too. It trains on one of two backends:
+  - **vibehash** (the default): `vibehash train` posts the job to the Vibe Hash network. The budget is worked out by
+    code from the chats and epochs, and the network-only checks are what the chain would refuse (chats past
+    `--max-len`, chat-template tokens, a gated base without a Hugging Face token).
+  - **local**: `train_local.py` trains a LoRA adapter on this machine's GPU, holding back a fifth of the chats and
+    keeping the best epoch.
+- **The Quality Judge** (`judge.py`) answers the question loss can't: did the model get better at the goal? The
+  fine-tune, the base model, and the base model *told* the goal answer the test prompts, two fixed sets of hard
+  prompts (`hard_prompts.txt`, `check_prompts.txt`) and prompts the judge writes itself. Muse Spark compares each pair
+  blind, twice, once in each order, and only a verdict both readings agree on counts. Code scores the rules. A second
+  model (Muse Wonder by default, `JUDGE2_MODEL`) reads every pair again, and the agreement is reported.
 
-They run from a checkout of this repository and aren't part of the `vibehash` package.
+Around them: `teacher.py` has Muse Spark answer the same prompts itself and judges it against the fine-tune;
+`publish.py` turns a finished job into a run for the results page (`web/public/results/<job>.json`, the site's
+folder); `dispatcher.py` takes requests and chat messages from the site and runs them end to end on this machine,
+repairing a run until it reaches the level asked for (`quick`, `standard`, `strict`). [SECURITY.md](SECURITY.md) goes
+through the OWASP Top 10 for LLM and for agentic applications.
+
+The site (agents.luhlabs.com, results.luhlabs.com) lives in the hackathon repository,
+[Luh-Labs-LLC/muse-finetune-agents](https://github.com/Luh-Labs-LLC/muse-finetune-agents), which is the Meta hackathon submission; the agents here
+are its `agents/` folder, adapted to this repository. They run from a checkout and aren't part of the `vibehash`
+package.
 
 ## A Meta API key
 
@@ -21,30 +35,27 @@ They run from a checkout of this repository and aren't part of the `vibehash` pa
    shown once.
 2. Set up billing on the same account. Without it, calls fail with "can't pay" (402). The Model API is a public
    preview, and which countries can use it is up to Meta (US developers first). From elsewhere you may get a 403.
-3. Put the key in the environment, never in a file:
-
-```powershell
-$env:MODEL_API_KEY = "paste-the-key-here"          # PowerShell: this window only
-```
+3. Put the key in `.env.local` at the top of the repository (git ignores it) or in the environment, never in a file
+   that gets committed:
 
 ```bash
-export MODEL_API_KEY="paste-the-key-here"          # bash
+MODEL_API_KEY=paste-the-key-here      # in .env.local; or $env:MODEL_API_KEY = "..." / export MODEL_API_KEY=...
 ```
 
 That's all Muse Spark needs. `MODEL_API_KEY` is the name Meta's docs use, and `META_API_KEY` works too. The default
-model is `muse-spark-1.3`, the one Meta recommends for new work (`LLM_MODEL=muse-spark-1.1` picks an older one at
-the same price). `LLM_REASONING_EFFORT=low` makes replies faster and cheaper.
+model is `muse-spark-1.3`. `LLM_REASONING_EFFORT=low` makes replies faster and cheaper. Any other OpenAI-compatible
+provider works too: set `LLM_BASE_URL` (the part before `/chat/completions`), `LLM_API_KEY` and `LLM_MODEL`. A Meta
+key is only ever sent to Meta. `python agents/llm_call.py` checks the settings with one short call.
 
-Any other OpenAI-compatible provider works too: set `LLM_BASE_URL` (the part before `/chat/completions`),
-`LLM_API_KEY` and `LLM_MODEL`. These also override the Meta defaults. A Meta key is only ever sent to Meta.
+Also read from `.env.local`: `ALLOWED_BASES` (default `qwen3-0.6b`; add `llama-3.2-1b`, which is gated on Hugging
+Face), `MAX_BUDGET` (the most one network job may spend, default 200 VIBE), `JUDGE2_MODEL` (empty to skip the second
+judge) and, for the dispatcher, `DISPATCH_TOKEN`.
 
-## Tonight's run
+## On the Vibe Hash network
 
-You'll need Python with this repository's requirements, plus `pip install -e ".[finetune]"` so `train` can read
-chats. The `answer` step also needs PyTorch, transformers and peft. This PC's GPU venv has all of it, so on this PC use
-`& "$env:USERPROFILE\.vibehash\venv\Scripts\python.exe"` (PowerShell) wherever the lines below say `python`. The lines below use a local
-testnet, where the VIBE is play money; on the public network leave out `--node` and `--wallet` (it needs two staked GPU
-workers before a fine-tune trains: TONIGHT.md):
+Install this repository with `pip install -e ".[finetune]"` so `vibehash train` can read chats. The judge's `answer`
+step also needs PyTorch, transformers and peft (`pip install -r agents/requirements-train.txt`, with PyTorch's CUDA
+build from pytorch.org). On a local testnet, where the VIBE is play money:
 
 ```bash
 # window 1: a node and three GPU workers
@@ -52,33 +63,67 @@ python -m vibehash testnet --job none --workers 3 --device cuda
 
 # window 2, from the repository folder
 python agents/architect.py "answer customer-support questions in two friendly sentences" --post --node http://127.0.0.1:8545 --wallet ~/.vibehash/testnet/requester.json
-#   it writes agent-jobs/<job>.jsonl, then `vibehash train` shows its pre-flight and asks "Post it?":
-#   open the .jsonl first if you like, and answer n to post nothing
-#   (without --post it only writes the files and prints the train command, to run later from this folder)
-python -m vibehash job watch                                  # follow the rounds
-python -m vibehash job download <job> --out <job>-lora        # the adapter, once some rounds have trained
-python agents/judge.py answer agent-jobs/<job>.eval.json <job>-lora
-python agents/judge.py grade agent-jobs/<job>.answers.json
+python -m vibehash job watch <job>
+python -m vibehash job download <job> --out agent-jobs/adapters/<job>
+python agents/judge.py answer agent-jobs/<job>.eval.json agent-jobs/adapters/<job>
+python agents/judge.py grade agent-jobs/<job>.eval.answers.json
+python agents/publish.py <job>                        # optional: the run, for the results page
 ```
 
-**`--post` spends VIBE** on the node it posts to: the `--node` you give, or else the one `vibehash setup` saved, or
-else the public network. `vibehash train` shows its pre-flight and asks "Post it?" before anything is spent (`--yes`
-skips the question). The budget goes into escrow when the job is posted and pays only for work that passes its
-checks. `vibehash cancel-job <job>` returns what's left. On a local testnet the VIBE is play money.
+The architect prints these lines with the job's name filled in once it has posted. Without `--post` it only writes
+`agent-jobs/<job>.jsonl` (the chats), `<job>.eval.json` (the test prompts) and `<job>.plan.json`, and prints the
+train command. On the public network leave out `--node` and `--wallet`.
 
-`answer` loads the base model at the commit the adapter pins: transformers downloads it once (1.5 GB for Qwen3-0.6B).
-To use a copy you already have, add `--base <folder>`. It runs on the GPU if there is one; `accelerate` isn't needed.
-Both models get the prompt exactly as training rendered chats. For Qwen3 that means the empty think block before the
-reply (its non-thinking mode), and decoding is greedy. Then `grade` writes `<job>.graded.json` next to the answers,
-with every verdict, the judge model's name and the shuffle's seed.
+**`--post` spends VIBE** on the node it posts to: the `--node` you give, or else the one `vibehash setup` saved, or
+else the public network. `vibehash train` shows its pre-flight and asks "Post it?" first (`--yes` skips the
+question). The budget is enough rounds for the plan's epochs over its chats at 10 VIBE a round (usually 10 to 40),
+capped by `MAX_BUDGET`; `--budget` sets it by hand. It goes into escrow when the job is posted and pays only for work
+that passes its checks; `vibehash cancel-job <job>` returns what's left.
+
+`answer` loads the base model at the commit the adapter says it was trained on, without `accelerate`.
+
+## On one machine
+
+Python 3.10+, an NVIDIA GPU, PyTorch's CUDA build, then `pip install -r agents/requirements-train.txt`. One goal end
+to end, planned, trained, judged and repaired until it reaches the level, then published for the results page:
+
+```bash
+python agents/dispatcher.py --goal "answer support questions in two friendly sentences" --rigor strict
+```
+
+Or a step at a time:
+
+```bash
+python agents/architect.py "answer support questions in two friendly sentences" --post --backend local
+python agents/judge.py answer agent-jobs/<job>.eval.json agent-jobs/adapters/<job>
+python agents/judge.py grade agent-jobs/<job>.eval.answers.json
+python agents/publish.py <job>
+```
+
+The adapter lands in `agent-jobs/adapters/<job>/`, with a `train_report.json` holding the held-back loss and accuracy
+after every epoch.
+
+## Requests and chat from the site
+
+The site's agents page has a form. A request (a goal and an access code) waits in a queue on the site (a
+Cloudflare Worker and D1 database, in the hackathon repository's `web/`) until a dispatcher takes it, runs it end
+to end and sends the run back. Chat messages go through the same queue and the same dispatcher, which answers them
+between requests. The site's own README has its setup; then, on the GPU machine, with `DISPATCH_TOKEN` in
+`.env.local`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File agents/dispatch.ps1     # or: python agents/dispatcher.py
+```
+
+`dispatch.ps1` restarts the dispatcher if it stops and keeps the PC awake while it runs.
 
 ## What it costs
 
 Muse Spark's list price is $1.25 per million tokens in and $4.25 per million out, and its thinking counts as output.
-One design is roughly 5–15 thousand tokens out, so a few cents; each retry costs about as much again. Grading 10
-prompts is about 10 short calls, another few cents. Plan on under $0.25 a job. Meta's rate limits (3,000 requests a
-minute) don't matter at this size. The VIBE side is the budget the architect picks: at most 200, usually 40–80, at 10
-VIBE a round.
+A plan is a handful of calls: the screen, the design (and up to three rewrites when the checks or the audit send it
+back), the audit and a second batch of chats. Grading is four calls a prompt (two rivals, two readings each), plus two
+for the second judge, over the test prompts, the fixed sets and the judge's own. Plan on cents for a plan and well
+under a few dollars for a fully judged run; repairs repeat the grading.
 
 ## Checking it
 
@@ -87,5 +132,5 @@ python -m unittest tests.test_agents
 ```
 
 These tests run offline with no key. A fake OpenAI-compatible server plays the model. `vibehash train` reads the
-architect's files up to its pre-flight against a fake Hugging Face. And where transformers and peft are installed, a
-tiny model runs the judge's `answer` step.
+architect's network files up to its pre-flight against a fake Hugging Face, where PyTorch, tokenizers and jinja2 are
+installed.
