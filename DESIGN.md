@@ -1252,6 +1252,15 @@ mints).
     one that would unpack to more than 64 times its file size (or 64 MB, if
     larger) is refused. Only the upload that completes a dataset checks it,
     and a check never deletes one already accepted.
+  - Datasets no job uses yet are on their uploader's quota (`node.py`,
+    `DATASET_QUOTA`, 20 GB an address, finished or part way): uploading 1 VIBE
+    of balance used to let anyone fill a node's disk 20 GB at a time. A job on
+    chain or in the mempool naming a dataset takes it off the quota for good.
+    A finished upload no job has used for three days (`LOOSE_DATASET_S`) is
+    deleted. Who uploaded what is kept in SQLite (`dataset_uploads`); datasets
+    added with `--dataset` or fetched from a peer have no row there, and are
+    never counted or deleted. Many funded addresses still get 20 GB each, for
+    three days at a time.
 - **Peers.** Sync gives up on a peer whose page adds nothing or whose block
   it refuses, and moves on past a malformed reply. Clients cap what they read:
   128 MiB of JSON, one chunk of binary, downloads at the size the job allows.

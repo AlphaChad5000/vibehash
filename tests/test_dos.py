@@ -321,6 +321,53 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(list(node.store.datasets.root.glob("*.part")), [])
 
 
+class DatasetQuotaTests(unittest.TestCase):
+    """Datasets no job uses count against their uploader (node.DATASET_QUOTA) and are deleted after LOOSE_DATASET_S."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def test_quota_freed_by_a_job_and_unused_datasets_cleared(self):
+        node = start_node(self)
+        api = NodeClient(node.url)
+        first = write_npz(self.dir / "a.npz", ModelSpec(), 1)
+        second = write_npz(self.dir / "b.npz", ModelSpec(), 2)
+        size = first.stat().st_size
+        with mock.patch.object(node_module, "DATASET_QUOTA", size + size // 2):  # room for one, not two
+            sha = api.upload_dataset(REQ, first)
+            self.assertEqual([(s, w, n) for s, w, n, _ in node.store.uploads()], [(sha, REQ.address, size)])
+            self.assertEqual(node.loose_bytes(REQ.address), size)
+            with self.assertRaisesRegex(NodeError, "already holds .* datasets no job uses yet"):
+                api.upload_dataset(REQ, second)
+            self.assertEqual(list(node.store.datasets.root.glob("*.part")), [], "a refused upload leaves nothing")
+            api.upload_dataset(REQ, first)  # the same one again: already kept, so nothing to count
+
+            # A job naming the first dataset takes it off the quota for good, making room for the second.
+            job = TrainingJob("quota-job", REQ.address, budget=0, fee_per_round=VIBE, units_per_round=8)
+            job.data_source = {"kind": "npz", "sha256": sha}
+            posted_job(self, api, node, job)
+            self.assertEqual(node.loose_bytes(REQ.address), 0)
+            sha2 = api.upload_dataset(REQ, second)
+
+        # An operator's dataset (--dataset) is nobody's upload: never counted, never deleted.
+        own = node.store.add_dataset(write_npz(self.dir / "c.npz", ModelSpec(), 3))
+        self.assertEqual(node.clear_loose_datasets(), 0, "nothing is old enough yet")
+        later = time.time() + node_module.LOOSE_DATASET_S + 1
+        self.assertEqual(node.clear_loose_datasets(now=later), 1)
+        self.assertFalse(node.store.datasets.has(sha2), "the unused upload is deleted")
+        self.assertTrue(node.store.datasets.has(sha), "the job's dataset is kept")
+        self.assertTrue(node.store.datasets.has(own))
+        self.assertEqual([s for s, *_ in node.store.uploads()], [sha])
+
+    def test_a_put_to_a_kept_dataset_doesnt_make_it_the_putters(self):
+        node = start_node(self)
+        own = node.store.add_dataset(write_npz(self.dir / "c.npz", ModelSpec(), 3))
+        NodeClient(node.url).upload(REQ, "dataset", node.store.datasets.path(own), own)  # already complete: no-op
+        self.assertEqual(node.store.uploads(), [])
+
+
 # --- 6. job models -------------------------------------------------------------------------------------------------
 
 class JobModelTests(unittest.TestCase):

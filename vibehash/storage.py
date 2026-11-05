@@ -69,6 +69,11 @@ class Store:
                             "accepted INTEGER NOT NULL, val_loss REAL NOT NULL, val_acc REAL NOT NULL, PRIMARY KEY (job_id, height))")
             self.db.execute("CREATE TABLE IF NOT EXISTS round_records (height INTEGER PRIMARY KEY, record TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS certificates (height INTEGER PRIMARY KEY, cert TEXT NOT NULL)")
+            # Who uploaded each dataset over HTTP, how big, and when it was complete: the per-address quota on datasets no
+            # job uses yet, and their clearing (node.py, DATASET_QUOTA). Datasets added with --dataset or fetched from a
+            # peer have no row, and are never cleared.
+            self.db.execute("CREATE TABLE IF NOT EXISTS dataset_uploads (sha256 TEXT PRIMARY KEY, uploader TEXT NOT NULL, "
+                            "size INTEGER NOT NULL, time REAL NOT NULL)")
 
     def close(self) -> None:
         self.db.close()
@@ -213,6 +218,22 @@ class Store:
             shutil.copyfile(src, tmp)
             tmp.replace(dest)
         return sha
+
+    def note_upload(self, sha256: str, uploader: str, size: int, when: float) -> None:
+        """A dataset uploaded over HTTP is complete (the first uploader to finish it is the one noted)."""
+        with self.lock, self.db:
+            self.db.execute("INSERT OR IGNORE INTO dataset_uploads VALUES (?, ?, ?, ?)", (sha256, uploader, size, when))
+
+    def uploads(self) -> list[tuple[str, str, int, float]]:
+        """(sha256, uploader, size, time) of every dataset uploaded over HTTP that's still kept."""
+        with self.lock:
+            return self.db.execute("SELECT sha256, uploader, size, time FROM dataset_uploads").fetchall()
+
+    def drop_upload(self, sha256: str) -> None:
+        """Delete an uploaded dataset and its row (node.py clears ones no job used)."""
+        self.datasets.path(sha256).unlink(missing_ok=True)
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM dataset_uploads WHERE sha256=?", (sha256,))
 
     def check_dataset(self, path: Path) -> None:
         """Raises InvalidJob unless `path` is a real, pickle-free dataset (with no more data than its size allows, see

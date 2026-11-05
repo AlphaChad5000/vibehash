@@ -102,6 +102,13 @@ MAX_JOB_BYTES = 64 * 2**20
 # for days. A job that would need more simply gets fewer units done a round.
 MAX_PHASE_S = tasks.MAX_PHASE_S
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
+# Datasets no job on chain (or waiting in the mempool) uses yet cost a node disk and their uploader nothing, so each
+# address may hold at most DATASET_QUOTA bytes of them, finished or part way, and a finished one no job has used for
+# LOOSE_DATASET_S is deleted (Node.clear_loose_datasets). Posting a job that names a dataset takes it off the quota for
+# good. Datasets added with --dataset or fetched from a peer are never counted or deleted. Before this, anyone with
+# 1 VIBE could fill a node's disk 20 GB at a time.
+DATASET_QUOTA = MAX_DATASET
+LOOSE_DATASET_S = 3 * 86400
 
 
 def bucket_from_env() -> dsg.Signer | None:
@@ -221,6 +228,8 @@ class Node:
         self.leader_hint: str | None = None  # the current leader, as a validator told us (for nodes that don't vote)
         self.blobs.prune(self._evidence())  # keep recent rounds' evidence; the rest belongs to an abandoned round
         self.store.datasets.prune_partial(older_than=STALE_PART_S)  # uploads and downloads abandoned part way
+        self._used: tuple[tuple, set[str]] = ((), set())  # (tip hash, mempool size) -> datasets jobs name
+        self.clear_loose_datasets()
 
     @property
     def url(self) -> str:
@@ -323,6 +332,7 @@ class Node:
         self.blobs.prune(self._evidence())
         self.coord.trace_blobs.forget()
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
+        self.clear_loose_datasets()
 
     def _rounds(self) -> None:
         c, t = self.coord, self.times
@@ -1110,7 +1120,59 @@ class Node:
             raise ProtocolError("uploading a dataset needs at least 1 VIBE balance")
         if not 0 < total <= MAX_DATASET:
             raise ProtocolError(f"datasets can be at most {MAX_DATASET // 2**30} GB")
+        store = self.store.datasets
+        # Checked when an upload starts: its later chunks were admitted with it.
+        if not store.has(sha) and store.received(sha, addr) == 0 and sha not in self.used_datasets():
+            held = self.loose_bytes(addr)
+            if held + total > DATASET_QUOTA:
+                raise ProtocolError(
+                    f"this address already holds {held / 2**30:.2f} GB of datasets no job uses yet, and may hold "
+                    f"{DATASET_QUOTA / 2**30:g} GB: post a job with one, or wait until unused ones are deleted "
+                    f"({LOOSE_DATASET_S // 86400} days after their upload)")
         return addr
+
+    def used_datasets(self) -> set[str]:
+        """The datasets jobs name: every job on chain, and post_jobs waiting in the mempool."""
+        key = (self.chain.tip.hash, len(self.coord.mempool))
+        if self._used[0] != key:
+            specs = list(self.chain.state.jobs.values()) + [t.memo for t in list(self.coord.mempool) if t.kind == "post_job"]
+            used = set()
+            for spec in specs:
+                try:
+                    data = json.loads(spec).get("data") or {}
+                    if isinstance(data, dict) and isinstance(data.get("sha256"), str):
+                        used.add(data["sha256"])
+                except (ValueError, AttributeError):
+                    pass
+            self._used = (key, used)
+        return self._used[1]
+
+    def loose_bytes(self, addr: str) -> int:
+        """What `addr` holds of datasets no job uses: those it finished uploading, and its uploads part way."""
+        used = self.used_datasets()
+        done = sum(size for sha, who, size, _ in self.store.uploads() if who == addr and sha not in used)
+        part = 0
+        for p in self.store.datasets.root.glob(f"*.{addr}.part"):
+            try:
+                part += p.stat().st_size
+            except OSError:
+                pass
+        return done + part
+
+    def clear_loose_datasets(self, now: float | None = None) -> int:
+        """Delete uploaded datasets no job has used for LOOSE_DATASET_S. One still open elsewhere (Windows won't
+        delete a mapped file) is tried again next round."""
+        now, used, cleared = time.time() if now is None else now, self.used_datasets(), 0
+        for sha, who, _, when in self.store.uploads():
+            if sha in used or now - when < LOOSE_DATASET_S:
+                continue
+            try:
+                self.store.drop_upload(sha)
+                cleared += 1
+                log.info("deleted dataset %s, which %s uploaded and no job used", sha[:12], checksummed(who))
+            except OSError:
+                pass
+        return cleared
 
 
 def _number(text, what: str) -> int:
@@ -1261,11 +1323,15 @@ def _handler(node: Node):
                 else:
                     uploader = node.authorize_dataset(bid, total, self.headers)
                 chunk = self._body(CHUNK)
+                had = stores[kind].has(bid)
                 # A dataset is checked by the write that completes it, before it's kept (not on a PUT to one that's
                 # already complete, which would load it all again for anyone who asked).
                 received = stores[kind].write_chunk(bid, offset, chunk, total, uploader,
                                                     check=node.store.check_dataset if kind == "dataset" else None)
-                return {"received": received, "complete": stores[kind].has(bid)}
+                complete = stores[kind].has(bid)
+                if kind == "dataset" and complete and not had:  # this upload finished it: on its uploader's quota
+                    node.store.note_upload(bid, uploader, received, time.time())
+                return {"received": received, "complete": complete}
 
             self._guard(route)
 
