@@ -1,6 +1,7 @@
 """Ledger rules that changed with block version 2 (ledger.VERSION), and the version 1 behaviour that every block
 already on a chain keeps: a node re-validates its chain from genesis on start-up, so a version 1 block must derive the
 same transactions and hash the same as it always did."""
+import copy
 import json
 import unittest
 from unittest import mock
@@ -108,7 +109,7 @@ class BootstrapSlashTests(unittest.TestCase):
     def test_bounties_come_from_withdrawable_coins_and_the_tx_list_says_so(self):
         c = chain(allocations={V.address: 3 * VIBE}, stakes={V.address: 2 * VIBE},
                   validators={V.address: "http://10.0.0.1:8545"}, bootstrap={V.address: 10 * VIBE})
-        seal(c, V, txs=[tx(c, V, "unstake", amount=VIBE)])
+        seal(c, V, txs=[tx(c, V, "unstake", amount=VIBE)], version=3)  # (version 4 bonds a validator's stake)
         before = c.state
         self.assertEqual((before.stake(V.address), before.locked[V.address], before.unbonding_total(V.address)),
                          (11 * VIBE, 10 * VIBE, VIBE))
@@ -150,7 +151,8 @@ class VotingSetTests(unittest.TestCase):
         return c
 
     def test_the_last_voting_validator_cant_leave(self):
-        c = self.listed_but_not_voting(VERSION)
+        # Set up under version 3: version 4 would refuse V2's join (VALIDATOR_STAKE) and its unstake (it's bonded).
+        c = self.listed_but_not_voting(3)
         leave = tx(c, V, "validator")
         with self.assertRaisesRegex(InvalidBlock, "last validator"):
             c.check_tx(leave, [])
@@ -159,12 +161,13 @@ class VotingSetTests(unittest.TestCase):
         self.assertEqual(list(c.state.validator_set()), [V.address])
 
     def test_or_unstake_below_the_minimum(self):
+        # Version 3: version 4 refuses any unstake by a validator in the set (test_rules_v4).
         c = chain(stakes={W.address: MIN + VIBE}, validators={W.address: "http://10.0.0.1:8545"})
-        self.assertEqual(seal(c, W, txs=[tx(c, W, "unstake", amount=VIBE)])[1], [], "it still votes after this one")
+        self.assertEqual(seal(c, W, txs=[tx(c, W, "unstake", amount=VIBE)], version=3)[1], [], "it still votes after this one")
         unstake = tx(c, W, "unstake", amount=1)
         with self.assertRaisesRegex(InvalidBlock, "no validator with a vote"):
-            c.check_tx(unstake, [])
-        self.assertEqual(seal(c, W, txs=[unstake])[1], [unstake])
+            ledger._apply_user_tx(copy.deepcopy(c.state), unstake, c.tip.height + 1, c.chain_id, 3)
+        self.assertEqual(seal(c, W, txs=[unstake], version=3)[1], [unstake])
         seal(c, W)  # and the chain goes on
 
     def test_version_1_let_both_happen(self):

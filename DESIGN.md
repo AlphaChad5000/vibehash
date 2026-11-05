@@ -259,7 +259,10 @@ round it completes work instead of almost never, as in lottery mining.
   nobody can take over a one-node chain by announcing themselves. Neither
   leaving nor unstaking may leave the chain with no validator that has a vote,
   since then nobody could propose a block. (A slash can't be refused, so it
-  still can.)
+  still can.) From block version 4 there's also `evidence`, proof that a
+  validator signed two conflicting votes, which costs it its stake; joining
+  takes 100 VIBE, and joins and leaves take effect 10 heights later (§10,
+  "Block versions").
   Each needs a valid signature, the sender's next nonce, and the right
   **chain id**.
 - **Unstaking** moves coins into a 20-round unbonding queue where they can
@@ -384,8 +387,10 @@ round it completes work instead of almost never, as in lottery mining.
   block.
   - **Safety:** two different blocks can't both be final at one height unless
     more than a third of the stake signs both ways. A validator that votes
-    both ways leaves two signed, conflicting votes behind, which are kept as
-    evidence. Before each vote it sends, a validator saves its round and
+    both ways leaves two signed, conflicting votes behind. Validators that
+    see both send them as an `evidence` transaction, and from block version 4
+    it costs the signer all its stake and its place (§10). Before each vote
+    or proposal it sends, a validator saves its round and
     lock, so after a crash it resumes past the rounds it voted in instead of
     voting in them again.
   - **Liveness:** if the leader is offline, slow, or proposes a block that
@@ -968,13 +973,24 @@ Being explicit about what this is and isn't:
      votes without looking, and `chain verify` would only catch it after the
      fact. Next: validators recheck a random sample before voting, and a
      dispute transaction slashes a leader whose record a recheck contradicts.
-  3. **Validator accountability.** Conflicting votes are kept as signed
-     evidence, but nothing slashes them on chain yet. A validator earns only
-     the 5% proposer share of the rounds it leads. Any account with the worker
-     minimum stake can join the set, and changes take effect at the next
-     height. A mainnet needs double-sign slashing, a higher validator stake,
-     and a delay before set changes apply. Bootstrap stake (§6) should be
-     spread across several independent first validators, not one operator.
+  3. **Validator accountability.** From block version 4 (§10), a validator
+     that signs two conflicting messages for one height and round loses all
+     its stake and its place, through evidence anyone can send; joining the
+     set takes 100 VIBE staked; and joins and leaves take effect 10 heights
+     after their block, with the validator's stake bonded meanwhile. Still
+     open:
+     - The numbers (`VALIDATOR_STAKE`, `VALIDATOR_DELAY`, the reporter's
+       tenth) are placeholders. A validator earns only the 5% proposer share
+       of the rounds it leads, so 100 VIBE at risk is a lot for it to earn.
+     - A validator compares only the messages it receives. One that sends
+       different votes to different validators leaves no single node holding
+       both, and nodes don't gossip each other's votes; a commit certificate
+       holds only one side. Conflicting messages for a later height, which a
+       node keeps one of until it gets there, are dropped, not kept.
+     - Nothing punishes a validator for being offline, and earn-in pay can
+       still lift a listed validator below the minimum back to a vote at once.
+     - Bootstrap stake (§6) should be spread across several independent first
+       validators, not one operator.
   4. **Hugging Face, for DeepSeek's frozen weights.** The referee reads base
      weights only from the pinned commit on Hugging Face, never from a party
      to a dispute. A fine-tune's tensors, and DeepSeek-V4.1-Flash's trained
@@ -1364,6 +1380,51 @@ version can't be lower than its parent's or higher than the node knows, and
 validators only vote for blocks of the current version, so once a chain has
 a version 2 block it stays on version 2. Every validator must run a release
 that knows a version before any block of it appears: older nodes refuse it.
+
+Version 4 brings validator accountability (`ledger.ACCOUNTABILITY_VERSION`, §9
+point 3):
+- **Double-sign slashing.** An `evidence` transaction carries two signed
+  consensus messages from one validator for the same height, round and kind
+  (two proposals, two prevotes or two precommits) that name different blocks,
+  a vote for nothing included. It holds only what the signatures cover: the
+  signer's public key, the two block ids (and a proposal's valid round) and
+  the two signatures, about 1 KB. A proposal's signature covers its block id,
+  not the block, so no block is needed. Anyone may send one; a validator
+  sends what its own engine catches, from its own key, once per offender.
+  The ledger checks both signatures against its own chain id, that the
+  height is on the chain (or is the block's own) and at most
+  `EVIDENCE_WINDOW` (20) heights back, and that the signer had a vote at that
+  height (`State.voters`: who voted on each recent height, kept from the
+  blocks). The offender loses all of its stake and unbonding coins. The
+  sender gets a tenth of the withdrawable part
+  (`economics.DOUBLE_SIGN_BOUNTY`; nothing if it reports itself), and the rest
+  is burned, bootstrap stake last, as in every slash since version 2. It
+  leaves the set at once and can never join again (`State.banned`), so each
+  validator is punished once. The window is the unbonding period: a
+  validator can't unstake while it's in the set (below), so the coins it had
+  at the offence unbond until after the window ends. A chain whose only
+  validator double-signs keeps it listed, with no stake and no vote, and
+  stops: with nobody listed it would become a chain any staked node seals
+  without certificates.
+- **A higher stake to join.** A `validator` transaction joining the set needs
+  `economics.VALIDATOR_STAKE` staked (100 VIBE, a placeholder: the owner's
+  call). Voting still needs only the 5 VIBE minimum, so validators that
+  joined before, like the public node with its 10 VIBE of bootstrap stake,
+  keep their vote. A validator already in the set announces a new address
+  with the minimum, as before.
+- **A delay before set changes.** A join or leave in block h takes effect at
+  height h + `VALIDATOR_DELAY` (10): the validators voting on that block are
+  the new set. An address has at most one change waiting, and a leave sent
+  while its join waits calls the join off. A validator's own `stake` and
+  `unstake` are refused while it's in the set or joining it, so its weight
+  can't jump past the others' in one block either. It unstakes from the
+  height its leave takes effect. The last validator with a vote still can't
+  leave, counting leaves already waiting (not joins, which can be called
+  off). Slashes, which can't be refused, still apply at once.
+
+Validators also save their round before sending a proposal, as they already did
+before a vote: a validator that crashed between proposing and voting would
+otherwise come back in the same round, build another block and sign it too.
 
 **Who runs what.** `/status` names the node's release (`version`), the
 block version it makes (`block_version`), the version of the chain's newest

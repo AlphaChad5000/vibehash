@@ -3,6 +3,7 @@ stake that can never be spent. Every round still replays from its record."""
 import unittest
 
 from vibehash import economics as econ
+from vibehash import ledger
 from vibehash.coordinator import CoordinatorConfig, ProtocolError
 from vibehash.crypto import KeyPair
 from vibehash.ledger import SYSTEM, Chain, InvalidBlock, Tx
@@ -118,8 +119,8 @@ class BootstrapStakeTests(unittest.TestCase):
                            validators={self.v1.address: "http://10.0.0.1:8545", self.v2.address: "http://10.0.0.2:8545"},
                            bootstrap={self.v1.address: 10 * VIBE, self.v2.address: 10 * VIBE}, earn_in=True)
 
-    def seal(self, txs, signer=None):
-        block, dropped = self.chain.build_block(None, txs, self.chain.tip.timestamp + 1)
+    def seal(self, txs, signer=None, version=ledger.VERSION):
+        block, dropped = self.chain.build_block(None, txs, self.chain.tip.timestamp + 1, version=version)
         block.sign(signer or self.v1)
         self.chain.append(block)
         return dropped
@@ -128,16 +129,19 @@ class BootstrapStakeTests(unittest.TestCase):
         return Tx.signed(keys, kind, SYSTEM, amount, self.chain.next_nonce(keys.address), memo, self.chain.chain_id)
 
     def test_it_votes_but_can_never_be_withdrawn(self):
+        # Version 3: from version 4 a validator in the set can't stake or unstake at all (test_rules_v4).
         s = self.chain.state
         self.assertEqual(s.validator_set(), {self.v1.address: 10 * VIBE, self.v2.address: 10 * VIBE})
-        self.assertEqual(len(self.seal([self.tx(self.v1, "unstake", 1)])), 1, "not even a little of it")
-        self.assertEqual(self.seal([self.tx(self.v1, "stake", 2 * VIBE)]), [])
-        self.assertEqual(self.seal([self.tx(self.v1, "unstake", 2 * VIBE)]), [], "stake added on top is free to leave")
+        self.assertEqual(len(self.seal([self.tx(self.v1, "unstake", 1)], version=3)), 1, "not even a little of it")
+        self.assertEqual(self.seal([self.tx(self.v1, "stake", 2 * VIBE)], version=3), [])
+        self.assertEqual(self.seal([self.tx(self.v1, "unstake", 2 * VIBE)], version=3), [],
+                         "stake added on top is free to leave")
         self.assertEqual(self.chain.state.stake(self.v1.address), 10 * VIBE)
 
     def test_a_validator_that_leaves_burns_it(self):
+        # Version 3, where the leave takes effect at once; version 4's delay is in test_rules_v4.
         before = self.chain.state.burned
-        self.assertEqual(self.seal([self.tx(self.v2, "validator")]), [])
+        self.assertEqual(self.seal([self.tx(self.v2, "validator")], version=3), [])
         s = self.chain.state
         self.assertEqual((s.stake(self.v2.address), s.locked.get(self.v2.address)), (0, None))
         self.assertEqual(s.burned - before, 10 * VIBE)

@@ -11,6 +11,9 @@ without trusting the node that serves the block.
 
 It's safe as long as validators holding more than two thirds of the stake follow the protocol: two different
 blocks can never both be final at one height, even if the network splits or messages arrive late or out of order.
+Breaking that takes more than a third of the stake signing conflicting messages, which each validator that sees
+them keeps (Engine.evidence) and node.py turns into an `evidence` transaction that costs the signer all its stake
+(ledger, block version 4).
 It's live once the network delivers messages in time. A proposer that's slow, offline or proposes something
 invalid only costs a round, and the next one takes over.
 
@@ -26,7 +29,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .crypto import Draw, KeyPair, address_of, h256, verify
-from .ledger import Block, canonical
+from .ledger import Block, canonical, consensus_message
 
 log = logging.getLogger("vibehash.consensus")
 MAX_ROUNDS_AHEAD = 1_000  # later rounds than this are ignored (an attacker's memory bomb, not a slow network)
@@ -79,9 +82,24 @@ def proposer_order(validators: dict[str, int], height: int) -> list[str]:
 
 # --- signed messages --------------------------------------------------------------------
 
-def _signed_part(chain_id: str, kind: str, height: int, round_: int, block_id: str | None, valid_round: int | None = None) -> bytes:
-    body = [chain_id, kind, height, round_, block_id]
-    return canonical(body + [valid_round] if kind == "proposal" else body)
+_signed_part = consensus_message  # (in ledger.py, which checks evidence of a double-sign against it)
+
+
+def _compact(msg: dict, block_id: str | None) -> dict:
+    """A message as kept for evidence: what its signature covers and the signature, not the block a proposal carries."""
+    out = {"type": msg["type"], "chain_id": msg["chain_id"], "height": int(msg["height"]), "round": int(msg["round"]),
+           "block": block_id, "pubkey": msg["pubkey"], "sig": msg["sig"]}
+    if msg["type"] == "proposal":
+        out["valid_round"] = int(msg["valid_round"])
+    return out
+
+
+def evidence_memo(first: dict, second: dict) -> str:
+    """The memo of an `evidence` tx (ledger.parse_evidence) for a pair Engine.evidence holds."""
+    def side(m: dict) -> dict:
+        return {"block": m["block"], "sig": m["sig"], **({"valid_round": m["valid_round"]} if m["type"] == "proposal" else {})}
+    return canonical({"kind": first["type"], "height": first["height"], "round": first["round"],
+                      "pubkey": first["pubkey"], "a": side(first), "b": side(second)}).decode()
 
 
 def vote(keys: KeyPair, chain_id: str, kind: str, height: int, round_: int, block_id: str | None) -> dict:
@@ -186,7 +204,10 @@ class Engine:
         self.validators: dict[str, int] = {}
         self.total, self.order, self.locked_round, self.waiting = 0, [], -1, False
         self.future: dict[tuple, tuple[dict, int]] = {}  # (sender, kind, height, round) -> (message, its size)
-        self.evidence: list[tuple[dict, dict]] = []  # pairs of conflicting messages from one validator: grounds for slashing
+        # Pairs of conflicting messages from one validator, as _compact keeps them: grounds for slashing (node.py sends
+        # each as an `evidence` tx, evidence_memo). One pair per validator, kind, height and round.
+        self.evidence: list[tuple[dict, dict]] = []
+        self._offences: set[tuple] = set()
         self.halted = False
 
     def halt(self) -> None:
@@ -226,7 +247,7 @@ class Engine:
             if self.wanted != (height, round_) or self.round != round_ or self.step != Step.PROPOSE or self.halted:
                 return False
             self.wanted = None
-            self._send(proposal(self.keys, self.chain_id, height, round_, -1, value, self._id(value)))
+            self._propose(proposal(self.keys, self.chain_id, height, round_, -1, value, self._id(value)))
             self._progress()
             return True
 
@@ -274,6 +295,7 @@ class Engine:
         self.timers: list[tuple[float, str, int]] = []
         self.fired: set[tuple[str, int]] = set()  # rules that act only the first time they hold in a round
         self.checked: dict[str, bool] = {}  # _value_key -> whether that value passed validate()
+        self.proposal_msgs: dict[int, dict] = {}  # round -> its first proposal, as _compact keeps it (for evidence)
         self.mine: list[dict] = []
         self.gossiped = self.now
         self._start_round(0)
@@ -285,7 +307,7 @@ class Engine:
         self.round, self.step, self.wanted = round_, Step.PROPOSE, None
         if self.me is not None and self.me == self.proposer(round_):
             if self.valid_value is not None:  # a block the network nearly agreed on: propose it again rather than a new one
-                self._send(proposal(self.keys, self.chain_id, self.height, round_, self.valid_round, self.valid_value, self.valid_id))
+                self._propose(proposal(self.keys, self.chain_id, self.height, round_, self.valid_round, self.valid_value, self.valid_id))
             else:
                 self.wanted = (self.height, round_)
         self.waiting = True
@@ -311,8 +333,26 @@ class Engine:
 
     def _vote(self, kind: str, block_id: str | None) -> None:
         if self.me in self.validators and not self.halted:
-            self._persist({"height": self.height, "round": self.round, "locked_id": self.locked_id, "locked_round": self.locked_round})
+            self._save_round()
             self._send(vote(self.keys, self.chain_id, kind, self.height, self.round, block_id))
+
+    def _propose(self, msg: dict) -> None:
+        """Our proposal goes out only once the round is saved, like a vote: a validator that crashed between proposing
+        and voting would otherwise come back in the same round, build a different block and sign it too, which is a
+        double-sign that costs it all its stake."""
+        if not self.halted:
+            self._save_round()
+            self._send(msg)
+
+    def _save_round(self) -> None:
+        self._persist({"height": self.height, "round": self.round, "locked_id": self.locked_id, "locked_round": self.locked_round})
+
+    def _record(self, first: dict, second: dict) -> None:
+        """Keep a pair of conflicting signed messages from one validator, once per validator, kind, height and round."""
+        key = (second["pubkey"], second["type"], second["height"], second["round"])
+        if key not in self._offences:
+            self._offences.add(key)
+            self.evidence.append((first, second))
 
     def _on_message(self, msg: dict) -> None:
         try:
@@ -353,7 +393,7 @@ class Engine:
         if kind == "proposal":
             have = self.proposals.get(round_)
             if have is not None and have[0] != block_id:
-                self.evidence.append(({"type": "proposal", "height": height, "round": round_, "block": have[0]}, msg))
+                self._record(self.proposal_msgs[round_], _compact(msg, block_id))
                 log.warning("proposer %s proposed two blocks in round %d at height %d", addr, round_, height)
                 return
             if have is not None and self.checked.get(have[3]) is not False:
@@ -364,11 +404,12 @@ class Engine:
             # The round's first proposal, or a different copy of one whose copy we have failed its checks: a relay may
             # have altered that one (see _value_key), and this may be the proposer's own.
             self.proposals[round_] = (block_id, value, valid_round, key)
+            self.proposal_msgs.setdefault(round_, _compact(msg, block_id))
             return
         votes = self.votes[kind].setdefault(round_, {})
         if addr in votes:
             if votes[addr][0] != block_id:
-                self.evidence.append((votes[addr][1], msg))
+                self._record(_compact(votes[addr][1], votes[addr][0]), _compact(msg, block_id))
                 log.warning("validator %s sent conflicting %ss in round %d at height %d", addr, kind, round_, height)
             return
         votes[addr] = (block_id, msg)

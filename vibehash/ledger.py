@@ -1,13 +1,18 @@
 """Account-based ledger: signed transactions, hash-linked signed blocks.
 
-User transactions (transfer, stake, unstake, post_job, cancel_job, validator)
-need an Ed25519 signature over a payload that includes the chain id, plus the
-sender's next nonce. They may pay a fee to the block's proposer (fees.py).
+User transactions (transfer, stake, unstake, post_job, cancel_job, validator,
+evidence) need an Ed25519 signature over a payload that includes the chain id,
+plus the sender's next nonce. They may pay a fee to the block's proposer
+(fees.py).
 
 Chains whose genesis (or a later `validator` transaction) names validators are
 run by them: only a validator may propose a block, and a block is final once
 validators holding more than two thirds of the stake have signed it
 (consensus.py). A chain without validators is sealed by one node, as before.
+From block version 4 a validator that signs two conflicting consensus messages
+loses its stake and its place to an `evidence` transaction anyone can send,
+joining takes economics.VALIDATOR_STAKE, and joins and leaves take effect
+VALIDATOR_DELAY heights after their block (ACCOUNTABILITY_VERSION).
 
 System transactions (slash, fee_release, reward) are never trusted from the
 proposer. Each block carries a RoundSummary (who did how much verified work,
@@ -35,7 +40,7 @@ from .crypto import KeyPair, address_of, h256, is_canonical_address, merkle_root
 from .tasks import InvalidJob, TrainingJob
 
 DEFAULT_CHAIN_ID = "vibehash-testnet-1"
-USER_KINDS = {"transfer", "stake", "unstake", "post_job", "cancel_job", "validator"}
+USER_KINDS = {"transfer", "stake", "unstake", "post_job", "cancel_job", "validator", "evidence"}
 SYSTEM = "system"
 BURN = "burn"
 UNBONDING_ROUNDS = 20  # unstaked coins stay slashable this long
@@ -57,8 +62,26 @@ BOOTSTRAP = "bootstrap"  # genesis memo: stake that votes but can never be withd
 #      proposing; the last voting validator can't unstake or leave; payouts are split in exact fractions.
 #   3: a post_job may be a fine-tune (tasks.is_finetune_spec), whose rounds are record version 4. Earlier versions
 #      refuse one, as nodes before fine-tunes did, so a chain can't hold one until its validators all know them.
-VERSION = 3
+#   4: validator accountability. An `evidence` tx slashes a validator that signed two conflicting consensus messages
+#      and puts it out of the set for good; joining the set takes economics.VALIDATOR_STAKE; a join or leave takes
+#      effect VALIDATOR_DELAY heights after its block; a validator's stake is bonded (no stake or unstake) while it's
+#      in the set or joining it.
+VERSION = 4
 FINETUNE_VERSION = 3
+ACCOUNTABILITY_VERSION = 4
+# A join or leave in block h takes effect at height h + VALIDATOR_DELAY: the validators voting on that block are the
+# new set. So the set can't be swapped in one block, everyone sees a change coming, and the validators have time to
+# reach a newcomer (they find each other from the addresses the chain lists). Before version 4 it was the next height.
+VALIDATOR_DELAY = 10
+# Evidence of a double-sign at height h is taken in blocks up to h + EVIDENCE_WINDOW. That's UNBONDING_ROUNDS, so
+# everything the offender had staked at h can still be slashed: a validator can't unstake while it's in the set, so
+# its coins leave the set at h + 1 at the earliest and unbond until h + 1 + UNBONDING_ROUNDS, a height later than any
+# evidence block (unbonding coins are released before a block's user txs, _settle_first). It also bounds how much
+# history of the validator set each node keeps (State.voters).
+EVIDENCE_WINDOW = UNBONDING_ROUNDS
+MAX_EVIDENCE_BYTES = 1024  # an evidence tx's memo: about 560 bytes for two votes' ids and signatures
+EVIDENCE_KINDS = ("proposal", "prevote", "precommit")
+MAX_BLOCK_ID = 64  # characters: a block id is its hash in hex; a message naming anything longer isn't evidence
 # User txs per block, as canonical JSON of to_dict(). A leader proposes its block and the round's record in one JSON
 # message, which nodes take up to 4 MiB of (node.MAX_JSON); 1 MiB leaves the rest for the record. That's about 2,400
 # plain transfers (430 bytes), or 64 of the largest tx a node relays (MAX_TX_BYTES).
@@ -80,6 +103,14 @@ class InvalidBlock(Exception):
 
 def canonical(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def consensus_message(chain_id: str, kind: str, height: int, round_: int, block_id: str | None,
+                      valid_round: int | None = None) -> bytes:
+    """What a validator signs for a proposal, prevote or precommit (consensus.py). It's here so the ledger can check
+    evidence of a double-sign (an `evidence` tx) without the blocks or the rest of the messages."""
+    body = [chain_id, kind, height, round_, block_id]
+    return canonical(body + [valid_round] if kind == "proposal" else body)
 
 
 # --- reading JSON from the network ------------------------------------------------
@@ -296,6 +327,15 @@ class State:
     # Rounds so far that paid for work (RoundSummary.pays_for_work), counted on every chain from its blocks, never
     # taken from a proposer. It's the halving clock of a schedule that counts paid rounds (economics.PAID_ROUNDS).
     paid_rounds: int = 0
+    # Validator accountability (block version 4), all derived from blocks:
+    # joins and leaves waiting to take effect, [height it takes effect at, address, url, or "" for a leave];
+    pending: list[list] = field(default_factory=list)
+    # validators punished for double-signing, and the height of the block that did it: they never vote again;
+    banned: dict[str, int] = field(default_factory=dict)
+    # who voted on each recent height, as [first height, sorted addresses] each time the set changed, back to the one
+    # in force EVIDENCE_WINDOW heights before the next block, so evidence can name only a validator of its height.
+    # Kept on every chain (it changes no block's meaning), so the first version 4 block can take evidence at once.
+    voters: list[list] = field(default_factory=list)
 
     def subsidy(self, height: int) -> int:
         """The subsidy a round mints at `height` on this chain, before that block is applied: any round's under the
@@ -317,8 +357,10 @@ class State:
 
     def validator_set(self) -> dict[str, int]:
         """Who votes on the next block, and with how much weight (their stake). A validator whose stake has fallen
-        below the minimum stays listed but has no vote."""
-        return {a: self.stake(a) for a in sorted(self.validators) if self.stake(a) >= econ.MIN_STAKE}
+        below the minimum stays listed but has no vote, and so does one punished for double-signing (only a chain's
+        last listed validator stays listed then, so the chain stops rather than become one any staked node seals)."""
+        return {a: self.stake(a) for a in sorted(self.validators)
+                if self.stake(a) >= econ.MIN_STAKE and a not in self.banned}
 
     def stake(self, addr: str) -> int:
         return self.stakes.get(addr, 0)
@@ -461,9 +503,11 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
         s._debit(tx.sender, tx.amount)
         s._credit(tx.recipient, tx.amount)
     elif tx.kind == "stake":
+        _not_bonded(s, tx.sender, version)
         s._debit(tx.sender, tx.amount)
         s.stakes[tx.sender] = s.stake(tx.sender) + tx.amount
     elif tx.kind == "unstake":
+        _not_bonded(s, tx.sender, version)
         if s.stake(tx.sender) < tx.amount:
             raise InvalidBlock("unstake exceeds stake")
         if s.stake(tx.sender) - tx.amount < s.locked.get(tx.sender, 0):
@@ -502,7 +546,9 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
             raise InvalidBlock("a validator announcement carries no amount")
         if not s.validators:  # else the first account to announce itself would take over a one-node chain
             raise InvalidBlock("this chain is run by one node; only a chain whose genesis names validators can add more")
-        if tx.memo:
+        if version >= ACCOUNTABILITY_VERSION:
+            _validator_tx(s, tx, height)
+        elif tx.memo:
             if not valid_endpoint(tx.memo):
                 raise InvalidBlock("a validator's address must look like http(s)://host:port")
             if s.stake(tx.sender) < econ.MIN_STAKE:
@@ -512,10 +558,181 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
             # v2 counts who votes, not who's listed: a listed validator below the minimum stake can't propose either.
             if (not s.validator_set().keys() - {tx.sender}) if version >= 2 else len(s.validators) == 1:
                 raise InvalidBlock("the last validator can't leave: nobody would be left to agree on blocks")
-            del s.validators[tx.sender]
-            bootstrap = s.locked.pop(tx.sender, 0)  # it was only ever there to vote with
-            s.stakes[tx.sender] = s.stake(tx.sender) - bootstrap
-            s.burned += bootstrap
+            _leave(s, tx.sender)
+    elif tx.kind == "evidence":
+        if version < ACCOUNTABILITY_VERSION:
+            raise InvalidBlock(f"evidence can go only in a block of version {ACCOUNTABILITY_VERSION} or later")
+        _punish(s, tx, height, chain_id)
+
+
+def _leave(s: State, addr: str) -> None:
+    """A validator's leave takes effect: out of the set, its bootstrap stake burned (it was only ever there to vote
+    with)."""
+    del s.validators[addr]
+    bootstrap = s.locked.pop(addr, 0)
+    s.stakes[addr] = s.stake(addr) - bootstrap
+    s.burned += bootstrap
+
+
+def _pending(s: State, addr: str) -> list | None:
+    """Its join or leave waiting to take effect, if it has one (it can have only one at a time)."""
+    return next((p for p in s.pending if p[1] == addr), None)
+
+
+def _not_bonded(s: State, addr: str, version: int) -> None:
+    """v4: a validator's stake is bonded while it's in the set (a leave pending included) or joining it. Otherwise a
+    validator could add stake and outvote the rest at once, which the join delay is there to prevent, or take its
+    stake out while still voting. It leaves first, and stakes or unstakes from the height the leave takes effect."""
+    if version >= ACCOUNTABILITY_VERSION and (addr in s.validators or _pending(s, addr)):
+        raise InvalidBlock("a validator's stake is bonded while it's in the validator set or joining it: leave first, "
+                           "then stake or unstake once the leave has taken effect")
+
+
+def _validator_tx(s: State, tx: Tx, height: int) -> None:
+    """v4's `validator` tx. With a url: join (at least economics.VALIDATOR_STAKE staked; never for an address punished
+    for double-signing), or a new url for a validator already in the set, which applies at once since it doesn't
+    change who votes. Empty: leave, or call off a join still waiting. A join or leave takes effect VALIDATOR_DELAY
+    heights later (_apply_pending), and an address has at most one waiting."""
+    waiting = _pending(s, tx.sender)
+    if tx.memo:
+        if not valid_endpoint(tx.memo):
+            raise InvalidBlock("a validator's address must look like http(s)://host:port")
+        if tx.sender in s.banned:
+            raise InvalidBlock(f"this address signed conflicting votes and was put out of the validator set at height "
+                               f"{s.banned[tx.sender]}: it can't be a validator again")
+        if waiting:
+            raise InvalidBlock(f"its {'join' if waiting[2] else 'leave'} is waiting to take effect at height {waiting[0]}")
+        if tx.sender in s.validators:
+            if s.stake(tx.sender) < econ.MIN_STAKE:
+                raise InvalidBlock("validators need at least the minimum stake")
+            s.validators[tx.sender] = tx.memo
+        else:
+            if s.stake(tx.sender) < econ.VALIDATOR_STAKE:
+                raise InvalidBlock(f"joining the validator set takes at least {econ.VALIDATOR_STAKE / econ.SYN_PER_VIBE:g} "
+                                   f"VIBE staked")
+            s.pending.append([height + VALIDATOR_DELAY, tx.sender, tx.memo])
+    elif waiting and waiting[2]:
+        s.pending.remove(waiting)  # a join called off before it took effect: it never voted
+    elif tx.sender in s.validators:
+        if waiting:
+            raise InvalidBlock(f"it already leaves at height {waiting[0]}")
+        # Someone with a vote must be left once every leave waiting has taken effect. Joins waiting don't count: one
+        # could still be called off. Nobody's stake can drop meanwhile (_not_bonded), except by a slash.
+        leaving = {p[1] for p in s.pending if not p[2]}
+        if not s.validator_set().keys() - leaving - {tx.sender}:
+            raise InvalidBlock("the last validator can't leave: nobody would be left to agree on blocks")
+        s.pending.append([height + VALIDATOR_DELAY, tx.sender, ""])
+
+
+def _apply_pending(s: State, next_height: int) -> None:
+    """v4: the joins and leaves that take effect at `next_height`, made at the end of the block before it, so the
+    validators voting on block `next_height` are the new set."""
+    due = [p for p in s.pending if p[0] <= next_height]
+    if due:
+        s.pending = [p for p in s.pending if p[0] > next_height]
+        for _, addr, url in due:
+            if url:
+                s.validators[addr] = url
+            elif addr in s.validators:
+                _leave(s, addr)
+
+
+def _note_voters(s: State, next_height: int) -> None:
+    """Record who votes on block `next_height` if that changed (State.voters), forgetting sets older than evidence
+    can name."""
+    now = sorted(s.validator_set())
+    if not s.voters or s.voters[-1][1] != now:
+        s.voters.append([next_height, now])
+    while len(s.voters) > 1 and s.voters[1][0] <= next_height - EVIDENCE_WINDOW:
+        s.voters.pop(0)
+
+
+def _voters_at(s: State, height: int) -> list[str]:
+    found: list[str] = []
+    for first, addrs in s.voters:
+        if first > height:
+            break
+        found = addrs
+    return found
+
+
+def parse_evidence(memo: str) -> dict:
+    """An evidence tx's memo: two signed consensus messages from one validator for the same height, round and kind,
+    naming different blocks. Only what's needed to check both signatures, never the blocks:
+    {"kind", "height", "round", "pubkey": the signer's, "a" and "b": {"block": id or null for a vote for nothing,
+    "sig", and for a proposal "valid_round"}}. Raises InvalidBlock if it isn't one."""
+    if len(memo.encode()) > MAX_EVIDENCE_BYTES:
+        raise InvalidBlock(f"evidence is at most {MAX_EVIDENCE_BYTES} bytes")
+    try:
+        d = json.loads(memo)
+        if not isinstance(d, dict) or set(d) != {"kind", "height", "round", "pubkey", "a", "b"}:
+            raise ValueError("it must hold kind, height, round, pubkey, a and b")
+        kind = _get(d, "kind", str)
+        if kind not in EVIDENCE_KINDS:
+            raise ValueError(f"kind is one of {', '.join(EVIDENCE_KINDS)}")
+        out = {"kind": kind, "height": _uint(d, "height", below=2**63, least=1), "round": _uint(d, "round", below=2**31),
+               "pubkey": _hex(d, "pubkey")}
+        if len(out["pubkey"]) != 32:
+            raise ValueError("pubkey is an Ed25519 public key")
+        for side in ("a", "b"):
+            m = _get(d, side, dict)
+            if set(m) != ({"block", "sig", "valid_round"} if kind == "proposal" else {"block", "sig"}):
+                raise ValueError(f"{side} holds block and sig" + (", and valid_round for a proposal" if kind == "proposal" else ""))
+            block = m["block"]
+            if not (isinstance(block, str) and 0 < len(block) <= MAX_BLOCK_ID or block is None and kind != "proposal"):
+                raise ValueError(f"{side}'s block is a block id" + (" or null" if kind != "proposal" else ""))
+            valid_round = None
+            if kind == "proposal":
+                valid_round = _get(m, "valid_round", int)
+                if not -1 <= valid_round < out["round"]:
+                    raise ValueError(f"{side}'s valid_round is out of range")
+            out[side] = {"block": block, "sig": _hex(m, "sig"), "valid_round": valid_round}
+    except ValueError as e:
+        raise InvalidBlock(f"malformed evidence: {e}") from e
+    if out["a"]["block"] == out["b"]["block"]:
+        raise InvalidBlock("both messages name the same block: that's no offence")
+    return out
+
+
+def _punish(s: State, tx: Tx, height: int, chain_id: str) -> None:
+    """v4's `evidence` tx: proof that a validator signed two conflicting messages (parse_evidence). Anyone may send it.
+    The validator loses all its stake and unbonding coins: the sender gets economics.DOUBLE_SIGN_BOUNTY's share of the
+    withdrawable part (nothing if it reports itself), and the rest is burned, bootstrap stake last. It leaves the set
+    at once and for good (State.banned). If it was the only validator listed it stays listed, with no vote, so the
+    chain stops: otherwise it would become a chain any staked node could seal (Node.bft). Each validator is punished
+    once; a later offence finds nothing left to take."""
+    ev = parse_evidence(tx.memo)
+    offender = address_of(ev["pubkey"])
+    if tx.amount or tx.recipient != offender:
+        raise InvalidBlock("evidence moves no coins, and its recipient is the validator it accuses")
+    h = ev["height"]
+    if h > height:
+        raise InvalidBlock("evidence must be of a height already on the chain, or this block's")
+    if height - h > EVIDENCE_WINDOW:
+        raise InvalidBlock(f"evidence is taken for {EVIDENCE_WINDOW} heights: height {h} is too long ago")
+    for side in ("a", "b"):
+        m = ev[side]
+        if not verify(ev["pubkey"], consensus_message(chain_id, ev["kind"], h, ev["round"], m["block"], m["valid_round"]),
+                      m["sig"]):
+            raise InvalidBlock("a forged signature in the evidence, or one for another chain")
+    if offender in s.banned:
+        raise InvalidBlock(f"that validator was already punished, at height {s.banned[offender]}")
+    if offender not in _voters_at(s, h):
+        raise InvalidBlock(f"that address had no vote at height {h}")
+    bonded = s.stake(offender) + s.unbonding_total(offender)
+    bounty, burn = econ.double_sign_amounts(bonded, _withdrawable(s, offender) + s.unbonding_total(offender))
+    if tx.sender == offender:
+        bounty, burn = 0, bonded
+    for to, amount in ((tx.sender, bounty), (BURN, burn)):  # the bounty first: _apply_system_tx takes it from free coins
+        if amount:
+            _apply_system_tx(s, Tx("slash", offender, to, amount, memo="double_sign", chain_id=chain_id),
+                             ACCOUNTABILITY_VERSION)
+    s.locked.pop(offender, None)
+    s.unbonding.pop(offender, None)
+    s.pending = [p for p in s.pending if p[1] != offender]
+    s.banned[offender] = height
+    if offender in s.validators and len(s.validators) > 1:
+        del s.validators[offender]
 
 
 def valid_endpoint(url: str) -> bool:
@@ -527,7 +744,8 @@ def _relayable(tx: Tx) -> None:
     """The relay policy (MAX_TX_BYTES): checked before check_tx replays the mempool, so an oversized tx costs a node
     almost nothing. The ledger already bounds the other memos: a post_job's is a job spec of at most
     tasks.MAX_SPEC_BYTES (TrainingJob.from_spec_json), a cancel_job's must name one of the sender's jobs, so it's a job
-    id of at most 64 characters, and a validator's is empty or what valid_endpoint takes."""
+    id of at most 64 characters, a validator's is empty or what valid_endpoint takes, and an evidence tx's is at most
+    MAX_EVIDENCE_BYTES (parse_evidence)."""
     if tx.size() > MAX_TX_BYTES:
         raise InvalidBlock(f"transaction too big: nodes relay up to {MAX_TX_BYTES} bytes")
     if tx.kind == "transfer" and not is_canonical_address(tx.recipient):
@@ -680,6 +898,7 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
             s.genesis += tx.amount
         if s.economics.max_supply and s.genesis > s.economics.max_supply:
             raise InvalidBlock("genesis allocates more than the schedule's maximum supply")
+        _note_voters(s, 1)
         return s
 
     if prev is None or block.prev_hash != prev.hash or block.height != prev.height + 1:
@@ -731,6 +950,9 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
         accepted, missed, offenders = set(summary.accepted), set(summary.missed), summary.offenders
         for addr in accepted | missed | offenders:
             s.reputation[addr] = econ.update_reputation(s.rep(addr), addr in accepted, addr in missed, addr in offenders)
+    if block.version >= ACCOUNTABILITY_VERSION:
+        _apply_pending(s, block.height + 1)
+    _note_voters(s, block.height + 1)  # (bookkeeping on every chain: it changes nothing a block settles)
     return s
 
 

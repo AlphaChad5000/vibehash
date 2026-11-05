@@ -459,7 +459,7 @@ python -m vibehash genesis create --chain-id my-testnet-1 --out genesis.json --b
 python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
 ```
 
-   For more validators, give each its own staked wallet and its own `--validator ADDR=URL` in the genesis, and start one node per wallet on its own machine, all with the same `genesis.json`. They find each other from the addresses in it. A staked account can also join a running network as a validator. Its node announces the address where other machines can reach it:
+   For more validators, give each its own staked wallet and its own `--validator ADDR=URL` in the genesis, and start one node per wallet on its own machine, all with the same `genesis.json`. They find each other from the addresses in it. An account with 100 VIBE staked can also join a running network as a validator; it starts voting 10 blocks after the join, its stake stays bonded until it leaves, and signing two conflicting votes costs it all of it (DESIGN §10, block version 4). Its node announces the address where other machines can reach it:
 
 ```bash
 python -m vibehash validator join --url http://203.0.113.7:8545 --wallet bob.json

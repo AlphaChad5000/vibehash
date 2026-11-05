@@ -59,7 +59,7 @@ from . import economics as econ
 from . import __version__, advice, filelock, netstats, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import MIN_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
-from .consensus import Engine, Timeouts, check_certificate
+from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
 from .crypto import AddressError, KeyPair, address_of, checksummed, parse_address, verify
@@ -253,6 +253,8 @@ class Node:
                              has_work=self._has_work, behind=lambda height: self.wake_sync.set(),
                              persist=lambda state: self.store.save_meta("consensus", state), propose_wait=self._propose_wait)
         self.proposed: dict[str, tuple] = {}  # block id -> (weights, scores, record) for blocks we proposed at this height
+        self.evidence_seen = 0  # how many of the engine's evidence pairs we've acted on (_report_double_signs)
+        self.reported: set[str] = set()  # validators we've sent evidence against, or found we can't
         self.commit_lock = threading.Lock()
         self.wake_sync = threading.Event()
         self.leader_hint: str | None = None  # the current leader, as a validator told us (for nodes that don't vote)
@@ -625,8 +627,44 @@ class Node:
             if self.bft:
                 try:
                     self.engine.tick()
+                    self._report_double_signs()
                 except Exception:  # noqa: BLE001
                     log.exception("consensus tick failed")
+
+    def _report_double_signs(self) -> None:
+        """Send an `evidence` tx, from this node's own key, for each validator the engine caught signing two conflicting
+        messages (Engine.evidence): the ledger then takes its stake and its place in the set (ledger._punish). Nobody
+        has to: any node, or anyone holding the two messages, can send the same tx. Once per validator, since one
+        punishment takes everything; if it fails (this node can't pay its own minimum fee, say), that's logged."""
+        with self.engine.lock:
+            found = self.engine.evidence[self.evidence_seen:]
+            self.evidence_seen += len(found)
+        for first, second in found:
+            try:
+                offender = address_of(bytes.fromhex(first["pubkey"]))
+            except ValueError:
+                continue
+            if offender in self.reported:
+                continue
+            self.reported.add(offender)
+            what = f"two {first['type']}s for height {first['height']}, round {first['round']}"
+            if offender == self.keys.address:
+                log.error("this validator's key signed %s: another node is running with it. Stop one of them; the "
+                          "other validators will slash its stake", what)
+                continue
+            try:
+                self.submit_tx(self._evidence_tx(offender, evidence_memo(first, second)))
+                log.warning("validator %s signed %s: sent the evidence, which costs it its stake", checksummed(offender), what)
+            except (ProtocolError, InvalidBlock, InvalidJob) as e:
+                log.warning("validator %s signed %s, but the evidence couldn't be sent: %s", checksummed(offender), what, e)
+
+    def _evidence_tx(self, offender: str, memo: str) -> Tx:
+        me, fee = self.keys.address, self.coord.config.min_fee
+        with self.coord.lock:  # our next nonce counts our own transactions still waiting
+            nonce = self.chain.next_nonce(me) + sum(t.sender == me for t in self.coord.mempool)
+            if self.chain.state.balance(me) < fee:
+                raise ProtocolError(f"this node's own balance can't pay its minimum fee of {fee} syn")
+        return Tx.signed(self.keys, "evidence", offender, 0, nonce, memo, self.chain.chain_id, fee)
 
     def _syncing(self) -> None:
         while not self.stopping.is_set():
