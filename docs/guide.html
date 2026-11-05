@@ -369,7 +369,7 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
         <li><strong>Two thirds make it final.</strong> A block counts once validators holding more than two thirds of the stake have signed it. Those signatures travel with the block, so anyone can check them.</li>
       </ol>
       <p>A leader that pays itself extra, favours a worker or drops someone's work is voted down, and the next validator runs the round again. If a validator goes offline, the others carry on without it, and it catches up when it's back. Two different blocks can never both be final unless more than a third of the stake signs both, and a validator that votes two ways leaves signed proof behind.</p>
-      <p>Anyone can check all of this without trusting a node: <code>vibehash chain verify</code> replays every round and checks every block's signatures, and a node started with <code>--peer</code> syncs the chain and refuses any block that fails those checks. A staked account can become a validator with <code>vibehash validator join</code>, and <code>vibehash validator list</code> shows who votes.</p>
+      <p>Anyone can check all of this without trusting a node: <code>vibehash chain verify</code> replays every round and checks every block's signatures, and a node started with <code>--peer</code> syncs the chain and refuses any block that fails those checks. An account with 100 VIBE staked can become a validator with <code>vibehash validator join</code>; it starts voting 10 blocks later, and <code>vibehash validator list</code> shows who votes. A validator that signs two conflicting votes loses its stake and its place to proof anyone can send.</p>
     </section>
 
     <section id="checks">
