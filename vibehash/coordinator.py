@@ -61,7 +61,7 @@ from . import fees
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
 from .finetune import MAX_VAL, WHOLE_TOLERANCE
-from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
+from .ledger import SYSTEM, Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
 from .storage import NotSaved
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
@@ -513,6 +513,10 @@ class Coordinator:
                 ready.append(job_id)
         if not ready:
             return None
+        # A starter job (in the genesis, owned by nobody: ledger.GENESIS_JOB) only fills rounds no paid job is ready for,
+        # so it never takes turns away from jobs people pay for.
+        paid = [j for j in ready if self.chain.state.job_owner.get(j) != SYSTEM]
+        ready = paid or ready
         last = next((s.job_id for s in self._summaries()), None)
         return ready[(ready.index(last) + 1) % len(ready)] if last in ready else ready[0]
 

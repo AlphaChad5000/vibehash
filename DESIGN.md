@@ -295,8 +295,28 @@ round it completes work instead of almost never, as in lottery mining.
     for voting and for proposing, but it can never be unstaked, and it's
     burned when its validator leaves the set, so it never becomes spendable
     money. As others earn stake and join as validators, it gets outweighed.
+  - **Starter jobs** (`"starter_jobs": [spec, ...]`, `genesis create
+    --starter-job SPEC.json`). Coins are made only by a job's rounds, and a
+    job needs at least 1 syn of budget, so with no coins at the start nobody
+    could post the first job and nothing would ever be mined. A starter job
+    is on chain from block one (a genesis tx with memo `job:` + the spec),
+    owned by nobody (`job_owner` is `system`, so nobody can cancel it), with
+    a fee of 0 and 1 syn of budget (`ledger.STARTER_ESCROW`, counted in the
+    genesis). Its rounds release no fee, so it never runs out, and its
+    workers are paid the subsidy alone. It runs only in rounds no paid job is
+    ready for (`Coordinator.active_job_id`), so it never takes a turn from a
+    job someone pays for. It can be an Evo job on a genesis with
+    `"es": true` (an Evo job's `rounds` only tapers its learning rate, so it
+    goes on at its lowest rate after them). A starter job that trains on an
+    uploaded dataset needs every validator to hold the file from the start.
+    Measured in `tests/test_starter_jobs.py`: a chain with no allocations and
+    no stakes, one validator with bootstrap stake that doesn't mine, and
+    three newcomers mints from its first round; the newcomers reach their
+    5 VIBE stake in six rounds; a lazy cheater among them is caught by the
+    coordinator's own checks from the first round and never paid.
 
-  The genesis hash commits to both. Genesis files without them keep their
+  The genesis hash commits to all three (starter jobs only when there are
+  some). Genesis files without them keep their
   hash, and every worker must be given stake, as before. `vibehash testnet`
   now starts this way: its validators have only bootstrap stake, and its
   workers start with nothing. The demo requester is the one account handed

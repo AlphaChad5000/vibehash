@@ -134,6 +134,7 @@ against the base model; `agents/README.md`, `tests/test_agents.py`; run from a c
 - **Merged:** `versions-supply-explorer` and `validator-accountability` (the two entries below). Run together after the merges: test_core, test_consensus, test_rules_v2, test_rules_v4, test_earn_in, test_record_v2, test_versions_supply, test_genesis_check and test_round_length, 192 tests OK.
 - **Rollout of block version 4:** a 0.5.15 or older node, follower or `chain verify` refuses the first version 4 block ("this node knows up to 3"). Release, then upgrade every validator at once (the public chain has one, the droplet, which makes version 4 blocks as soon as it runs this), then followers. Old workers keep mining: they parse blocks only to audit receipts and follow Evo jobs, and `Block.from_dict` takes any version. The owner's Evo testnet makes version 4 blocks from its next restart on this branch.
 - **For the owner to decide** (each is a constant today): `economics.VALIDATOR_STAKE` 100 VIBE; `VALIDATOR_DELAY` 10 heights; `DOUBLE_SIGN_BOUNTY` a tenth; whether a double-sign takes all of a validator's stake (as built: on a one-validator chain, like the public one, an accidental second copy of the validator on another machine could then stop the chain for good once someone reports it); `client.MIN_CLIENT` 0.5.14; "circulating" as spendable balances only.
+- **Starter jobs in the genesis** (the owner's choice for funding mainnet's first job, over a tiny premine; DESIGN §6). With no coins at the start nobody could post a job (a job needs at least 1 syn), and coins come only from jobs' rounds, so nothing would ever be mined. `"starter_jobs": [spec]` in a genesis (`genesis create --starter-job SPEC.json`) puts a job on chain from block one: memo `ledger.GENESIS_JOB` + spec, owned by `system` (nobody can cancel it), fee 0 (the CLI sets it), `STARTER_ESCROW` = 1 syn of budget counted in the genesis, so it never runs out and pays only the subsidy. `Coordinator.active_job_id` runs it only when no paid job is ready. An Evo starter job needs `"es": true` before it in the genesis (the owner wants Evo on for mainnet). `genesis check` fails a genesis with no coins and no starter job ("first job"), and warns on a starter job that needs an uploaded dataset. A genesis without the field keeps its hash (checked against vibehash-public-1's). Tests: `tests/test_starter_jobs.py` (7, ~35 s, in CI): from no coins, a non-mining validator and three newcomers mint from round 1, earn their 5 VIBE stake in 6 rounds, and a lazy cheater is never paid; paid jobs take every round while they have budget; replays match; and a live node with three workers over HTTP.
 - **Reviewed for bugs and vulnerabilities (2026-11-04, branch `review-fixes`, merged).** The security pass found nothing High or Medium. Fixed:
   - the dataset quota counted a part-way upload by what was on disk, so uploads started side by side (one chunk each) got the quota each; now each counts at the size it declared, admitted under one lock (`Node._admitted`; `test_dos.DatasetQuotaTests`);
   - its cache of datasets jobs name was keyed on the mempool's length (a full mempool swapping one tx kept it), now on the waiting post_jobs;
@@ -576,11 +577,13 @@ genesis (so no Evo jobs; Evo Hash runs on local test networks only), no block ex
 
 **A fresh chain for real money.** The testnet's coins stay worthless; a mainnet starts from a new genesis.
 - [ ] The final issuance numbers, and the founder allocation: a premine weakens both "nobody controls it" and the legal
-  position, and without one the first jobs need another way to be funded.
+  position. Without one, the first job is funded by a **starter job in the genesis** (the owner's choice, 2026-11-04;
+  `genesis create --starter-job`, DESIGN §6): owned by nobody, paying only new coins. Which job it is (an Evo job is
+  the natural fit, once Evo's checks close their gaps) is still to pick.
 - [ ] Its own SLIP-0044 coin type (`mnemonic.PATH` uses 1, "testnet, all coins"), so the same words give different
   testnet and mainnet keys.
-- [ ] `"es": true` in that genesis if Evo Hash is part of it: there's no chain-upgrade process to add it later
-  (`genesis create --es` writes it, `genesis check` warns without it).
+- [x] `"es": true` in that genesis: the owner decided Evo Hash is on for mainnet (2026-11-04). There's no chain-upgrade
+  process to add it later (`genesis create --es` writes it, `genesis check` warns without it).
 - [x] A check anyone can run on a proposed genesis: `vibehash genesis check FILE` (branch `mainnet-checklist`,
   2026-11-04) fails a test network's id, the old issuance rule, no cap, too few validators or one with a third of the
   vote, shared or private validator hosts; it warns on a premine, earn-in off, Evo off and the testnet coin type.

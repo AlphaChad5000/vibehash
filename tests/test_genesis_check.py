@@ -10,7 +10,7 @@ from pathlib import Path
 from vibehash import economics as econ
 from vibehash import genesis_check as gc
 from vibehash.crypto import KeyPair
-from vibehash.tasks import SYN_PER_VIBE
+from vibehash.tasks import SYN_PER_VIBE, TrainingJob
 
 V = SYN_PER_VIBE
 
@@ -19,13 +19,17 @@ def addr(n: int) -> str:
     return KeyPair.generate(bytes([n]) * 32).address
 
 
+def starter(job_id: str = "starter-mlp", **over) -> dict:
+    return {**TrainingJob(job_id, "system", budget=0, fee_per_round=0).to_spec(), **over}
+
+
 def mainnet(**over) -> dict:
     """A genesis that passes: four validators on four public HTTPS hosts with equal bootstrap stake, no premine,
-    earn-in, Evo on, the mainnet schedule counting paid rounds."""
+    earn-in, Evo on, the mainnet schedule counting paid rounds, and a starter job."""
     vals = {addr(i): f"https://v{i}.example.org:8545" for i in range(1, 5)}
     g = {"chain_id": "vibehash-1", "timestamp": 1_800_000_000, "allocations": {}, "stakes": {},
          "validators": vals, "bootstrap": {a: 10 * V for a in vals}, "earn_in": True, "es": True,
-         "economics": econ.NEW_SCHEDULES["mainnet"].to_dict()}
+         "economics": econ.NEW_SCHEDULES["mainnet"].to_dict(), "starter_jobs": [starter()]}
     g.update(over)
     return g
 
@@ -81,6 +85,16 @@ class GenesisCheckTests(unittest.TestCase):
         g = mainnet(validators={}, bootstrap={})
         self.assertEqual(self.status(g, "validators"), {"fail"})
 
+    def test_the_first_job(self):
+        # No coins and no starter job: nobody can post a job, so nothing is ever mined.
+        self.assertEqual(self.status(mainnet(starter_jobs=[]), "first job"), {"fail"})
+        self.assertEqual(self.status(mainnet(starter_jobs=[], allocations={addr(9): V}), "first job"), {"info"})
+        self.assertEqual(self.status(mainnet(), "first job"), {"ok"})
+        on_a_file = starter(data={"kind": "npz", "sha256": "ab" * 32})
+        self.assertEqual(self.status(mainnet(starter_jobs=[on_a_file]), "first job"), {"ok", "warn"})
+        # The starter job's 1 syn of budget isn't a premine.
+        self.assertEqual(self.status(mainnet(), "premine"), {"ok"})
+
     def test_tolerates(self):
         self.assertEqual(gc.tolerates([1, 1, 1, 1]), 1)
         self.assertEqual(gc.tolerates([1, 1, 1]), 0)
@@ -131,12 +145,17 @@ class CommandTests(unittest.TestCase):
             out = Path(d, "g.json")
             vals = [f"--validator={addr(i)}=https://v{i}.example.org:8545" for i in range(1, 5)]
             boot = [f"--bootstrap={addr(i)}=10" for i in range(1, 5)]
+            spec = Path(d, "starter.json")
+            spec.write_text(json.dumps(starter(fee_per_round=5 * V)))  # a fee is set to 0, and said so
             r = self.run_cli("genesis", "create", "--chain-id", "vibehash-1", "--economics", "mainnet", "--es",
-                             *vals, *boot, "--out", str(out))
+                             *vals, *boot, "--starter-job", str(spec), "--out", str(out))
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("vibehash genesis check", r.stdout)
+            self.assertIn("fee_per_round is set to 0", r.stdout)
+            self.assertIn("starter job starter-mlp", r.stdout)
             g = json.loads(out.read_text())
             self.assertIs(g["es"], True)
+            self.assertEqual([j["fee_per_round"] for j in g["starter_jobs"]], [0])
             self.assertFalse(gc.failed(gc.check(g)))
 
 

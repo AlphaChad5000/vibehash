@@ -53,6 +53,14 @@ EARN_IN = "earn-in"  # genesis memo: workers may start with no stake and earn it
 # would take a block version instead, as fine-tunes did (FINETUNE_VERSION).
 ES_GATE = "es-prototype"
 BOOTSTRAP = "bootstrap"  # genesis memo: stake that votes but can never be withdrawn (see State.locked)
+# Starter jobs: a genesis tx with memo GENESIS_JOB + a job spec puts that job on chain from block one, owned by nobody
+# (job_owner SYSTEM, so nobody can cancel it), with STARTER_ESCROW syn of budget and a fee of 0 a round. It never runs
+# out (a round's fee release is 0) and its workers are paid only the subsidy, so a network can mine from its first
+# round without anyone holding coins to post a job: a job needs at least 1 syn of budget, and with no starting coins
+# nobody would have it, and nothing would ever be mined. The coordinator runs a starter job only in rounds no paid job
+# is ready for (Coordinator.active_job_id). The syn is counted in the genesis, like any allocation.
+GENESIS_JOB = "job:"
+STARTER_ESCROW = 1
 # The block version build_block makes. A chain's versions never go down, and a node refuses versions it doesn't know.
 #   1: the original rules (0.5.1 and before).
 #   2: a txid appears at most once (crypto.merkle_root pads odd levels by repeating the last node, so a list with its
@@ -565,6 +573,26 @@ def _apply_user_tx(s: State, tx: Tx, height: int, chain_id: str, version: int,
         _punish(s, tx, height, chain_id)
 
 
+def _starter_job(s: State, tx: Tx) -> None:
+    """A starter job in the genesis block (GENESIS_JOB): on chain, owned by nobody, paying only the subsidy."""
+    if tx.recipient != SYSTEM or tx.amount != STARTER_ESCROW:
+        raise InvalidBlock(f"a starter job belongs to nobody and holds exactly {STARTER_ESCROW} syn of budget")
+    spec = tx.memo[len(GENESIS_JOB):]
+    try:
+        job = TrainingJob.from_spec_json(spec, SYSTEM, tx.amount)
+    except InvalidJob as e:
+        raise InvalidBlock(f"starter job: {e}") from e
+    if job.fee_per_round:
+        raise InvalidBlock("a starter job pays only new coins: its fee_per_round must be 0")
+    if job.es and not s.es:
+        raise InvalidBlock('a starter Evo job needs a genesis that takes Evo jobs ("es": true), before it')
+    if job.job_id in s.jobs:
+        raise InvalidBlock("job id already used")
+    s.escrow[job.job_id] = tx.amount
+    s.jobs[job.job_id] = spec
+    s.job_owner[job.job_id] = SYSTEM
+
+
 def _leave(s: State, addr: str) -> None:
     """A validator's leave takes effect: out of the set, its bootstrap stake burned (it was only ever there to vote
     with)."""
@@ -893,6 +921,8 @@ def apply_block(state: State, block: Block, chain_id: str, prev: Block | None) -
                 s.es = True
             elif tx.memo.startswith(ECONOMICS_MEMO):
                 s.economics = _economics_of(tx)
+            elif tx.memo.startswith(GENESIS_JOB):
+                _starter_job(s, tx)
             else:
                 s._credit(tx.recipient, tx.amount)
             s.genesis += tx.amount
@@ -960,7 +990,7 @@ class Chain:
     def __init__(self, allocations: dict[str, int], stakes: dict[str, int] | None = None,
                  chain_id: str = DEFAULT_CHAIN_ID, genesis_time: int = 0, economics: econ.Economics | None = None,
                  validators: dict[str, str] | None = None, bootstrap: dict[str, int] | None = None, earn_in: bool = False,
-                 es: bool = False):
+                 es: bool = False, starter_jobs: list[str] | None = None):
         """`bootstrap`: stake for the first validators that votes but can never be withdrawn or spent. `earn_in`:
         workers may start with no stake and earn it. Genesis files without them keep their genesis hash."""
         self.chain_id = chain_id
@@ -971,6 +1001,8 @@ class Chain:
         txs += [Tx("genesis", SYSTEM, a, v, memo=BOOTSTRAP, chain_id=chain_id) for a, v in sorted((bootstrap or {}).items())]
         txs += [Tx("genesis", SYSTEM, SYSTEM, 0, memo=EARN_IN, chain_id=chain_id)] if earn_in else []
         txs += [Tx("genesis", SYSTEM, SYSTEM, 0, memo=ES_GATE, chain_id=chain_id)] if es else []  # (es.py)
+        txs += [Tx("genesis", SYSTEM, SYSTEM, STARTER_ESCROW, memo=GENESIS_JOB + spec, chain_id=chain_id)
+                for spec in starter_jobs or []]  # after the ES rule, which an Evo starter job needs
         genesis = Block(0, b"\x00" * 32, genesis_time, None, txs, chain_id)
         self.state = apply_block(State(), genesis, chain_id, None)
         self.blocks: list[Block] = [genesis]
@@ -981,7 +1013,8 @@ class Chain:
                    g["chain_id"], int(g.get("timestamp", 0)), econ.Economics.from_genesis(g),
                    {k: str(v) for k, v in g.get("validators", {}).items()},
                    {k: int(v) for k, v in g.get("bootstrap", {}).items()}, bool(g.get("earn_in", False)),
-                   bool(g.get("es", False)))
+                   bool(g.get("es", False)),
+                   [j if isinstance(j, str) else canonical(j).decode() for j in g.get("starter_jobs", [])])
 
     @property
     def tip(self) -> Block:

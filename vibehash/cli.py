@@ -259,6 +259,19 @@ def cmd_genesis_create(a):
         g["earn_in"] = True
     if a.es:
         g["es"] = True
+    starters = []
+    for path in a.starter_job or []:
+        try:
+            spec = json.loads(Path(path).read_text())
+        except (OSError, ValueError) as e:
+            sys.exit(f"can't read the starter job {path}: {e}")
+        if not isinstance(spec, dict):
+            sys.exit(f"{path} isn't a job spec (vibehash job template writes one)")
+        if spec.get("fee_per_round"):
+            print(f"{path}: a starter job pays only new coins, so its fee_per_round is set to 0")
+        starters.append({**spec, "fee_per_round": 0})
+    if starters:
+        g["starter_jobs"] = starters
     economics = econ.NEW_SCHEDULES[a.economics]  # only rounds that pay for work mint, and the halvings count them
     g["economics"] = economics.to_dict()
     hash_ = Chain.from_genesis(g).genesis_hash  # also checks the allocations fit under the supply cap
@@ -268,6 +281,9 @@ def cmd_genesis_create(a):
         print(f"workers can start with no stake: their first {fmt(econ.MIN_STAKE)} of pay becomes their stake")
     if a.es:
         print("Evo jobs can run on it (\"es\": true)")
+    for spec in starters:
+        print(f"starter job {spec.get('id')}: on chain from block one, owned by nobody, paying miners new coins in "
+              "rounds no paid job wants")
     if a.economics == "mainnet":
         print(f"check it against what a network meant to carry value needs: vibehash genesis check {a.out}")
 
@@ -2002,6 +2018,9 @@ def parser() -> argparse.ArgumentParser:
                    help="require workers to be given stake; by default they can start with none and earn it")
     p.add_argument("--es", action="store_true",
                    help="let Evo jobs run on this network (\"es\": true); it can't be turned on later")
+    p.add_argument("--starter-job", action="append", metavar="SPEC.json",
+                   help="a job on chain from block one, owned by nobody, paying only new coins (fee 0), so the "
+                        "network can mine with no starting coins; a spec as `vibehash job template` writes")
     p = g.add_parser("check", help="hold a genesis file against what a network meant to carry value needs")
     p.add_argument("file"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_genesis_check)
 

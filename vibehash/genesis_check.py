@@ -113,6 +113,22 @@ def check(genesis: dict) -> list[Finding]:
                                "checklist), and should be a decision made on purpose")
     else:
         add("ok", "premine", "none: every spendable coin is earned by work")
+    # The first job. A job needs at least 1 syn of budget, and coins are only made by jobs' rounds: with no coins at the
+    # start and no starter job (ledger.GENESIS_JOB), nobody could post one and nothing would ever be mined.
+    starters = sorted(j for j, owner in s.job_owner.items() if owner == "system")
+    if starters:
+        add("ok", "first job", f"starter job{'s' if len(starters) > 1 else ''} {', '.join(starters)}: owned by nobody, "
+                               "paying miners new coins from the first round, in rounds no paid job wants")
+        for j in starters:
+            src = s.job(j).data_source
+            if src.get("kind") in ("npz", "tokens"):
+                add("warn", "first job", f"{j} trains on an uploaded dataset ({str(src.get('sha256'))[:12]}…): every "
+                                         "validator needs that file (`vibehash node --dataset`) before the first round")
+    elif premine:
+        add("info", "first job", "no starter job: the first job has to be paid for out of the starting coins")
+    else:
+        add("fail", "first job", "nobody holds any VIBE and there's no starter job, so nobody can post a job and nothing "
+                                 "is ever mined: add one (`genesis create --starter-job SPEC.json`)")
     if not s.earn_in:
         add("warn", "earn-in", "off: workers must be handed stake, so whoever holds coins at the start picks who mines")
     else:
