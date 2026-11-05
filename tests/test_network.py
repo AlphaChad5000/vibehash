@@ -372,6 +372,11 @@ class CommandLineTests(unittest.TestCase):
         s = node.chain.state  # what the lines say it earned is what the chain paid it, beyond its genesis stake
         self.assertEqual(round(sum(x["earned_vibe"] for x in sealed) * VIBE),
                          s.balance(workers[0].address) + s.stake(workers[0].address) - 10 * VIBE)
+        census = api.get("/network")["hardware"]  # the machine it registered as, counted, with no address in sight
+        self.assertEqual((census["online"], census["day"], census["reported"]), (1, 1, 1), census)
+        [klass] = census["classes"]
+        self.assertEqual((klass["vendor"], klass["online"]), ("cpu", 1))
+        self.assertNotIn(workers[0].address, json.dumps(census))
 
     def test_worker_job_must_be_one_the_node_lists(self):
         """`worker --job JOB` (for pods and --plain): a job the node doesn't list with budget left stops it at once,

@@ -425,14 +425,20 @@ def _chosen_job(api: NodeClient, job: str, url: str) -> None:
 def cmd_devices(a):
     from .compute import TorchBackend, list_devices, self_test, torch_available
 
-    found = [(d, None if d.id == "cpu" else self_test(TorchBackend(d.id))) for d in list_devices()]
+    from .compute import NumpyBackend
+
+    found = []
+    for d in list_devices():
+        backend = NumpyBackend() if d.id == "cpu" else TorchBackend(d.id)
+        found.append((d, None if d.id == "cpu" else self_test(backend), hardware.hardware_class(backend)))
     if a.json:
-        print(json.dumps([{"id": d.id, "label": d.label, "ready": p is None, "problem": p} for d, p in found]))
+        print(json.dumps([{"id": d.id, "label": d.label, "ready": p is None, "problem": p, "class": k} for d, p, k in found]))
         return
     print("Devices this computer can train on (best first):")
-    for d, problem in found:
+    for d, problem, klass in found:
         state = "ready" if problem is None else f"NOT USABLE: {problem[:120]}. Update the graphics driver."
         print(f"  {d.id:<8} {d.label}  [{state}]")
+        print(f"           registers as: {hardware.class_name(klass)}")
     if not torch_available():
         print(f"\nNo GPU support installed. `{prog()} install-gpu` finds your graphics card and installs support for it.")
 

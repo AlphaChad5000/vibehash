@@ -133,6 +133,15 @@ Each wallet gets its own cache (`~/.vibehash/cache/ADDRESS`: checkpoints,
 datasets, receipts). Model weights are shared: when two workers need the same
 model, one downloads it while the other waits for it.
 
+**What the network knows about your machine.** Each round, a worker registers
+what kind of machine it is: the card's vendor and family, its memory and its
+usual name (`RTX 4060, 8 GB (nvidia sm_89)`; a CPU-only worker says how many
+threads). `vibehash devices` shows what each device registers as. The node
+counts these for the public `/network` page (so many of this card, so many of
+that), never with an address attached, and nothing in it identifies you or
+your computer. It is a count, not a check: a worker's pay still follows the
+speed the node observes.
+
 ## Quick start
 
 Try a whole network on one computer: a node, two workers and a training job.

@@ -79,7 +79,7 @@ MAX_BLOCKS_REPLY = 4 * 2**20
 # up to ~10 KB for a reveal's Merkle proofs. Registrations and verdicts go into the round record exactly as sent, so
 # anything more would be junk that every validator stores and every proposal carries.
 ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
-BODIES = {"register": {"round", "flops_per_sec", "memory_mb"}, "assignment": {"round"}, "commit": {"round", "commitment"},
+BODIES = {"register": {"round", "flops_per_sec", "memory_mb", "hardware"}, "assignment": {"round"}, "commit": {"round", "commitment"},
           "sign": {"round", "requests"},
           "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"},
           "move": {"round", "game", "n", "move"}}
@@ -801,7 +801,28 @@ class Node:
         jobs.sort(key=lambda j: (order[j["status"]], -j["escrow"], j["id"]))
         return {"chain_id": self.chain.chain_id, "height": tip.height, "time": tip.timestamp, "now": now,
                 "subsidy": s.subsidy(tip.height + 1), "validators": len(s.validator_set()), "round": rnd,
-                "miners": netstats.summarize(recent, now), "jobs": jobs}
+                "miners": netstats.summarize(recent, now), "hardware": netstats.census(self._registrations(recent, now), now),
+                "jobs": jobs}
+
+    def _registrations(self, recent: list[dict], now: float) -> list[dict]:
+        """Who registered for the last day's rounds and on what kind of machine, from the round records this node
+        keeps: [{"timestamp", "workers": {public key: hardware class}}], oldest first. Records of the last
+        netstats.CENSUS_BLOCKS blocks at most, since each is a database read; a worker that mined today registered
+        in one of those."""
+        out = []
+        for b in recent[-netstats.CENSUS_BLOCKS:]:
+            if not b.get("summary") or now - b["timestamp"] > netstats.DAY_S:
+                continue
+            record = self.store.load_record(b["height"])
+            if not isinstance(record, dict):
+                continue
+            workers = {}
+            for env in record.get("registrations", []):
+                body = env.get("body") if isinstance(env, dict) else None
+                if isinstance(body, dict) and isinstance(env.get("pubkey"), str):
+                    workers[env["pubkey"]] = body.get("hardware")
+            out.append({"timestamp": b["timestamp"], "workers": workers})
+        return out
 
     def job_model(self, job_id: str, offset: int) -> bytes:
         if job_id not in self.chain.state.jobs:
