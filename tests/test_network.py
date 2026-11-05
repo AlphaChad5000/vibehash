@@ -282,7 +282,7 @@ class CommandLineTests(unittest.TestCase):
         with mock.patch("sys.stdin", io.StringIO()):  # no terminal: no question
             self.assertIn("All set. Start earning with", self.run_cli("setup", "--gpu", "skip"))
         out = self.run_cli("balance")
-        self.assertIn(address, out)
+        self.assertIn(f"address:    {crypto.checksummed(address)}", out)  # as people copy it, the checksum in its case
         self.assertIn("stake:      10 VIBE", out)
 
     def test_train_a_model_from_a_csv(self):
@@ -428,6 +428,9 @@ class CommandLineTests(unittest.TestCase):
             out = self.run_cli("testnet", "--rounds", "2", *fast)
         logging.disable(logging.INFO)
         self.assertIn("posted job demo-1", out)
+        # A new testnet's schedule: only rounds that pay for work mint (economics.NEW_SCHEDULES).
+        made = (self.home / "tn" / "genesis.json").read_bytes()
+        self.assertEqual(json.loads(made)["economics"]["count"], "paid_rounds")
         earned = [float(x) for x in re.findall(r"worker-1 ([\d.]+)", out)]
         self.assertEqual(len(earned), 2)
         self.assertGreater(earned[-1], 0)
@@ -447,6 +450,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("round", log)  # the feed's events: the node's rounds, in a testnet
         out = self.run_cli("testnet", "--rounds", "1", *fast)  # same chain and job, picked up from disk
         self.assertNotIn("posted job", out)
+        self.assertEqual((self.home / "tn" / "genesis.json").read_bytes(), made, "a testnet carried on keeps its genesis")
         self.assertGreater(float(re.findall(r"worker-1 ([\d.]+)", out)[-1]), 0, out)  # the first round back gets worked
 
 

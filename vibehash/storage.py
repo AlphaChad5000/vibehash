@@ -37,6 +37,22 @@ def record_blobs(record: dict) -> set[str]:
     return keep
 
 
+class NotSaved(Exception):
+    """A final block that couldn't be written to disk (a full disk, an I/O error), so it mustn't go into the chain in
+    memory either: a node that served and built on it would lose it at its next restart (Coordinator.adopt)."""
+
+    def __init__(self, height: int, why):
+        super().__init__(f"couldn't write block {height}: {why}")
+        self.height = height
+
+
+class RivalBlock(NotSaved):
+    """The database already holds a different block at this height: another node writes to the same folder."""
+
+    def __init__(self, height: int):
+        super().__init__(height, "the database already has a different block there")
+
+
 class Store:
     def __init__(self, data_dir: str | Path):
         self.dir = Path(data_dir)
@@ -53,6 +69,11 @@ class Store:
                             "accepted INTEGER NOT NULL, val_loss REAL NOT NULL, val_acc REAL NOT NULL, PRIMARY KEY (job_id, height))")
             self.db.execute("CREATE TABLE IF NOT EXISTS round_records (height INTEGER PRIMARY KEY, record TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS certificates (height INTEGER PRIMARY KEY, cert TEXT NOT NULL)")
+            # Who uploaded each dataset over HTTP, how big, and when it was complete: the per-address quota on datasets no
+            # job uses yet, and their clearing (node.py, DATASET_QUOTA). Datasets added with --dataset or fetched from a
+            # peer have no row, and are never cleared.
+            self.db.execute("CREATE TABLE IF NOT EXISTS dataset_uploads (sha256 TEXT PRIMARY KEY, uploader TEXT NOT NULL, "
+                            "size INTEGER NOT NULL, time REAL NOT NULL)")
 
     def close(self) -> None:
         self.db.close()
@@ -81,12 +102,36 @@ class Store:
             chain.append(block)
         return chain
 
-    def save_block(self, block: Block, certificate: dict | None = None) -> None:
-        """`certificate`: the validators' signatures that made the block final (consensus.py), on chains that have them."""
-        with self.lock, self.db:
-            self.db.execute("INSERT INTO blocks VALUES (?, ?, ?)", (block.height, block.hash.hex(), json.dumps(block.to_dict())))
-            if certificate is not None:
-                self.db.execute("INSERT OR REPLACE INTO certificates VALUES (?, ?)", (block.height, canonical(certificate).decode()))
+    def save_block(self, block: Block, certificate: dict | None = None, record: dict | None = None) -> bool:
+        """A final block, its `certificate` (the validators' signatures that made it final, consensus.py, on chains that
+        have them) and its round `record` (coordinator.py, kept so anyone can replay the round), in one transaction: all
+        of them are on disk, or none. True if they were written now. False if this very block (by hash) was here
+        already, put there by another writer: what it lacked is filled in, and nothing is replaced. RivalBlock if a
+        different block holds its height; any other failure (a full disk, an I/O error) is raised as it comes."""
+        body, h = json.dumps(block.to_dict()), block.hash.hex()
+        cert = canonical(certificate).decode() if certificate is not None else None
+        rec = canonical(record).decode() if record is not None else None
+        with self.lock:
+            try:
+                with self.db:
+                    self.db.execute("INSERT INTO blocks VALUES (?, ?, ?)", (block.height, h, body))
+                    if cert is not None:
+                        self.db.execute("INSERT OR REPLACE INTO certificates VALUES (?, ?)", (block.height, cert))
+                    if rec is not None:
+                        self.db.execute("INSERT OR REPLACE INTO round_records VALUES (?, ?)", (block.height, rec))
+                return True
+            except sqlite3.IntegrityError:
+                row = self.db.execute("SELECT hash FROM blocks WHERE height=?", (block.height,)).fetchone()
+                if row is None:
+                    raise
+                if row[0] != h:
+                    raise RivalBlock(block.height) from None
+            with self.db:
+                if cert is not None:
+                    self.db.execute("INSERT OR IGNORE INTO certificates VALUES (?, ?)", (block.height, cert))
+                if rec is not None:
+                    self.db.execute("INSERT OR IGNORE INTO round_records VALUES (?, ?)", (block.height, rec))
+            return False
 
     def save_meta(self, key: str, value) -> None:
         with self.lock, self.db:
@@ -173,6 +218,22 @@ class Store:
             shutil.copyfile(src, tmp)
             tmp.replace(dest)
         return sha
+
+    def note_upload(self, sha256: str, uploader: str, size: int, when: float) -> None:
+        """A dataset uploaded over HTTP is complete (the first uploader to finish it is the one noted)."""
+        with self.lock, self.db:
+            self.db.execute("INSERT OR IGNORE INTO dataset_uploads VALUES (?, ?, ?, ?)", (sha256, uploader, size, when))
+
+    def uploads(self) -> list[tuple[str, str, int, float]]:
+        """(sha256, uploader, size, time) of every dataset uploaded over HTTP that's still kept."""
+        with self.lock:
+            return self.db.execute("SELECT sha256, uploader, size, time FROM dataset_uploads").fetchall()
+
+    def drop_upload(self, sha256: str) -> None:
+        """Delete an uploaded dataset and its row (node.py clears ones no job used)."""
+        self.datasets.path(sha256).unlink(missing_ok=True)
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM dataset_uploads WHERE sha256=?", (sha256,))
 
     def check_dataset(self, path: Path) -> None:
         """Raises InvalidJob unless `path` is a real, pickle-free dataset (with no more data than its size allows, see

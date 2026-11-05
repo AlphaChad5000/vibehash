@@ -195,12 +195,16 @@ Each round has a pool:
 
 ```
 pool = block_subsidy(round) + fee_release(job)
-block_subsidy(round) = 50 VIBE / 2^(round // HALVING_INTERVAL)
+block_subsidy(round) = 50 VIBE / 2^(paid_rounds // HALVING_INTERVAL)   if the round pays for work, else 0
 fee_release          = min(job_escrow_remaining,
                            job_fee_per_round × accepted_units / units_per_round)
 ```
 
-The requester pays only for the share of the round that verified.
+The requester pays only for the share of the round that verified. Each
+network's genesis fixes the subsidy's numbers, and on networks made since
+2026-11-03 only a round that pays for work mints one, with `paid_rounds` the
+rounds before it that did; older ones mint in every round and halve by block
+height (§10, "Issuance schedule").
 
 The pool is split:
 
@@ -210,8 +214,9 @@ The pool is split:
 | 15 % | Verifiers | replay FLOPs × reputation |
 | 5 %  | Block proposer | — |
 
-Anything unclaimed (for example, no unit verified that round) is burned, not
-handed to the proposer, so proposers can't profit from rejecting good work.
+Anything unclaimed (for example, no verifiers that round, or on an older
+network a round in which no unit verified) is burned, not handed to the
+proposer, so proposers can't profit from rejecting good work.
 
 **Reputation** is a multiplier in `[0.5, 1.0]`: new workers start at 0.8, gain
 +0.02 per round with verified work, lose 0.05 per round with a missed
@@ -254,7 +259,10 @@ round it completes work instead of almost never, as in lottery mining.
   nobody can take over a one-node chain by announcing themselves. Neither
   leaving nor unstaking may leave the chain with no validator that has a vote,
   since then nobody could propose a block. (A slash can't be refused, so it
-  still can.)
+  still can.) From block version 4 there's also `evidence`, proof that a
+  validator signed two conflicting votes, which costs it its stake; joining
+  takes 100 VIBE, and joins and leaves take effect 10 heights later (§10,
+  "Block versions").
   Each needs a valid signature, the sender's next nonce, and the right
   **chain id**.
 - **Unstaking** moves coins into a 20-round unbonding queue where they can
@@ -287,8 +295,38 @@ round it completes work instead of almost never, as in lottery mining.
     for voting and for proposing, but it can never be unstaked, and it's
     burned when its validator leaves the set, so it never becomes spendable
     money. As others earn stake and join as validators, it gets outweighed.
+  - **Starter jobs** (`"starter_jobs": [spec, ...]`, `genesis create
+    --starter-job SPEC.json`). Coins are made only by a job's rounds, and a
+    job needs at least 1 syn of budget, so with no coins at the start nobody
+    could post the first job and nothing would ever be mined. A starter job
+    is on chain from block one (a genesis tx with memo `job:` + the spec),
+    owned by nobody (`job_owner` is `system`, so nobody can cancel it), with
+    a fee of 0 and 1 syn of budget (`ledger.STARTER_ESCROW`, counted in the
+    genesis). Its rounds release no fee, so it never runs out, and its
+    workers are paid the subsidy alone. It runs only in rounds no paid job is
+    ready for (`Coordinator.active_job_id`), so it never takes a turn from a
+    job someone pays for. It can be an Evo job on a genesis with
+    `"es": true`: `vibehash job template --evo MODEL` writes one whose
+    `tasks` (es_tasks.CURATED's 17 by default) take turns, `--rounds` (12) rounds each, the
+    learning rate's cosine starting again with each task (`es2.task_at`,
+    `es2.lr_at`), as the testnet's short jobs do one after another, but in one
+    job and one line. A round's task follows from its step, which every node
+    and worker reads from the job's state; a replay target keeps its own
+    round's task (its place in the job's history is its step). Its step is
+    anchored (`es2.Spec2.decay`, 1/64 with lr 1e-3): before each round's
+    step the weight change gives back that share of itself, so a job that
+    never ends stays near its base model instead of drifting away (unanchored,
+    the Evo v2 step broke Qwen2.5-0.5B within about 100 rounds; HANDOFF, "The
+    Evo collapse: cause and fix"). A starter job that trains on an
+    uploaded dataset needs every validator to hold the file from the start.
+    Measured in `tests/test_starter_jobs.py`: a chain with no allocations and
+    no stakes, one validator with bootstrap stake that doesn't mine, and
+    three newcomers mints from its first round; the newcomers reach their
+    5 VIBE stake in six rounds; a lazy cheater among them is caught by the
+    coordinator's own checks from the first round and never paid.
 
-  The genesis hash commits to both. Genesis files without them keep their
+  The genesis hash commits to all three (starter jobs only when there are
+  some). Genesis files without them keep their
   hash, and every worker must be given stake, as before. `vibehash testnet`
   now starts this way: its validators have only bootstrap stake, and its
   workers start with nothing. The demo requester is the one account handed
@@ -354,7 +392,14 @@ round it completes work instead of almost never, as in lottery mining.
 - **Node** (`vibehash node`): runs the round state machine on a wall clock
   (register → compute → reveal → verify → finalize), serves a JSON API, stores
   blocks, model weights and datasets on disk, and re-validates the whole chain
-  on start-up.
+  on start-up. A final block goes to disk, with its certificate and round
+  record in one transaction, before the chain the node builds on and serves
+  takes it. If it can't be saved (the database already holds a different
+  block at that height, as when two nodes share a data folder, or the disk is
+  full or failing), the node stops: it no longer leads, votes, proposes or
+  syncs, serves only the blocks it saved, says why in `/status` (`halted`),
+  and `vibehash node` exits with the reason. A restart carries on from what's
+  on disk. The very block already on disk is no error.
 - **Validators** run the chain. The genesis names them (`genesis create
   --validator ADDR=URL`), and a staked account can join later with a
   `validator` transaction (`vibehash validator join --url …`). Voting power
@@ -372,8 +417,10 @@ round it completes work instead of almost never, as in lottery mining.
   block.
   - **Safety:** two different blocks can't both be final at one height unless
     more than a third of the stake signs both ways. A validator that votes
-    both ways leaves two signed, conflicting votes behind, which are kept as
-    evidence. Before each vote it sends, a validator saves its round and
+    both ways leaves two signed, conflicting votes behind. Validators that
+    see both send them as an `evidence` transaction, and from block version 4
+    it costs the signer all its stake and its place (§10). Before each vote
+    or proposal it sends, a validator saves its round and
     lock, so after a crash it resumes past the rounds it voted in instead of
     voting in them again.
   - **Liveness:** if the leader is offline, slow, or proposes a block that
@@ -956,13 +1003,24 @@ Being explicit about what this is and isn't:
      votes without looking, and `chain verify` would only catch it after the
      fact. Next: validators recheck a random sample before voting, and a
      dispute transaction slashes a leader whose record a recheck contradicts.
-  3. **Validator accountability.** Conflicting votes are kept as signed
-     evidence, but nothing slashes them on chain yet. A validator earns only
-     the 5% proposer share of the rounds it leads. Any account with the worker
-     minimum stake can join the set, and changes take effect at the next
-     height. A mainnet needs double-sign slashing, a higher validator stake,
-     and a delay before set changes apply. Bootstrap stake (§6) should be
-     spread across several independent first validators, not one operator.
+  3. **Validator accountability.** From block version 4 (§10), a validator
+     that signs two conflicting messages for one height and round loses all
+     its stake and its place, through evidence anyone can send; joining the
+     set takes 100 VIBE staked; and joins and leaves take effect 10 heights
+     after their block, with the validator's stake bonded meanwhile. Still
+     open:
+     - The numbers (`VALIDATOR_STAKE`, `VALIDATOR_DELAY`, the reporter's
+       tenth) are placeholders. A validator earns only the 5% proposer share
+       of the rounds it leads, so 100 VIBE at risk is a lot for it to earn.
+     - A validator compares only the messages it receives. One that sends
+       different votes to different validators leaves no single node holding
+       both, and nodes don't gossip each other's votes; a commit certificate
+       holds only one side. Conflicting messages for a later height, which a
+       node keeps one of until it gets there, are dropped, not kept.
+     - Nothing punishes a validator for being offline, and earn-in pay can
+       still lift a listed validator below the minimum back to a vote at once.
+     - Bootstrap stake (§6) should be spread across several independent first
+       validators, not one operator.
   4. **Hugging Face, for DeepSeek's frozen weights.** The referee reads base
      weights only from the pinned commit on Hugging Face, never from a party
      to a dispute. A fine-tune's tensors, and DeepSeek-V4.1-Flash's trained
@@ -1005,6 +1063,11 @@ Being explicit about what this is and isn't:
   is checked one cell (one shard over one segment) at a time, so no worker,
   checker or arbitrating node ever runs the whole model. That document has
   the design, and `shards.py` a tested prototype of its core.
+- **Recipients no key holds.** The ledger credits a transfer to any
+  recipient that starts `vibe1`, though only the canonical form can ever be
+  spent (§10, "Addresses"). Clients check addresses' checksums and nodes
+  refuse other spellings by relay policy, but a block holding one still
+  validates: a block version should make it a rule.
 - **Security review.** None of this has been audited. Don't put real value
   on it, and get legal advice before issuing a token anyone can buy.
 
@@ -1068,29 +1131,79 @@ before recovery words load as they are.
 
 ### Issuance schedule (`economics.Economics`)
 
-The block subsidy, halving interval and supply cap are fixed in the genesis
-file's `"economics"` field (`genesis create --economics testnet|mainnet`):
+The block subsidy, halving interval, supply cap and which rounds count are
+fixed in the genesis file's `"economics"` field (`genesis create --economics
+testnet|mainnet`):
 
 | | testnet | mainnet |
 |---|---|---|
-| Subsidy per round | 50 VIBE | 3.125 VIBE |
-| Halving interval | 210 blocks | 3,320,000 blocks |
-| One halving, at 38 s rounds | ~2.2 hours | ~4.0 years |
+| Subsidy per round that pays for work | 50 VIBE | 3.125 VIBE |
+| Halving interval | 210 rounds that paid for work | 3,320,000 rounds that paid for work |
+| One halving, if every 38 s round is worked | ~2.2 hours | ~4.0 years |
+| A round that pays nobody for work | mints nothing | mints nothing |
 | Issued in total | ~21,000 VIBE | ~20,750,000 VIBE |
 | Cap on all coins ever (genesis + issued) | none | 21,000,000 VIBE |
 
-The testnet numbers are the old ones, so existing chains and tests are
-unchanged. Mainnet is Bitcoin's shape stretched to Vibe Hash's block time.
-The node's default round is 38 s (register 3 + compute 20 + reveal 5 +
-verify 10), and 4 × 365.25 days / 38 s ≈ 3.32M blocks. 3.125 VIBE per block
-then issues 20.75M VIBE, which leaves room for up to 250,000 VIBE of genesis
-allocations under the 21M cap. The cap is enforced as well as designed in: a
-genesis that allocates more is invalid, and a subsidy never takes coins
-created past the cap. Halvings count block heights, and blocks that only
-carry transactions (when no job is running) mint nothing, so the 4 years
-assume the network is busy. No round is shorter than the node's own, however
-fast its work comes in (§3, "Round length follows the job"), so at the
-default phases blocks never come faster than the schedule assumes.
+The testnet numbers are the old ones. Mainnet is Bitcoin's shape stretched
+to Vibe Hash's block time. The node's default round is 38 s (register 3 +
+compute 20 + reveal 5 + verify 10), and 4 × 365.25 days / 38 s ≈ 3.32M
+rounds. 3.125 VIBE per round then issues 20.75M VIBE, which leaves room for
+up to 250,000 VIBE of genesis allocations under the 21M cap. The cap is
+enforced as well as designed in: a genesis that allocates more is invalid,
+and a subsidy never takes coins created past the cap.
+
+**Only rounds that pay for work mint (`"count": "paid_rounds"`).** A chain
+seals a block every round whether anyone works or not. A round that pays
+nobody for work mints nothing and burns nothing, and the halvings count
+rounds that paid for work, not block heights: the subsidy is
+`initial_subsidy >> (paid_rounds // halving_interval)`, capped as above,
+where `paid_rounds` (`State.paid_rounds`) is how many earlier rounds on the
+chain paid for work. A quiet network so delays its halvings rather than
+losing coins: the 20.75M VIBE are minted in full however busy it is, and the
+4 years per halving are the shortest it can take. (A share nobody claims in a
+round that does pay for work, such as the checkers' 15% when nobody checked,
+is still burned.) Blocks that carry only
+transactions (when no job is running) mint nothing either. No round is
+shorter than the node's own, however fast its work comes in (§3, "Round
+length follows the job"), so at the default phases rounds never come faster
+than the schedule assumes.
+
+A round pays for work (`RoundSummary.pays_for_work`) when its summary credits
+accepted work, worker FLOPs above zero, to a worker who isn't an offender:
+the same work `_reward_txs` pays workers for, and that a proposer's 5% needs.
+It's that in every kind of round: an MLP's (a unit that verified), a sharded
+team's (a member whose cells and edges checked out), a fine-tune's (a claim a
+checker approved or that won its disputes), an Evo round's (approved, and
+nobody rejected it) and a DeepSeek prep round's (a unit kept into the work
+graph). Checking and scoring don't make a round one on their own: they are
+paid out of a round that pays for work. In a round where no work is
+accepted, a checker that caught a cheater is paid by the slash's bounty, and
+other checks, approvals of claims someone else rejected and fine-tune scores
+go unpaid, since nothing is minted. The rule reads the summary, not what the
+split comes to, which depends on the subsidy itself. The count isn't in any
+block: every node derives it while applying blocks, and the reward
+transactions follow from it, so a block paying a subsidy in a round without
+accepted work, or one from a different halving, doesn't match the derived
+transactions and is invalid. A proposer can make a round count only by
+crediting work in its summary, which is paying for it; validators replay the
+round from its signed record before voting (§9), and `chain verify` does the
+same, so that is caught as any forged payment is. Fees are unchanged: a
+round's job fee is charged only for its accepted units, so a round nobody's
+work is accepted in leaves the job's escrow as it was, and transaction fees
+go to the block's proposer whatever the round did.
+
+**Older networks.** A genesis whose `"economics"` has no `"count"` (or
+`"count": "blocks"`), names a preset (`"economics": "mainnet"`), or has no
+`"economics"` at all, keeps the original rule, and its hash: every block that
+seals a round mints its subsidy, whatever nobody earned of it is burned, and
+the halvings count block heights. On such a chain a quiet network still sees
+its halvings on time, and the coins of every empty round are destroyed. On
+2026-11-03 a local Evo testnet minted and burned 325 VIBE in 26 empty rounds,
+and by block 9,654 `vibehash-public-1` had paid for work in 133 rounds and
+minted and burned 29,743.75 VIBE in the 9,518 that paid nobody.
+`vibehash-public-1` and every testnet folder made before 2026-11-03 are on it.
+`genesis create`, with either preset, and new `vibehash testnet` folders
+write the preset's numbers with `"count": "paid_rounds"`, the rule above.
 
 **Commitment.** A schedule other than the testnet one adds one genesis
 transaction, `memo = "economics:" + canonical JSON of the numbers`, so it's
@@ -1098,8 +1211,13 @@ in the genesis block's transaction root and hash. Nodes with different
 schedules never share a genesis hash, refuse each other's data directories,
 and workers stop if their node changes networks. A genesis file without the
 field, or naming the testnet schedule, gets no such transaction and keeps its
-old hash. The schedule lives in `State.economics` and is read by settlement,
-`Coordinator.finalize` and `/status` (`economics`, `subsidy`).
+old hash. `"count"` is in the committed JSON only when it's `"paid_rounds"`,
+so schedules from before it keep theirs, and a node from before it, which
+would read such a genesis as the original rule, works out a different genesis
+hash and can't take the network's blocks for its own. The schedule lives in
+`State.economics` and is read by settlement, `Coordinator.finalize` and
+`/status` (`economics`; `subsidy`, what the next round that pays for work
+mints).
 
 ### TLS (`tls.py`)
 
@@ -1180,6 +1298,15 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
     one that would unpack to more than 64 times its file size (or 64 MB, if
     larger) is refused. Only the upload that completes a dataset checks it,
     and a check never deletes one already accepted.
+  - Datasets no job uses yet are on their uploader's quota (`node.py`,
+    `DATASET_QUOTA`, 20 GB an address, finished or part way): uploading 1 VIBE
+    of balance used to let anyone fill a node's disk 20 GB at a time. A job on
+    chain or in the mempool naming a dataset takes it off the quota for good.
+    A finished upload no job has used for three days (`LOOSE_DATASET_S`) is
+    deleted. Who uploaded what is kept in SQLite (`dataset_uploads`); datasets
+    added with `--dataset` or fetched from a peer have no row there, and are
+    never counted or deleted. Many funded addresses still get 20 GB each, for
+    three days at a time.
 - **Peers.** Sync gives up on a peer whose page adds nothing or whose block
   it refuses, and moves on past a malformed reply. Clients cap what they read:
   128 MiB of JSON, one chunk of binary, downloads at the size the job allows.
@@ -1217,6 +1344,60 @@ old hash. The schedule lives in `State.economics` and is read by settlement,
   recovery words. `vibehash testnet`'s throwaway wallets are still plain
   random keys.
 
+### Addresses and their checksum (`crypto.checksummed`, `crypto.parse_address`)
+
+- An address is `vibe1` and the first 36 hex digits of sha256(public key),
+  in small letters (`address_of`). That **canonical form** is what the
+  ledger, blocks, genesis files, wallet files, the node's API and every
+  record a program reads (`--json`, `rounds.jsonl`, `history.csv`) hold. It
+  hasn't changed, so every chain, wallet and block stays valid byte for byte.
+- People see a **checksummed form**, EIP-55's idea with sha256 in place of
+  keccak: h = sha256(the canonical address, `vibe1` included), and each
+  letter a-f among the 36 digits is a capital when nibble i of h is 8 or
+  more. Digits and the prefix stay as they are, and lowercased it's the
+  canonical address again. Commands' text, the mining dashboard, the menu,
+  selftest and the recovery-words file show it, a shortened address included
+  (`vibe17B0D8…9525`).
+- `parse_address` reads what people give: `send --to`, `balance ADDRESS`,
+  `genesis create`'s `--alloc`, `--stake`, `--bootstrap` and `--validator`,
+  the menu's Send VIBE. Spaces around it are dropped and the prefix may be in
+  any case. A wrong length or a character outside 0-9 and a-f is refused.
+  Any capital makes it a checksummed address, whose capitals must be exactly
+  right. All small letters is taken unchecked, since that's how addresses
+  were shown before (EIP-55 does the same). All capitals is checked, not
+  waved through: nothing writes an address that way, so taking it unchecked
+  would only widen what goes unchecked. Commands check before they open the
+  wallet, so a typo stops before anything is signed or sent, and
+  `NodeClient.send_tx` runs every transfer's recipient through it too, so no
+  program built on it signs one for a mistyped address, whatever the node.
+- **What it catches.** Of every one-character substitution in the
+  checksummed forms of 20,000 random addresses (the 21 other hex characters,
+  in either case, at each of the 36 places: 14.85 million typos), 99.876% are
+  refused. Of the rest, 0.072% leave no capital at all (an address with at
+  most one capital, typed with that one changed), which reads as an unchecked
+  old-style address, and 0.052% happen to get the new address's capitals
+  right: an address has 13.5 letters on average, each a coin toss. Swapping
+  two neighbours is caught 99.855% of the time. A case-only slip (one capital
+  typed small) is the same address, and never sends coins elsewhere.
+- **The ledger takes any recipient that starts `vibe1`** (`_apply_user_tx`),
+  capitals and any length included, and credits that exact string. No key's
+  `address_of` makes anything but the canonical form, so coins sent to any
+  other spelling, a checksummed address included, can never be spent.
+  Changing that is a block rule, which changes which blocks are valid, so for
+  now it's relay policy: `_relayable` refuses a transfer whose recipient isn't
+  canonical, and a node neither takes one into its mempool nor builds a block
+  with one. A block holding one, from a node without the policy, still
+  validates. The next block version should make it a rule.
+- **bech32m instead**, for a fresh mainnet genesis: its checksum catches
+  every typo of up to four characters, not 99.9% of one-character ones. It
+  would change the canonical form itself (`vibe` as the human-readable part,
+  `1` as the separator, so it still starts `vibe1`, then the 18 bytes and a
+  6-character checksum, all in one case), so it can't come to an existing
+  chain: every allocation, balance key, block, record and wallet file names
+  addresses in today's form. A new chain would need `address_of` changed, a
+  block version whose rules take only the new form, and `parse_address` and
+  the displays updated; keys and recovery words work as before.
+
 ### Block versions (`ledger.VERSION`)
 
 Fixing a ledger rule changes which blocks are valid, but a node re-applies
@@ -1229,6 +1410,63 @@ version can't be lower than its parent's or higher than the node knows, and
 validators only vote for blocks of the current version, so once a chain has
 a version 2 block it stays on version 2. Every validator must run a release
 that knows a version before any block of it appears: older nodes refuse it.
+
+Version 4 brings validator accountability (`ledger.ACCOUNTABILITY_VERSION`, §9
+point 3):
+- **Double-sign slashing.** An `evidence` transaction carries two signed
+  consensus messages from one validator for the same height, round and kind
+  (two proposals, two prevotes or two precommits) that name different blocks,
+  a vote for nothing included. It holds only what the signatures cover: the
+  signer's public key, the two block ids (and a proposal's valid round) and
+  the two signatures, about 1 KB. A proposal's signature covers its block id,
+  not the block, so no block is needed. Anyone may send one; a validator
+  sends what its own engine catches, from its own key, once per offender.
+  The ledger checks both signatures against its own chain id, that the
+  height is on the chain (or is the block's own) and at most
+  `EVIDENCE_WINDOW` (20) heights back, and that the signer had a vote at that
+  height (`State.voters`: who voted on each recent height, kept from the
+  blocks). The offender loses all of its stake and unbonding coins. The
+  sender gets a tenth of the withdrawable part
+  (`economics.DOUBLE_SIGN_BOUNTY`; nothing if it reports itself), and the rest
+  is burned, bootstrap stake last, as in every slash since version 2. It
+  leaves the set at once and can never join again (`State.banned`), so each
+  validator is punished once. The window is the unbonding period: a
+  validator can't unstake while it's in the set (below), so the coins it had
+  at the offence unbond until after the window ends. A chain whose only
+  validator double-signs keeps it listed, with no stake and no vote, and
+  stops: with nobody listed it would become a chain any staked node seals
+  without certificates.
+- **A higher stake to join.** A `validator` transaction joining the set needs
+  `economics.VALIDATOR_STAKE` staked (100 VIBE, a placeholder: the owner's
+  call). Voting still needs only the 5 VIBE minimum, so validators that
+  joined before, like the public node with its 10 VIBE of bootstrap stake,
+  keep their vote. A validator already in the set announces a new address
+  with the minimum, as before.
+- **A delay before set changes.** A join or leave in block h takes effect at
+  height h + `VALIDATOR_DELAY` (10): the validators voting on that block are
+  the new set. An address has at most one change waiting, and a leave sent
+  while its join waits calls the join off. A validator's own `stake` and
+  `unstake` are refused while it's in the set or joining it, so its weight
+  can't jump past the others' in one block either. It unstakes from the
+  height its leave takes effect. The last validator with a vote still can't
+  leave, counting leaves already waiting (not joins, which can be called
+  off). Slashes, which can't be refused, still apply at once.
+
+Validators also save their round before sending a proposal, as they already did
+before a vote: a validator that crashed between proposing and voting would
+otherwise come back in the same round, build another block and sign it too.
+
+**Who runs what.** `/status` names the node's release (`version`), the
+block version it makes (`block_version`), the version of the chain's newest
+block (`tip_version`) and the oldest release whose workers it takes
+(`min_client`, `vibehash node --min-client`). Clients send `User-Agent:
+vibehash/VERSION`. A client whose code knows fewer block versions than the
+tip's, or that is older than `min_client`, says so in one line and carries
+on, and a worker in that state won't start, since it couldn't follow the
+chain. A node answers a worker's `register` from a release below its
+`min_client` with a 400 naming the upgrade. It's a nudge, not a rule: a
+client that names no version is taken as before, and anyone can send any
+User-Agent. Validators agreeing on an upgrade is still to do (§9).
 
 Version 3 lets a post_job be a fine-tune (`tasks.is_finetune_spec`, §8): earlier versions refuse one, as the nodes
 before them did, so a chain holds none until its validators all know them.

@@ -112,9 +112,17 @@ def answer_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list
     ids, ending at an end-of-turn token (kept) or at max_tokens. members: [(pair index j, sign +1/-1)]."""
     p = next(rt.model.parameters())
     with torch.no_grad():
+        if _hybrid(rt):
+            from . import es_hybrid
+            return es_hybrid.answer(rt, linears, fac, members, rows, max_tokens, sigma, rank)
         if p.device.type == "cuda" and p.dtype == torch.bfloat16:
             return _answer_engine(rt, linears, fac, members, rows, max_tokens, sigma, rank)
         return _answer_plain(rt, linears, fac, members, rows, max_tokens, sigma, rank, max_rows)
+
+
+def _hybrid(rt) -> bool:
+    """A Qwen3.5-style model (Gated DeltaNet and full attention layers): es_hybrid's engine, on every device."""
+    return "linear_attention" in (getattr(rt.model.config, "layer_types", None) or ())
 
 
 def _answer_plain(rt, linears, fac, members, rows, T, sigma, rank, max_rows):
@@ -424,6 +432,14 @@ def gaps_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, s
     answers' limit, which sizes the engine's cache as answering did), so a checker rounds exactly as the worker did
     however many rows each had; elsewhere in one forward pass."""
     p = next(rt.model.parameters())
+    if _hybrid(rt):  # Qwen3.5: through es_hybrid's decode steps on every device
+        T = max([max_tokens or 0] + [len(a) for _, a in items])
+        if not members or not items or T == 0:
+            return torch.zeros(len(members), len(items), device=p.device)
+        from . import es_hybrid
+        with torch.no_grad():
+            return es_hybrid.forced(rt, linears, fac, members, [q for q, _ in items],
+                                    [[a for _, a in items]] * len(members), T, sigma, rank)[0]
     if p.device.type == "cuda" and p.dtype == torch.bfloat16:
         T = max([max_tokens or 0] + [len(a) for _, a in items])
         if not members or not items or T == 0:
@@ -442,7 +458,18 @@ def _worst_gap(rt, h, w):
 def score_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, sigma: float, rank: int = 1,
                 max_rows: int = 512):
     """How likely each member finds each item's answer, under the shared-prompt rule: a [members, items] float tensor
-    of mean per-token log-probabilities. items: [(prompt token ids, answer token ids)], from any round."""
+    of mean per-token log-probabilities. items: [(prompt token ids, answer token ids)], from any round.
+
+    On a Qwen3.5-style model, through es_hybrid's decode steps (so worker and checker get the same numbers)."""
+    if _hybrid(rt):
+        p = next(rt.model.parameters())
+        T = max([0] + [len(a) for _, a in items])
+        if not members or not items or T == 0:
+            return torch.zeros(len(members), len(items), device=p.device)
+        from . import es_hybrid
+        with torch.no_grad():
+            return es_hybrid.forced(rt, linears, fac, members, [q for q, _ in items],
+                                    [[a for _, a in items]] * len(members), T, sigma, rank)[1]
     return _forced(rt, linears, fac, members, items, sigma, rank, max_rows, _mean_logprob)
 
 

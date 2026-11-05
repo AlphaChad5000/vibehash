@@ -19,6 +19,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from . import settings, termui
+from .crypto import AddressError, checksummed, parse_address
 
 GUIDE = "https://vibehash.org/guide/"
 
@@ -57,8 +58,15 @@ def _yes(question: str) -> bool:
 
 def _send() -> list[list[str]] | None:
     to = input("Send to (an address starting vibe1): ").strip()
+    if not to:
+        return None
+    try:  # a mistyped address is said at once, before the amount, and nothing is sent
+        to = checksummed(parse_address(to))
+    except AddressError as e:
+        print(e)
+        return None
     amount = input("How many VIBE: ").strip()
-    if to and amount and _yes(f"Send {amount} VIBE to {to}? It can't be undone."):
+    if amount and _yes(f"Send {amount} VIBE to {to}? It can't be undone."):
         return [["send", "--to", to, "--amount", amount]]
     return None
 
@@ -199,7 +207,8 @@ class Status:
     def line(self) -> str:
         if not self.address:
             return "No wallet yet: choose Set up again to make one."
-        who = f"{self.address[:9]}…{self.address[-4:]}"
+        shown = checksummed(self.address)  # as people copy it: its checksum in the letters' case
+        who = f"{shown[:9]}…{shown[-4:]}"
         if self.account:
             fmt = termui._vibe
             return f"{who} · {fmt(self.account['balance'])} · staked {fmt(self.account['stake'])}"

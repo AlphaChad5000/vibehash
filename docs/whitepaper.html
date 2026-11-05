@@ -270,7 +270,7 @@ hash. A receipt for a message missing from its round's record is signed proof th
 
 <h2>8. Incentive</h2>
 <p>Each round has a pool, made of the block subsidy and the fee the job releases for the work that verified:</p>
-<p class="eq"><i>pool</i> = <i>subsidy</i>(<i>height</i>) + min( <i>escrow</i>, <i>fee</i> × <i>accepted units</i> / <i>units per round</i> ).</p>
+<p class="eq"><i>pool</i> = <i>subsidy</i>(<i>n</i>) + min( <i>escrow</i>, <i>fee</i> × <i>accepted units</i> / <i>units per round</i> ).</p>
 <p>Eighty percent goes to workers in proportion to their verified training operations, fifteen percent to checkers
 in proportion to the operations they replayed, both weighted by reputation, and five percent to the block's
 proposer. Anything unclaimed is burned rather than given to the proposer, so a proposer gains nothing by rejecting
@@ -279,8 +279,11 @@ verified work, falls by 0.05 for a missed deadline, and drops to 0.5 on fraud. I
 unit, so a laptop builds it exactly as fast as a large machine.</p>
 <p>Fraud costs half of the offender's stake, including coins unstaked in the last 20 blocks, which stay slashable, so
 a cheater cannot withdraw ahead of the verdict. Half of the slashed stake goes to whoever caught it and half is
-burned. The subsidy follows Bitcoin's shape stretched to Vibe Hash's block time: 3.125 VIBE a block, halving every
-3,320,000 blocks, which is about four years at 38-second rounds, with at most 21,000,000 VIBE ever. Amounts are
+burned. The subsidy follows Bitcoin's shape stretched to Vibe Hash's block time: 3.125 VIBE in each round that pays
+for verified work, halving every 3,320,000 such rounds, which is at least four years at 38-second rounds, with at most
+21,000,000 VIBE ever. <i>n</i> counts the earlier rounds that paid for work. A round in which no work is accepted
+mints nothing and does not count, so a quiet network delays its halvings instead of destroying the coins of its
+empty rounds. Amounts are
 integers of 10<sup>−8</sup> VIBE and rounding remainders are burned, so the supply is exactly the genesis allocation
 plus subsidies minus burns.</p>
 

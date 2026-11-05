@@ -334,9 +334,12 @@ def _load_line(c: _Chain, job_id: str, spec):
 
 
 def _posted_at(c: _Chain, job_id: str) -> int | None:
-    """The height of the block that posted `job_id` (its post_job's memo is the job's spec), among the blocks read."""
+    """The height of the block that posted `job_id` (its post_job's memo is the job's spec), among the blocks read;
+    0 for a starter job, which the genesis brings."""
     for h, b in c.blocks.items():
         for tx in b.txs:
+            if tx.kind == "genesis" and not h and f'"{job_id}"' in tx.memo:
+                return 0
             if tx.kind == "post_job" and f'"{job_id}"' in tx.memo:
                 try:
                     if json.loads(tx.memo).get("id") == job_id:
@@ -415,10 +418,12 @@ def round_factors(rt: es.Runtime, spec, round_seed: int) -> dict:
 
 
 def apply_round(rt: es.Runtime, spec, ch: es2.Change, ent: dict) -> None:
-    """A round's entry onto a change (es2.apply_entry's arithmetic, with the round's shared factors)."""
+    """A round's entry onto a change (es2.apply_entry's arithmetic, with the round's shared factors): the job's anchor
+    gives back spec.decay of the change, then the round's step."""
     import torch
     if not ent["update"]:
         return
+    ch.shrink(getattr(spec, "decay", 0.0))
     fac = round_factors(rt, spec, int(ent["seed"], 16))
     idx = torch.tensor([j for j, _ in ent["update"]], device=rt.device)
     ch.apply(rt.linears, {n: (A[idx], B[idx]) for n, (A, B) in fac.items()}, [c for _, c in ent["update"]],
@@ -426,9 +431,13 @@ def apply_round(rt: es.Runtime, spec, ch: es2.Change, ent: dict) -> None:
 
 
 def prompt_rows(rt: es.Runtime, items) -> list[list[int]]:
+    """Each item's chat prompt as token ids. Thinking off: Qwen3.5-4B's template opens a <think> block by default,
+    which a 64-token answer never gets out of; the templates that don't know the switch (Qwen2.5's, and
+    Qwen3.5-0.8B's, which already closes the block) give the same ids with it as without."""
     out = []
     for it in items:
-        ids = rt.tokenizer.apply_chat_template(it.messages, add_generation_prompt=True, tokenize=True)
+        ids = rt.tokenizer.apply_chat_template(it.messages, add_generation_prompt=True, tokenize=True,
+                                               enable_thinking=False)
         if isinstance(ids, dict) or hasattr(ids, "keys"):
             ids = ids["input_ids"]
         out.append(list(ids))
@@ -450,7 +459,8 @@ class Es2Work:
         try:
             from . import es_fast  # noqa: F401 - PyTorch
             from . import es_tasks
-            es_tasks.get(job.spec.task).items(0, 1)  # ARC-Easy's download, once (TaskUnavailable without it)
+            for task in job.spec.tasks or (job.spec.task,):  # their datasets' downloads, once (TaskUnavailable without)
+                es_tasks.get(task).items(0, 1)
             find_base(job.spec)
             runtime2(job.spec, self.work.device())
         except Exception as e:  # noqa: BLE001 - whatever stops it, this worker can't take the job
@@ -609,9 +619,9 @@ class Es2Work:
     def replay_items(self, rt: es.Runtime, ln: _Line) -> list[tuple[list[int], list[int]]]:
         """The round's replay targets as (prompt ids, answer ids): the last `replay` of the job's targets so far."""
         spec, out, rows = ln.spec, [], {}
-        for seed, i, ids in es2_rounds.targets_of(ln.history, spec.replay):
+        for seed, i, ids, step in es2_rounds.targets_of(ln.history, spec.replay):
             if seed not in rows:
-                rows[seed] = prompt_rows(rt, es2_rounds.items(spec, seed))
+                rows[seed] = prompt_rows(rt, es2_rounds.items(spec, seed, step))
             out.append((rows[seed][i], ids))
         return out
 
@@ -628,7 +638,8 @@ class Es2Work:
         t0 = time.perf_counter()
         rt, ln = self.at(job, units[0].start_hash)
         seed = units[0].seed
-        ps = es2_rounds.items(spec, seed)
+        step = int(es2.ctrl_of(ln.state)[2])  # the round's step: its task (es2.task_at)
+        ps = es2_rounds.items(spec, seed, step)
         rows = prompt_rows(rt, ps)
         want_lps = bool(spec.replay) and es2.ctrl_of(ln.state)[3] > 0
         replay = self.replay_items(rt, ln) if want_lps else []
@@ -636,7 +647,7 @@ class Es2Work:
         members = [(j, sign) for u in units for j, _, sign in es.unit_members(spec, seed, u.index)]
         work.claims[rnd] = []
         st.activity = (f"answering {len(units)} Evo unit{'s' * (len(units) > 1)} ({len(members)} twisted models x "
-                       f"{spec.problems} {spec.task} problems)")
+                       f"{spec.problems} {es2.task_at(spec, step)} problems)")
         with rt.busy, torch.no_grad():
             self.load(rt, ln)
             got = es_fast.answer_members(rt, rt.linears, fac, members, rows, spec.max_tokens, spec.sigma, spec.rank,
@@ -706,7 +717,7 @@ class Es2Work:
             return False, chosen[0]
         rt, ln = self.at(job, unit.start_hash)
         seed = unit.seed
-        rows = prompt_rows(rt, es2_rounds.items(spec, seed))
+        rows = prompt_rows(rt, es2_rounds.items(spec, seed, int(es2.ctrl_of(ln.state)[2])))
         members = es.unit_members(spec, seed, unit.index)
         lps = task.get("lps")
         replay = self.replay_items(rt, ln) if lps is not None else []

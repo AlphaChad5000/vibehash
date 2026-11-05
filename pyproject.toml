@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibehash"
-version = "0.5.16"
+version = "0.5.17"
 description = "Vibe Hash: earn VIBE by training AI models on everyday computers (testnet)"
 readme = "README.md"
 license = "MIT"
@@ -36,4 +36,4 @@ vibehash = "vibehash.cli:main"
 packages = ["vibehash"]
 
 [tool.setuptools.package-data]
-vibehash = ["data/*.csv", "data/*.txt", "data/*.json"]  # the sample data `vibehash example` writes out; the BIP39 word list; DeepSeek-V4.1-Flash's per-tensor manifest
+vibehash = ["data/*.csv", "data/*.txt", "data/*.json", "data/*.html"]  # the sample data `vibehash example` writes out; the BIP39 word list; DeepSeek-V4.1-Flash's per-tensor manifest; the explorer page nodes serve

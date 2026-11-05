@@ -756,18 +756,12 @@ def rebuild_chain(blocks, record_of, job_id: str, spec: EsSpec | None = None) ->
     for b in blocks:
         s = b.summary
         if s is None or s.job_id != job_id:
-            if spec is None and b.height:  # the job's post_job, whose spec this needs
-                for tx in b.txs:
-                    if tx.kind == "post_job":
-                        try:
-                            job = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount)
-                        except ValueError:
-                            continue
-                        if job.job_id == job_id:
-                            spec = job.spec
+            if spec is None:  # the job's post_job (or its genesis starter job), whose spec this needs
+                from .es2_rounds import job_spec_in
+                spec = job_spec_in(b, job_id)
             continue
         if spec is None:
-            raise ValueError(f"no post_job for {job_id} before block {b.height}")
+            raise ValueError(f"no post_job or starter job for {job_id} before block {b.height}")
         if state is None:
             state = spec.init_params()
         record = record_of(b.height)

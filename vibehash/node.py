@@ -6,9 +6,11 @@ gossips votes and transactions to its peers and catches up on blocks it missed (
 current leader, which /status names. A chain without validators is run by one node, which seals each block itself.
 
 Public (read-only) endpoints let anyone audit the chain:
-    GET  /status                 phase, round, deadlines, beacon, chain tip; the consensus round and its leader
+    GET  /status                 phase, round, deadlines, beacon, chain tip; the consensus round and its leader; why
+                                 the node stopped itself, if it did (`halted`: a block it couldn't save)
     GET  /genesis                genesis document
-    GET  /blocks?from=N&to=M     raw blocks (max 100 per request), each with its commit certificate if it has one
+    GET  /blocks?from=N&to=M     raw blocks (max 100 per request), each with its commit certificate if it has one, its
+                                 `hash`, its `proposer`'s address and each tx's `txid`
     GET  /account/<address>      balance, stake, unbonding, nonce, reputation
     GET  /validators             each validator's address, stake, and whether it has a vote
     GET  /job/<id>               job spec, remaining escrow, validation score after each round, model size
@@ -16,6 +18,9 @@ Public (read-only) endpoints let anyone audit the chain:
     GET  /round/params           the current round's starting weights (as a blob id)
     GET  /round/<height>/record  the signed messages and check results a block's round was decided from (replay.py)
     GET  /round/games            a fine-tune round's disputes: whose move, and what's been posted (dispute.py)
+    GET  /supply                 how much VIBE exists and where (supply.py), in syn and as VIBE strings
+    GET  /supply/total           total supply, and /supply/circulating spendable balances: a plain decimal VIBE number
+    GET  /explorer               a block explorer page (data/explorer.html) that reads the endpoints above
 Signed-envelope endpoints (workers):
     POST /register  /assignment  /commit  /reveal  /tasks  /verdict  /move
     (register, commit, reveal and verdict answer with a signed receipt: proof the message will be in the
@@ -34,32 +39,36 @@ proxy. Every request passes per-client rate limits and connection caps first (ra
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import os
+import re
 import ssl
 import threading
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
 from . import deepseek_graph as dsg
 from . import economics as econ
-from . import hardware, netstats, receipts, tasks
+from . import __version__, advice, filelock, hardware, netstats, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
-from .client import NodeError
-from .consensus import Engine, Timeouts, check_certificate
+from .client import MIN_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
+from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
-from .crypto import KeyPair, address_of, verify
-from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
+from .crypto import AddressError, KeyPair, address_of, checksummed, parse_address, verify
+from .ledger import EVIDENCE_WINDOW, VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
 from .replay import replay_block
-from .storage import Store, record_blobs
+from .storage import NotSaved, RivalBlock, Store, record_blobs
 from .tasks import SYN_PER_VIBE, InvalidJob, Reveal, TrainingJob
 from .verification import FINETUNE_CHECK
 from .wire import MAX_CLOCK_SKEW_S, WireError, blob_openings_in, blob_openings_out, commitment_in, commitment_out, open_envelope
@@ -99,14 +108,41 @@ MAX_JOB_BYTES = 64 * 2**20
 # for days. A job that would need more simply gets fewer units done a round.
 MAX_PHASE_S = tasks.MAX_PHASE_S
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
+# Datasets no job on chain (or waiting in the mempool) uses yet cost a node disk and their uploader nothing, so each
+# address may hold at most DATASET_QUOTA bytes of them, finished or part way, and a finished one no job has used for
+# LOOSE_DATASET_S is deleted (Node.clear_loose_datasets). Posting a job that names a dataset takes it off the quota for
+# good. Datasets added with --dataset or fetched from a peer are never counted or deleted. Before this, anyone with
+# 1 VIBE could fill a node's disk 20 GB at a time.
+DATASET_QUOTA = MAX_DATASET
+REPORT_RETRY_S = 15.0  # seconds between tries at sending a double-sign's evidence that isn't in the mempool or a block
+LOOSE_DATASET_S = 3 * 86400
+# The block explorer page (GET /explorer), and the Content-Security-Policy it's served with: nothing from anywhere
+# else, requests only to this node, and only its own inline script and style (by their sha256), so text from the chain
+# that slipped into the page as markup still couldn't run.
+EXPLORER = Path(__file__).resolve().parent / "data" / "explorer.html"
+_explorer: tuple[bytes, str] | None = None
+
+
+def explorer_page() -> tuple[bytes, str]:
+    """The explorer's HTML and its Content-Security-Policy, read once."""
+    global _explorer
+    if _explorer is None:
+        html = EXPLORER.read_bytes()
+
+        def allow(tag: bytes) -> str:
+            found = re.findall(rb"<" + tag + rb">(.*?)</" + tag + rb">", html, re.S)
+            return " ".join("'sha256-" + base64.b64encode(hashlib.sha256(m).digest()).decode() + "'" for m in found) or "'none'"
+        csp = (f"default-src 'none'; script-src {allow(b'script')}; style-src {allow(b'style')}; connect-src 'self'; "
+               "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        _explorer = (html, csp)
+    return _explorer
 
 
 def bucket_from_env() -> dsg.Signer | None:
     """The bucket for DeepSeek jobs' hand-offs, from $VIBEHASH_BUCKET_HOST (my-bucket.nyc3.digitaloceanspaces.com),
     $VIBEHASH_BUCKET_REGION, $VIBEHASH_BUCKET_KEY and $VIBEHASH_BUCKET_SECRET (and $VIBEHASH_BUCKET_SCHEME, https
     unless set): the operator sets them on the node at launch. None if they aren't set."""
-    import os
-    env = {k: os.environ.get(f"VIBEHASH_BUCKET_{k}") for k in ("HOST", "REGION", "KEY", "SECRET", "SCHEME")}
+    env ={k: os.environ.get(f"VIBEHASH_BUCKET_{k}") for k in ("HOST", "REGION", "KEY", "SECRET", "SCHEME")}
     if not all(env[k] for k in ("HOST", "REGION", "KEY", "SECRET")):
         return None
     return dsg.Signer(env["HOST"], env["REGION"], env["KEY"], env["SECRET"], scheme=env["SCHEME"] or "https")
@@ -114,6 +150,27 @@ def bucket_from_env() -> dsg.Signer | None:
 
 class Busy(Exception):
     """The node can't take this request now (503): the client waits and resends."""
+
+
+class FolderInUse(RuntimeError):
+    """Another node already runs on this data folder."""
+
+
+class Halted(RuntimeError):
+    """This node has stopped itself: a block it was adding couldn't be saved (Node._halt; Node.halted says why)."""
+
+
+def hold_folder(data_dir) -> filelock.Lock:
+    """The data folder's lock, held while a node runs there (the lock goes with its process, however it ends). Two
+    nodes on one folder each build blocks on the chain they loaded, sign rival ones with the one validator key, and
+    fail every save the other got to first (2026-11-03: the menu's Evo Hash beside a running `testnet --evo2`)."""
+    path = Path(data_dir) / "node.lock"
+    lock = filelock.try_hold(path, note=f"process {os.getpid()}")
+    if lock is None:
+        who = filelock.holder(path) or "another process"
+        raise FolderInUse(f"another node ({who}) already runs on {data_dir}: two on one folder would sign rival "
+                          f"blocks with one key. Stop that one first")
+    return lock
 
 
 @dataclass
@@ -138,21 +195,30 @@ class Node:
                  times: PhaseTimes | None = None, config: CoordinatorConfig | None = None, keep_rounds: int = 10,
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
-                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None):
+                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
         `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
         `bucket`: the storage DeepSeek jobs hand off through (deepseek_graph.Signer, its keys this node's): workers get
         links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
-        reads one from the environment)."""
+        reads one from the environment).
+        `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade."""
+        if not parse_version(min_client):
+            raise ValueError(f"min_client is a release such as {MIN_CLIENT}, not {min_client!r}")
+        self.min_client = min_client
         self.times = times or PhaseTimes()
         self.keep_rounds = keep_rounds  # rounds whose checkpoints stay available to re-check (the challenge window)
         self.max_job_bytes = max_job_bytes
         cfg = config or CoordinatorConfig()
         cfg.compute_s = self.times.compute_s * 0.8  # leave slack for network and polling
         self.keys = keys
-        self.store = Store(data_dir)
-        self.chain = self.store.open_chain(genesis)
+        self.folder = hold_folder(data_dir)  # FolderInUse if another node runs there
+        try:
+            self.store = Store(data_dir)
+            self.chain = self.store.open_chain(genesis)
+        except BaseException:
+            self.folder.release()
+            raise
         self.genesis = genesis
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
         self.bucket = bucket
@@ -171,8 +237,17 @@ class Node:
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self._census_cache: dict[int, dict] = {}  # height -> who registered that round and on what (_registrations)
-        self.stopping = threading.Event()
-        self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
+        self.stopping = threading.Event()  # set by stop(), and by a halt, which leaves the server up
+        self.halted: str | None = None  # why this node stopped itself (_halt): a block it couldn't save
+        # What /status and refusals say about it: the height, not the folder or the database's own error text, which
+        # name this computer's paths and user to anyone who asks (the full reason is in the log and `vibehash node`'s exit).
+        self.halted_public: str | None = None
+        try:
+            self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
+        except BaseException:  # the port is taken: the folder is free for whoever tries next (the menu goes on)
+            self.store.close()
+            self.folder.release()
+            raise
         self.threads: list[threading.Thread] = []
         self.announce = (announce or self.chain.state.validators.get(keys.address) or self.url).rstrip("/")
         self.peers = Peers(self.announce, keys.address, list(peers), lambda: self.chain.state.validators)
@@ -183,11 +258,21 @@ class Node:
                              has_work=self._has_work, behind=lambda height: self.wake_sync.set(),
                              persist=lambda state: self.store.save_meta("consensus", state), propose_wait=self._propose_wait)
         self.proposed: dict[str, tuple] = {}  # block id -> (weights, scores, record) for blocks we proposed at this height
+        self.evidence_seen = 0  # how many of the engine's evidence pairs we've acted on (_report_double_signs)
+        self.reported: set[str] = set()  # validators our evidence against is in the mempool or a block for
+        self.to_report: dict[str, tuple[dict, dict]] = {}  # offender -> its pair, until the evidence is in
+        self.report_failed: set[str] = set()  # offenders whose evidence couldn't be sent yet (said once)
+        self.report_next: dict[str, float] = {}  # offender -> when to try sending its evidence again
         self.commit_lock = threading.Lock()
         self.wake_sync = threading.Event()
         self.leader_hint: str | None = None  # the current leader, as a validator told us (for nodes that don't vote)
         self.blobs.prune(self._evidence())  # keep recent rounds' evidence; the rest belongs to an abandoned round
         self.store.datasets.prune_partial(older_than=STALE_PART_S)  # uploads and downloads abandoned part way
+        self._used: tuple[tuple, set[str]] = ((), set())  # (tip hash, waiting post_jobs) -> datasets jobs name
+        self._quota_lock = threading.Lock()
+        self._supply: tuple[bytes, dict] | None = None  # (tip hash, /supply at it)
+        self._admitted: dict[tuple[str, str], tuple[int, float]] = {}  # (uploader, sha) -> (declared size, when admitted)
+        self.clear_loose_datasets()
 
     @property
     def url(self) -> str:
@@ -216,6 +301,35 @@ class Node:
             t.join(timeout=30)
         self.peers.close()
         self.store.close()
+        self.folder.release()
+
+    def close(self) -> None:
+        """A node made but never started: its port, database and folder back."""
+        self.server.server_close()
+        self.store.close()
+        self.folder.release()
+
+    def _halt(self, e: NotSaved, what: str) -> None:
+        """Stop for good once a block couldn't be saved (Coordinator.adopt: the chain in memory stays what's on disk):
+        no more leading, proposing, voting, opening rounds or syncing. The server stays up, so /blocks serves only
+        saved blocks and /status says why (`halted`); `vibehash node` and `testnet` end with the message. On
+        2026-11-03 a node whose saves all failed (a second node on its folder had written those heights first) went on
+        leading rounds for 15 minutes on blocks only its memory held, and served them with the other's certificates.
+        `what`: whose block it was, for the message."""
+        if self.halted:
+            return
+        why = (f"this node's database already has a different block {e.height} than the one {what}"
+               if isinstance(e, RivalBlock) else str(e))
+        self.halted = (f"{why}. Another node may be using this folder ({self.store.dir}), or the disk is full or failed. "
+                       f"Stopped so it can't sign or serve blocks it didn't save; restart it to carry on from what's on disk")
+        self.halted_public = (f"block {e.height} couldn't be saved, so this node stopped rather than sign or serve blocks it "
+                              "doesn't have; its operator's log says why")
+        log.critical("%s", self.halted)
+        self.engine.halt()  # (takes no lock: this can run holding the commit and round locks)
+        with self.coord.lock:  # a round open now is never sealed: workers are told there's none
+            self.coord.phase, self.coord.r = Phase.IDLE, None
+        self.stopping.set()  # every loop ends as at stop()
+        self.wake_sync.set()
 
     def _role(self) -> str:
         if not self.bft:
@@ -263,6 +377,7 @@ class Node:
         self.blobs.prune(self._evidence())
         self.coord.trace_blobs.forget()
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
+        self.clear_loose_datasets()
 
     def _rounds(self) -> None:
         c, t = self.coord, self.times
@@ -272,7 +387,11 @@ class Node:
                     self._lead()
                 else:
                     self._solo()
+            except NotSaved as e:  # a block this node sealed alone (the validators' blocks are saved in _commit)
+                self._halt(e, "this node sealed")
             except Exception:
+                if self.halted:  # (another thread's halt, which said why and closed the round)
+                    return
                 log.exception("round failed; abandoning it")
                 with c.lock:
                     c.phase, c.r = Phase.IDLE, None
@@ -394,8 +513,8 @@ class Node:
                 c.expire_moves(time.time())
             c.end_disputes(time.time())
             for g in sorted(c.r.games.values(), key=lambda g: g.gid):
-                log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, g.challenger[:10], g.defender[:10],
-                         g.outcome or "unfinished")
+                log.info("  dispute %s (%s, %s against %s): %s", g.gid, g.why, checksummed(g.challenger)[:10],
+                         checksummed(g.defender)[:10], g.outcome or "unfinished")
         return True
 
     # --- running a chain with validators ------------------------------------------------------
@@ -494,12 +613,19 @@ class Node:
         self.proposed.clear()
 
     def _commit(self, block: Block, record: dict | None, cert: dict | None, mine: tuple | None = None) -> bool:
-        """Add a final block. `mine` is what we kept from proposing it, if we did. False if we already had it."""
+        """Add a final block. `mine` is what we kept from proposing it, if we did. False if we already had it. Halted if
+        it couldn't be saved (or an earlier one couldn't): the node stops there (_halt)."""
         with self.commit_lock, self.coord.lock:
+            if self.halted:
+                raise Halted(self.halted)
             if block.height != self.chain.tip.height + 1:
                 return False
-            # A round of ours still running for this height has lost out; _lead notices and gives it up.
-            self.coord.adopt(block, record, mine[0] if mine else None, mine[1] if mine else None, cert)
+            try:
+                # A round of ours still running for this height has lost out; _lead notices and gives it up.
+                self.coord.adopt(block, record, mine[0] if mine else None, mine[1] if mine else None, cert)
+            except NotSaved as e:
+                self._halt(e, "the validators decided")
+                raise Halted(self.halted) from e
         s = block.summary
         # One line per block across the network: its proposer's. The rest log it quietly.
         log.log(logging.INFO if mine or address_of(block.proposer_pubkey) == self.keys.address else logging.DEBUG,
@@ -514,8 +640,61 @@ class Node:
             if self.bft:
                 try:
                     self.engine.tick()
+                    self._report_double_signs()
                 except Exception:  # noqa: BLE001
                     log.exception("consensus tick failed")
+
+    def _report_double_signs(self) -> None:
+        """Send an `evidence` tx, from this node's own key, for each validator the engine caught signing two conflicting
+        messages (Engine.evidence): the ledger then takes its stake and its place in the set (ledger._punish). Nobody
+        has to: any node, or anyone holding the two messages, can send the same tx. Each pair waits here until it's
+        sent, and is sent again if it leaves the mempool without reaching a block, until the offender is punished or
+        the evidence is too old (EVIDENCE_WINDOW): a node that couldn't pay its fee when it saw the offence, or whose
+        tx was dropped, used to give up for good."""
+        with self.engine.lock:
+            found = self.engine.evidence[self.evidence_seen:]
+            self.evidence_seen += len(found)
+        for first, second in found:
+            try:
+                offender = address_of(bytes.fromhex(first["pubkey"]))
+            except ValueError:
+                continue
+            if offender == self.keys.address:
+                log.error("this validator's key signed two %ss for height %s, round %s: another node is running with "
+                          "it. Stop one of them; the other validators will slash its stake",
+                          first["type"], first["height"], first["round"])
+                continue
+            self.to_report.setdefault(offender, (first, second))
+        if not self.to_report:
+            return
+        s = self.chain.state
+        with self.coord.lock:
+            waiting = {t.recipient for t in self.coord.mempool if t.kind == "evidence"}
+        for offender, (first, second) in list(self.to_report.items()):
+            what = f"two {first['type']}s for height {first['height']}, round {first['round']}"
+            if offender in s.banned or self.chain.tip.height + 1 - int(first["height"]) > EVIDENCE_WINDOW:
+                del self.to_report[offender]  # punished (by anyone's evidence), or too late to be
+                continue
+            if offender in waiting or time.time() < self.report_next.get(offender, 0.0):
+                continue  # ours or someone else's is on its way into a block, or we tried a moment ago
+            self.report_next[offender] = time.time() + REPORT_RETRY_S
+            try:
+                self.submit_tx(self._evidence_tx(offender, evidence_memo(first, second)))
+                log.warning("validator %s signed %s: sent the evidence, which costs it its stake", checksummed(offender), what)
+                self.reported.add(offender)
+            except (ProtocolError, InvalidBlock, InvalidJob) as e:
+                if offender not in self.report_failed:
+                    self.report_failed.add(offender)
+                    log.warning("validator %s signed %s, but the evidence couldn't be sent yet (trying again): %s",
+                                checksummed(offender), what, e)
+
+    def _evidence_tx(self, offender: str, memo: str) -> Tx:
+        me, fee = self.keys.address, self.coord.config.min_fee
+        with self.coord.lock:  # our next nonce counts our own transactions still waiting
+            nonce = self.chain.next_nonce(me) + sum(t.sender == me for t in self.coord.mempool)
+            if self.chain.state.balance(me) < fee:
+                raise ProtocolError(f"this node's own balance can't pay its minimum fee of {fee} syn")
+        return Tx.signed(self.keys, "evidence", offender, 0, nonce, memo, self.chain.chain_id, fee)
 
     def _syncing(self) -> None:
         while not self.stopping.is_set():
@@ -526,6 +705,8 @@ class Node:
             try:
                 self._sync()
                 self._fetch_missing_data()
+            except Halted:  # a block it fetched couldn't be saved (_halt said why)
+                return
             except Exception:  # noqa: BLE001
                 log.exception("sync failed")
 
@@ -665,6 +846,8 @@ class Node:
                     log.debug("dataset %s from %s: %s", src["sha256"][:12], url, e)
 
     def submit_tx(self, tx: Tx) -> None:
+        if self.halted:  # it would never reach a block from here
+            raise ProtocolError(f"this node has stopped: {self.halted_public}")
         if tx.kind == "post_job":  # relay policy, not a rule: a block with a bigger job is as valid as before
             size = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount).checkpoint_bytes
             if size > self.max_job_bytes:
@@ -718,6 +901,15 @@ class Node:
                 "min_fee": c.config.min_fee, "earn_in": self.chain.state.earn_in,
                 # Jobs with budget that aren't training, and why, in words (a fine-tune with too few workers to check it).
                 "waiting": dict(c.waiting),
+                "halted": self.halted_public,  # that this node stopped itself (a block it couldn't save), else None
+                # Versions: this node's release, the block version it makes (ledger.VERSION), the version of the
+                # chain's tip, and the oldest release whose workers it takes. A client that knows fewer block versions
+                # than the tip's, or is older than min_client, is told to upgrade (client.too_old).
+                "version": __version__, "block_version": VERSION, "tip_version": self.chain.tip.version,
+                "min_client": self.min_client,
+                # Rounds that paid for work so far: the halving clock, on chains whose schedule counts them.
+                "paid_rounds": (self.chain.state.paid_rounds if self.chain.state.economics.count == econ.PAID_ROUNDS
+                                else None),
             }
         if consensus is not None:
             # Workers do the round with its leader, the validator whose turn it is to propose: None means this node.
@@ -729,7 +921,32 @@ class Node:
                 out["leader"] = None if leader == self.keys.address else self.chain.state.validators.get(leader)
         return out
 
+    def check_client(self, user_agent: str | None) -> None:
+        """A worker's register: refused (400) if its User-Agent names a release older than min_client. No version, or
+        another client's, is taken as before."""
+        have = agent_version(user_agent)
+        if have and have < parse_version(self.min_client):
+            raise ProtocolError(advice.too_old_client(self.min_client))
+
+    def supply(self) -> dict:
+        """/supply (supply.py): at the tip, from the state every node derives from the blocks (both read under the
+        round lock, which adding a block holds, so they're the same block's). Worked out once a block: it sums every
+        account, and anyone may ask as often as the read limit lets them, which held the round lock each time."""
+        cached = self._supply
+        if cached is not None and cached[0] == self.chain.tip.hash:
+            return cached[1]
+        with self.coord.lock:
+            tip, out = self.chain.tip.hash, supply.supply(self.chain.state, self.chain.tip.height)
+        self._supply = (tip, out)
+        return out
+
     def account(self, addr: str) -> dict:
+        """/account/<addr>. A checksummed address (crypto.parse_address) is read as the canonical one it stands for;
+        anything else as it's given, since the ledger keys balances by the exact recipient a transfer named."""
+        try:
+            addr = parse_address(addr)
+        except AddressError:
+            pass
         s = self.chain.state
         return {"address": addr, "balance": s.balance(addr), "stake": s.stake(addr), "bootstrap": s.locked.get(addr, 0),
                 "unbonding": s.unbonding.get(addr, []), "nonce": s.nonces.get(addr, 0), "reputation": s.rep(addr)}
@@ -866,6 +1083,8 @@ class Node:
 
     def handle(self, kind: str, env: dict) -> dict:
         c = self.coord
+        if self.halted:  # no round is open, nor will be: no receipts for messages no block will hold
+            raise ProtocolError(f"this node has stopped: {self.halted_public}")
         # Only what wire.seal sends, and no bigger than an honest message (see ENVELOPE): replay and receipts take a
         # registration or verdict exactly as sent, so nothing can be stripped from those, only refused.
         if not isinstance(env, dict) or not set(env) <= ENVELOPE or not isinstance(env.get("body"), dict):
@@ -1064,7 +1283,72 @@ class Node:
             raise ProtocolError("uploading a dataset needs at least 1 VIBE balance")
         if not 0 < total <= MAX_DATASET:
             raise ProtocolError(f"datasets can be at most {MAX_DATASET // 2**30} GB")
+        store = self.store.datasets
+        # Checked when an upload starts, and admitted at the size it declares (an upload can't grow past it, BlobStore),
+        # under one lock: counting what was on disk let uploads started side by side each pass with a chunk written.
+        with self._quota_lock:
+            if (not store.has(sha) and (addr, sha) not in self._admitted and store.received(sha, addr) == 0
+                    and sha not in self.used_datasets()):
+                held = self.loose_bytes(addr)
+                if held + total > DATASET_QUOTA:
+                    raise ProtocolError(
+                        f"this address already holds {held / 2**30:.2f} GB of datasets no job uses yet, and may hold "
+                        f"{DATASET_QUOTA / 2**30:g} GB: post a job with one, or wait until unused ones are deleted "
+                        f"({LOOSE_DATASET_S // 86400} days after their upload)")
+                self._admitted[(addr, sha)] = (total, time.time())
         return addr
+
+    def used_datasets(self) -> set[str]:
+        """The datasets jobs name: every job on chain, and post_jobs waiting in the mempool."""
+        waiting = [t.memo for t in list(self.coord.mempool) if t.kind == "post_job"]
+        key = (self.chain.tip.hash, tuple(waiting))  # (a full mempool can swap one tx for another and keep its length)
+        if self._used[0] != key:
+            specs = list(self.chain.state.jobs.values()) + waiting
+            used = set()
+            for spec in specs:
+                try:
+                    data = json.loads(spec).get("data") or {}
+                    if isinstance(data, dict) and isinstance(data.get("sha256"), str):
+                        used.add(data["sha256"])
+                except (ValueError, AttributeError):
+                    pass
+            self._used = (key, used)
+        return self._used[1]
+
+    def loose_bytes(self, addr: str) -> int:
+        """What `addr` holds of datasets no job uses: those it finished uploading, and its uploads part way, each at the
+        size it declared (or what's on disk, for one from before a restart)."""
+        used = self.used_datasets()
+        done = sum(size for sha, who, size, _ in self.store.uploads() if who == addr and sha not in used)
+        admitted = {sha: total for (who, sha), (total, _) in self._admitted.items() if who == addr}
+        part = 0
+        for p in self.store.datasets.root.glob(f"*.{addr}.part"):
+            sha = p.name.split(".")[0]
+            try:
+                part += max(admitted.pop(sha, 0), p.stat().st_size)
+            except OSError:
+                pass
+        # Admitted with no part file yet: the first chunk is on its way.
+        return done + part + sum(t for sha, t in admitted.items() if not self.store.datasets.has(sha))
+
+    def clear_loose_datasets(self, now: float | None = None) -> int:
+        """Delete uploaded datasets no job has used for LOOSE_DATASET_S. One still open elsewhere (Windows won't
+        delete a mapped file) is tried again next round."""
+        now, used, cleared = time.time() if now is None else now, self.used_datasets(), 0
+        with self._quota_lock:  # uploads finished, or abandoned (their part file pruned, or never written)
+            for (who, sha), (_, when) in list(self._admitted.items()):
+                if self.store.datasets.has(sha) or (now - when > 600 and self.store.datasets.received(sha, who) == 0):
+                    del self._admitted[(who, sha)]
+        for sha, who, _, when in self.store.uploads():
+            if sha in used or now - when < LOOSE_DATASET_S:
+                continue
+            try:
+                self.store.drop_upload(sha)
+                cleared += 1
+                log.info("deleted dataset %s, which %s uploaded and no job used", sha[:12], checksummed(who))
+            except OSError:
+                pass
+        return cleared
 
 
 def _number(text, what: str) -> int:
@@ -1078,22 +1362,37 @@ def _number(text, what: str) -> int:
     return n
 
 
+def _served(b: Block) -> dict:
+    """A block as /blocks serves it: Block.to_dict, plus its `hash`, its `proposer`'s address and each tx's `txid`,
+    which take sha256 (the ids over length-prefixed parts, crypto.h256) and so are awkward to work out outside Python.
+    Block.from_dict and Tx.from_dict ignore them, and whoever checks a block works its hash out again
+    (check_certificate)."""
+    d = b.to_dict()
+    d["hash"] = b.hash.hex()
+    d["proposer"] = address_of(b.proposer_pubkey) if b.proposer_pubkey else None  # (the genesis has none)
+    for tx, t in zip(b.txs, d["txs"]):
+        t["txid"] = tx.txid.hex()
+    return d
+
+
 def _handler(node: Node):
     stores = {"blob": node.blobs, "dataset": node.store.datasets}
     big = threading.BoundedSemaphore(MAX_BIG_BODIES)
 
     class Handler(GuardedHandler):
-        server_version = "vibehash-node/0.5"
+        server_version = f"vibehash-node/{__version__}"
 
         def log_message(self, fmt, *args):
             log.debug("%s %s", self.address_string(), fmt % args)
 
-        def _send(self, code: int, payload, content_type="application/json"):
+        def _send(self, code: int, payload, content_type="application/json", headers: dict | None = None):
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(code)
             if self.command == "GET":  # everything a GET answers is public: any web page may read it
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Type", content_type)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1132,10 +1431,10 @@ def _handler(node: Node):
             finally:
                 big.release()
 
-        def _guard(self, fn, raw: bool = False):
+        def _guard(self, fn, raw: bool = False, content_type: str | None = None):
             try:
                 result = fn()
-                self._send(200, result, "application/octet-stream" if raw else "application/json")
+                self._send(200, result, content_type or ("application/octet-stream" if raw else "application/json"))
             except KeyError as e:
                 self._send(404, {"error": f"not found: {e}"})
             except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
@@ -1162,6 +1461,15 @@ def _handler(node: Node):
             if len(parts) == 3 and parts[0] == "job" and parts[2] == "model":
                 self._guard(lambda: node.job_model(parts[1], _number(q.get("offset", ["0"])[0], "offset")), raw=True)
                 return
+            if parts in (["supply", "total"], ["supply", "circulating"]):  # a number alone, as listing sites read it
+                self._guard(lambda: node.supply()["vibe"][parts[1]].encode(), content_type="text/plain; charset=utf-8")
+                return
+            if parts == ["explorer"]:
+                html, csp = explorer_page()
+                self._send(200, html, "text/html; charset=utf-8",
+                           {"Content-Security-Policy": csp, "X-Content-Type-Options": "nosniff",
+                            "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY", "Cache-Control": "no-cache"})
+                return
 
             def route():
                 if parts == ["status"]:
@@ -1170,6 +1478,8 @@ def _handler(node: Node):
                     return node.genesis
                 if parts == ["network"]:
                     return node.network()
+                if parts == ["supply"]:
+                    return node.supply()
                 if parts == ["blocks"]:
                     lo = _number(q.get("from", ["0"])[0], "from")
                     hi = min(_number(q.get("to", [str(lo + 99)])[0], "to"), lo + 99, node.chain.tip.height)
@@ -1178,7 +1488,7 @@ def _handler(node: Node):
                     for b in node.chain.blocks[lo:hi + 1]:  # a short page just means another request
                         if size >= MAX_BLOCKS_REPLY:
                             break
-                        page.append(b.to_dict() | ({"certificate": certs[b.height]} if b.height in certs else {}))
+                        page.append(_served(b) | ({"certificate": certs[b.height]} if b.height in certs else {}))
                         size += len(json.dumps(page[-1]))
                     return page
                 if len(parts) == 2 and parts[0] == "account":
@@ -1215,11 +1525,15 @@ def _handler(node: Node):
                 else:
                     uploader = node.authorize_dataset(bid, total, self.headers)
                 chunk = self._body(CHUNK)
+                had = stores[kind].has(bid)
                 # A dataset is checked by the write that completes it, before it's kept (not on a PUT to one that's
                 # already complete, which would load it all again for anyone who asked).
                 received = stores[kind].write_chunk(bid, offset, chunk, total, uploader,
                                                     check=node.store.check_dataset if kind == "dataset" else None)
-                return {"received": received, "complete": stores[kind].has(bid)}
+                complete = stores[kind].has(bid)
+                if kind == "dataset" and complete and not had:  # this upload finished it: on its uploader's quota
+                    node.store.note_upload(bid, uploader, received, time.time())
+                return {"received": received, "complete": complete}
 
             self._guard(route)
 
@@ -1234,6 +1548,8 @@ def _handler(node: Node):
                 body = self._json(MAX_REVEAL if worker else MAX_JSON)
                 if not isinstance(body, dict):
                     raise WireError("expected a JSON object")
+                if parts == ["register"]:  # a worker too old for this node is told to upgrade (min_client)
+                    node.check_client(self.headers.get("User-Agent"))
                 if parts == ["tx"]:
                     tx = Tx.from_dict(body)
                     node.submit_tx(tx)

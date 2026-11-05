@@ -16,10 +16,12 @@ from . import es, es2
 from .crypto import h256
 
 
-def items(spec, round_seed: int) -> list:
-    """The round's problems (es_tasks.Item), drawn from its seed."""
+def items(spec, round_seed: int, step: int = 0) -> list:
+    """The round's problems (es_tasks.Item), drawn from its seed, of the task its step has (es2.task_at); with the
+    spec's `lenient`, each checked by es_tasks.lenient (a right answer counts without its tags)."""
     from . import es_tasks
-    return es_tasks.get(spec.task).items(round_seed, spec.problems)
+    got = es_tasks.get(es2.task_at(spec, step)).items(round_seed, spec.problems)
+    return [es_tasks.lenient(p) for p in got] if getattr(spec, "lenient", False) else got
 
 
 def claim_root(answers_sha: str, rewards: list, lps: list | None) -> bytes:
@@ -41,7 +43,7 @@ def shaped_claim(spec, rewards, lps, want_lps: bool) -> bool:
     return pairs(lps, lambda x: math.isfinite(x) and -1e4 <= x <= 1e-3)
 
 
-def rescore(spec, round_seed: int, raw: bytes, unit_id: str):
+def rescore(spec, round_seed: int, raw: bytes, unit_id: str, step: int = 0):
     """(rewards [[r+, r-] per pair], answers [member][problem] token ids, ok [member][problem]) from a claim's blob,
     or None if it isn't a unit's answers in shape: the node's own check of every claim's right/wrong scores."""
     try:
@@ -57,7 +59,7 @@ def rescore(spec, round_seed: int, raw: bytes, unit_id: str):
                 if not (isinstance(a, dict) and isinstance(a.get("text"), str) and isinstance(a.get("ids"), list)
                         and len(a["ids"]) <= spec.max_tokens and all(type(t) is int for t in a["ids"])):
                     return None
-        ps = items(spec, round_seed)
+        ps = items(spec, round_seed, step)
         ok = [[bool(p.check(a["text"])) for p, a in zip(ps, member)] for member in answers]
     except (ValueError, KeyError, TypeError):
         return None
@@ -72,14 +74,38 @@ def entry_of(es_record: dict) -> dict:
                      es_record.get("targets") or [])
 
 
-def targets_of(history: list, replay: int) -> list[tuple[int, int, list[int]]]:
+def targets_of(history: list, replay: int) -> list[tuple[int, int, list[int], int]]:
     """The replay targets a round scores members on: the last `replay` of the job's earlier rounds' targets, newest
-    last, each (round seed, problem index, answer token ids). history: those rounds' entries in chain order."""
+    last, each (round seed, problem index, answer token ids, that round's step). history: those rounds' entries in
+    chain order, from the job's first round (each round is one entry and one step, es2.step_state), so an entry's
+    place is its round's step, which says its task (es2.task_at)."""
     out = []
-    for ent in history:
+    for step, ent in enumerate(history):
         seed = int(ent["seed"], 16)
-        out += [(seed, int(i), list(ids)) for i, ids in ent["targets"]]
+        out += [(seed, int(i), list(ids), step) for i, ids in ent["targets"]]
     return out[-replay:] if replay else []
+
+
+def job_spec_in(block, job_id: str):
+    """`job_id`'s spec if `block` brings the job: a post_job, or in the genesis block a starter job (ledger.GENESIS_JOB),
+    which no post_job ever names. None otherwise."""
+    from .ledger import GENESIS_JOB, SYSTEM
+    from .tasks import TrainingJob
+
+    for tx in block.txs:
+        if block.height and tx.kind == "post_job":
+            memo, owner = tx.memo, tx.sender
+        elif not block.height and tx.kind == "genesis" and tx.memo.startswith(GENESIS_JOB):
+            memo, owner = tx.memo[len(GENESIS_JOB):], SYSTEM
+        else:
+            continue
+        try:
+            job = TrainingJob.from_spec_json(memo, owner, tx.amount)
+        except ValueError:
+            continue
+        if job.job_id == job_id:
+            return job.spec
+    return None
 
 
 def rebuild_chain(blocks, record_of, job_id: str, spec=None):
@@ -93,18 +119,11 @@ def rebuild_chain(blocks, record_of, job_id: str, spec=None):
     for b in blocks:
         s = b.summary
         if s is None or s.job_id != job_id:
-            if spec is None and b.height:
-                for tx in b.txs:
-                    if tx.kind == "post_job":
-                        try:
-                            job = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount)
-                        except ValueError:
-                            continue
-                        if job.job_id == job_id:
-                            spec = job.spec
+            if spec is None:
+                spec = job_spec_in(b, job_id)
             continue
         if spec is None:
-            raise ValueError(f"no post_job for {job_id} before block {b.height}")
+            raise ValueError(f"no post_job or starter job for {job_id} before block {b.height}")
         if state is None:
             state = spec.init_params()
         record = record_of(b.height)

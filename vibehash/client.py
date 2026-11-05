@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -20,10 +21,11 @@ from pathlib import Path
 
 import numpy as np
 
-from . import advice, finetune, hardware, receipts, settings, termui, tls
+from . import __version__, advice, finetune, hardware, receipts, settings, termui, tls
 from .blobs import CHUNK, MAX_DATASET, BlobStore, file_sha256
 from .compute import get_backend
-from .crypto import KeyPair
+from .crypto import KeyPair, checksummed, parse_address
+from .ledger import VERSION as BLOCK_VERSION
 from .ledger import Block, Tx, canonical
 from .model import params_hash
 from .tasks import _JOB_ID, MAX_CHECKPOINT_BYTES, InvalidJob, TrainingJob, load_dataset
@@ -44,6 +46,62 @@ MAX_REPLY = 128 * 2**20
 MAX_ERROR = 2**16  # of an error reply
 MAX_JOBS = 64  # jobs with budget left that open_jobs lists: a node could name thousands
 OPEN_EVERY = 30.0  # seconds between a worker mining one job asking whether that job still has budget left
+# Sent with every request, so a node can tell a worker too old for it to upgrade (MIN_CLIENT below). Nodes from before
+# it ignore it, as they ignored urllib's own.
+USER_AGENT = f"vibehash/{__version__}"
+# The oldest release whose workers a node takes by default (`vibehash node --min-client`, /status `min_client`): a
+# register whose User-Agent names an older one is refused, naming the upgrade (node.Node.check_client). 0.5.14 because
+# its Evo v2 checkers round as its workers do (HANDOFF, "Release 0.5.14"); 0.5.10 brought fine-tunes' rule 2. Releases
+# from before this setting send no version, and requests that name none are taken as before: a nudge, not security.
+MIN_CLIENT = "0.5.14"
+_SHOWN = re.compile(r"[0-9A-Za-z.+-]{1,32}")  # a version a node names, fit for a terminal: anything else isn't shown
+_NUDGED: set[tuple[str, str]] = set()  # (node, advice) said once a process already
+
+
+def parse_version(v) -> tuple[int, ...]:
+    """'0.5.15' -> (0, 5, 15), for comparing releases; the numbers before anything else ('0.5.16rc1' -> (0, 5, 16)).
+    () for anything without a leading number ('unknown', None), which compares with nothing."""
+    out = []
+    for part in str(v if v is not None else "").strip().split("."):
+        m = re.match(r"\d+", part)
+        if not m:
+            break
+        out.append(int(m.group()))
+        if m.end() != len(part):
+            break
+    return tuple(out)
+
+
+def stamp(req: urllib.request.Request) -> urllib.request.Request:
+    """Name this release in a request to a node (USER_AGENT), unless it names a client already."""
+    if not req.has_header("User-agent"):  # (urllib keeps header names capitalize()d)
+        req.add_header("User-Agent", USER_AGENT)
+    return req
+
+
+def agent_version(user_agent: str | None) -> tuple[int, ...]:
+    """The release a request's User-Agent names (`vibehash/0.5.16`), or () for any other client: a node treats those
+    as it always did."""
+    m = re.search(r"(?:^|\s)vibehash/(\S+)", user_agent or "")
+    return parse_version(m.group(1)) if m else ()
+
+
+def too_old(status, mine: str = __version__, block_version: int = BLOCK_VERSION) -> str | None:
+    """advice.newer_rules if this copy of Vibe Hash can't follow the node whose /status this is: its chain's tip is a
+    block version newer than this code knows (ledger.VERSION), or it names a `min_client` newer than this release.
+    None otherwise, and for a node from before these fields (it says neither)."""
+    if not isinstance(status, dict):
+        return None
+    tip, need = status.get("tip_version"), status.get("min_client")
+    newer_blocks = isinstance(tip, int) and not isinstance(tip, bool) and tip > block_version
+    have, want = parse_version(mine), parse_version(need) if isinstance(need, str) else ()
+    newer_client = bool(have and want and have < want)
+    if not (newer_blocks or newer_client):
+        return None
+    node = status.get("version")
+    return advice.newer_rules(node if isinstance(node, str) and _SHOWN.fullmatch(node) else None, mine,
+                              tip if newer_blocks else None, block_version,
+                              need if newer_client and _SHOWN.fullmatch(need) else None)
 
 
 class NodeError(Exception):
@@ -70,6 +128,7 @@ class NodeClient:
     def _req(self, method: str, path: str, data: bytes | None = None, headers: dict | None = None, limit: int | None = None) -> bytes:
         """The reply's body, if it's at most `limit` bytes (default MAX_REPLY; NodeError if it's more)."""
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers or {})
+        stamp(req)
         limit = MAX_REPLY if limit is None else limit
         try:
             with self._open(req) as resp:
@@ -89,6 +148,7 @@ class NodeClient:
     def _open(self, req):
         """urlopen, waiting and trying again while the node says it's busy: a 429 (rate limited) or 503 (at its
         connection limit) means it turned the request away before doing anything, so resending is safe."""
+        stamp(req)  # (selftest builds its own requests and opens them here)
         for attempt in range(BUSY_RETRIES + 1):
             try:
                 return (self._opener.open if self._opener else urllib.request.urlopen)(req, timeout=self.timeout)
@@ -107,7 +167,13 @@ class NodeClient:
         return _json(self._req("POST", path, json.dumps(body).encode(), {"Content-Type": "application/json"}), f"POST {path}")
 
     def status(self) -> dict:
+        """/status. If this copy of Vibe Hash is too old for the node (too_old), it says so once a process, as a
+        warning, and carries on: `worker` refuses to start instead (cli._mine), as it couldn't follow the chain."""
         self._status = self.get("/status")
+        problem = too_old(self._status)
+        if problem and (self.url, problem) not in _NUDGED:
+            _NUDGED.add((self.url, problem))
+            log.warning("%s", problem)
         return self._status
 
     @property
@@ -131,7 +197,12 @@ class NodeClient:
         return int((self._status or self.status()).get("min_fee", 0))
 
     def send_tx(self, keys: KeyPair, kind: str, recipient: str, amount: int, memo: str = "", fee: int | None = None) -> str:
-        """`fee` defaults to the node's minimum, so a transaction always clears it."""
+        """`fee` defaults to the node's minimum, so a transaction always clears it. A transfer's recipient goes through
+        crypto.parse_address first, before anything is asked or signed: a checksummed address is sent as the ledger
+        holds it, and a mistyped one raises AddressError, so no node (one from before the relay policy included) can be
+        handed coins for an address nobody holds."""
+        if kind == "transfer":
+            recipient = parse_address(recipient)
         nonce = self.account(keys.address)["nonce"]
         tx = Tx.signed(keys, kind, recipient, amount, nonce, memo, self.chain_id, self.min_fee() if fee is None else fee)
         return self.post("/tx", tx.to_dict())["txid"]
@@ -1038,8 +1109,9 @@ class WorkerClient:
             return None
 
     def run(self, stop=None) -> None:
-        log.info("worker %s starting on %s (%s); registers as %s", self.keys.address, self.backend.describe(),
-                 hardware.describe(), hardware.class_name(self.hardware_class) if self.hardware_class else "no class")
+        log.info("worker %s starting on %s (%s); registers as %s", checksummed(self.keys.address),
+                 self.backend.describe(), hardware.describe(),
+                 hardware.class_name(self.hardware_class) if self.hardware_class else "no class")
         if self.deepseek:
             self.ds.sweep()
         while stop is None or not stop.is_set():

@@ -66,13 +66,203 @@ class SpecTests(unittest.TestCase):
         self.assertEqual((es2.steps_of(after), int(es2.ctrl_of(after)[3])), (1, 1))
 
 
+class TaskCycleTests(unittest.TestCase):
+    """A job that never ends (a genesis starter job) takes its `tasks` in turn, `rounds` rounds each, the cosine starting
+    again with each; a job without the field is what it always was, its spec byte for byte."""
+    rule1_only = ("rule", "pairs", "pairs_per_unit", "problems", "max_tokens", "alpha", "reward", "level", "retarget",
+                  "optimizer", "betas", "eps")
+
+    def spec(self, **kw) -> es2.Spec2:
+        base = {k: v for k, v in spec_for().__dict__.items() if k not in self.rule1_only}
+        return es2.Spec2(**(base | dict(pairs=4, pairs_per_unit=2, problems=4, max_tokens=8, rounds=3) | kw))
+
+    def test_without_tasks_nothing_changes(self):
+        spec = self.spec()
+        self.assertNotIn("tasks", spec.to_json()["es"])
+        self.assertEqual([es2.task_at(spec, i) for i in (0, 3, 100)], [spec.task] * 3)
+        self.assertEqual(es2.lr_at(spec, 7), spec.lr * spec.lr_floor, "flat after the cosine, as before")
+
+    def test_tasks_take_turns_and_the_cosine_starts_again(self):
+        spec = self.spec(task="countdown", tasks=("countdown", "arithmetic"))
+        self.assertEqual(spec.problems_list(), [])
+        self.assertEqual([es2.task_at(spec, i) for i in range(8)],
+                         ["countdown"] * 3 + ["arithmetic"] * 3 + ["countdown"] * 2)
+        self.assertEqual([es2.lr_at(spec, i) for i in (0, 3, 6)], [spec.lr] * 3)
+        self.assertEqual(es2.lr_at(spec, 2), es2.lr_at(self.spec(), 2))
+        d = {"id": "cycle", "fee_per_round": 0, **spec.to_json(), "init_seed": 0, "units_per_round": spec.units,
+             "memory_mb": 1024}
+        self.assertEqual(TrainingJob.from_spec_json(json.dumps(d), "system", 1).spec, spec)
+        # A round's problems are its step's task's: the same seed, different problems a task later.
+        a, b = es2_rounds.items(spec, 12345, 0), es2_rounds.items(spec, 12345, 3)
+        self.assertEqual([p.messages for p in a], [p.messages for p in es2_rounds.items(self.spec(task="countdown"), 12345)])
+        self.assertNotEqual([p.messages for p in a], [p.messages for p in b])
+
+    def test_bad_task_lists(self):
+        self.assertTrue(self.spec(task="countdown", tasks=("arithmetic", "countdown")).problems_list())  # task first
+        self.assertTrue(self.spec(task="countdown", tasks=("countdown", "no-such-task")).problems_list())
+
+    def test_replay_targets_carry_their_rounds_step(self):
+        history = [{"seed": "%016x" % s, "targets": [[0, [5]], [1, [6]]]} for s in (7, 8, 9)]
+        self.assertEqual(es2_rounds.targets_of(history, 3), [(8, 1, [6], 1), (9, 0, [5], 2), (9, 1, [6], 2)])
+
+
+class AnchorTests(unittest.TestCase):
+    """The anchor (Spec2.decay): before each round's step the change gives back `decay` of itself, so random steps level
+    off near the base instead of adding up (es2's docstring). A job without it is what it always was."""
+    rule1_only = TaskCycleTests.rule1_only
+
+    def spec(self, **kw) -> es2.Spec2:
+        base = {k: v for k, v in spec_for().__dict__.items() if k not in self.rule1_only}
+        return es2.Spec2(**(base | dict(pairs=4, pairs_per_unit=2, problems=4, max_tokens=8, rounds=3) | kw))
+
+    def test_the_field(self):
+        self.assertNotIn("decay", self.spec().to_json()["es"], "no anchor: the spec byte for byte as before")
+        spec = self.spec(decay=1 / 64)
+        self.assertEqual(spec.problems_list(), [])
+        self.assertEqual(spec.to_json()["es"]["decay"], 0.015625)
+        d = {"id": "a", "fee_per_round": VIBE, **spec.to_json(), "init_seed": 0, "units_per_round": spec.units,
+             "memory_mb": 1024}
+        self.assertEqual(TrainingJob.from_spec_json(json.dumps(d), "req", VIBE).spec, spec)
+        self.assertNotEqual(es2.Spec2.from_json(spec.to_json()), self.spec())
+        self.assertEqual(self.spec(decay=0).decay, 0.0)
+        for bad in (-0.1, 0.75, "0.1"):
+            self.assertTrue(self.spec(decay=bad).problems_list(), bad)
+
+    @unittest.skipUnless(HAVE_TORCH, "needs PyTorch")
+    def test_the_arithmetic(self):
+        """Two linears, three rounds (the middle one with no update, so no step and no decay): a worker's float32
+        change and the canonical float64 weights agree, and both are (1 - d) x the first round's step + the last's,
+        worked out from each round alone; a parent's anchor applies inside the parent, the child's on top."""
+        import torch
+        from vibehash.es_fast import stream_layout
+        torch.manual_seed(0)
+        linears = [("a", torch.nn.Linear(4, 3, bias=False)), ("b", torch.nn.Linear(2, 5, bias=False))]
+        layout = stream_layout(linears)
+        base = {n: m.weight.detach().float().numpy() for n, m in linears}
+        e1 = es2.entry(11, [[0, 0.7], [1, -0.4]], 0.05, [])
+        e0 = es2.entry(12, [], 0.05, [])
+        e2 = es2.entry(13, [[1, 0.3]], 0.05, [])
+
+        def step(e):
+            w = es2.canonical_weights(layout, base, [e])
+            return {n: w[n].astype(np.float64) - base[n] for n in base}
+        s1, s2 = step(e1), step(e2)
+        d = 0.25
+        exact = es2.canonical_weights(layout, base, [e1, e0, e2], decay=d)
+        worker = es2.rebuild(linears, [e1, e0, e2], device="cpu", decay=d)
+        for n in base:
+            np.testing.assert_allclose(exact[n] - base[n], (1 - d) * s1[n] + s2[n], atol=1e-6)
+            np.testing.assert_allclose(worker.d[n].numpy(), exact[n] - base[n], atol=1e-6)
+        # No anchor: the old order (base, then each round), the same as before this field.
+        plain = es2.canonical_weights(layout, base, [e1, e0, e2])
+        for n in base:
+            np.testing.assert_allclose(plain[n] - base[n], s1[n] + s2[n], atol=1e-6)
+        # A parent anchored at 1/2 ran e1 (a step from zero: nothing to give back); its child, weight 0.5 and anchor
+        # 0.25, gives back a quarter of that before e2.
+        child = es2.canonical_weights(layout, base, [e2], parents=[(0.5, [e1], [], 0.5)], decay=d)
+        pc = es2.rebuild(linears, [e1], device="cpu", decay=0.5)
+        cw = es2.rebuild(linears, [e2], parents=[(0.5, pc)], device="cpu", decay=d)
+        for n in base:
+            np.testing.assert_allclose(child[n] - base[n], 0.5 * (1 - d) * s1[n] + s2[n], atol=1e-6)
+            np.testing.assert_allclose(cw.d[n].numpy(), child[n] - base[n], atol=1e-6)
+
+
+class FormatTests(unittest.TestCase):
+    """es_tasks.lenient: a right answer counts with or without its <answer> tags, so a job's reward (Spec2.lenient) and
+    the progress checker's scores are for being right, not for writing the tags; and the curated mix."""
+
+    def check(self, text, gold, kind):
+        from vibehash import es_tasks as t
+        make = {"letter": t._letter_check, "number": t._number_check, "words": lambda g: t._words_check([g])}[kind]
+        item = t.Item([], make(gold), gold)
+        return item.check(text), t.lenient(item).check(text)
+
+    def test_right_answers_without_tags_count(self):
+        for text, gold, kind in (("B", "B", "letter"), ("(C)", "C", "letter"), ("B. Sports", "B", "letter"),
+                                 ("The answer is D.", "D", "letter"), ("Answer: (A)", "A", "letter"),
+                                 ("So 3 + 4 = 7. That makes 7", "7", "number"), ("1,250 dollars", "1250", "number"),
+                                 ("Yes, because it rains", "yes", "words"), ("no.", "no", "words"),
+                                 ("Paris.", "Paris", "words")):
+            self.assertEqual(self.check(text, gold, kind), (False, True), text)
+
+    def test_wrong_or_unclear_answers_dont(self):
+        for text, gold, kind in (("A dog would bark", "A", "letter"), ("I think it's B", "B", "letter"),
+                                 ("C", "B", "letter"), ("The answer is C", "B", "letter"), ("7 or 8", "7", "number"),
+                                 ("No, yes", "yes", "words"), ("", "B", "letter")):
+            self.assertFalse(self.check(text, gold, kind)[1], text)
+
+    def test_tags_win_when_there_are_any(self):
+        self.assertEqual(self.check("<answer>C</answer>", "C", "letter"), (True, True))
+        self.assertEqual(self.check("B <answer>C</answer>", "B", "letter"), (False, False))
+
+    def test_the_spec_field_and_the_rounds(self):
+        spec = AnchorTests().spec(lenient=True)
+        self.assertEqual(spec.problems_list(), [])
+        self.assertIs(spec.to_json()["es"]["lenient"], True)
+        self.assertNotIn("lenient", AnchorTests().spec().to_json()["es"], "strict: the spec byte for byte as before")
+        self.assertEqual(es2.Spec2.from_json(spec.to_json()), spec)
+        self.assertTrue(AnchorTests().spec(lenient=1).problems_list())
+        strict, loose = es2_rounds.items(AnchorTests().spec(), 5, 0), es2_rounds.items(spec, 5, 0)
+        self.assertEqual([p.messages for p in strict], [p.messages for p in loose])
+        gold = loose[0].gold
+        self.assertEqual((strict[0].check(gold), loose[0].check(gold)), (False, True))
+
+    def test_the_curated_mix(self):
+        from vibehash import es_local, es_tasks
+        self.assertTrue(set(es_tasks.CURATED) <= set(es_tasks.NAMES))
+        self.assertFalse({"trivia_qa", "nq_open", "web_questions", "countdown", "arithmetic"} & set(es_tasks.CURATED))
+        self.assertEqual(es_tasks.NAMES[:19][-1], "boolq", "the first nineteen keep their places")
+        self.assertIs(es_local.V2_SETTINGS["lenient"], True)
+        t = es_tasks
+        piqa = t.HUB["piqa"][-1]({"goal": "Open a jar", "sol1": "Twist the lid", "sol2": "Eat the lid", "label": 0})
+        self.assertEqual((piqa.gold, piqa.messages[0]["content"].splitlines()[2]), ("A", "A. Twist the lid"))
+        siqa = t.HUB["social_iqa"][-1]({"context": "Ash cooked.", "question": "What next?", "answerA": "eat",
+                                        "answerB": "sleep", "answerC": "run", "label": "2"})
+        self.assertEqual(siqa.gold, "B")
+        arc = t.HUB["arc_challenge"][-1]({"question": "Q?", "choices": {"label": ["A", "B", "C", "D"],
+                                                                         "text": ["w", "x", "y", "z"]},
+                                          "answerKey": "C"})
+        self.assertEqual(arc.gold, "C")
+
+
+@unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
+class StarterTemplateTests(unittest.TestCase):
+    def test_an_evo_starter_job_from_the_template_goes_into_a_genesis(self):
+        from vibehash import cli, economics as econ, es_tasks
+        from vibehash.ledger import SYSTEM, Chain, InvalidBlock
+        with tempfile.TemporaryDirectory() as d:
+            folder, out = tiny_model(Path(d) / "tiny", seed=3), Path(d) / "starter.json"
+            with mock.patch("sys.stdout"):
+                cli.main(["job", "template", "--evo", str(folder), "--id", "evo-starter", "--rounds", "5",
+                          "--out", str(out)])
+            spec = json.loads(out.read_text())
+        self.assertEqual((spec["id"], spec["fee_per_round"]), ("evo-starter", 0))
+        self.assertEqual((spec["es"]["tasks"], spec["es"]["rounds"]), (list(es_tasks.CURATED), 5))
+        g = {"chain_id": "evo-start", "timestamp": 0, "allocations": {}, "es": True, "starter_jobs": [spec],
+             "economics": econ.NEW_SCHEDULES["mainnet"].to_dict()}
+        s = Chain.from_genesis(g).state
+        job = s.job("evo-starter")
+        self.assertEqual((job.es, s.job_owner["evo-starter"], s.escrow["evo-starter"]), (True, SYSTEM, 1))
+        self.assertEqual([es2.task_at(job.spec, i) for i in (0, 4, 5, 10)],
+                         [es_tasks.CURATED[0], es_tasks.CURATED[0], es_tasks.CURATED[1], es_tasks.CURATED[2]])
+        with self.assertRaisesRegex(InvalidBlock, "es"):  # an Evo starter job needs a genesis that takes Evo jobs
+            Chain.from_genesis({**g, "es": False})
+        # Rebuilds that look the spec up on chain (es2_rounds.rebuild_chain without one) find it in the genesis block.
+        chain = Chain.from_genesis(g)
+        self.assertEqual(es2_rounds.job_spec_in(chain.blocks[0], "evo-starter"), job.spec)
+        state, history, rounds = es2_rounds.rebuild_chain(chain.blocks, lambda h: None, "evo-starter")
+        self.assertEqual((rounds, history), (0, []))
+        self.assertEqual(es.state_hash(state), es.state_hash(job.spec.init_params()))
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class NetworkTests2(unittest.TestCase):
     def test_rounds_replay_cheats_a_child_and_a_restart(self):
+        from vibehash import economics as econ
         from vibehash import es_client
         from vibehash.client import NodeClient, WorkerClient
         from vibehash.coordinator import Coordinator, CoordinatorConfig
-        from vibehash.ledger import Block
+        from vibehash.ledger import Block, Chain
         from vibehash.node import Node, PhaseTimes
         from vibehash.storage import Store
         from tests.test_network import run_until
@@ -93,8 +283,10 @@ class NetworkTests2(unittest.TestCase):
             self.addCleanup(p.stop)
         node_keys, req = KeyPair.generate(b"es2 node"), KeyPair.generate(b"es2 requester")
         workers = [KeyPair.generate(f"es2 worker {i}".encode()) for i in range(4)]
+        # As a new testnet's: only rounds that pay for work mint (economics.PAID_ROUNDS), checked below.
         genesis = {"chain_id": "vibehash-es2-test", "timestamp": 0, "allocations": {req.address: 500 * VIBE},
-                   "stakes": {k.address: 10 * VIBE for k in [node_keys, *workers]}, "es": True}
+                   "stakes": {k.address: 10 * VIBE for k in [node_keys, *workers]}, "es": True,
+                   "economics": econ.NEW_SCHEDULES["testnet"].to_dict()}
         node = Node(root / "node", genesis, node_keys, port=0,
                     times=PhaseTimes(register_s=1.0, compute_s=20.0, reveal_s=3.0, verify_s=15.0, idle_s=0.3),
                     config=CoordinatorConfig(newcomer_units=4)).start()
@@ -132,6 +324,18 @@ class NetworkTests2(unittest.TestCase):
         self.assertLess(st.stake(liar), 10 * VIBE, "the liar wasn't slashed")
         self.assertTrue(all(forger not in b.summary.accepted for b in mine), "forged answers were accepted")
         self.assertTrue(any(w.address in b.summary.accepted for b in mine for w in workers[:2]))
+        # An Evo round pays for work when a claim was approved and nobody rejected it: those rounds minted 50 VIBE each,
+        # and no other did, as the blocks applied again from the genesis say.
+        again = Chain.from_genesis(genesis)
+        for b in blocks[1:]:
+            again.append(b)
+        worked = [b for b in mine if b.summary.pays_for_work]
+        self.assertTrue(worked)
+        self.assertEqual((again.state.paid_rounds, again.state.minted), (len(worked), 50 * VIBE * len(worked)))
+        for b in mine:
+            self.assertEqual(any(t.memo == "work" for t in b.txs), b.summary.pays_for_work, b.height)
+            if not b.summary.pays_for_work:
+                self.assertFalse([t for t in b.txs if t.kind == "reward"], b.height)
 
         # The workers' change (float32, rounds applied as their blocks came) against the canonical float64 one.
         rt = es_client.runtime2(spec, "cpu")
@@ -139,7 +343,9 @@ class NetworkTests2(unittest.TestCase):
         self.assertEqual(line.params_hash, es.state_hash(state))
         from vibehash.es_fast import stream_layout
         layout = stream_layout(rt.linears)
-        exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, history)
+        self.assertEqual(spec.decay, 1 / 64, "the anchor is on by default")
+        exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, history,
+                                      decay=spec.decay)
         worst = max(float(np.abs((rt.base[n] + line.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         moved = max(float(np.abs(line.change.d[n].numpy()).max()) for n, _, _ in layout)
         self.assertGreater(moved, 1e-4, "the weights never moved")
@@ -158,7 +364,7 @@ class NetworkTests2(unittest.TestCase):
         cline = clients[0].es.v2._line(rt, "evo2-b", child)
         self.assertEqual(cline.params_hash, es.state_hash(node.coord.start_params("evo2-b")))
         exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, cline.history,
-                                      parents=[(0.5, history, [])])
+                                      parents=[(0.5, history, [], spec.decay)], decay=child.decay)
         worst = max(float(np.abs((rt.base[n] + cline.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         self.assertLess(worst, 1e-5, f"the child's change is {worst} from the canonical one")
 
@@ -201,6 +407,42 @@ class NetworkTests2(unittest.TestCase):
         self.assertTrue(any(f"{total} rounds to replay" in m for m in logs.output), logs.output)
         self.assertTrue(any(f"rebuilt from the chain: {n} rounds" in m for m in logs.output), logs.output)
 
+        # `vibehash evo export`: the child's model worked out from the node's chain alone (no line in memory or on disk)
+        # and saved as a Hugging Face folder that loads with transformers and holds exactly base + the child's change.
+        from transformers import AutoModelForCausalLM
+        from vibehash import es_export
+        from vibehash.cli import _evo_job
+        newest = max((b for b in node.chain.blocks if b.summary is not None and b.summary.accepted_units),
+                     key=lambda b: b.height).summary.job_id
+        self.assertEqual(es_export.newest_job(api), newest)
+        self.assertTrue(_evo_job(api, "evo2-b"))  # (so `job download evo2-b` exports it too)
+        cache.lines.clear()
+        cache.starts.clear()
+        for f in es_client._saved_dir().glob("*.pt"):
+            f.unlink()
+        out = root / "evo2-b-model"
+        info = es_export.export(api, "evo2-b", out, device="cpu", dtype="float32")
+        self.assertEqual(info["params_hash"], cline.params_hash)
+        self.assertGreaterEqual(info["block"], cline.last_round)  # (the node seals empty rounds meanwhile)
+        self.assertEqual([p["job"] for p in info["lineage"]], ["evo2-a"])
+        self.assertTrue((out / "EVO.md").is_file() and (out / "evo.json").is_file())
+        self.assertFalse(out.with_name(out.name + ".partial").exists())
+        got = AutoModelForCausalLM.from_pretrained(out, dtype=torch_float32())
+        params = dict(got.named_parameters())
+        for n, _, _ in layout:
+            np.testing.assert_allclose(params[n + ".weight"].detach().numpy(),
+                                       (rt.base[n] + cline.change.d[n]).numpy(), rtol=0, atol=1e-6)
+        self.assertGreater(max(float(np.abs(params[n + ".weight"].detach().numpy() - rt.base[n].numpy()).max())
+                               for n, _, _ in layout), 1e-4, "the export is the base")
+        half = es_export.export(api, "evo2-b", root / "half", device="cpu")  # bfloat16, the default
+        self.assertEqual(half["params_hash"], cline.params_hash)
+        cfg = json.loads((root / "half" / "config.json").read_text())
+        self.assertEqual(cfg.get("dtype", cfg.get("torch_dtype")), "bfloat16")
+        self.assertIsNotNone(AutoModelForCausalLM.from_pretrained(root / "half", dtype="auto"))
+        es_export.export(api, "evo2-b", out, device="cpu")  # an earlier export's folder is written over
+        with self.assertRaises(FileExistsError):  # but not a folder of other files
+            es_export.export(api, "evo2-b", root / "node", device="cpu")
+
         # A restart: the node works the jobs' states out from the chain, even with its saved copies gone.
         want = {j: node.coord.start_params(j).copy() for j in ("evo2-a", "evo2-b")}
         node.stop()
@@ -213,6 +455,11 @@ class NetworkTests2(unittest.TestCase):
         for j, s in want.items():
             np.testing.assert_array_equal(c.start_params(j), s)
             self.assertEqual(es.state_hash(c.start_params(j)), c.expected_start_hash(c.job(j)).hex())
+
+
+def torch_float32():
+    import torch
+    return torch.float32
 
 
 def _cuda() -> bool:

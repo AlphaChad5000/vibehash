@@ -4,6 +4,7 @@ Vectors come from the official sources, copied here so the tests never touch the
 trezor/python-mnemonic's vectors.json (passphrase "TREZOR"), SLIP-0010 from satoshilabs/slips.
 """
 import contextlib
+import copy
 import hashlib
 import io
 import socket
@@ -17,6 +18,7 @@ import re
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -26,9 +28,10 @@ from vibehash import wallet as wallets
 from vibehash.client import NodeClient, NodeError
 from vibehash.coordinator import Coordinator, CoordinatorConfig, ProtocolError
 from vibehash.crypto import KeyPair, public_key
-from vibehash.ledger import SYSTEM, Chain, InvalidBlock, Tx
+from vibehash.ledger import SYSTEM, Chain, InvalidBlock, RoundSummary, State, Tx, apply_block
 from vibehash.node import Node, PhaseTimes
 from vibehash.protocol import Protocol
+from vibehash.replay import replay_block
 from vibehash.ratelimit import Limits, RateLimiter, bucket_of
 from vibehash.storage import Store
 from vibehash.tasks import SYN_PER_VIBE, TrainingJob
@@ -709,31 +712,300 @@ class IssuanceTests(unittest.TestCase):
 
     def test_bad_schedules_are_refused(self):
         for bad in ({"initial_subsidy": 1, "halving_interval": 0}, {"initial_subsidy": -1, "halving_interval": 5},
-                    {"initial_subsidy": 1.5, "halving_interval": 5}, {"halving_interval": 5}, "moonshot", 7):
+                    {"initial_subsidy": 1.5, "halving_interval": 5}, {"halving_interval": 5}, "moonshot", 7,
+                    {"initial_subsidy": 1, "halving_interval": 5, "count": "heights"},
+                    {"initial_subsidy": 1, "halving_interval": 5, "count": None}):
             with self.assertRaises(ValueError, msg=bad):
                 Chain.from_genesis({**COMPAT_GENESIS, "economics": bad})
+
+
+# --- only rounds that pay for work mint (economics.PAID_ROUNDS) ---------------------------------------------------
+
+PAID = econ.NEW_SCHEDULES["testnet"]  # what `genesis create` and a new `vibehash testnet` folder write
+P, W, V = (KeyPair.generate(f"paid rounds {n}".encode()) for n in ("proposer", "worker", "checker"))
+
+
+def quiet_round(proto):
+    """A round nobody works in, as on a quiet network: it opens, nobody registers, and it's sealed all the same."""
+    c = proto.coord
+    c.open_round()
+    c.start_compute()
+    beacon = c.start_reveal()
+    c.start_verify()
+    return c.finalize(proposer_keys=proto._proposer(beacon), timestamp=proto.chain.tip.height + 1)
+
+
+def play(proto, rounds: str) -> list[int]:
+    """A round for each letter, w worked (every unit verifies) or q quiet. Returns what each block minted."""
+    minted = []
+    for kind in rounds:
+        before = proto.chain.state.minted
+        proto.run_round() if kind == "w" else quiet_round(proto)
+        minted.append(proto.chain.state.minted - before)
+    return minted
+
+
+def replayed(test, proto) -> State:
+    """Every block applied again from the genesis block and every round re-run from its record, as a validator and
+    `chain verify` do. Returns the state they come to."""
+    chain = copy.deepcopy(proto.chain)
+    chain.blocks, chain.state = chain.blocks[:1], apply_block(State(), chain.blocks[0], chain.chain_id, None)
+    records = {r.block.height: r.record for r in proto.history}
+    for block in proto.chain.blocks[1:]:
+        if block.summary is not None:
+            test.assertEqual(replay_block(chain, block, records[block.height]), [], f"block {block.height}")
+        chain.append(block)
+    test.assertTrue(chain.validate())
+    return chain.state
+
+
+class PaidRoundsTests(unittest.TestCase):
+    """A genesis with "count": "paid_rounds": a round that pays nobody for work mints nothing, and the halvings count
+    the rounds that paid. Rounds through the same Coordinator a node runs, replayed from their records."""
+
+    def test_an_empty_round_mints_and_burns_nothing(self):
+        proto, workers, req, job = network(economics=PAID)
+        st = proto.chain.state
+        before = (st.minted, st.burned, st.total_supply(), st.escrow[job.job_id], st.subsidy(10**6))
+        report = quiet_round(proto)
+        st = proto.chain.state
+        self.assertFalse(report.block.summary.pays_for_work)
+        self.assertFalse([t for t in report.block.txs if t.kind in ("reward", "fee_release")])
+        self.assertEqual((report.pool, report.burned), (0, 0))
+        # Nothing minted, burned or charged, and the halving clock didn't move.
+        self.assertEqual((st.minted, st.burned, st.total_supply(), st.escrow[job.job_id], st.subsidy(10**6)), before)
+        self.assertEqual(st.paid_rounds, 0)
+        # The same round on a chain from before the field: the whole subsidy minted, and burned.
+        old, *_ = network()
+        quiet_round(old)
+        self.assertEqual((old.chain.state.minted, old.chain.state.burned), (50 * VIBE, 50 * VIBE))
+        self.assertEqual(old.chain.state.total_supply(), old.chain.state.expected_supply())
+
+    def test_the_subsidy_halves_after_n_paid_rounds_not_n_heights(self):
+        schedule = econ.Economics(40 * VIBE, 3, count=econ.PAID_ROUNDS)
+        proto, *_ = network(economics=schedule, budget=500 * VIBE)
+        minted = play(proto, "wqqwqwwqqqwwqw")
+        self.assertEqual(minted, [40 * VIBE, 0, 0, 40 * VIBE, 0, 40 * VIBE, 20 * VIBE, 0, 0, 0, 20 * VIBE, 20 * VIBE, 0,
+                                  10 * VIBE])
+        st = proto.chain.state
+        self.assertEqual(st.paid_rounds, 7)
+        self.assertEqual(st.subsidy(proto.chain.tip.height + 1), 10 * VIBE, "the eighth paid round: still the third level")
+        self.assertEqual(st.total_supply(), st.expected_supply())
+        again = replayed(self, proto)
+        self.assertEqual((again.minted, again.burned, again.paid_rounds), (st.minted, st.burned, 7))
+
+    def test_a_genesis_without_the_field_keeps_the_original_rule(self):
+        for schedule in (None, econ.Economics(40 * VIBE, 3)):
+            proto, *_ = network(economics=schedule, budget=500 * VIBE)
+            e = proto.chain.state.economics
+            self.assertEqual(e.count, econ.BLOCKS)
+            heights = range(proto.chain.tip.height + 1, proto.chain.tip.height + 15)
+            burned = proto.chain.state.burned
+            minted = play(proto, "wqqwqwwqqqwwqw")
+            self.assertEqual(minted, [e.subsidy(h) for h in heights], "every round mints, halving by height")
+            st = proto.chain.state
+            self.assertGreaterEqual(st.burned - burned, sum(m for m, k in zip(minted, "wqqwqwwqqqwwqw") if k == "q"),
+                                    "and the empty rounds' coins are burned")
+            self.assertEqual(st.paid_rounds, 7, "counted all the same, and used for nothing")
+            replayed(self, proto)
+        # The genesis hash: "count": "blocks" is the same schedule as no count, and "paid_rounds" another.
+        self.assertEqual(Chain.from_genesis({**COMPAT_GENESIS, "economics": {**econ.TESTNET.to_dict(), "count": "blocks"}})
+                         .genesis_hash, COMPAT_GENESIS_HASH)
+        paid = Chain.from_genesis({**COMPAT_GENESIS, "economics": PAID.to_dict()})
+        self.assertNotEqual(paid.genesis_hash, COMPAT_GENESIS_HASH)
+        self.assertEqual(paid.state.economics, PAID)
+        self.assertTrue(paid.validate())
+        # vibehash-public-1's genesis, as its node serves it: the original rule, and no "count" in what it commits to.
+        public = {"name": "mainnet", "initial_subsidy": 312500000, "halving_interval": 3320000,
+                  "max_supply": 2100000000000000}
+        self.assertEqual(econ.Economics.from_dict(public), econ.MAINNET)
+        self.assertEqual(econ.MAINNET.consensus_dict(), {k: v for k, v in public.items() if k != "name"})
+        self.assertEqual(econ.Economics.from_dict("mainnet").count, econ.BLOCKS, "a preset's name means what it always did")
+
+    def test_the_names_and_the_new_presets(self):
+        for name, e in econ.NEW_SCHEDULES.items():
+            self.assertEqual((e.name, e.count), (name, econ.PAID_ROUNDS))
+            self.assertEqual(replace(e, count=econ.BLOCKS), econ.SCHEDULES[name])
+            self.assertEqual(e.to_dict(), {**econ.SCHEDULES[name].to_dict(), "count": "paid_rounds"})
+            self.assertEqual(econ.Economics.from_dict(json.loads(json.dumps(e.to_dict()))), e)
+        self.assertEqual(econ.Economics(1, 5, count=econ.PAID_ROUNDS).name, "custom")
+        self.assertEqual(econ.NEW_SCHEDULES["mainnet"].total_issuance(), econ.MAINNET.total_issuance())
+
+    def test_the_cap_still_holds(self):
+        genesis_total = 1000 * VIBE + 3 * 10 * VIBE
+        capped = econ.Economics(50 * VIBE, 210, max_supply=genesis_total + 120 * VIBE, count=econ.PAID_ROUNDS)
+        proto, *_ = network(economics=capped, budget=1000 * VIBE)
+        self.assertEqual(play(proto, "wqwqwwq"), [50 * VIBE, 0, 50 * VIBE, 0, 20 * VIBE, 0, 0])
+        st = proto.chain.state
+        self.assertEqual(st.genesis + st.minted, capped.max_supply)
+        self.assertEqual((st.paid_rounds, st.subsidy(10**6)), (4, 0))
+        replayed(self, proto)
+
+
+class PaidRoundsLedgerTests(unittest.TestCase):
+    """The rule at the ledger, where it's applied: which summaries pay for work, and blocks minting where it says they
+    can't, which every node refuses whatever the proposer signed (the count is in no block: each node derives it)."""
+    JOB = TrainingJob("paid-job", BOB.address, budget=500 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+
+    def setUp(self):
+        self.chain = Chain({BOB.address: 1000 * VIBE}, stakes={k.address: 10 * VIBE for k in (P, W, V)},
+                           chain_id="paid-rounds", economics=econ.Economics(40 * VIBE, 2, count=econ.PAID_ROUNDS))
+        post = Tx.signed(BOB, "post_job", SYSTEM, self.JOB.budget, 0, self.JOB.spec_json(), self.chain.chain_id)
+        self.seal(None, [post])
+
+    def summary(self, worker_flops=(), verifier_flops=(), slashes=(), units=0) -> RoundSummary:
+        workers = dict(worker_flops)
+        return RoundSummary(self.JOB.job_id, units, workers, dict(verifier_flops), [list(s) for s in slashes],
+                            sorted(workers), [], "00", P.address)
+
+    def block(self, summary, chain=None):
+        c = chain or self.chain
+        block, _ = c.build_block(summary, [], c.tip.timestamp + 1)
+        block.sign(P)
+        return block
+
+    def seal(self, summary, txs=()):
+        block, _ = self.chain.build_block(summary, list(txs), self.chain.tip.timestamp + 1)
+        block.sign(P)
+        self.chain.append(block)
+        return block
+
+    def test_which_rounds_pay_for_work(self):
+        f = self.JOB.unit_flops
+        cases = {
+            "a unit verified": (self.summary({W.address: f}, {V.address: f}, units=1), True),
+            "a sharded member paid for its cells, its unit not kept": (self.summary({W.address: f // 2}), True),
+            "nobody worked": (self.summary(), False),
+            "only checkers": (self.summary(verifier_flops={V.address: f}), False),
+            "only scorers, the claims unchecked": (self.summary(verifier_flops={V.address: 7, P.address: 7}), False),
+            "work by the round's offender": (self.summary({W.address: f}, {V.address: f},
+                                                          [[W.address, V.address, "failed_replay"]]), False),
+            "no FLOPs": (self.summary({W.address: 0}), False),
+        }
+        for what, (sm, paid) in cases.items():
+            with self.subTest(what):
+                self.assertEqual(sm.pays_for_work, paid)
+                c = copy.deepcopy(self.chain)
+                block = self.block(sm, c)
+                c.append(block)
+                rewards = [t for t in block.txs if t.kind == "reward"]
+                self.assertEqual(c.state.minted, 40 * VIBE if paid else 0)
+                self.assertEqual(c.state.paid_rounds, int(paid))
+                self.assertEqual(bool(rewards), paid, "nothing is minted to pay anyone with")
+                self.assertEqual(c.state.total_supply(), c.state.expected_supply())
+        # A catcher in a round with no accepted work is paid by the bounty, not from a subsidy.
+        c = copy.deepcopy(self.chain)
+        c.append(self.block(cases["work by the round's offender"][0], c))
+        self.assertEqual(c.state.balance(V.address), econ.slash_amounts(10 * VIBE)[0])
+
+    def test_a_block_minting_in_a_round_without_paid_work_is_refused(self):
+        checkers_only = self.summary(verifier_flops={V.address: self.JOB.unit_flops})
+        old = copy.deepcopy(self.chain)  # a proposer working by the original rule: checkers paid from a subsidy
+        old.state.economics = replace(old.state.economics, count=econ.BLOCKS)
+        forged = self.block(checkers_only, old)
+        self.assertIn("verify", [t.memo for t in forged.txs if t.kind == "reward"])
+        with self.assertRaisesRegex(InvalidBlock, "system transactions don't match"):
+            self.chain.append(forged)
+        # Or the proposer pays itself for an empty round.
+        forged = self.block(self.summary(), copy.deepcopy(self.chain))
+        forged.txs.append(Tx("reward", SYSTEM, P.address, 2 * VIBE, memo="propose", chain_id=self.chain.chain_id))
+        forged.sign(P)
+        with self.assertRaisesRegex(InvalidBlock, "system transactions don't match"):
+            self.chain.append(forged)
+        self.chain.append(self.block(checkers_only))  # the honest block: nothing minted, nobody paid
+        self.assertEqual((self.chain.state.minted, self.chain.state.paid_rounds), (0, 0))
+
+    def test_a_block_from_the_wrong_halving_is_refused(self):
+        worked = lambda: self.summary({W.address: self.JOB.unit_flops}, units=1)  # noqa: E731
+        self.seal(worked())
+        self.seal(self.summary())  # an empty round between: it moves no clock
+        self.seal(worked())
+        self.assertEqual((self.chain.state.paid_rounds, self.chain.state.subsidy(0)), (2, 20 * VIBE))
+        for wrong in ("a paid count one short", "halvings by height"):
+            c = copy.deepcopy(self.chain)
+            if wrong == "a paid count one short":
+                c.state.paid_rounds -= 1
+            else:  # height 5: two halvings of two blocks
+                c.state.economics = replace(c.state.economics, count=econ.BLOCKS)
+            forged = self.block(worked(), c)
+            c.append(forged)  # it's consistent with its maker's mistaken state...
+            self.assertNotEqual(c.state.minted - self.chain.state.minted, 20 * VIBE, wrong)
+            with self.subTest(wrong), self.assertRaisesRegex(InvalidBlock, "system transactions don't match"):
+                self.chain.append(forged)  # ...and no other node's
+            self.assertFalse(c.validate(), "re-derived from genesis, its chain is invalid")
+        self.chain.append(self.block(worked()))
+        self.assertEqual((self.chain.state.minted, self.chain.state.paid_rounds), (100 * VIBE, 3))
+        self.assertTrue(self.chain.validate())
 
 
 class IssuanceCommandLineTests(Cli, unittest.TestCase):
     def test_genesis_create_economics(self):
         out = self.run_cli("genesis", "create", "--chain-id", "net", "--out", self.home / "main.json", "--economics", "mainnet",
                            "--alloc", f"{ALICE.address}=100")
-        self.assertIn("issuance (mainnet): 3.125 VIBE per round, halving every 3,320,000 blocks (~4 years", out)
+        self.assertIn("issuance (mainnet): 3.125 VIBE per round that pays for work, halving every 3,320,000 such rounds "
+                      "(~4 years if every 38 s round is worked", out)
         main = json.loads((self.home / "main.json").read_text())
-        self.assertEqual(econ.Economics.from_genesis(main), econ.MAINNET)
+        self.assertEqual(main["economics"]["count"], "paid_rounds")
+        self.assertEqual(econ.Economics.from_genesis(main), econ.NEW_SCHEDULES["mainnet"])
         self.run_cli("genesis", "create", "--chain-id", "net", "--out", self.home / "test.json", "--alloc", f"{ALICE.address}=100")
         test = json.loads((self.home / "test.json").read_text())
-        self.assertEqual(econ.Economics.from_genesis(test), econ.TESTNET)
+        self.assertEqual(econ.Economics.from_genesis(test), econ.NEW_SCHEDULES["testnet"])
         test["timestamp"] = main["timestamp"]
         self.assertNotEqual(Chain.from_genesis(main).genesis_hash, Chain.from_genesis(test).genesis_hash)
+        self.assertNotEqual(Chain.from_genesis(test).genesis_hash,
+                            Chain.from_genesis({**test, "economics": "testnet"}).genesis_hash, "a preset's name: the old rule")
         del test["economics"]  # the testnet schedule is the one genesis files had before the field existed
         self.assertEqual(Chain.from_genesis(test).genesis_hash, Chain.from_genesis({**test, "economics": "testnet"}).genesis_hash)
+
+    def test_a_quiet_node_mints_nothing_and_chain_verify_agrees(self):
+        """A node with a job and nobody mining seals empty rounds; then a worker joins. `chain verify` re-derives the
+        same supply and paid-round count from the blocks as the node holds."""
+        from vibehash.client import WorkerClient
+        genesis = {"chain_id": "paid-net", "timestamp": 0, "allocations": {BOB.address: 100 * VIBE},
+                   "stakes": {k.address: 10 * VIBE for k in (ALICE, W, V)}, "economics": PAID.to_dict()}
+        node = start_node(self, genesis)
+        api = NodeClient(node.url)
+        job = TrainingJob("quiet-job", BOB.address, budget=50 * VIBE, fee_per_round=VIBE, units_per_round=2)
+        api.send_tx(BOB, "post_job", "system", job.budget, job.spec_json())
+        rounds = lambda: [b for b in node.chain.blocks if b.summary is not None]  # noqa: E731
+        wait_for(lambda: len(rounds()) >= 3)
+        st = node.chain.state
+        self.assertEqual((st.minted, st.burned, st.paid_rounds), (0, 0, 0), "three rounds nobody worked in")
+        self.assertEqual(api.status()["subsidy"], 50 * VIBE)
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        clients = [WorkerClient(node.url, k, memory_mb=8192, flops_override=1e9, poll_s=0.1, device="cpu",
+                                cache_dir=self.home / f"c{i}")
+                   for i, k in enumerate((W, V))]
+        threads = [threading.Thread(target=c.run, args=(stop,), daemon=True) for c in clients]
+        for t in threads:
+            t.start()
+        wait_for(lambda: node.chain.state.paid_rounds >= 2, seconds=90)
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+        node.stopping.set()  # no more rounds while we compare
+        node.threads[1].join(timeout=30)
+        st = node.chain.state
+        self.assertEqual(st.minted, 50 * VIBE * st.paid_rounds)
+        self.assertGreater(len(rounds()), st.paid_rounds)
+        out = self.run_cli("chain", "verify", "--node", node.url)
+        self.assertIn(f"verified {len(node.chain.blocks)} blocks: VALID", out)
+        self.assertIn(f"minted {fmt_vibe(st.minted)} - burned {fmt_vibe(st.burned)}", out)
+        self.assertIn(f"{st.paid_rounds} rounds paid for work: the halvings count them", out)
+        self.assertIn("every decision follows from the signed messages", out)
+
+
+def fmt_vibe(syn: int) -> str:
+    return cli.fmt(syn)
 
 
 class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
     def test_create_shows_words_once_and_restore_rebuilds_the_wallet(self):
         out = self.run_cli("wallet", "create", "--out", self.home / "a.json", terminal=True)
-        address = re.search(r"address: (vibe1\w+)", out)[1]
+        address = crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1])  # shown checksummed
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
+        self.assertEqual(json.loads((self.home / "a.json").read_text())["address"], address)  # the file: canonical
         words = " ".join(re.findall(r"\d+\. ([a-z]+)", out))
         self.assertEqual(len(words.split()), 24)
         self.assertIn("won't be shown again", out)
@@ -745,29 +1017,203 @@ class RecoveryWordsCommandLineTests(Cli, unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"VIBEHASH_MNEMONIC": ordered}):
             out = self.run_cli("wallet", "restore", "--out", self.home / "b.json")
-        self.assertIn(f"address: {address}", out)
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
         self.assertTrue(wallets.is_encrypted(self.home / "b.json"))
         self.assertEqual(wallets.load(self.home / "b.json", "test-only").address, address)
         with mock.patch.dict(os.environ, {"VIBEHASH_MNEMONIC": ordered, "VIBEHASH_MNEMONIC_PASSPHRASE": "extra"}):
             out = self.run_cli("wallet", "restore", "--passphrase", "--out", self.home / "c.json")
-        self.assertNotIn(address, out)  # a passphrase is a different wallet
-        self.assertEqual(re.search(r"address: (vibe1\w+)", out)[1], mnemonic.keypair(ordered, "extra").address)
+        self.assertNotIn(crypto.checksummed(address), out)  # a passphrase is a different wallet
+        self.assertEqual(crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1]),
+                         mnemonic.keypair(ordered, "extra").address)
 
     def test_unattended_the_words_go_to_a_private_file_not_the_log(self):
         """Output to a pipe or log (nohup, Docker, a pod): the words aren't in it, but in a file, and it says where."""
         out = self.run_cli("wallet", "create", "--out", self.home / "a.json")
-        address = re.search(r"address: (vibe1\w+)", out)[1]
+        address = crypto.parse_address(re.search(r"address: (vibe1\w+)", out)[1])
         self.assertNotRegex(out, r"\d+\. [a-z]+")
         self.assertIn("NOT printed", out)
         path = self.home / f"recovery-words-{address[:12]}.txt"
         self.assertIn(str(path), out.replace("\n", ""))
         words = " ".join(re.findall(r"^\s*\d+\. ([a-z]+)$", path.read_text(), re.M))
         self.assertEqual(mnemonic.keypair(words).address, address)
+        self.assertIn(f"recovery words for {crypto.checksummed(address)}", path.read_text())
 
     def test_old_wallet_shows_it_has_no_words(self):
         k = KeyPair.generate(b"legacy-plain")
         wallets.save(k, self.home / "old.json", None)
         self.assertIn("recovery words: no", self.run_cli("wallet", "show", "--wallet", self.home / "old.json"))
+
+
+# --- addresses: the checksum people see, the canonical form the chain keeps ---------------------------------------
+
+def random_address(i: int) -> str:
+    return crypto.address_of(hashlib.sha256(b"address %d" % i).digest())
+
+
+def one_digit_off(shown: str) -> str:
+    """A checksummed address with its first digit typed one higher: a typo its checksum catches (Dave's, checked)."""
+    j = next(j for j in range(5, 41) if shown[j].isdigit())
+    return shown[:j] + str((int(shown[j]) + 1) % 10) + shown[j + 1:]
+
+
+class AddressTests(unittest.TestCase):
+    def test_the_checksum_is_in_the_letters_case_and_the_canonical_form_is_unchanged(self):
+        self.assertEqual(ALICE.address, "vibe11c0c490f1b5528d8173c5de46d131160e4b2")  # address_of, as chains hold it
+        # Pinned: the guide's example worker. A change here would make every address anyone has copied look mistyped.
+        self.assertEqual(crypto.checksummed("vibe17b0d8bce54f6eab50df24fd44e5a408a9525"),
+                         "vibe17B0D8bce54f6eAb50df24fd44E5a408A9525")
+        for i in range(500):
+            a = random_address(i)
+            c, h = crypto.checksummed(a), hashlib.sha256(a.encode()).hexdigest()
+            self.assertEqual(c, "vibe1" + "".join(x.upper() if x in "abcdef" and int(h[j], 16) >= 8 else x
+                                                  for j, x in enumerate(a[5:])))
+            self.assertEqual(c.lower(), a)
+            self.assertEqual(crypto.parse_address(c), a)  # the round trip
+            self.assertEqual(crypto.parse_address(a), a)  # and the old way of writing it, unchecked
+        for other in ("system", "burn", "vibe1abc", "vibe1" + "A" * 36, ""):  # not canonical addresses: left alone
+            self.assertEqual(crypto.checksummed(other), other)
+
+    def test_every_one_character_typo_is_refused_or_reads_as_an_unchecked_address(self):
+        """Each other hex character, in either case, at each of the 36 places of a checksummed address: refused, or the
+        same address (only a letter's case slipped), or no capital left, which reads as an old-style address and isn't
+        checked, or (rarely: each letter is a coin toss) capitals that happen to be the other address's checksum.
+        DESIGN §10, "Addresses", has the rate over 20,000 addresses: 99.876%."""
+        typos = caught = 0
+        for i in range(300):
+            a = random_address(i)
+            c = crypto.checksummed(a)
+            for j in range(5, 41):
+                for ch in "0123456789abcdefABCDEF":
+                    if ch == c[j]:
+                        continue
+                    t = c[:j] + ch + c[j + 1:]
+                    try:
+                        got = crypto.parse_address(t)
+                    except crypto.AddressError:
+                        got = None
+                    if ch.lower() == c[j].lower():  # a case slip: refused, or still this address
+                        self.assertIn(got, (None, a), t)
+                        continue
+                    typos += 1
+                    caught += got is None
+                    if got is not None:
+                        self.assertTrue(t[5:] == t[5:].lower() or t == crypto.checksummed(got), t)
+        self.assertGreater(caught / typos, 0.995, f"{caught} of {typos} caught")
+
+    def test_what_is_refused_and_why(self):
+        a = random_address(1)
+        c = crypto.checksummed(a)
+        j = next(j for j in range(5, 41) if c[j].isupper())
+        refused = {"": "no address given", "   ": "no address given", "hello": "isn't a Vibe Hash address",
+                   "0x" + a[5:]: "isn't a Vibe Hash address", "vibf1" + a[5:]: "isn't a Vibe Hash address",
+                   a[:-1]: "36 more characters, but this has 35", c + "0": "but this has 37",
+                   a[:9] + "g" + a[10:]: "and the letters a-f, but this has 'g'", a[:9] + " " + a[10:]: "has ' '",
+                   c[:j] + c[j].lower() + c[j + 1:]: "one of its characters is wrong (its capital letters don't match",
+                   "vibe1" + a[5:].upper(): "all in capitals"}
+        for text, why in refused.items():
+            with self.subTest(text=text), self.assertRaisesRegex(crypto.AddressError, re.escape(why)):
+                crypto.parse_address(text)
+        self.assertTrue(issubclass(crypto.AddressError, ValueError))  # commands' error exits say what a ValueError says
+        for text in (f"  {c}\n", "Vibe1" + c[5:], "VIBE1" + c[5:], a, f"\t{a} "):  # spaces, a capitalised prefix
+            self.assertEqual(crypto.parse_address(text), a, text)
+        for text in (None, 7):
+            with self.assertRaisesRegex(crypto.AddressError, "no address given"):
+                crypto.parse_address(text)
+
+    def test_all_capitals_is_checked_not_waved_through(self):
+        every = next(a for a in map(random_address, range(10**5))  # an address whose checksum capitalises every letter
+                     if crypto.checksummed(a)[5:] == a[5:].upper() and a[5:] != a[5:].upper())
+        self.assertEqual(crypto.parse_address("vibe1" + every[5:].upper()), every)
+        digits = "vibe1" + "0123456789" * 3 + "012345"  # no letters: nothing in it for a checksum, nothing to mistype
+        self.assertEqual((crypto.checksummed(digits), crypto.parse_address(digits)), (digits, digits))
+
+    def test_the_client_signs_no_transfer_to_a_mistyped_address(self):
+        api = NodeClient("http://127.0.0.1:1")  # nothing listens there: asking it anything would raise NodeError
+        with mock.patch.object(crypto, "sign", side_effect=AssertionError("signed")):
+            with self.assertRaisesRegex(crypto.AddressError, "one of its characters is wrong"):
+                api.send_tx(CAROL, "transfer", one_digit_off(crypto.checksummed(DAVE.address)), VIBE)
+
+    def test_nodes_relay_transfers_only_to_canonical_addresses(self):
+        """The ledger credits any recipient that starts vibe1 (ledger._apply_user_tx), a spelling no key's address_of
+        makes included, so those coins could never be spent. Nodes refuse such transfers by policy (_relayable); a
+        block holding one still validates, as it always did: making it a rule waits for a block version."""
+        chain = Chain({ALICE.address: 100 * VIBE}, stakes={BOB.address: 10 * VIBE})
+        def tx(to):
+            return Tx.signed(ALICE, "transfer", to, VIBE, chain.next_nonce(ALICE.address), "", chain.chain_id)
+        chain.check_tx(tx(CAROL.address), [])
+        for to in (crypto.checksummed(CAROL.address), "vibe1" + CAROL.address[5:].upper(), CAROL.address[:-1],
+                   CAROL.address + "0", "vibe1", "vibe1" + "x" * 36, SYSTEM):
+            with self.subTest(to=to), self.assertRaisesRegex(InvalidBlock, "recipient"):
+                chain.check_tx(tx(to), [])
+        lost = crypto.checksummed(CAROL.address)
+        block, dropped = chain.build_block(None, [tx(lost)], 1)  # a node without the policy built it
+        self.assertEqual(dropped, [])
+        block.sign(BOB)
+        chain.append(block)
+        self.assertEqual((chain.state.balance(lost), chain.state.balance(CAROL.address)), (VIBE, 0))  # not Carol's
+        self.assertTrue(chain.validate())
+
+
+class AddressCommandLineTests(Cli, unittest.TestCase):
+    def run_cli_status(self, *argv) -> tuple:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.main([str(a) for a in argv])
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, out.getvalue()
+
+    def test_a_mistyped_address_stops_send_before_anything_is_signed_or_sent(self):
+        wallets.save(CAROL, self.home / "carol.json", None)
+        good = crypto.checksummed(DAVE.address)
+        typo = one_digit_off(good)
+        node = start_node(self, {"chain_id": "addr-net", "timestamp": 0, "allocations": {CAROL.address: 50 * VIBE},
+                                 "stakes": {ALICE.address: 10 * VIBE}})
+        flags = ["--node", node.url, "--wallet", self.home / "carol.json"]
+        # No wallet opened means no key to sign with; no client made means nothing sent.
+        with mock.patch.object(cli, "NodeClient", side_effect=AssertionError("asked the node")) as asked, \
+                mock.patch.object(cli, "load_wallet", side_effect=AssertionError("opened the wallet")) as opened:
+            send, balance = ["send", *flags, "--to", typo, "--amount", "1"], ["balance", "--node", node.url, typo]
+            genesis = ["genesis", "create", "--chain-id", "x", "--out", self.home / "g.json", "--alloc", f"{typo}=5"]
+            for argv in (send, balance, genesis):
+                with self.subTest(argv=argv[0]):
+                    code, _ = self.run_cli_status(*argv)
+                    self.assertRegex(str(code), rf"^error: {typo}: one of its characters is wrong \(its capital "
+                                                r"letters don't match its checksum\)\. Copy it again from the wallet "
+                                                r"that owns it\.")
+            self.assertFalse(asked.called or opened.called)
+        self.assertFalse((self.home / "g.json").exists())
+        self.assertEqual(node.coord.mempool, [])
+        # The right one, as people copy it: sent to the address as the ledger holds it.
+        self.assertIn("submitted transfer", self.run_cli("send", *flags, "--to", good, "--amount", "2"))
+        wait_for(lambda: node.chain.state.balance(DAVE.address) == 2 * VIBE)
+        out = self.run_cli("balance", "--node", node.url, good)
+        self.assertIn(f"address:    {good}\nbalance:    2 VIBE", out)
+        self.assertEqual(self.run_cli("balance", "--node", node.url, DAVE.address), out)  # small letters: unchecked
+
+    def test_genesis_create_writes_canonical_addresses(self):
+        a, v = crypto.checksummed(ALICE.address), crypto.checksummed(BOB.address)
+        self.run_cli("genesis", "create", "--chain-id", "net", "--out", self.home / "g.json", "--alloc", f"{a}=100",
+                     "--bootstrap", f" {v} =10", "--validator", f"{v}=http://10.0.0.5:8545")
+        g = json.loads((self.home / "g.json").read_text())
+        self.assertEqual((g["allocations"], g["bootstrap"], g["validators"]),
+                         ({ALICE.address: 100 * VIBE}, {BOB.address: 10 * VIBE}, {BOB.address: "http://10.0.0.5:8545"}))
+        code, _ = self.run_cli_status("genesis", "create", "--chain-id", "net", "--out", self.home / "h.json",
+                                      "--validator", f"{v}=http://10.0.0.5:8545")
+        self.assertIn(v, str(code))  # unstaked validators, named as people copy them
+        code, _ = self.run_cli_status("genesis", "create", "--chain-id", "net", "--out", self.home / "h.json",
+                                      "--alloc", "alice=100")
+        self.assertEqual(code, "error: that isn't a Vibe Hash address: those start with vibe1 (in 'alice=100')")
+
+    def test_wallets_show_the_checksummed_form_and_keep_the_canonical_one(self):
+        out = self.run_cli("wallet", "create", "--out", self.home / "a.json", "--no-password")
+        address = json.loads((self.home / "a.json").read_text())["address"]
+        self.assertTrue(crypto.is_canonical_address(address))
+        self.assertIn(f"address: {crypto.checksummed(address)}", out)
+        shown = self.run_cli("wallet", "show", "--wallet", self.home / "a.json")
+        self.assertIn(f"address: {crypto.checksummed(address)}", shown)
 
 
 if __name__ == "__main__":

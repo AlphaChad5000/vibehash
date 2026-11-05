@@ -62,8 +62,9 @@ from . import hardware
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
 from .finetune import MAX_VAL, WHOLE_TOLERANCE
-from .ledger import Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
+from .ledger import SYSTEM, Block, Chain, InvalidBlock, RoundSummary, Tx, canonical
 from .model import params_hash
+from .storage import NotSaved
 from .tasks import Commitment, InvalidJob, Reveal, TrainingJob, Verdict, WorkUnit, commit_digest
 from .verification import (
     FINETUNE_CHECK,
@@ -514,6 +515,10 @@ class Coordinator:
                 ready.append(job_id)
         if not ready:
             return None
+        # A starter job (in the genesis, owned by nobody: ledger.GENESIS_JOB) only fills rounds no paid job is ready for,
+        # so it never takes turns away from jobs people pay for.
+        paid = [j for j in ready if self.chain.state.job_owner.get(j) != SYSTEM]
+        ready = paid or ready
         last = next((s.job_id for s in self._summaries()), None)
         return ready[(ready.index(last) + 1) % len(ready)] if last in ready else ready[0]
 
@@ -753,7 +758,8 @@ class Coordinator:
             else:
                 step, fitness = got.get("step"), got.get("fitness")
             self.r.record |= {"version": ES_RECORD_VERSION,
-                              "es": {"rule": es2.RULE2, "task": job.spec.task, "step": step, "fitness": fitness}}
+                              "es": {"rule": es2.RULE2, "task": es2.task_at(job.spec, int(step or 0)), "step": step,
+                                     "fitness": fitness}}
         elif job.es:  # its seed (start_compute), the level its problems are at, and the update (_settle_es)
             level = es.level_of(start) if start is not None else (self.replaying or {}).get("es", {}).get("level")
             if self.replaying and level != self.replaying.get("es", {}).get("level"):
@@ -1154,7 +1160,7 @@ class Coordinator:
                 if self.replaying:
                     raise ValueError("the answers aren't here")
                 return "missing"
-            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id)
+            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id, int(r.record["es"]["step"] or 0))
             return "bad_answers" if parsed is None else "ok" if parsed[0] == rewards else "wrong_rewards"
         outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
         if outcome == "missing":
@@ -2635,7 +2641,7 @@ class Coordinator:
                              teams=[list(t.members) for t in r.teams], waiting=r.waiting)
         rewards = [t for t in block.txs if t.kind == "reward"]
         fee = sum(t.amount for t in block.txs if t.kind == "fee_release")
-        report.pool = self.chain.state.subsidy(block.height) + fee  # the subsidy this block issues, plus released fees
+        report.pool = self.chain.state.round_subsidy(summary, block.height) + fee  # what this block mints, plus released fees
         report.burned = report.pool - sum(t.amount for t in rewards)
         report.worker_pay = {t.recipient: t.amount for t in rewards if t.memo == "work"}
         report.verifier_pay = {t.recipient: t.amount for t in rewards if t.memo == "verify"}
@@ -2670,8 +2676,15 @@ class Coordinator:
               scores: tuple[float, float] | None = None, certificate: dict | None = None) -> None:
         """Add a finished block to the chain: one we sealed, or one the validators agreed on. `params` are the weights
         its round trained, when we have them, and `scores` their (loss, accuracy) on the job's validation data.
-        Without `params` (another validator ran the round), the weights have to be fetched (node.py)."""
-        self.chain.append(block)
+        Without `params` (another validator ran the round), the weights have to be fetched (node.py).
+
+        The block, its certificate and its record go to disk first, in one transaction (Store.save_block), and only
+        then into the chain in memory and the mempool. A block that couldn't be saved (NotSaved; RivalBlock when the
+        database holds a different one at its height) leaves both as they were, and the error goes to the caller:
+        node.py stops the node. Before, a node whose saves failed (2026-11-03: a second node on its folder had written
+        those heights first) went on leading rounds on blocks only its memory held, served them, and would have lost
+        them all at its next restart. The very block already on disk, put there by another writer, isn't an error."""
+        self.chain.append(block, (lambda: self._save(block, certificate, record)) if self.store else None)
         included = {t.txid for t in block.txs}
         kept = []
         for tx in self.mempool:  # what's left waits for the next block, if it's still valid after this one
@@ -2682,10 +2695,6 @@ class Coordinator:
                 except (InvalidBlock, InvalidJob):
                     pass
         self.mempool = kept
-        if self.store:
-            self.store.save_block(block, certificate)
-            if record is not None:
-                self.store.save_record(block.height, record)
         s = block.summary
         if s is None:
             return
@@ -2712,6 +2721,16 @@ class Coordinator:
             fine_tune = isinstance(record, dict) and record.get("version") in (FINETUNE_RECORD_VERSION, ES_RECORD_VERSION)
             if scores is not None and not fine_tune:  # (a fine-tune's were saved from its record, above)
                 self.store.save_round(s.job_id, block.height, s.accepted_units, *scores)
+
+    def _save(self, block: Block, certificate: dict | None, record: dict | None) -> None:
+        """adopt()'s write, before the chain changes: NotSaved however it fails, so the caller can tell a block that
+        isn't on disk from one that doesn't apply (InvalidBlock, raised before anything is written)."""
+        try:
+            self.store.save_block(block, certificate, record)  # (False: this very block was there already; fine)
+        except NotSaved:
+            raise
+        except Exception as e:  # noqa: BLE001 - a full disk, an I/O error, a locked database: it isn't saved, whatever it is
+            raise NotSaved(block.height, e) from e
 
 
 class _MemoryBlobs:

@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from . import filelock, settings
+from .crypto import checksummed
 
 
 def interactive(stream=None) -> bool:
@@ -54,7 +55,7 @@ def save_words(words: str, address: str, wallet: Path) -> Path:
     path = words_file(address)
     path.parent.mkdir(parents=True, exist_ok=True)
     w = words.split()
-    text = (f"Vibe Hash recovery words for {address}\nwallet file: {wallet}\n\n"
+    text = (f"Vibe Hash recovery words for {checksummed(address)}\nwallet file: {wallet}\n\n"
             + "".join(f"{i + 1:>2}. {word}\n" for i, word in enumerate(w))
             + "\nWrite them down or keep them in a password manager, offline, then delete this file. They restore the "
               "wallet if its file or password is lost (vibehash wallet restore), and anyone who reads them can take "
@@ -87,9 +88,10 @@ class WorkerLock:
 
     def why_not(self, address: str, prog: str = "vibehash") -> str:
         who = filelock.holder(self.path)
-        return (f"error: another worker ({who or 'still running'}) already mines with wallet {address[:14]}... on this "
-                f"computer, and two with one wallet would undo each other's work. For a second GPU, give it its own "
-                f"wallet: `{prog} wallet create --out gpu1.json`, then `{prog} worker --device cuda:1 --wallet gpu1.json`")
+        return (f"error: another worker ({who or 'still running'}) already mines with wallet "
+                f"{checksummed(address)[:14]}... on this computer, and two with one wallet would undo each other's "
+                f"work. For a second GPU, give it its own wallet: `{prog} wallet create --out gpu1.json`, then "
+                f"`{prog} worker --device cuda:1 --wallet gpu1.json`")
 
     def release(self) -> None:
         if self.lock is not None:

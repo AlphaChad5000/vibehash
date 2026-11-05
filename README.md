@@ -309,6 +309,17 @@ python -m vibehash wallet restore
 enough) and a new password. Add `--passphrase` if you gave the words one, and
 `--out FILE` to restore somewhere other than the default wallet.
 
+**Addresses.** A wallet's address is `vibe1` and 36 digits and letters a-f,
+shown with some of the letters in capitals, like
+`vibe17B0D8bce54f6eAb50df24fd44E5a408A9525`. The capitals are a checksum:
+`send --to`, `balance ADDRESS`, `genesis create` and the menu's Send VIBE check
+them, so a mistyped character is refused (about 999 one-character typos in
+1,000) before anything is signed or sent, instead of sending coins to an
+address nobody holds. Copy and paste addresses rather than typing them. One in
+all small letters, the way addresses were shown before, still works, but
+unchecked. It's the same address either way: the chain, the node's API, wallet
+files and `--json` output keep it in small letters.
+
 **GPUs.** `vibehash install-gpu` does the GPU step on its own. It reads the
 card and driver (NVIDIA through `nvidia-smi`, Intel Arc, Apple silicon, AMD
 with ROCm on Linux), checks which PyTorch builds are currently published for
@@ -333,15 +344,34 @@ vibehash testnet --evo2
 
 This is Evo Hash ([white paper](docs/evo-hash.pdf); also in the menu: run `vibehash` and pick it under Mine). It runs a node
 and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another,
-19 of them, then round again: Countdown puzzles and arithmetic, made up as it goes, and
-science, commonsense, word-problem math, trivia, sentiment, news and emotion questions from
-16 public datasets (downloaded once, about 1 GB, each pinned to one version so every
-computer reads the same questions). Each job is
+17 of them, then round again: science, commonsense, word-problem math, sentiment, news and
+emotion questions from public datasets (ARC, SciQ, CommonsenseQA, OpenBookQA, PIQA, Social IQa,
+WinoGrande, HellaSwag, BoolQ and more; downloaded once, about 1 GB, each pinned to one version
+so every computer reads the same questions). A right answer counts whether or not the model
+wrote it in the asked-for format, so the model is paid for being right. Each step is anchored
+to the original model, so long runs don't drift it to pieces, and GSM8K and MMLU are never
+trained on, so they show whether what it learns carries over. Each job is
 short, because evolution makes most of its gains on a task in the first dozen rounds, and
 each starts where the last one ended, so the model keeps what every task taught it. The
 dashboard shows each generation incubating in the open block. `--evo2-rounds N` sets a
 job's length (default 12). `vibehash testnet --evo` is the first, simpler version: one layer
 of the model, Countdown only.
+
+To take the tuned Qwen out, while the testnet runs (or after starting it again: it carries on
+where it stopped), in another terminal:
+
+```
+vibehash evo export
+```
+
+It works the newest Evo job's model out from the chain the way a miner does, every round
+checked against its block, and saves it as an ordinary Hugging Face folder (`JOB-model/`:
+safetensors in bfloat16, the tokenizer and chat template, and an `EVO.md` saying which chain,
+job and block it is). Name a job to take an earlier one (`vibehash evo export evo2-c1-arc_easy`),
+`--out DIR` for the folder, `--float32` for unrounded weights. A line a miner on this computer
+saved makes it quick; on another computer it replays every round on the CPU (about 5 s a round),
+and needs Qwen2.5-0.5B-Instruct in its Hugging Face cache. `vibehash job download JOB` does the
+same for an Evo job.
 
 ## The Muse agents: a fine-tune from a sentence
 
@@ -479,7 +509,7 @@ python -m vibehash wallet create --out alice.json
 python -m vibehash wallet create --out requester.json
 ```
 
-2. Write a genesis file (use the addresses printed above). `--validator` names the node as a validator, with the address other machines reach it at, and `--bootstrap` gives it **bootstrap stake**: enough to vote on block one, but it can never be withdrawn or spent, and it's burned if the validator leaves. Workers need nothing. By default they start with no stake and **earn it in**: their first 5 VIBE of pay goes into their stake, and until then they get small batches of work and don't check anyone else's. So every spendable coin starts from work. `--no-earn-in` makes workers be given stake instead (`--stake`). `--economics mainnet` picks the long issuance schedule (3.125 VIBE a round, halving about every 4 years, 21M VIBE at most) instead of the fast testnet one. The genesis hash commits to all of it. Here only the requester is handed coins, to pay for training:
+2. Write a genesis file (use the addresses printed above). `--validator` names the node as a validator, with the address other machines reach it at, and `--bootstrap` gives it **bootstrap stake**: enough to vote on block one, but it can never be withdrawn or spent, and it's burned if the validator leaves. Workers need nothing. By default they start with no stake and **earn it in**: their first 5 VIBE of pay goes into their stake, and until then they get small batches of work and don't check anyone else's. So every spendable coin starts from work. `--no-earn-in` makes workers be given stake instead (`--stake`). `--economics mainnet` picks the long issuance schedule (3.125 VIBE in each round that pays for work, halving every 3.32M such rounds, at least ~4 years, 21M VIBE at most) instead of the fast testnet one. With either, a round in which nobody's work is accepted mints nothing and doesn't count toward a halving (DESIGN §10, "Issuance schedule"). `--starter-job SPEC.json` (a spec as `vibehash job template` writes) puts a job on chain from block one, owned by nobody and paying only new coins, so a network with no starting coins can still mine; `--es` lets Evo jobs run. `vibehash genesis check FILE` then holds the file against what a mainnet needs. The genesis hash commits to all of it. Here only the requester is handed coins, to pay for training:
 
 ```bash
 python -m vibehash genesis create --chain-id my-testnet-1 --out genesis.json --bootstrap NODE_ADDR=10 --validator NODE_ADDR=http://192.168.1.20:8545 --alloc REQUESTER_ADDR=500
@@ -491,7 +521,7 @@ python -m vibehash genesis create --chain-id my-testnet-1 --out genesis.json --b
 python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
 ```
 
-   For more validators, give each its own staked wallet and its own `--validator ADDR=URL` in the genesis, and start one node per wallet on its own machine, all with the same `genesis.json`. They find each other from the addresses in it. A staked account can also join a running network as a validator. Its node announces the address where other machines can reach it:
+   For more validators, give each its own staked wallet and its own `--validator ADDR=URL` in the genesis, and start one node per wallet on its own machine, all with the same `genesis.json`. They find each other from the addresses in it. An account with 100 VIBE staked can also join a running network as a validator; it starts voting 10 blocks after the join, its stake stays bonded until it leaves, and signing two conflicting votes costs it all of it (DESIGN §10, block version 4). Its node announces the address where other machines can reach it:
 
 ```bash
 python -m vibehash validator join --url http://203.0.113.7:8545 --wallet bob.json
@@ -577,6 +607,44 @@ changes some (requests a second and burst; the buckets are read, worker, tx,
 upload and other), and `--max-connections N` sets the overall cap. DESIGN.md
 §10 has the numbers.
 
+### The node's API
+
+Every node serves the chain to anyone, as JSON over HTTP(S). The reads:
+
+| Request | What it answers |
+|---|---|
+| `GET /status` | Chain id, genesis hash, height, the round and its phase, the leader, fees, and the versions: `version` (the node's release), `block_version` (the blocks it makes), `tip_version` (the newest block's), `min_client` (the oldest release whose workers it takes) and `paid_rounds` |
+| `GET /genesis` | The genesis document |
+| `GET /blocks?from=N&to=M` | Up to 100 blocks, each with its `hash`, its `proposer`'s address, each transaction's `txid`, and its commit certificate on a chain validators run |
+| `GET /account/ADDRESS` | Balance, stake (and how much is bootstrap stake), unbonding coins, nonce and reputation |
+| `GET /validators` | Each validator's address, stake and whether it has a vote |
+| `GET /job/ID` | A job's spec, budget left, each round's validation score and its model's size and hash |
+| `GET /round/N/record` | The signed messages block N's round was decided from |
+| `GET /network` | What vibehash.org's live panel shows: miners lately and every job |
+| `GET /supply` | How much VIBE exists and where: total, circulating, staked, unbonding, in job budgets, minted and burned, the cap, the subsidy and the next halving, in syn and as VIBE strings |
+| `GET /supply/total`, `GET /supply/circulating` | One plain-text number in VIBE, the format listing sites ask for |
+| `GET /explorer` | A block explorer page (below) |
+
+`POST /tx` takes a signed transaction. The rest are workers' and validators'
+messages; `vibehash/node.py` lists them all.
+
+**The explorer.** Open `http://NODE:8545/explorer` (on the public node,
+`https://node.vibehash.org/explorer`, once it runs a release with it) for a page that shows the chain: height,
+validators and their stake, the supply, the latest blocks, and any block,
+address or job you search for. It's one page served by the node itself, with
+nothing from anywhere else, so it works offline against a local testnet.
+
+**Versions.** Every client sends `User-Agent: vibehash/VERSION`. When a
+node's newest block is a version this copy doesn't know, or its
+`min_client` is newer than this copy, commands say so in one line and carry
+on, and `worker` refuses to start: upgrade with `python -m pip install -U
+vibehash`. A node turns away a worker's registration from a release older
+than its `--min-client` (default 0.5.14) with the same advice. Clients that
+send no version are taken as before.
+
+Exchanges, wallets and listing sites: [EXCHANGES.md](EXCHANGES.md) says how
+to follow the chain, spot deposits, send withdrawals and read the supply.
+
 ## Simulate the economics
 
 Runs the same round logic as a real node, with 14 simulated rigs (7 of them
@@ -635,6 +703,8 @@ rule; `tests/test_setup.py` runs `setup` and `worker` with no terminal.
 | `vibehash/coordinator.py` | The round state machine, shared by the node and the simulator |
 | `vibehash/worker.py` | Training, committing, revealing, verifying (plus cheat modes for tests) |
 | `vibehash/node.py` | HTTP node: API, wall-clock round driver, leading rounds and committing blocks validators agree on |
+| `vibehash/supply.py` | What `/supply` answers: where every coin is and how it came to be, from the chain's state |
+| `vibehash/data/explorer.html` | The block explorer page a node serves at `/explorer` |
 | `vibehash/consensus.py` | Tendermint-style BFT voting among validators; commit certificates |
 | `vibehash/p2p.py` | Peers: gossiping votes and transactions between nodes |
 | `vibehash/replay.py` | Re-runs a block's round from its record: how validators check a proposal |

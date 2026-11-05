@@ -5,6 +5,9 @@ import unittest
 from unittest import mock
 
 from vibehash import cli, menu, termui
+from vibehash.crypto import KeyPair, checksummed
+
+FRIEND = KeyPair.generate(b"friend").address
 
 
 def no_wallet():
@@ -61,10 +64,10 @@ class MenuTests(unittest.TestCase):
     def test_more_commands_is_a_page_of_its_own(self):
         ran, main, more = [], [i.label for i in menu.items()], [i.label for i in menu.items(menu.MORE, menu.BACK)]
         picks = iter([main.index("More commands"), more.index("Send VIBE"), None, None])  # in, send, Back, Quit
-        answers = iter(["vibe1friend", "2.5", "y", ""])  # to, amount, confirm, then "back to the menu"
+        answers = iter([FRIEND, "2.5", "y", ""])  # to, amount, confirm, then "back to the menu"
         with no_wallet(), mock.patch.object(menu, "pick", lambda *a: next(picks)),                 mock.patch.object(menu.termui, "supported", return_value=True),                 mock.patch("builtins.input", lambda *a: next(answers)), contextlib.redirect_stdout(io.StringIO()):
             menu.run(ran.append, "vibehash")
-        self.assertEqual(ran, [["send", "--to", "vibe1friend", "--amount", "2.5"]])
+        self.assertEqual(ran, [["send", "--to", checksummed(FRIEND), "--amount", "2.5"]])  # shown as people copy it
         for label in ("Stake more", "Unstake", "Restore a wallet", "Predict with my model", "Validators",
                       "Verify the whole chain", "Install GPU support", "Every command"):
             self.assertIn(label, more)
@@ -105,9 +108,26 @@ class MenuTests(unittest.TestCase):
             self.assertIsNone(item.ask())  # nothing started without a yes
 
     def test_nothing_is_sent_without_a_yes(self):
-        answers = iter(["vibe1friend", "2.5", ""])
+        answers = iter([checksummed(FRIEND), "2.5", ""])
         with mock.patch("builtins.input", lambda *a: next(answers)):
             self.assertIsNone(menu._send())
+
+    def test_a_mistyped_address_is_said_at_once_and_nothing_is_sent(self):
+        good = checksummed(FRIEND)
+        i = next(i for i in range(5, len(good)) if good[i].isupper())
+        typo = good[:i] + good[i].lower() + good[i + 1:]  # a capital typed small: no longer its checksum
+        asked = []
+        with mock.patch("builtins.input", lambda q: asked.append(q) or typo), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(menu._send())
+        self.assertEqual(len(asked), 1, "it asked for more after a mistyped address")
+        self.assertIn("one of its characters is wrong", out.getvalue())
+
+    def test_the_wallet_line_shows_the_address_checksummed(self):
+        status = menu.Status.__new__(menu.Status)
+        status.address, status.account, status.failed = FRIEND, None, False
+        shown = checksummed(FRIEND)
+        self.assertTrue(status.line().startswith(f"{shown[:9]}…{shown[-4:]} · "))
 
     def test_keys_by_name(self):
         self.assertEqual([menu.Keys.name(c) for c in "\r\nqk j7x"], ["enter", "enter", "quit", "up", None, "down", "7", None])

@@ -37,12 +37,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import advice, crypto, hardware, mnemonic, modelstore, settings, tls, unattended
+from . import advice, crypto, filelock, hardware, mnemonic, modelstore, settings, tls, unattended
 from . import economics as econ
 from . import fees
 from . import wallet as wallets
-from .client import NodeClient, NodeError, WorkerClient
-from .crypto import KeyPair
+from .client import MIN_CLIENT, NodeClient, NodeError, WorkerClient, too_old
+from .crypto import AddressError, KeyPair, checksummed, parse_address
 from .ledger import UNBONDING_ROUNDS, Block, Chain, canonical
 from .model import ModelSpec
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
@@ -126,13 +126,22 @@ def normalise_url(text: str, https: bool = False) -> str:
     return f"{scheme}://{text}" if urlsplit(f"http://{text}").port else f"{scheme}://{text}:8545"
 
 
+def _address(text: str, where: str = "") -> str:
+    """An address someone gave a command, as the ledger holds it (crypto.parse_address), or exit saying what's wrong
+    with it. Commands call it before opening a wallet, so a mistyped address stops there: nothing signed or sent."""
+    try:
+        return parse_address(text)
+    except AddressError as e:
+        sys.exit(f"error: {e}" + (f" (in {where})" if where else ""))
+
+
 def _kv(items: list[str]) -> dict[str, int]:
     out = {}
     for item in items or []:
         addr, _, amount = item.partition("=")
-        if not addr.startswith("vibe1") or not amount:
+        if not addr.strip() or not amount:
             sys.exit(f"expected ADDRESS=AMOUNT, got {item!r}")
-        out[addr] = to_syn(amount)
+        out[_address(addr, repr(item))] = to_syn(amount)
     return out
 
 
@@ -142,9 +151,9 @@ def _validators(items: list[str]) -> dict[str, str]:
     out = {}
     for item in items or []:
         addr, _, url = item.partition("=")
-        if not addr.startswith("vibe1") or not valid_endpoint(normalise_url(url) if url else ""):
+        if not addr.strip() or not valid_endpoint(normalise_url(url) if url else ""):
             sys.exit(f"expected ADDRESS=URL (the address other nodes reach that validator at), got {item!r}")
-        out[addr] = normalise_url(url)
+        out[_address(addr, repr(item))] = normalise_url(url)
     return out
 
 
@@ -168,7 +177,7 @@ def ensure_wallet(path: Path, indent: str = "") -> tuple[str, str | None]:
     password a new wallet was made with, else None)."""
     if path.exists():
         address = json.loads(path.read_text())["address"]
-        print(f"{indent}using {path}\n{indent}address {address}")
+        print(f"{indent}using {path}\n{indent}address {checksummed(address)}")
         return address, None
     pw = password(f"{indent}Choose a wallet password: ", confirm=True)
     if pw is None:
@@ -179,7 +188,7 @@ def ensure_wallet(path: Path, indent: str = "") -> tuple[str, str | None]:
     words = mnemonic.generate()
     keys = mnemonic.keypair(words)
     wallets.save(keys, path, pw, mnemonic.PATH)
-    print(f"{indent}created {path}\n{indent}address {keys.address}")
+    print(f"{indent}created {path}\n{indent}address {checksummed(keys.address)}")
     give_words(words, keys.address, path, indent)
     return keys.address, pw
 
@@ -232,7 +241,7 @@ def cmd_wallet_create(a):
     keys = mnemonic.keypair(words, _passphrase(a, confirm=True))
     pw = _new_wallet_password(a)
     wallets.save(keys, out, pw, mnemonic.PATH)
-    print(f"created {out}\naddress: {keys.address}")
+    print(f"created {out}\naddress: {checksummed(keys.address)}")
     give_words(words, keys.address, out)
     if not pw:
         print("warning: stored unencrypted", file=sys.stderr)
@@ -246,7 +255,7 @@ def cmd_wallet_restore(a):
     keys = mnemonic.keypair(mnemonic.check(_read_words()), _passphrase(a, confirm=False), a.path)
     pw = _new_wallet_password(a)
     wallets.save(keys, out, pw, a.path)
-    print(f"restored {out}\naddress: {keys.address}")
+    print(f"restored {out}\naddress: {checksummed(keys.address)}")
     if not pw:
         print("warning: stored unencrypted", file=sys.stderr)
 
@@ -255,7 +264,7 @@ def cmd_wallet_show(a):
     path = wallet_of(a)
     doc = json.loads(Path(path).read_text())
     hd = wallets.hd_path(path)
-    print(f"address: {doc['address']}\nencrypted: {'crypto' in doc}\n"
+    print(f"address: {checksummed(doc['address'])}\nencrypted: {'crypto' in doc}\n"
           f"recovery words: {f'yes (path {hd})' if hd else 'no (made before recovery words; back up the file)'}")
 
 
@@ -269,28 +278,79 @@ def cmd_genesis_create(a):
         unstaked = [v for v in g["validators"] if stake(v) < econ.MIN_STAKE]
         if unstaked:
             sys.exit(f"validators need a stake of at least {fmt(econ.MIN_STAKE)} in the genesis (--bootstrap or --stake): "
-                     f"{', '.join(unstaked)}")
+                     f"{', '.join(map(checksummed, unstaked))}")
     if a.earn_in:
         g["earn_in"] = True
-    g["economics"] = econ.SCHEDULES[a.economics].to_dict()
+    if a.es:
+        g["es"] = True
+    starters = []
+    for path in a.starter_job or []:
+        try:
+            spec = json.loads(Path(path).read_text())
+        except (OSError, ValueError) as e:
+            sys.exit(f"can't read the starter job {path}: {e}")
+        if not isinstance(spec, dict):
+            sys.exit(f"{path} isn't a job spec (vibehash job template writes one)")
+        if spec.get("fee_per_round"):
+            print(f"{path}: a starter job pays only new coins, so its fee_per_round is set to 0")
+        starters.append({**spec, "fee_per_round": 0})
+    if starters:
+        g["starter_jobs"] = starters
+    economics = econ.NEW_SCHEDULES[a.economics]  # only rounds that pay for work mint, and the halvings count them
+    g["economics"] = economics.to_dict()
     hash_ = Chain.from_genesis(g).genesis_hash  # also checks the allocations fit under the supply cap
     Path(a.out).write_text(json.dumps(g, indent=2))
-    print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(econ.SCHEDULES[a.economics])}")
+    print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(economics)}")
     if a.earn_in:
         print(f"workers can start with no stake: their first {fmt(econ.MIN_STAKE)} of pay becomes their stake")
+    if a.es:
+        print("Evo jobs can run on it (\"es\": true)")
+    for spec in starters:
+        print(f"starter job {spec.get('id')}: on chain from block one, owned by nobody, paying miners new coins in "
+              "rounds no paid job wants")
+    if a.economics == "mainnet":
+        print(f"check it against what a network meant to carry value needs: vibehash genesis check {a.out}")
+
+
+def cmd_genesis_check(a):
+    from . import genesis_check
+
+    try:
+        g = json.loads(Path(a.file).read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"can't read {a.file}: {e}")
+    if not isinstance(g, dict) or "chain_id" not in g or "allocations" not in g:
+        sys.exit(f"{a.file} isn't a genesis file (it needs chain_id and allocations)")
+    findings = genesis_check.check(g)
+    if a.json:
+        print(json.dumps(genesis_check.to_json(findings), indent=2))
+    else:
+        mark = {"ok": "ok  ", "warn": "warn", "fail": "FAIL", "info": "info"}
+        for f in findings:
+            print(f"{mark[f.status]}  {f.title}: {f.detail}")
+        bad = sum(f.status == "fail" for f in findings)
+        warn = sum(f.status == "warn" for f in findings)
+        print(f"\n{bad} to fix, {warn} to decide on purpose" if bad or warn else "\nnothing to fix")
+    if genesis_check.failed(findings):
+        sys.exit(1)
 
 
 def _describe_economics(e: econ.Economics) -> str:
     s = e.halving_interval * econ.MAINNET_BLOCK_S
     span = f"{s / (365.25 * 86400):.3g} years" if s > 86400 * 365 else f"{s / 86400:.3g} days" if s > 86400 else f"{s / 3600:.3g} hours"
     cap = f", never more than {fmt(e.max_supply)} in all" if e.max_supply else ""
+    if e.count == econ.PAID_ROUNDS:
+        return (f"issuance ({e.name}): {fmt(e.initial_subsidy)} per round that pays for work, halving every "
+                f"{e.halving_interval:,} such rounds (~{span} if every {econ.MAINNET_BLOCK_S} s round is worked, longer "
+                f"if not); {fmt(e.total_issuance())} issued in total{cap}. "
+                "A round nobody's work is accepted in mints nothing")
     return (f"issuance ({e.name}): {fmt(e.initial_subsidy)} per round, halving every {e.halving_interval:,} blocks "
             f"(~{span} of {econ.MAINNET_BLOCK_S} s rounds); {fmt(e.total_issuance())} issued in total{cap}")
 
 
 def cmd_node(a):
     from .coordinator import CoordinatorConfig
-    from .node import Node, PhaseTimes, bucket_from_env  # only nodes need the server
+    from .node import FolderInUse, Node, PhaseTimes, bucket_from_env  # only nodes need the server
     from .ratelimit import Limits
 
     if crypto.BACKEND != "openssl":
@@ -309,10 +369,14 @@ def cmd_node(a):
             compute.use(compute.get_backend(a.device, logging.getLogger("vibehash.node")))
         except RuntimeError as e:
             sys.exit(f"error: {e}")
-    node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
-                keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
-                announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
-                bucket=bucket_from_env()).start()  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+    try:
+        node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
+                    keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
+                    announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
+                    bucket=bucket_from_env(),  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+                    min_client=a.min_client).start()
+    except FolderInUse as e:
+        sys.exit(f"error: {e}")
     if context:
         fp = tls.cert_fingerprint(a.tls_cert)
         print(f"serving HTTPS; certificate sha256 fingerprint {fp}\n"
@@ -321,10 +385,13 @@ def cmd_node(a):
         for path in a.dataset:
             print(f"dataset {path} -> {node.store.add_dataset(path)}")
     try:
-        while True:
+        while not node.halted:
             time.sleep(1)
     except KeyboardInterrupt:
-        node.stop()
+        pass
+    node.stop()
+    if node.halted:  # a block it couldn't save (Node._halt): it ends, rather than run on serving what isn't on disk
+        sys.exit(f"error: {node.halted}")
 
 
 def cmd_tls_cert(a):
@@ -382,6 +449,12 @@ def _mine(a, keys: KeyPair):
 
     _stop_like_ctrl_c()
     url = node_of(a)
+    # A worker that can't follow the node's chain (blocks of a version newer than it knows) or that the node won't take
+    # (older than its min_client) stops here, before the GPU's self-test, naming the upgrade. A node from before
+    # these fields says neither, and the worker starts as it always did.
+    problem = too_old(NodeClient(url).get("/status"))
+    if problem:
+        sys.exit(f"error: {problem}")
     job = None if getattr(a, "job", None) in (None, "auto") else a.job
     if job:  # before the GPU's self-test: a mistyped job is said at once
         _chosen_job(NodeClient(url), job, url)
@@ -408,7 +481,7 @@ def _mine(a, keys: KeyPair):
     session = _record([w])  # the event log and a line per round, whatever's on screen (records.py)
     watcher = _watch(a, [("you", w)], url, session)  # --watch: the same, as JSON for a window or a script (watch.py)
     if not minerui.supported(a.plain):
-        print(f"worker {w.keys.address} training on {w.backend.describe()} ({hardware.describe()})")
+        print(f"worker {checksummed(w.keys.address)} training on {w.backend.describe()} ({hardware.describe()})")
         if session:
             print(session.where())
         if watcher:
@@ -633,7 +706,8 @@ def cmd_setup(a):
                   "   becomes your stake; until then you get small batches of work")
         elif acct["balance"] < short + fee:
             print(f"   balance {fmt(acct['balance'])}; staking needs at least {fmt(need)}. Ask the node's operator to send\n"
-                  f"   VIBE to {address}, then run setup again (or: {prog()} stake --amount {need // SYN_PER_VIBE})")
+                  f"   VIBE to {checksummed(address)}, then run setup again "
+                  f"(or: {prog()} stake --amount {need // SYN_PER_VIBE})")
         else:
             amount = a.stake or min(acct["balance"] - fee, max(short, 10 * SYN_PER_VIBE))
             if (a.stake or unattended.interactive()) and ask(f"   Stake {fmt(amount)} now? Only cheating can cost you it.", bool(a.stake)):
@@ -713,10 +787,10 @@ def cmd_cache(a):
 
 
 def cmd_balance(a):
-    addr = a.address or json.loads(Path(wallet_of(a)).read_text())["address"]
+    addr = _address(a.address) if a.address else json.loads(Path(wallet_of(a)).read_text())["address"]
     node = NodeClient(node_of(a))
     acct = node.account(addr)
-    print(f"address:    {addr}\nbalance:    {fmt(acct['balance'])}\nstake:      {fmt(acct['stake'])}")
+    print(f"address:    {checksummed(addr)}\nbalance:    {fmt(acct['balance'])}\nstake:      {fmt(acct['stake'])}")
     if acct.get("bootstrap"):
         print(f"            of which {fmt(acct['bootstrap'])} is bootstrap stake: it votes, but can't be withdrawn")
     for amount, height in acct["unbonding"]:
@@ -738,7 +812,7 @@ def _fee_flag(p) -> None:
 
 
 def cmd_send(a):
-    _send(a, "transfer", a.to, a.amount)
+    _send(a, "transfer", _address(a.to), a.amount)  # checked before the wallet is opened: a typo stops here
 
 
 def cmd_stake(a):
@@ -778,6 +852,8 @@ def cmd_job_template(a):
     out = Path(a.out)
     if out.exists():
         sys.exit(f"{out} already exists; refusing to overwrite it")
+    if a.evo:
+        return _evo_template(a, out)
     try:
         job = template_job(a.id, a.gpu)
     except InvalidJob as e:
@@ -786,12 +862,35 @@ def cmd_job_template(a):
     print(f"wrote {out}; edit it, then post it with post-job --spec {out}")
 
 
+def _evo_template(a, out: Path):
+    """An Evo job that never ends, for a genesis's starter job (`genesis create --starter-job`): Evo v2's settings,
+    its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
+    from . import es_local, es_tasks
+
+    tasks = (list(es_tasks.NAMES) if a.tasks == "all" else list(es_tasks.CURATED) if a.tasks == "curated"
+             else [t.strip() for t in a.tasks.split(",") if t.strip()])
+    unknown = [t for t in tasks if t not in es_tasks.NAMES]
+    if unknown or not tasks:
+        sys.exit(f"unknown task {unknown[0] if unknown else '(none given)'}: the tasks are {', '.join(es_tasks.NAMES)}")
+    try:
+        found = es_local.find(a.evo, config_only=True)
+        spec = es_local.spec2_for(found, tasks[0], rounds=a.rounds, tasks=tuple(tasks))
+        job = es_local.job2(spec, a.id, "system", budget=1, fee=0)
+    except (ValueError, RuntimeError, OSError, InvalidJob) as e:
+        sys.exit(f"can't make an Evo job for {a.evo}: {e}")
+    out.write_text(json.dumps(job.to_spec(), indent=2) + "\n")
+    print(f"wrote {out}: an Evo job on {found.repo}, {len(tasks)} tasks in turn, {a.rounds} rounds each, paying only "
+          f"new coins; give it to `vibehash genesis create --es --starter-job {out}`")
+
+
 def cmd_cancel_job(a):
     _send(a, "cancel_job", "system", 0, _job_of(a))
 
 
 def cmd_validator_join(a):
-    """Announce this wallet as a validator, reachable at --url: from the next block it votes, and leads rounds."""
+    """Announce this wallet as a validator, reachable at --url: once the join takes effect (ledger.VALIDATOR_DELAY
+    blocks later, on block version 4) it votes, and leads rounds. Joining takes economics.VALIDATOR_STAKE staked, which
+    stays bonded until the wallet leaves again; a validator already in the set can announce a new url this way."""
     from .ledger import valid_endpoint
 
     url = normalise_url(a.url)
@@ -801,7 +900,8 @@ def cmd_validator_join(a):
     if "consensus" not in node.status():
         sys.exit("this node's chain is run by a single node, not validators; its genesis would need to name some")
     _send(a, "validator", "system", 0, url)
-    print(f"Run your node with --announce {url} and the same wallet, so the other validators can reach it.")
+    print(f"Run your node with --announce {url} and the same wallet, so the other validators can reach it. "
+          "It starts voting a few blocks from now; your stake stays bonded until you leave.")
 
 
 def cmd_validator_leave(a):
@@ -817,10 +917,10 @@ def cmd_validator_list(a):
     total = sum(v["stake"] for v in vals.values() if v["votes"]) or 1
     for addr, v in sorted(vals.items(), key=lambda kv: -kv[1]["stake"]):
         share = f"{v['stake'] / total:6.1%}" if v["votes"] else "no vote (stake below the minimum)"
-        print(f"  {addr}  {fmt(v['stake']):>14}  {share}  {v['url']}")
+        print(f"  {checksummed(addr)}  {fmt(v['stake']):>14}  {share}  {v['url']}")
     c = st["consensus"]
     print(f"\nvoting on block {c['height']} (consensus round {c['round']}, {c['step']}); "
-          f"leading it: {c['proposer']} at {st.get('leader')}")
+          f"leading it: {checksummed(c['proposer'])} at {st.get('leader')}")
 
 
 # --- training a model on your own data ---------------------------------------------------
@@ -1254,6 +1354,8 @@ def cmd_job_download(a):
 
     job_id = _job_of(a)
     node = _job_node(a, job_id)
+    if _evo_job(node, job_id):  # an Evo job keeps no weights: its model is worked out from the chain
+        return _evo_export(node, job_id, a.out)
     info, raw = node.download_model(job_id)
     job = TrainingJob.from_spec_json(json.dumps(info["spec"]), info["owner"], 0)
     weights = np.frombuffer(raw, dtype=job.wire_dtype).astype(np.float64)
@@ -1309,6 +1411,62 @@ def _download_adapter(a, job, info: dict, weights, receipt_path: Path) -> Path:
           f"  model = PeftModel.from_pretrained(base, \"{out.as_posix()}\")\n\n"
           f"or vLLM: vllm serve {spec.repo} --revision {spec.commit} --enable-lora --lora-modules mine={out.as_posix()}")
     return out
+
+
+def _evo_job(node: NodeClient, job_id: str) -> bool:
+    """Whether `job_id` is an Evo job (its model is worked out from the chain, not downloaded)."""
+    from . import es_export
+    try:
+        return bool(es_export.job_of(node, job_id).es)
+    except (NodeError, KeyError, ValueError):
+        return False  # download_model says what's wrong with it
+
+
+def _evo_export(node: NodeClient, job_id: str, out, device: str | None = None, dtype: str = "bfloat16") -> None:
+    """An Evo Hash job's model, worked out from the chain, saved as a Hugging Face folder (es_export.py)."""
+    import logging
+
+    from . import es_export
+    from .finetune import available
+
+    if not available():
+        sys.exit(f"exporting an Evo model needs PyTorch: {prog()} install-gpu (or pip install vibehash[evo])")
+    out = Path(out or f"{job_id}-model")
+    print(f"Working out {job_id}'s model from {node.url}'s chain: every round of it and of the jobs it started "
+          "from, each checked against its block. A line a worker on this computer saved makes it quick; without one "
+          "it's about 5 s a round on the CPU.", flush=True)
+    worker_log = logging.getLogger("vibehash.worker")
+    if not worker_log.handlers and not logging.getLogger().handlers:  # the rebuild's progress lines, on screen
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("  %(message)s"))
+        worker_log.addHandler(h)
+        worker_log.setLevel(logging.INFO)
+    try:
+        info = es_export.export(node, job_id, out, device=device, dtype=dtype)
+    except (NodeError, ValueError, FileNotFoundError, FileExistsError, RuntimeError) as e:
+        sys.exit(f"error: {e}")
+    settings.save(last_model=str(out.resolve()))
+    parents = len(info["lineage"])
+    print(f"saved {out}/: {info['base'].split('@')[0].removeprefix('hf:')} after Evo job {job_id} ({info['task']}, "
+          f"{info['rounds_learned']} rounds that changed it"
+          + (f", built on {parents} earlier job{'s' * (parents != 1)}" if parents else "")
+          + f"), as of block {info['block']}, {info['dtype']}, in {info['seconds']:.0f} s\n"
+          f"What it is and how to use it: {out / 'EVO.md'}")
+
+
+def cmd_evo_export(a):
+    """`vibehash evo export [JOB]`: an Evo Hash job's model as a Hugging Face folder; the newest Evo job by default."""
+    from . import es_export
+
+    node = NodeClient(normalise_url(a.node) if a.node else es_export.LOCAL_NODE)
+    try:
+        job_id = a.job_id or es_export.newest_job(node)
+    except NodeError as e:
+        sys.exit(f"error: {e}\n(is the Evo testnet running? Start it again with `{prog()} testnet --evo2`: it carries "
+                 "on where it stopped. Or name its node with --node)")
+    if not job_id:
+        sys.exit(f"{node.url} has no Evo Hash job with a round that changed its model yet")
+    _evo_export(node, job_id, a.out, device="cpu" if a.cpu else None, dtype="float32" if a.float32 else "bfloat16")
 
 
 # --- records of what happened: worker logs, and a job's history ------------------------------------------------
@@ -1549,6 +1707,8 @@ def cmd_chain_verify(a):
     st = chain.state
     print(f"verified {len(chain.blocks)} blocks: {'VALID' if ok else 'INVALID'}")
     print(f"supply {fmt(st.total_supply())} = genesis {fmt(st.genesis)} + minted {fmt(st.minted)} - burned {fmt(st.burned)}")
+    if st.economics.count == econ.PAID_ROUNDS:  # (counted from the blocks, as everything above)
+        print(f"{st.paid_rounds:,} rounds paid for work: the halvings count them, and only they minted")
     if certified or chain.state.validators:
         print(f"{certified} blocks final: each signed by validators holding more than two thirds of the stake "
               f"({len(chain.state.validator_set())} validators now)")
@@ -1629,18 +1789,42 @@ def _evo_round(node, block) -> str:
 def cmd_testnet(a):
     """A whole network on this computer: node, workers and a training job, from one command.
     Its wallets are unencrypted throwaway keys, so never send real coins to them."""
+    held: list[filelock.Lock] = []  # the folder's lock, given back however this ends: the menu runs it in its process
+    try:
+        _testnet(a, held)
+    finally:
+        for lock in held:
+            lock.release()
+
+
+def _hold_testnet(d: Path) -> filelock.Lock:
+    """The testnet folder's lock, or exit at once: a second copy would run a second node on the folder's chain."""
+    lock = filelock.try_hold(d / "testnet.lock", note=f"process {os.getpid()}")
+    if lock is None:
+        who = filelock.holder(d / "testnet.lock") or "another process"
+        sys.exit(f"error: the testnet in {d} is already running ({who}), maybe in another window or the menu. "
+                 f"Stop it there first, or give this one its own --dir")
+    return lock
+
+
+def _testnet(a, held: list) -> None:
     from . import minerui
-    from .node import Node, PhaseTimes
+    from .node import FolderInUse, Node, PhaseTimes
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with the node's log, even when piped
     evo2 = bool(getattr(a, "evo2", False))  # Evo v2 (es2.py): the fast recipe, averaged in cycles
     evo = evo2 or bool(getattr(a, "evo", False) or getattr(a, "evo_model", None))  # Evo mode (es_local.py)
     d = Path(a.dir) if a.dir else settings.home() / ("testnet-evo2" if evo2 else "testnet-evo" if evo else "testnet")
+    if (d / "genesis.json").exists():  # a testnet already: refused at once if it's running, before --reset deletes it
+        held.append(_hold_testnet(d))
     if a.reset and d.exists():
         if not (d / "genesis.json").exists():
             sys.exit(f"{d} doesn't look like a testnet folder; not deleting it")
+        held.pop().release()  # Windows can't delete a lock file that's held
         shutil.rmtree(d)
+    if not held:
+        held.append(_hold_testnet(d))
     if _in_onedrive(d):
         print(f"warning: {d} is inside OneDrive, whose syncing can corrupt a running node's database; "
               "use --dir somewhere else", file=sys.stderr)
@@ -1665,7 +1849,7 @@ def cmd_testnet(a):
         if evo2:
             from . import es_tasks
             evo2_tasks = []
-            for t in es_tasks.NAMES:  # the tasks this computer can serve (ARC-Easy needs `datasets` and a download)
+            for t in es_tasks.CURATED:  # the tasks this computer can serve (they need `datasets` and a download)
                 try:
                     es_tasks.get(t).items(0, 1)
                     evo2_tasks.append(t)
@@ -1684,13 +1868,15 @@ def cmd_testnet(a):
     if existing is None:
         # Validators run the chain, even just one: each listens on the address the genesis gives it. They vote with
         # bootstrap stake, which can't be spent; the workers start with nothing and earn their stake. Only the
-        # requester is handed coins, to pay for the demo jobs.
+        # requester is handed coins, to pay for the demo jobs. The testnet schedule, with only rounds that pay for work
+        # minting (economics.NEW_SCHEDULES); a folder made before keeps the genesis it has, and with it the old rule.
         public = _lan_ip() if a.host == "0.0.0.0" else "127.0.0.1" if a.host in ("127.0.0.1", "localhost") else a.host
         ports = _free_ports(count) if a.port == 0 else [a.port + i for i in range(count)]
         genesis = {"chain_id": f"vibehash-local-{secrets.token_hex(3)}", "timestamp": int(time.time()),
                    "allocations": {keys["requester"].address: 10_000 * SYN_PER_VIBE}, "stakes": {},
                    "bootstrap": {keys[v].address: 10 * SYN_PER_VIBE for v in validators}, "earn_in": True,
-                   "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)}}
+                   "validators": {keys[v].address: f"http://{public}:{port}" for v, port in zip(validators, ports)},
+                   "economics": econ.NEW_SCHEDULES["testnet"].to_dict()}
         if evo:  # a chain that takes ES jobs (ledger.ES_GATE), whose workers are staked: nothing else here to earn it on
             genesis |= {"es": True, "stakes": {keys[n].address: es_local.STAKE for n in worker_names}}
         (d / "genesis.json").write_text(json.dumps(genesis, indent=2))
@@ -1713,10 +1899,11 @@ def cmd_testnet(a):
         for v, port in zip(validators, ports):
             nodes.append(Node(d / ("node-data" if v == "node" else f"{v}-data"), genesis, keys[v], a.host, port, times,
                               **big))
-    except OSError as e:
+    except (OSError, FolderInUse) as e:
         for n in nodes:
-            n.server.server_close()
-            n.store.close()
+            n.close()
+        if isinstance(e, FolderInUse):
+            sys.exit(f"error: {e}")
         sys.exit(f"couldn't start a node on port {port} ({e}). Is one already running? Try --port.")
     node = nodes[0]
     for n in nodes:
@@ -1725,8 +1912,7 @@ def cmd_testnet(a):
         clients = [(n, WorkerClient(node.url, keys[n], device=a.device, cache_dir=d / "cache" / n)) for n in workers]
     except RuntimeError as e:
         for n in nodes:
-            n.server.server_close()
-            n.store.close()
+            n.close()
         sys.exit(f"error: {e}")
     from . import compute
     before = compute.active()
@@ -1825,7 +2011,7 @@ def cmd_testnet(a):
             dash.note(f"open to other computers: they join with `{p} setup --node {url}`", logging.INFO + 1)
 
     threads = [threading.Thread(target=c.run, args=(stop,), daemon=True, name=n) for n, c in clients]
-    rounds, height = 0, node.chain.tip.height
+    rounds, height, halted = 0, node.chain.tip.height, None
 
     def begin():
         for t in threads:
@@ -1833,7 +2019,12 @@ def cmd_testnet(a):
         ensure_job()
 
     def tick():
-        nonlocal rounds, height
+        nonlocal rounds, height, halted
+        stuck = next((n for n in nodes if n.halted), None)
+        if stuck is not None:  # a block one couldn't save (Node._halt): the testnet ends with why, below
+            halted = stuck.halted
+            stop.set()
+            return
         tip = node.chain.tip
         if tip.height == height:
             return
@@ -1879,6 +2070,8 @@ def cmd_testnet(a):
     if dash:
         print(f"{dash.summary()}\nThe chain and wallets are kept in {d}; run it again to carry on.\n\n{hints}")
     _record_end(session)
+    if halted:  # (through SystemExit, not os._exit: the menu runs testnets in its own process and goes on)
+        sys.exit(f"error: {halted}")
 
 
 def _min_fee_flag(p) -> None:
@@ -1998,11 +2191,21 @@ def parser() -> argparse.ArgumentParser:
                         "one node runs the chain alone")
     p.add_argument("--out", required=True, help="genesis file to write"); p.set_defaults(fn=cmd_genesis_create)
     p.add_argument("--economics", choices=sorted(econ.SCHEDULES), default="testnet",
-                   help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year halvings)")
+                   help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year "
+                        "halvings on a busy network); either way only rounds that pay for work mint, and halvings count them")
     p.add_argument("--bootstrap", action="append", metavar="ADDR=VIBE",
                    help="stake for a first validator that votes but can never be withdrawn or spent; burned if it leaves")
     p.add_argument("--no-earn-in", dest="earn_in", action="store_false",
                    help="require workers to be given stake; by default they can start with none and earn it")
+    p.add_argument("--es", action="store_true",
+                   help="let Evo jobs run on this network (\"es\": true); it can't be turned on later")
+    p.add_argument("--starter-job", action="append", metavar="SPEC.json",
+                   help="a job on chain from block one, owned by nobody, paying only new coins (fee 0), so the "
+                        "network can mine with no starting coins; a spec as `vibehash job template` writes")
+    p = g.add_parser("check", help="hold a genesis file against what a network meant to carry value needs")
+    p.add_argument("file", help="the genesis file to check")
+    p.add_argument("--json", action="store_true", help="print the findings as JSON, for scripts")
+    p.set_defaults(fn=cmd_genesis_check)
 
     p = sub.add_parser("node", help="run a node: serve the chain to workers, and validate if its wallet is a validator")
     p.add_argument("--genesis", required=True, help="the network's genesis file (see `genesis create`)")
@@ -2027,6 +2230,9 @@ def parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_node)
     _min_fee_flag(p)
     _rate_limit_flags(p)
+    p.add_argument("--min-client", default=MIN_CLIENT, metavar="VERSION",
+                   help=f"the oldest Vibe Hash release whose workers may register (default {MIN_CLIENT}); older ones are "
+                        "told to upgrade. Releases from before this option send no version and are taken as before")
     p.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this PEM certificate (see `tls cert`)")
     p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
 
@@ -2109,7 +2315,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("address", nargs="?", help="the address to look up (default: your wallet's)"); p.set_defaults(fn=cmd_balance)
     p = sub.add_parser("send", help="send VIBE to an address")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--to", required=True, metavar="ADDR", help="the address to pay")
+    p.add_argument("--to", required=True, metavar="ADDRESS", help="where to send it: an address copied from the wallet "
+                   "that owns it (vibe1...). Its capital letters are a checksum, so a mistyped one is refused")
     p.add_argument("--amount", type=to_syn, required=True, metavar="VIBE", help="how much to send, e.g. 2.5")
     p.set_defaults(fn=cmd_send)
     _fee_flag(p)
@@ -2137,7 +2344,8 @@ def parser() -> argparse.ArgumentParser:
     _fee_flag(p)
 
     v = sub.add_parser("validator", help="validators vote on blocks and take turns leading rounds").add_subparsers(dest="vcmd", required=True)
-    p = v.add_parser("join", help="announce your (staked) wallet as a validator")
+    p = v.add_parser("join", help=f"announce your wallet as a validator (it needs {econ.VALIDATOR_STAKE // SYN_PER_VIBE} "
+                     "VIBE staked)")
     p.add_argument("--url", required=True, help="the address other nodes reach your node at, e.g. http://203.0.113.7:8545")
     p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET); p.set_defaults(fn=cmd_validator_join)
     p = v.add_parser("leave", help="stop validating"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
@@ -2211,7 +2419,22 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="job.json", help="file to write (default job.json)")
     p.add_argument("--id", default="my-first-job", help="the job's name (default my-first-job)")
     p.add_argument("--gpu", action="store_true", help="a larger float32 model sized for GPUs")
+    p.add_argument("--evo", metavar="MODEL", help="an Evo job on MODEL that never ends, taking its tasks in turn: a "
+                                                  "genesis starter job (genesis create --es --starter-job)")
+    p.add_argument("--tasks", default="curated", help="with --evo: the tasks, comma-separated, curated (the default: "
+                   "the ones a small model learns from) or all")
+    p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
     p.set_defaults(fn=cmd_job_template)
+
+    e = sub.add_parser("evo", help="Evo Hash's models").add_subparsers(dest="ecmd", required=True)
+    p = e.add_parser("export", help="save an Evo Hash job's model (the tuned Qwen) as a Hugging Face folder, worked "
+                     "out from the chain")
+    p.add_argument("job_id", nargs="?", help="default: the newest Evo job that has trained")
+    p.add_argument("--out", help="folder to save (default JOB-model)")
+    p.add_argument("--node", help="the Evo network's node (default http://127.0.0.1:8545, testnet --evo2's)")
+    p.add_argument("--cpu", action="store_true", help="work it out on the CPU even with a GPU")
+    p.add_argument("--float32", action="store_true", help="save float32 weights (twice the size) instead of bfloat16")
+    p.set_defaults(fn=cmd_evo_export)
 
     c = sub.add_parser("chain", help="audit the chain yourself, without trusting the node").add_subparsers(dest="ccmd", required=True)
     p = c.add_parser("verify", help="download every block, re-check it from genesis, and replay every round")

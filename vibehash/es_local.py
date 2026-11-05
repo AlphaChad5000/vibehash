@@ -201,9 +201,13 @@ def chain_bytes(entry) -> int:
 # --- Evo v2 (es2.py): the fast recipe, on every layer, in cycles averaged into the next cycle's start ---------------
 
 # The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
-# sigma 1e-3, a cosine from 4e-3 to a quarter of it over the job, replay of 16 earlier correct answers.
-V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=4e-3, lr_floor=0.25,
-                   rounds=12, replay=16, margin=0.1, lp_tol=0.05)
+# sigma 1e-3, a cosine from 1e-3 to a quarter of it over the job, replay of 16 earlier correct answers, the anchor.
+V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=1e-3, lr_floor=0.25,
+                   rounds=12, replay=16, margin=0.1, lp_tol=0.05, decay=1 / 64, lenient=True)
+# lr 1e-3 and decay 1/64, the anchored step (es2's docstring, HANDOFF "The Evo collapse: cause and fix"): lr 4e-3 with
+# no anchor drifted the model 1.6% from its base a round at the cosine's top, broke it within about 100 rounds, and
+# made the testnet's ~400-round line worse on every task. Anchored, random drift levels off near 1-2%. lenient: a right
+# answer pays with or without its <answer> tags (es_tasks.lenient), so rounds reward being right, not the format.
 # margin 0.1: a checker teacher-forces answers through the engine that wrote them, in its passes of es_fast.ROWS rows,
 # so it rounds exactly as the worker did. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, a worker's 64 members x 16
 # answers on countdown, trivia_qa, commonsense_qa and sst2, each member checked alone, in the same process and in
@@ -216,10 +220,19 @@ V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma
 V2_COMPUTE_S = 300
 
 
+def tensors2_for(config) -> tuple:
+    """The linears a rule-2 job twists in a model with this config: every attention and MLP projection (es2.TENSORS),
+    and on Qwen3.5's hybrid layers (Gated DeltaNet + full attention) es_hybrid.TENSORS."""
+    from . import es2, es_hybrid
+    tc = config.get_text_config() if hasattr(config, "get_text_config") else config
+    return es_hybrid.TENSORS if "linear_attention" in (getattr(tc, "layer_types", None) or ()) else es2.TENSORS
+
+
 def spec2_for(found: Base, task: str, start=(), **settings):
     """A rule-2 Evo job's spec for `found` on `task` (es_tasks.NAMES), starting from `start` ([[job id, weight,
-    params_hash], ...]: the parents averaged into its start): every attention and MLP projection twisted (es2.TENSORS),
-    their names and shapes from the model's config on PyTorch's meta device (nothing loaded)."""
+    params_hash], ...]: the parents averaged into its start): every attention and MLP projection twisted
+    (tensors2_for), their names and shapes from the model's config on PyTorch's meta device (nothing loaded). A
+    Qwen3.5 model's config holds its text model's dims in text_config; its vision tower isn't loaded."""
     from . import es2
     try:
         import torch
@@ -228,15 +241,17 @@ def spec2_for(found: Base, task: str, start=(), **settings):
         raise RuntimeError("Evo mode needs PyTorch and transformers: `vibehash install-gpu`, then pip install "
                            "transformers") from None
     s = {**V2_SETTINGS, **settings}
-    c = AutoConfig.from_pretrained(found.folder)
+    full = AutoConfig.from_pretrained(found.folder)
+    c = full.get_text_config()
+    tensors = tensors2_for(full)
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(c)
-    n, sha = es.tensors_digest(es.select(((k, p.shape) for k, p in model.named_parameters()), es2.TENSORS))
+        model = AutoModelForCausalLM.from_config(full)
+    n, sha = es.tensors_digest(es.select(((k, p.shape) for k, p in model.named_parameters()), tensors))
     dims = {"family": c.model_type, "vocab": c.vocab_size, "hidden": c.hidden_size, "layers": c.num_hidden_layers,
             "heads": c.num_attention_heads, "kv_heads": getattr(c, "num_key_value_heads", None) or c.num_attention_heads,
             "head_dim": getattr(c, "head_dim", None) or c.hidden_size // c.num_attention_heads,
             "ffn": c.intermediate_size, "tied": bool(getattr(c, "tie_word_embeddings", False))}
-    spec = es2.Spec2(base=found.base, manifest=manifest(found.base), dims=dims, tensors=es2.TENSORS, n=n,
+    spec = es2.Spec2(base=found.base, manifest=manifest(found.base), dims=dims, tensors=tensors, n=n,
                      tensors_sha=sha, task=task, start=tuple(tuple(x) for x in start), **s)
     bad = spec.problems_list()
     if bad:

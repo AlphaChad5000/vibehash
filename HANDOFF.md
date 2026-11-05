@@ -38,7 +38,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `model.py` | Reference MLP (multi-layer, tanh, softmax), deterministic SGD, float32 or float64. Batch indices come from `(unit_seed, step)`, so any segment can be replayed alone. |
 | `compute.py` | Backends: `NumpyBackend` (CPU reference) and `TorchBackend` (cuda / xpu / mps), with identical maths. `self_test()` catches broken GPU drivers, and gives up on one that hangs after `SELF_TEST_SECONDS` (120 s, on a daemon thread); `get_backend("auto")` falls back to the CPU. |
 | `blobs.py` | **Content-addressed, chunked, resumable binary storage** for checkpoints and datasets. id = sha256 of the bytes. Arrays load memory-mapped. |
-| `node.py` | HTTP node. JSON for small messages; `/blob/<sha>` and `/dataset/<sha>` for chunked binary transfer (GET status, GET `?offset=`, signed PUT). On a validator chain: `_lead` runs the round when it's our turn and proposes it, `_validate` (apply + replay) decides our vote, `_commit` adopts final blocks, `_sync` catches up from peers, `_ensure_params` / `_fetch_missing_data` pull trained weights and datasets from peers. |
+| `node.py` | HTTP node. JSON for small messages (`/status` names its versions; `/supply`, from `supply.py`, and `/supply/total`, `/supply/circulating` for listing sites; `/explorer` serves `data/explorer.html`, the block explorer, under a strict Content-Security-Policy); `/blob/<sha>` and `/dataset/<sha>` for chunked binary transfer (GET status, GET `?offset=`, signed PUT). On a validator chain: `_lead` runs the round when it's our turn and proposes it, `_validate` (apply + replay) decides our vote, `_commit` adopts final blocks, `_sync` catches up from peers, `_ensure_params` / `_fetch_missing_data` pull trained weights and datasets from peers. |
 | `consensus.py` | Tendermint Algorithm 1 (`Engine`: proposals, prevote/precommit, locking, timeouts, round skipping), stake-weighted `proposer_order`, `check_certificate`. Transport-agnostic: node.py feeds it messages and ticks. |
 | `p2p.py` | `Peers`: `--peer` addresses plus validators' on-chain addresses; background POST fan-out with a back-off for unreachable peers. |
 | `client.py` | `NodeClient` (API, upload/download with retry on transport errors only; `put_blob`/`get_blob`, a small blob in one request) and `WorkerClient` (worker loop). The loop notes each round into `record` (a `records.RoundLog` when the command keeps one, else nothing) and writes its line once the round's block is final. Disputes come first: a round's checks run in a thread beside the loop (`_check`, stopping once the verify phase is over), each dispute's move is worked out in a thread of its own (`_move`), a round's checkpoints are kept until its disputes end (`_tidy`), and `_Remote` moves a state's tensors `TRACE_REQUESTS` at a time. |
@@ -83,6 +83,7 @@ rigs earn the same rate as big ones. It's a **testnet** run by validators
 | `es.py` | **Evolution strategies on the chain (prototype, branch `es-chain`): the model is a pure function of the chain.** A round is one ES step: antithetic seed pairs, greedy answers to Countdown problems, scores; the node works the update out with `step` and a fresh node gets the same bits with `rebuild`/`rebuild_chain` (no GPU, no weight files). The state is how far training moved the perturbed tensors from the pinned base (`delta`), the optimiser's moments and control words (level, steps). Pinned: `noise` (Philox raw words, Box-Muller with the module's own ln/sin/cos in exactly rounded ops), `step`'s order (z-scores; sgd, momentum or Adam in float64; float32 once), `problem` (built solvable from a seed with `crypto.Draw`), `reward` (fractions; binary or partial), `LEVELS` and the retarget rule. `EsSpec` (spec field `es`; tensors by glob pattern, `PRESETS`), `Group` (several members' weights in one batch), `generate` (greedy), `gaps`/`check` (teacher forcing: each token the greedy choice within `margin`), `rescore` (what the node checks every reward with). `cache_noise` for processes that play several parts. Tests: `tests/test_es.py`. |
 | `es_client.py` | A worker's ES rounds (from `client.py`): the round's state rebuilt from the chain's records (each block's `params_hash` checked), else fetched; answering units, uploading the answers blob and committing to it and the rewards; checking others' sampled members. `cheat` (tests only): `liar`, `forger`. A local network's base is looked for in the Hugging Face cache first (`es_local.find_base`). |
 | `es_local.py` | Evo mode's wiring (branch `evo-mode`): `find` (a model's folder, or a Hugging Face model from the local cache, else downloaded), `manifest` (es_local_run's stand-in), `spec_for` (the measured run's settings, `SETTINGS`, the last layer's MLP; tensors from the config on the meta device), `job`, `accepts` (a genesis with `"es": true`), `chain_bytes` (a round's ES entry, canonical JSON), `find_base` (a worker's: looks, never downloads). |
+| `es_hybrid.py` | Evo v2's engine for Qwen3.5's hybrid layers (branch `evo-qwen35`): the shared reading by transformers, every twisted token a hand-written decode step (Gated DeltaNet's recurrent rule, gated full attention), one resident pass of `rows_per_pass(config)` rows with waiting rows taking finished rows' slots, a CUDA graph a pass; `answer`, `forced` (gaps and log-probabilities); `TENSORS`. es_fast routes Qwen3.5 models here. |
 | `esui.py` | The Evo scene both dashboards show for an Evo job: sealed blocks joined by links, each with a hatchling and a bar of its generation's mean reward, its level (an arrow when it moved) and its bytes on chain; the open block incubating the round's twin pairs by phase (laid, growing, cracking, checked), hatching and locking into the chain when sealed. `Lineage` follows a job's generations from `/blocks` and `/round/<h>/record`, read defensively. |
 
 Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
@@ -108,12 +109,12 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 - **Receipts against censorship (2026-10-29).** The node signs a receipt (`receipts.py`) for every register/commit/reveal/verdict it accepts: chain id, round, the round's random `attempt` label (in the record, so a re-run round doesn't look like censorship), kind, and the sha256 of the message exactly as the record holds it. `WorkerClient._signed` checks each receipt vouches for what it sent and appends it to `<cache>/receipts.jsonl`; `audit_receipts` checks every sealed round and logs `censored: …` (shown red in the dashboard). `chain verify` audits local receipts by default, or `--receipts FILE`. Tested against a node patched to drop a worker's commitments: replay passes (the record is self-consistent), and the receipts catch it.
 - **Validators and BFT consensus (decentralisation step 2, 2026-10-29).** A genesis `validators` map, `{addr: url}`, becomes genesis txs with memo `"validator <url>"`. Genesis files without it keep their hash and run single-node (`Node._solo`), exactly as before. `State.validators` holds `addr -> url`; `validator_set()` is the ones with at least `MIN_STAKE`, weighted by stake. The `validator` tx joins or leaves, and only works on chains that already have validators (otherwise anyone could take over a one-node chain). On a validator chain the proposer must be a validator, and the block's **commit certificate** (precommits from more than 2/3 of the stake) is stored in SQLite `certificates`, served in `/blocks`, checked by `Store.open_chain`, `_sync` and `chain verify`.
   - A height's leader runs the training round (`Coordinator.finalize(seal=False)` builds the block without appending it), then proposes `{block, record}`.
-  - Validators vote using `_validate`, which is `apply_block` plus `replay_block`. `Coordinator.adopt` appends the final block, prunes the mempool, and saves the record and params (ours, or fetched later and checked against `params_hash`).
+  - Validators vote using `_validate`, which is `apply_block` plus `replay_block`. `Coordinator.adopt` writes the final block, its certificate and record to disk in one transaction (`Store.save_block`), then appends it and prunes the mempool, then saves the params (ours, or fetched later and checked against `params_hash`). A block that can't be saved halts the node (below, "Unreleased").
   - The propose timeout is `1.5 × round + 5 s`. `has_work` keeps idle chains from churning rounds.
   - Workers follow `/status` `leader` (None means "this node"). `done` is keyed by the round's `attempt`, so they rejoin a re-run round.
   - `testnet --validators N` runs N in-process validators on consecutive ports. A new testnet always has at least one validator, so the default single validator uses this path too.
   - Tests: `test_consensus.py` (engine on a simulated clock, ledger rules) and `test_validators.py` (4 live validators: rotation, a self-paying leader outvoted, an offline validator, sync, forged certificates, an edited data dir).
-  - Not done: rechecking weight-based claims before voting, on-chain disputes, double-sign slashing (evidence is only collected, in `Engine.evidence`), replicating checkpoints. DESIGN §9 lists these.
+  - Not done: rechecking weight-based claims before voting, on-chain disputes, replicating checkpoints. DESIGN §9 lists these. Double-sign slashing, a higher stake to join and a delay before set changes are block version 4 (branch `validator-accountability`, "Current state").
 - **A fair start (2026-10-29): earn-in and bootstrap stake.** Two genesis rules, committed to by genesis txs with memos `"earn-in"` and `"bootstrap"`; `genesis create` and new `testnet`s turn both on, while older genesis files lack them and behave as before.
   - **Earn-in:** `State.earn_in` lets unstaked addresses register (`Coordinator.eligible`), at most `max_newcomers` (64) a round. They're capped at `newcomer_units`, assigned only units staked workers don't need (`pick` prefers staked), and never chosen as verifiers (`pool` takes staked only). A `reward` to an address below `MIN_STAKE` tops up its stake first (`_apply_system_tx`). `_check_summary` lets unstaked workers be paid, but verifiers must be staked.
   - **Bootstrap stake:** `State.locked`. It votes and counts for proposing, but `unstake` can't touch it, a validator leaving burns it, and a slash takes withdrawable stake first.
@@ -127,6 +128,139 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 - **Retries only on transport errors / 5xx.** Retrying 4xx stalled workers for whole rounds.
 
 ## Current state
+
+**Release 0.5.17 (2026-11-05): `mainnet-checklist` (PR #27) and the Evo anchor (`evo-anchor`), on main.** Everything
+in the "Unreleased" sections below that names `mainnet-checklist`, `evo-qwen35`, `versions-supply-explorer`,
+`validator-accountability`, `save-before-adopt`, `address-checksum`, `halvings-count-work` or `evo-anchor` is in it:
+block version 4 (double-sign slashing, 100 VIBE to join as a validator, a 10-height delay), one node per folder and
+port, save-before-adopt, checksummed addresses, paid-round halvings on new networks, versions in `/status`, `/supply`
+and `/explorer`, `genesis check`, starter jobs, Evo on Qwen3.5's hybrid layers, and the anchored Evo step (lr 1e-3,
+decay 1/64: "The Evo collapse: cause and fix" below), so `testnet --evo2` and the menu's Evo Hash train without
+wrecking the model. Also the hardware census (PR #30), `vibehash evo export` (an Evo job's model as a Hugging Face
+folder, from branch `evo-export`), and the curated mix: Evo Hash trains on es_tasks.CURATED (17 tasks: the five
+the base model can't learn from dropped, ARC-Challenge, PIQA and Social IQa added) and pays for a right answer with or
+without its tags (Spec2.lenient, es_tasks.lenient). Measured with this code (68 rounds, 4 on each task, 200 held-out
+items, both models scored without the tags mattering): sciq 54.5% → 67%, arc_challenge 31.5% → 43%, arc_easy 47% →
+58%, commonsense_qa 42% → 49%, winogrande 43.5% → 49%, openbookqa 33% → 38%, sst2 35.5% → 57.5%, emotion 35% → 49%,
+MMLU (never trained) 25% → 32.5%; the four math sets 1.5–3.5 points down (each within chance, all the same way);
+drift 2.1%. Scored by which letter the model finds likeliest (what lm-evaluation-harness measures) the same sets
+moved within ±3 points (MMLU 43% → 44.5%): the gain is in saying what it knows, not in knowing more. Rollout:
+- **Evo chains** (local, `"es": true`): every node and worker needs 0.5.17 before a job with `decay` is posted (0.5.16
+  refuses the field), and a testnet folder from before carries the old line's broken change into its next job: start
+  a new folder (the owner's old one was moved aside to `~/.vibehash/testnet-evo2-collapsed-20261105`).
+- **The public node** (vibehash-public-1) still runs 0.5.10 and makes version 3 blocks; 0.5.17 follows them. Upgrading
+  it starts version 4 blocks, which 0.5.16 and older can't follow: release notes first, then every validator at once
+  (the block version 4 rollout below).
+
+**Unreleased (branch `evo-qwen35`, off `mainnet-checklist` at 63da216, 2026-11-04): Evo Hash's engine for Qwen3.5's hybrid layers, exact on Qwen3.5-0.8B and 4B.** Toward a mainnet starter job on current Qwen models (Qwen3.5-0.8B/2B/4B/9B and Qwen3.8-27B share the design: three of four layers Gated DeltaNet linear attention, a fixed-size memory per head, every fourth gated full attention). `vibehash/es_hybrid.py`; `es_fast.answer_members`, `gaps_items` and `score_items` route a model whose config has `linear_attention` layers there, on every device; the Qwen2 engine is untouched.
+- **How it works.** The shared reading of each prompt but its last token is transformers' own forward (untwisted, Gated DeltaNet's chunked algorithm), the same batch for worker and checker. Everything twisted is a hand-written decode step (Gated DeltaNet's recurrent rule, partial RoPE, gated attention and the output gate), so a checker teacher-forces through exactly the steps that wrote the answers; reading a whole answer in one forward would take the chunked algorithm, which rounds differently. A pass is always `es_hybrid.rows_per_pass(config)` rows (`ROWS_BY_HIDDEN`: 0.8B 64, 4B 16; 2B, 9B, 27B provisional), because the recurrent state (float32, 18 MB a row in 0.8B, 48 MB in 4B) leaves room for one pass only: rows that finish are replaced by waiting rows at the next step, each at its own step and cache slot, and a pass is one CUDA graph. The engine matches transformers' greedy decode token for token on both models (one exact three-way bf16 logit tie aside). Replay log-probabilities (`score_items`) go through the same steps, so worker and checker get the same numbers too.
+- **Twisted:** full attention's q/k/v/o, linear attention's in_proj_qkv, in_proj_z and out_proj, the MLP's gate/up/down (`es_hybrid.TENSORS`; `es_local.tensors2_for` picks it, and `spec2_for` reads a Qwen3.5 config's text_config; 0.8B 150 linears, 0.50B weights; 4B 200 linears, 3.57B weights, 1.9M noise numbers a pair). Not in_proj_a/in_proj_b (each value head's memory decay and write strength: 0.1% of the weights).
+- **Prompts with thinking off:** `es_client.prompt_rows` passes `enable_thinking=False`: Qwen3.5-4B's template opens a `<think>` block by default (its answers started "Thinking Process:" and never ended in 64 tokens); Qwen2.5's and Qwen3.5-0.8B's templates give the same text with it.
+- **Measured (RTX 4070 SUPER, bf16).** Honest members' answers (countdown, arithmetic, trivia_qa, commonsense_qa) teacher-forced one member at a time: 0.8B 704 answers in the same process and 2,240 in a fresh one; 4B 1,248 in the same process (at 16, 24 and 32 rows a pass) and 1,184 in a fresh one (at 16): every gap exactly 0; a twin's answers claimed for its sibling fail by 0.125 or more. Speed: 0.8B, 64 pairs x 16 problems x 64 tokens, 1,900-2,200 tokens/s (countdown's 2,048 rows 19.5 s, commonsense_qa 5.1 s), peak 3.5 GiB; 4B the same round 476 tokens/s (countdown 76.8 s, commonsense_qa 30.9 s), peak 10.6 GiB allocated, 10.9 reserved; a member's check 0.3-1 s (0.8B), 0.6-1.5 s (4B). The 4B at 32 rows a pass peaked at 11.1 GiB and spilled into system memory (3x slower); at 24 it fits with 16 pairs but not 64. A step costs mostly passes over the recurrent state (five a step, ~400 GB/s): a fused kernel (flash-linear-attention's, which needs Triton, not installed on Windows here) would make it two.
+- **Left before a 4B job on a local testnet:** a worker's weight change (`es2.Change`, float32 on the CPU, beside `rt.base`, also float32 on the CPU) is 14 GB each for the 4B's twisted weights (28 GB of this PC's 48 GB for one job's line, more with parents being averaged), each round's update a CPU einsum over all 3.57B of them, and a rebuild from the chain about 7x the 0.5B's 5 s a round, so it has to change (kept on the GPU in bf16 with a float32 remainder elsewhere, or as the rounds' rank-1 factors); `memory_mb2` and `EsSpec.base_params` assume Qwen2's layout; `es.noise` for 64 pairs takes 20 s a round on the CPU; rows a pass belongs in the spec (it decides rounding, so changing it is a consensus change); checkers check one member a call, mostly padding (several at once would be cheaper). **Qwen3.8-27B:** 55 GB in bf16, so FP8 or several GPUs, and the recurrent state is ~72 MB a row; which tensors to twist and the rows a pass need measuring there. Tests: `tests/test_es_hybrid.py` (a tiny random Qwen3.5 on the CPU: the engine against transformers' own chunked forward with `es_fast.Twist`, members checked alone; and a CUDA test with Qwen3.5-0.8B, skipped without it).
+
+**Unreleased (branch `mainnet-checklist`, 2026-11-04): the second batch toward mainnet.** The owner asked to "figure out what we need to do to get to mainnet and do it". This branch now holds main's 0.5.15, the unreleased 0.5.16 (`fix-gpu-test-hang`, a GPU that hangs its self-test is reported in 2 minutes), the 2026-11-03 fixes below, and:
+- **`vibehash genesis check FILE`** (`genesis_check.py`, `tests/test_genesis_check.py`): holds a genesis against what a network meant to carry value needs and exits 1 on a failure: a test network's chain id (transactions name the chain id, not the genesis hash), the old issuance rule, no cap, a premine (bootstrap stake isn't one), earn-in off, fewer than 4 voting validators or one holding a third of the vote (`tolerates`: how many can be offline, biggest first, with the chain still going), validators sharing a host or on private addresses, Evo off, and the wallets' SLIP-0044 coin type. `vibehash-public-1` fails three (its id, the old rule, one validator). `genesis create --es` writes `"es": true`.
+- **A per-address dataset quota** (node hardening, DESIGN §10): 20 GB an address of datasets no job uses, deleted three days after upload if still unused.
+- **CI runs Evo's tests** (`tests.test_es`, `test_es2.SpecTests`) on CPU PyTorch as its own job `evo`, not a required check yet.
+- **The issuance docs** (whitepaper, its PDF, guide, README) describe paid-round minting.
+- **Merged:** `versions-supply-explorer` and `validator-accountability` (the two entries below). Run together after the merges: test_core, test_consensus, test_rules_v2, test_rules_v4, test_earn_in, test_record_v2, test_versions_supply, test_genesis_check and test_round_length, 192 tests OK.
+- **Rollout of block version 4:** a 0.5.15 or older node, follower or `chain verify` refuses the first version 4 block ("this node knows up to 3"). Release, then upgrade every validator at once (the public chain has one, the droplet, which makes version 4 blocks as soon as it runs this), then followers. Old workers keep mining: they parse blocks only to audit receipts and follow Evo jobs, and `Block.from_dict` takes any version. The owner's Evo testnet makes version 4 blocks from its next restart on this branch.
+- **For the owner to decide** (each is a constant today): `economics.VALIDATOR_STAKE` 100 VIBE; `VALIDATOR_DELAY` 10 heights; `DOUBLE_SIGN_BOUNTY` a tenth; whether a double-sign takes all of a validator's stake (as built: on a one-validator chain, like the public one, an accidental second copy of the validator on another machine could then stop the chain for good once someone reports it); `client.MIN_CLIENT` 0.5.14; "circulating" as spendable balances only.
+- **Starter jobs in the genesis** (the owner's choice for funding mainnet's first job, over a tiny premine; DESIGN §6). With no coins at the start nobody could post a job (a job needs at least 1 syn), and coins come only from jobs' rounds, so nothing would ever be mined. `"starter_jobs": [spec]` in a genesis (`genesis create --starter-job SPEC.json`) puts a job on chain from block one: memo `ledger.GENESIS_JOB` + spec, owned by `system` (nobody can cancel it), fee 0 (the CLI sets it), `STARTER_ESCROW` = 1 syn of budget counted in the genesis, so it never runs out and pays only the subsidy. `Coordinator.active_job_id` runs it only when no paid job is ready. An Evo starter job needs `"es": true` before it in the genesis (the owner wants Evo on for mainnet). `genesis check` fails a genesis with no coins and no starter job ("first job"), and warns on a starter job that needs an uploaded dataset. A genesis without the field keeps its hash (checked against vibehash-public-1's). Tests: `tests/test_starter_jobs.py` (7, ~35 s, in CI): from no coins, a non-mining validator and three newcomers mint from round 1, earn their 5 VIBE stake in 6 rounds, and a lazy cheater is never paid; paid jobs take every round while they have budget; replays match; and a live node with three workers over HTTP.
+- **The starter job is an Evo job (the owner's choice), and Evo jobs can take tasks in turn.** A rule-2 spec may list `"tasks"` (es2.Spec2.tasks; the first is `task`; left out of the spec when empty, so every earlier job's spec and hash is unchanged): the round with step s trains `tasks[(s // rounds) % len(tasks)]` (`es2.task_at`) and the cosine starts again with each task (`es2.lr_at`), as the testnet's 12-round jobs do one after another, but in one job and one line. The step is the state's control word 2 on workers and the record's `es.step` on the node (`es2_rounds.items(spec, seed, step)`, `rescore(..., step)`); replay targets carry their own round's step (`targets_of`: an entry's place in the history is its step, since each round adds one entry and one step). `vibehash job template --evo MODEL [--tasks all|a,b] [--rounds 12]` writes such a job with fee 0 for `genesis create --es --starter-job`. A demo mainnet genesis (4 validators, no premine, Evo on, this starter job on Qwen2.5-0.5B-Instruct) passes `genesis check` with only the coin type left to decide. Tests: `test_es2.TaskCycleTests`, `StarterTemplateTests` (in CI's `evo` job). Not yet run end to end on a node with a real model; the owner wants a current model for it (Qwen3.8-27B; branch `evo-qwen35` ports the Evo engine to Qwen3.5's design, proving it on Qwen3.5-4B first).
+- **⚠️ Two findings that block an Evo starter job (2026-11-04):**
+  - **The Evo v2 recipe destroys the model over hundreds of rounds.** The owner's Evo testnet line `evo2-c2-emotion` (all of cycle 1 and cycle 2 to its 18th task, block 650; the miners' saved line in `~/.vibehash/cache/evo2-lines/`) scored against the base Qwen2.5-0.5B-Instruct the way `scripts/evo2_progress.py` scores (200 items a set, greedy, 64 tokens): worse on every set, e.g. ag_news 77% → 0%, sciq 54.5% → 1%, arc_easy 47% → 1.5%, ARC-Challenge (never trained) 26% → 3%, GSM8K (never trained) 2% → 0%. It answers every question with `<answer> <answer> <answer>…`. The change it carries is a median 24% (up to 43%) of each weight matrix's norm. A rank-1 twist A Bᵀ with unit-variance factors is the size of the whole matrix in unit terms, and the step `lr / N · Σ c_j Aⱼ Bⱼᵀ` (lr 4e-3, V2_SETTINGS) never scales it to the weights or pulls it back toward the base, so jobs that start from the last job's whole change random-walk away. Rerun with `scripts/evo2_score_line.py LINE.pt` (it also prints how far the weights moved); `scripts/evo2_progress.py` was never run before.
+  - **The owner's open question, unanswered: does Evo teach a model anything, or is it fiddling with a model Qwen already tuned well?** It can't add general knowledge (reward-driven training only sharpens what the model half knows). Losing other skills isn't inevitable: it depends on how far the weights move, and reward-driven training like Evo tends to forget less than copying examples. Anchoring to the base, replaying old tasks and checking held-out scores as it goes all help. The experiment that answers it (about 30–45 min on the 4070 SUPER, Qwen2.5-0.5B, asked for but not run, the owner called it a day):
+    1. fix the step: much smaller, scaled to each weight's size, anchored to the base;
+    2. train one weak, checkable skill only: GSM8K's train split (base: 2% on its test items in this format);
+    3. every few rounds, score held-out GSM8K test items and a few unrelated tasks (the progress checker's sets).
+    Held-out math up with the rest flat: Evo teaches skills, and that's the network's purpose. No movement: the value has to come from paid fine-tunes on people's own data. Also worth scoring the earliest jobs rebuilt from a copy of the chain, to see when the testnet line broke.
+  - **Newcomers alone can't earn on an Evo-only network.** An Evo claim is approved only by staked checkers holding the model (`Coordinator._es_tasks`); with earn-in and no staked miners, nothing is checked, so nothing is accepted or minted. Measured on Qwen3.5-0.8B: a starter-Evo genesis with a non-mining validator and two newcomer workers sealed 6 rounds with 0 accepted, step 0, nothing minted. Ways out: the launch validators also mine (their bootstrap stake makes them checkers), or a second starter job the coordinator checks itself (an MLP one) for newcomers to earn their stake on first.
+- **The Evo collapse: cause and fix (2026-11-05, branch `evo-anchor` off `mainnet-checklist`; answers the first
+  finding above).**
+  - **The cause is drift, not what it learned.** `es2.coefficients` z-scores fitness, so every round steps the same
+    size whether or not it found anything, and the noise adds up as a random walk. The v2 step with random
+    coefficients alone (no answering: 12-round jobs, the cosine from 4e-3, chained at full weight) took the model
+    25.1% from its base in 400 rounds, the testnet line's 24%, with every score near 0 and rambling answers.
+  - **The drift budget**, measured the same way (100 items a set): fine up to about 4–5% from the base, slipping at
+    5–6%, broken by 9%. v2 adds about 1.6% a round at the cosine's top, so it's past 4% within a few rounds.
+  - **The fix, measured.** 60 real rounds on svamp with the network's round arithmetic on one GPU (64 pairs, 16
+    problems, replay fitness; 100 held-out items a set, so ±5 points is noise):
+
+    | | base | v2 (lr 4e-3) | anchored (lr 1e-3, decay 1/64) |
+    |---|---|---|---|
+    | svamp (trained) | 14% | 29% | 25% |
+    | ag_news | 75% | 20% | 75% |
+    | sciq | 56% | 44% | 57% |
+    | arc_easy | 47% | 30% | 47% |
+    | median drift | 0 | 6.8%, rising | 0.9%, flat |
+
+    So Evo does teach a held-out skill when it can't wander: the owner's open question, answered for one task.
+  - **What changed.** `Spec2.decay`, the anchor: before each round's step (each entry with an update) the change is
+    multiplied by 1 − decay (`Change.shrink`, in `es2.apply_entry`, `es2.rebuild`, `es_client.apply_round`, and
+    `es2.canonical_weights`, which with an anchor anywhere works each job's change out on its own and adds the base
+    last; without one it keeps its old order, so old jobs' numbers are unchanged). Random noise then levels off at
+    about step / √(2·decay); a push the rounds agree on adds up to about step / decay. Left out of the spec when 0, so
+    every earlier job's spec and hash are the same. `es_local.V2_SETTINGS`: lr 1e-3 and decay 1/64 (exact in
+    float32), so `testnet --evo2`'s jobs and `job template --evo` starter jobs get it.
+  - **Rollout.** A 0.5.16 or older node refuses a spec with `decay` ("a rule-2 ES spec has no field 'decay'"), so
+    every node and worker on an Evo chain needs this code before such a job is posted. Evo runs only on chains whose
+    genesis says `"es": true`, none of them public. The owner's testnet chains each new job from the last one's
+    change at weight 1, so its next job starts from the broken line; the anchor gives back 1/64 of it a round, about
+    90% within 150 rounds. A fresh testnet (`--reset`) starts clean.
+  - **Tests:** `tests/test_es2.py` `AnchorTests` (the field and its hash, and the arithmetic against each round worked
+    out alone, a parent's anchor and the child's); the network test runs with the anchor on and checks the workers'
+    change against `canonical_weights` with it. The experiment's scripts are in that session's scratchpad
+    (`evo/random_walk.py`, `evo/evo_train.py`).
+  - **Across tasks, with this branch's code as it is (V2_SETTINGS, 2026-11-05, 7 minutes):** 64 rounds, 8 tasks taken
+    in turn 8 rounds each (svamp, arc_easy, sciq, commonsense_qa, sst2, arithmetic, openbookqa, winogrande), scored
+    every 16 rounds, 100 held-out items a set. Everything went up, nothing down: svamp 14% → 19%, arc_easy 47% → 57%,
+    sciq 56% → 75%, commonsense_qa 45% → 58%, and two never trained on, ag_news 75% → 79% and boolq 28% → 63% (much of
+    that is likely the answer format). Median drift 1.4%, 1.7%, 1.9%, 2.0% at rounds 16–64 (the most-moved weight
+    3.6%): still rising slowly, so watch it over a longer run; the 4–5% budget is for the median.
+  - **Not done yet:** a run of several hundred rounds, to see drift level off (expected near 2–3%) and nothing slide;
+    the second finding (newcomers on an Evo-only network).
+- **Reviewed for bugs and vulnerabilities (2026-11-04, branch `review-fixes`, merged).** The security pass found nothing High or Medium. Fixed:
+  - the dataset quota counted a part-way upload by what was on disk, so uploads started side by side (one chunk each) got the quota each; now each counts at the size it declared, admitted under one lock (`Node._admitted`; `test_dos.DatasetQuotaTests`);
+  - its cache of datasets jobs name was keyed on the mempool's length (a full mempool swapping one tx kept it), now on the waiting post_jobs;
+  - evidence of a double-sign was given up after one failed send; now it's kept and sent again every `REPORT_RETRY_S` (15 s) until the offender is punished or the window closes;
+  - a conflicting vote or proposal that arrived after the others had decided its height was dropped (and with it `test_a_validator_signing_two_precommits…`, which failed whenever the honest three finished first); the engine now keeps the last height's votes and catches it (`Engine._late`, `test_consensus`);
+  - `/supply` summed every account under the round lock on each request; now once a block;
+  - a halted node's `/status` and refusals named its data folder and the database's error text; they now say only which block couldn't be saved (`halted_public`), and the full reason stays in the log.
+  - Left for the owner (design): one double-sign stops a one-validator chain for good; a listed validator whose stake a slash pushed below the minimum can't stake back up in v4 (it must leave, wait, and rejoin with 100 VIBE); a double-signer can report itself from a second wallet and keep the tenth that's the bounty; consensus signatures name the chain id, not the genesis hash, so a relaunch under the same chain id with the same validator keys would let anyone pair old and new certificates as double-sign evidence (`genesis check` fails a reused test id, but a block version could add the genesis hash); a post_job naming a dataset the node deleted is still relayed.
+  - Not ours: `test_finetune.LiveNetworkTests.test_post_train_and_download_an_adapter` fails on this PC at origin/main too (0 rounds trained in its time).
+
+**Unreleased (branch `versions-supply-explorer`, off `mainnet-checklist` and merged into it, 2026-11-04): versions in `/status`, a supply endpoint, a block explorer and EXCHANGES.md.** Four items of the mainnet checklist's "What exchanges and listing sites need" and the pre-deployment "Versioning" line.
+- **Versions.** `vibehash.__version__` is the one source (a checkout's pyproject.toml first, since this PC's venv has 0.5.7's metadata under a 0.5.15 checkout; then the package's; selftest and the menu read it). `/status` gains `version`, `block_version` (ledger.VERSION), `tip_version` (the tip block's; the genesis counts as 1), `min_client` (`client.MIN_CLIENT`, 0.5.14 by default, `vibehash node --min-client`) and `paid_rounds` (on genesis files that count them, else null). Every client request sends `User-Agent: vibehash/VERSION` (`client.stamp`). `client.too_old(status)` gives advice.newer_rules when the tip's block version is newer than this code's or `min_client` is newer than this release: `NodeClient.status()` logs it once a process and carries on, `worker` stops with it before the GPU self-test, and selftest fails a "versions" check. A node answers a `register` whose User-Agent names a release below its `min_client` with a 400 naming `python -m pip install -U vibehash`; no version, or another client's, is taken as before. A node from before these fields says neither, and clients carry on as they did.
+- **Supply.** `GET /supply` (`supply.py`): total, circulating (balances at canonical addresses), unspendable (balances at recipients no key has), staked and its bootstrap part, unbonding, escrow, genesis, minted, burned, the cap, the schedule's issuance, the next subsidy, `paid_rounds` and where the next halving is, in syn with exact VIBE strings. circulating + unspendable + staked + unbonding + escrow = total = State.total_supply() = genesis + minted − burned, tested after every block of a chain with transfers (one to a non-canonical recipient), a stake, an unstake, a job and its cancelling, and slashed cheaters. `GET /supply/total` and `/supply/circulating` answer one plain-text VIBE number, as CoinGecko and CoinMarketCap ask.
+- **`/blocks` carries ids.** Each block now has `hash` and `proposer`, and each tx `txid`: they're sha256 over length-prefixed parts, so nobody outside Python could match a `/tx` answer to a block before. Block.from_dict and Tx.from_dict ignore them. `/account/ADDRESS` reads a checksummed address as the canonical one (it answered zeros before).
+- **Explorer.** `GET /explorer` serves `vibehash/data/explorer.html` (package data; ~310 lines, inline CSS and JS, no outside scripts or fonts): chain, supply, validators, jobs, the latest blocks, a block's transactions, an address (balance, stake, unbonding, nonce, its transactions in the last 200 blocks), a job (spec, model, rounds), and a search box for a height, an address (a mistyped checksum is refused) or a job id. Light and dark. Node text only ever goes in as text (no innerHTML anywhere). Its Content-Security-Policy allows the page's own script and style by their sha256 (`node.explorer_page`), requests to the node only, and nothing else; it's a GET, so the `read` rate limit covers it. Addresses show checksummed where the browser has `crypto.subtle` (https and localhost), else in small letters.
+- **EXCHANGES.md**, linked from README (which has a new "The node's API" section): running a follower node, finality and checking a certificate, spotting deposits (and how system transactions and balance changes without a transaction look), addresses and validating them, signing and sending withdrawals (nonces, fees, what's signed), the supply endpoints, versions, and what's not there yet. Its examples are from a local `vibehash testnet`.
+- Tests: `tests/test_versions_supply.py` (20 tests, ~10 s, in CI's lists). test_network, test_dos, test_hardening, test_core, test_validators, test_selftest and test_menu pass. The explorer was looked at in the browser pane against a throwaway `vibehash testnet` on port 8611: dark and light, 375 px wide with no sideways scroll, a transfer whose memo was `<img onerror=…><script>…` shown as text, no console errors under the CSP. EXCHANGES.md's signing, certificate and checksum recipes were checked against that network's JSON with plain json and hashlib.
+- To decide: the `min_client` default (0.5.14: Evo v2's checkers; 0.5.10 would only cover fine-tunes' rule 2). "Circulating" counts spendable balances only; some listing sites count staked coins as circulating too. A release number for these changes (pyproject still says 0.5.15, so this branch's clients say `vibehash/0.5.15`, as the released 0.5.15 that sends nothing does).
+- Not done: a lookup of a transaction by id, an address index, the site linking to the explorer, the public node running it (it's on 0.5.10).
+
+**Unreleased (branch `validator-accountability`, off `mainnet-checklist` and merged into it, 2026-11-04): block version 4, validator accountability** (DESIGN §10 "Block versions", §9 point 3). `ledger.VERSION` is 4; every new rule applies only to blocks of version 4 (`ACCOUNTABILITY_VERSION`), so versions 1–3 hash, serialise and settle as before.
+- **Double-sign slashing.** A new user tx kind, `evidence`, which anyone can send: its memo holds the signer's pubkey, the kind, height and round, and for each of the two messages the block id (null for a vote for nothing), the signature and a proposal's valid round, about 560 bytes (at most `MAX_EVIDENCE_BYTES` 1024); its recipient is the offender. No blocks: a proposal's signature covers only its block id (`ledger.consensus_message`, which `consensus._signed_part` now is). The ledger (`_punish`, `parse_evidence`) checks both signatures for its chain id, a different block id, a height on chain or the block's own and at most `EVIDENCE_WINDOW` (= `UNBONDING_ROUNDS`, 20) back, and that the signer had a vote at that height: `State.voters` records the voting set whenever it changes, on every chain, pruned to the window. Punishment: all stake and unbonding coins; the sender gets 1/`economics.DOUBLE_SIGN_BOUNTY` (10) of the withdrawable part (nothing if it reports itself), the rest is burned, bootstrap stake last; out of the set at once and for good (`State.banned`, which `validator_set()` also leaves out), so one punishment per validator. A chain whose only listed validator double-signs keeps it listed with no stake and no vote, and stops: an empty list would turn it into a chain any staked node seals (`Node.bft`).
+- **Nodes report what they see.** `Node._report_double_signs` (in the consensus loop) sends an `evidence` tx from the node's own key for each pair `Engine.evidence` holds, once per offender, paying the node's min fee (logged if its balance can't). The engine now keeps evidence compactly (no proposal blocks; `_compact`, `evidence_memo`), once per validator, kind, height and round, and saves its round before sending a proposal as well as a vote: before, a crash between proposing and voting would have it build and sign a second block in the same round, now slashable.
+- **A higher stake to join:** `economics.VALIDATOR_STAKE` = 100 VIBE, the owner's call. Voting still needs `MIN_STAKE`, so the public node (10 VIBE bootstrap) keeps its vote. A validator in the set changes its url with the minimum, at once.
+- **A delay:** a join or leave in block h takes effect at h + `VALIDATOR_DELAY` (10): the set voting on that block is the new one (`State.pending`, applied at the end of the block before). One change waiting per address; an empty `validator` tx calls off a waiting join. A validator's own stake and unstake are refused while it's in the set or joining it (`_not_bonded`), so its weight can't jump past the others' without the delay; it unstakes from the height its leave takes effect. The last voter can't leave, counting leaves waiting. This is also what makes the window enough: coins a validator had at the offence unbond until past the window.
+- **Rollout (checked in the code, not run):** a 0.5.15 node or `chain verify` refuses the first version 4 block: `apply_block` raises "block version 4 after 3; this node knows up to 3". An old follower logs "refusing block N" and stops syncing there; old `chain verify` ends with that `InvalidBlock` traceback (cli.main catches only ValueError and the like). An old validator votes against version 4 proposals ("a new block must be version 3"), and validators of each version vote only for their own, so a mixed set stalls unless one side holds more than two thirds. Old workers carry on: they parse blocks only to audit receipts (`client.py`) and follow Evo jobs (`es_client.py`), and `Block.from_dict` takes any version and any tx kind. So: release it, upgrade every validator together (the public chain has one), then followers and anyone running `chain verify`; workers needn't hurry.
+- Tests: `tests/test_rules_v4.py` (15: slashing amounts with bootstrap and unbonding coins, proposals and nil votes, a self-report, v3 refuses evidence, twelve kinds of non-evidence, the window's edge, the fastest escape still slashed, a sole validator, the stake to join in v3 and v4, the delay to the height, bonded stake, a called-off join, the last voter with leaves waiting) and `test_validators.test_a_validator_signing_two_precommits_loses_its_stake_and_its_place` (four live validators, ~2 s). Tests of the v2/v3 rules now seal version 3 blocks explicitly (test_consensus, test_rules_v2, test_earn_in). Run on this branch: test_core, test_consensus, test_rules_v2, test_rules_v4, test_earn_in, test_record_v2 (144, OK), test_validators (5, OK, 141 s), test_hardening (63; `test_connection_caps_answer_503_and_the_client_waits` failed once with another agent loading the PC and passed alone), test_finetune.SpecTests (16, OK). `chain verify --no-replay --no-recheck` of vibehash-public-1 with this code: 11,630 blocks VALID, supply exact, every certificate good (with round replay it hadn't finished after 10 minutes, so it was stopped).
+- Left: the numbers; `/validators` and `validator list` don't show changes waiting; no CLI command sends evidence someone collected by hand (any signed tx to `/tx` works); the gaps in DESIGN §9 point 3 (votes sent differently to different validators, offline validators, earn-in pay lifting a listed validator back to a vote).
+
+**Unreleased (branch `mainnet-checklist`, 2026-11-03): one node per folder and per port.** `chain verify` on the owner's Evo testnet failed at blocks 502 on: the menu's Evo Hash had started a second copy of the running `testnet --evo2` in the same folder. Windows let both servers bind 127.0.0.1:8545 (http.server asks for SO_REUSEADDR, which on Windows lets a second process take a port in use), so requests reached one or the other and workers stopped registering; the two nodes built rival blocks with the one validator key, and the one behind failed every save ("UNIQUE constraint failed: blocks.height"). The database kept one consistent chain (the copy ahead wrote first); stopping both and starting one carried on from it, and `chain verify` then passed all 530 blocks. Fixes, nodes and testnets only:
+- `GuardedServer.allow_reuse_address` is off on Windows, which still rebinds right after a stop (measured).
+- A node holds `node.lock` in its data folder (`node.hold_folder`, `FolderInUse`), from before its database opens until `stop()`, or `close()` for one never started; a failed start gives it back.
+- `testnet` holds `testnet.lock` in its folder from the first line (before `--reset` deletes anything, and before an Evo model loads), and gives it back however it ends: the menu runs commands in its own process and goes on.
+- Tests: `test_dos.OneNodePerFolderTests` (the port test fails with the old setting on Windows; Linux refused a second listener already).
+
+**Unreleased, same branch: a node saves each block before adopting it, and stops if it can't** (merged from `save-before-adopt`). The same incident's node behind led rounds for 15 minutes on blocks only its memory held: `adopt` appended to the chain before `save_block`, and `Engine._decide` logged the failed commit and went on to the next height. Now `Chain.append(block, save)` applies the block, calls the save, and only then changes the chain; `Store.save_block` writes block, certificate and record in one transaction, takes the very block already on disk as saved (filling in what it lacked), and raises `storage.RivalBlock` for a different one (`NotSaved` for any other failure). `Node._halt` then stops the node for good (`Engine.halt`: no votes, proposals or heights; no rounds, sync or receipts; `/tx` and workers refused), leaving the server up so `/status` says why (`halted`); `vibehash node` and `testnet` exit with the reason. Tests: `test_dos.SaveFirstTests`, `SyncTests.test_the_very_block_already_on_disk_is_taken_as_saved`, a `test_validators` case with a rival block 1 on one of four validators; each failed on the old code. Left: writes after the block (params, scores, prep state) still only log a failure; a halt over an uncertified rival block tells the operator to restart, but the restart refuses the folder ("isn't final"); and under systemd's `Restart=always` a full disk would loop start, halt, exit every few seconds.
+
+**Unreleased, same branch: addresses people see carry a checksum in their letters' case** (merged from `address-checksum`; DESIGN §10 "Addresses and their checksum"). The canonical address is unchanged (`vibe1` and 36 small hex digits, what ledger, blocks, wallet and genesis files, the API and JSON hold), so every chain and wallet stays valid. `crypto.checksummed` capitalises a letter when the matching nibble of sha256(the address) is 8 or more (EIP-55's scheme with sha256); `crypto.parse_address` takes a person's text to the canonical form, accepts all small letters unchecked, and refuses a mixed-case or all-capitals one whose capitals don't match. Every command that takes an address parses it before a wallet opens (`send --to`, `balance`, `genesis create`, the menu's Send), and `NodeClient.send_tx` parses a transfer's recipient before signing; people-facing text shows the checksummed form, machine formats stay lowercase. Measured over 14.85M single-character typos of 20,000 random addresses: 99.876% refused. **Found on the way:** the ledger credits any transfer recipient that starts with `vibe1` (capitals, any length), coins nobody could ever spend; `ledger._relayable` now refuses non-canonical transfer recipients (relay policy only; making it a block rule waits for a block version). Not done: docs/guide.html's and the site's example addresses are still lowercase (the site would need sha256 in its JavaScript); bech32m would need a new genesis and block version (DESIGN §10).
+
+**Unreleased, same branch: on new networks only rounds that pay for work mint, and the halvings count them** (merged from `halvings-count-work`; DESIGN §10 "Issuance schedule"). Every round used to mint its subsidy and burn what nobody earned, and the halvings counted heights, so a quiet network kept halving on schedule and destroyed every empty round's coins (26 empty rounds on the owner's Evo testnet: minted and burned both +325 VIBE). A genesis whose economics says `"count": "paid_rounds"` (economics.PAID_ROUNDS) now mints only in a round that `RoundSummary.pays_for_work` (accepted work credited to a worker who isn't an offender, in every round kind; checkers or scorers alone don't count), and halves every `halving_interval` such rounds: `State.paid_rounds`, derived from blocks, never from a proposer. Without the field (every genesis before this) nothing changes, and it enters the genesis hash only when set: `chain verify` of vibehash-public-1 (9,759 blocks) and the Evo testnet gave the same state at every height as the code before. `genesis create` and new `testnet` folders write it (`economics.NEW_SCHEDULES`); a genesis naming a preset by string keeps the old rule. Fees and slashes in empty rounds are as before. Tests: `test_hardening.PaidRoundsTests` and `PaidRoundsLedgerTests`, a scorers-only round in test_finetune, the field in test_network and test_es2. The whitepaper (PDF reprinted), the guide and README describe the rule; the guide still gives the public network's 3.125 VIBE a block, which is right for vibehash-public-1's genesis. Choices to revisit: rounds that pay only checkers or scorers count as unpaid; a paid round still burns a share nobody claims (the checkers' 15% when nobody checked); `/status` doesn't report `paid_rounds`. `test_es2.NetworkTests2.test_rounds_replay_cheats_a_child_and_a_restart` fails on this PC with and without the change (the parent's round 8 waits out its 321 s compute deadline, so the child never runs within the test's 300 s).
 
 **Release 0.5.14 (2026-11-03, branch `evo-check` off `evo-v2`): Evo v2's answer checks are exact on one kind of GPU.** Honest workers' units were failing "a token … below the greedy choice's logit" on text tasks (about a third of trivia_qa's and commonsense_qa's units on the testnet), because the checker re-read answers on transformers' path at another batch size and rounded differently. Checkers now teacher-force through the answering engine, which always works 256 rows at a time; v2's margin is 0.1. Every worker on a network needs 0.5.14: the engine's rounding changed. Details under Evo v2 below.
 
@@ -504,13 +638,13 @@ Blockers before inviting anyone onto a public testnet:
 - [x] **License:** MIT, chosen by the owner 2026-10-30 (`LICENSE`, and `license = "MIT"` in pyproject, which needs setuptools 77+).
 - [ ] **Faucet.** Earn-in (Key design decisions) means workers no longer need one: they start with nothing and earn their stake. People who want to *post* jobs still need VIBE from a transfer, so a rate-limited faucet would still help requesters.
 - [x] **Publish to PyPI:** 0.4.0 is out (2026-10-29). Later releases: bump the version and push a `v*` tag (README, "Publishing a release").
-- [ ] **Node hardening:** ~~TLS; per-IP rate limits; connection caps; transaction fees~~ done 2026-10-29 (DESIGN §10: `tls.py`, `ratelimit.py`, `fees.py`). Message, memory and peer limits, and a block size limit, done 2026-10-30 (item 7). Still open: a per-address dataset quota (anyone with ≥1 VIBE can upload 20 GB datasets repeatedly); public blob GETs can be abused for bandwidth; replace-by-fee; a funded job up to `--max-job-mb` still costs the leader real memory each round.
+- [ ] **Node hardening:** ~~TLS; per-IP rate limits; connection caps; transaction fees~~ done 2026-10-29 (DESIGN §10: `tls.py`, `ratelimit.py`, `fees.py`). Message, memory and peer limits, and a block size limit, done 2026-10-30 (item 7). A per-address quota on datasets no job uses, which are deleted after three days, done 2026-11-04 (DESIGN §10, branch `mainnet-checklist`). Still open: public blob GETs can be abused for bandwidth; replace-by-fee; a funded job up to `--max-job-mb` still costs the leader real memory each round.
 - [ ] **Operations:** run the node as a service; back up `node-data/` and the node wallet; monitoring and alerting; disk-space alarms (opened checkpoints are kept for `--keep-rounds` rounds, about units × (2q+2) × model size per round; datasets are never deleted).
 - [ ] **Load test:** many workers, a large model, and real home upload speeds. Tune phase durations (`--compute-s`, etc.). Defaults are sized for small models.
 - [ ] **Security review:** fuzz the HTTP API; have someone else review ledger/coordinator/verification. Nothing has been audited.
 - [x] **Wallet recovery:** done 2026-10-29. `wallet create` and `setup` show 24 BIP39 words (SLIP-0010 Ed25519, `m/44'/1'/0'/0'/0'`), and `wallet restore` rebuilds the wallet from them. A mainnet needs its own SLIP-0044 coin type.
 - [ ] **Issuance:** `genesis create --economics mainnet` gives a Bitcoin-like schedule (3.125 VIBE a round, ~4-year halvings, 21M cap). Choose the real numbers before any launch.
-- [ ] **Versioning:** (block and record versions exist since 0.5.2, but `/status` still doesn't report the software version) protocol and client version in `/status`; refuse incompatible clients; plan for chain upgrades.
+- [ ] **Versioning:** ~~protocol and client version in `/status`; refuse incompatible clients~~ done on branch `versions-supply-explorer` ("Current state": `version`, `block_version`, `tip_version`, `min_client`; clients send `User-Agent: vibehash/VERSION`, and a worker too old is refused and told how to upgrade). Still open: a plan for chain upgrades that validators agree to.
 - [ ] **Legal:** keep it explicitly valueless and testnet-only; terms and privacy notice (the node sees worker IPs); legal advice before anything that could carry value.
 
 Known limits (fine for testnet, document rather than fix now):
@@ -519,9 +653,132 @@ Known limits (fine for testnet, document rather than fix now):
 - `Dataset.from_npz` loads the whole dataset into RAM; the node evaluates on the CPU.
 - Verifiers download ~2q checkpoints per task, which is significant bandwidth for big models.
 
+## Before VIBE is a real, listed currency (mainnet checklist, 2026-11-03)
+
+The owner asked what stands between Vibe Hash, Evo Hash included, and listing VIBE as a currency people can buy.
+Everything still open in the checklist above comes first (the security review, issuance, versioning, legal), plus the
+items below. Where things stood when this was written: `vibehash-public-1` at block ~9,560 with **one validator** (the
+droplet), 2 miners in the last day, 10,000 VIBE allocated to the owner's wallet at genesis, no `"es": true` in its
+genesis (so no Evo jobs; Evo Hash runs on local test networks only), no block explorer and no supply endpoint.
+
+**A fresh chain for real money.** The testnet's coins stay worthless; a mainnet starts from a new genesis.
+- [ ] The final issuance numbers, and the founder allocation: a premine weakens both "nobody controls it" and the legal
+  position. Without one, the first job is funded by a **starter job in the genesis** (the owner's choice, 2026-11-04;
+  `genesis create --starter-job`, DESIGN §6): owned by nobody, paying only new coins. Which job it is (an Evo job is
+  the natural fit, once Evo's checks close their gaps) is still to pick.
+- [ ] Its own SLIP-0044 coin type (`mnemonic.PATH` uses 1, "testnet, all coins"), so the same words give different
+  testnet and mainnet keys.
+- [x] `"es": true` in that genesis: the owner decided Evo Hash is on for mainnet (2026-11-04). There's no chain-upgrade
+  process to add it later (`genesis create --es` writes it, `genesis check` warns without it).
+- [x] A check anyone can run on a proposed genesis: `vibehash genesis check FILE` (branch `mainnet-checklist`,
+  2026-11-04) fails a test network's id, the old issuance rule, no cap, too few validators or one with a third of the
+  vote, shared or private validator hosts; it warns on a premine, earn-in off, Evo off and the testnet coin type.
+
+**Nobody controls it (DESIGN §9).**
+- [ ] Several independent validators, the bootstrap stake spread across them. Today the owner's node alone can halt or
+  censor the chain, and exchanges look for exactly this.
+- [x] Double-sign slashing, a higher validator stake, a delay before set changes apply: block version 4 (branch
+  `validator-accountability`, "Current state"). Its numbers (100 VIBE to join, 10 heights, the reporter's tenth) are
+  placeholders for the owner to set, and it reaches the public chain only once its validator runs it.
+- [ ] Validators recheck a sample of weight-based checks before voting, a dispute tx that slashes a leader whose record
+  a recheck contradicts, and checkpoints replicated across validators.
+- [ ] Upgrades that don't depend on one person re-running `deploy/setup-node.sh`: ~~versions in `/status`, old clients
+  refused~~ (branch `versions-supply-explorer`), a planned upgrade path validators agree to.
+- [ ] DeepSeek jobs kept off it until their trust points go (Hugging Face for the frozen weights, the operator-paid
+  hand-off bucket; DEEPSEEK.md §8).
+- [x] A node locks its data folder and refuses a port that's taken (branch `mainnet-checklist`; "Current state" has
+  the story). Found by `chain verify` on the owner's Evo testnet: two copies of one testnet signed rival blocks with
+  one validator key. On a real network that is a validator double-signing, which from block version 4 costs it all
+  its stake (above).
+
+**Evo Hash.**
+- [ ] On a public network at all: `vibehash-public-1` refuses Evo jobs (`ledger.ES_GATE`).
+- [ ] The checks' last gaps after 0.5.14 (Evo v2 above): bf16 logits that tie exactly for some multiple-choice
+  forgeries (14 of 1,439), another kind of GPU unmeasured, replay log-probabilities still scored on transformers' path.
+- [ ] Selection (docs/evo-hash.pdf §10): a worker withholding units, or a checker's unrefereed rejections, can steer
+  which pairs enter an update. Needs refereed rejections and units given to more than one worker.
+- [ ] Verifiable snapshots: a new node or worker rebuilds the whole line from the chain, which grows forever (0.5.13's
+  saved line only speeds up a restart on the same machine).
+- [x] `tests/test_es.py` and `test_es2.py`'s spec tests in CI, on CPU PyTorch (job `evo`, not a required check yet; 2026-11-04).
+  Left out: test_es2's network test (slow machines miss its deadline) and its engine test (needs CUDA).
+- [ ] Weeks on a public testnet with miners other than the owner's machines.
+
+**What exchanges and listing sites need.**
+- [x] A block explorer, and an endpoint for total and circulating supply (branch `versions-supply-explorer`:
+  `/explorer`, `/supply`, `/supply/total`, `/supply/circulating`). Not on the public node yet, which runs 0.5.10.
+- [x] Integration docs for an exchange's deposits and withdrawals (the node's API, BFT finality in one block):
+  EXCHANGES.md, branch `versions-supply-explorer`.
+- [ ] A market. CoinGecko and CoinMarketCap list only coins already trading on an exchange they track. Either an
+  exchange integrates the chain (real ones want audits, a legal opinion and users; small ones asking a "listing fee" are
+  often scams), or a bridge to a wrapped token, where someone holds the real coins (a controller, and bridges are
+  crypto's most-hacked part).
+- [ ] Demand that isn't the owner's: today every job on the public chain was posted from the genesis allocation.
+
+**Legal and money (not legal advice; see a lawyer, e.g. a university's student or entrepreneurship legal clinic).**
+- [ ] Before VIBE has a price: a founder allocation, the founder selling, or talk of the price push a coin toward being
+  a security; coins only earned by mining are on firmer ground, and US rules are moving in 2025–26.
+- [ ] The owner doesn't sell VIBE, run an exchange or hold others' coins (money-transmitter rules).
+- [ ] Taxes: once VIBE has a market price, mined coins are income when received (US), for every miner.
+- [ ] Terms, a privacy notice (the node sees worker IPs), and the logo-like emblems (`emblems.py`) looked at again once
+  money is involved.
+
+Order: Evo's checks and Evo on the public testnet; outside validators there; a lawyer early, since the answers shape the
+genesis; the audit; the new chain; explorer and supply endpoint; only then exchanges.
+
+## Roadmap: a model the network tunes itself ("Vibe", the owner's choice, 2026-11-05)
+
+**Why.** The owner's bar for Vibe Hash being big: people get paid to push an open model past the original **across
+the board**, not narrow one-dataset fine-tunes. The network does all of an open model's post-training from Qwen's raw
+base and releases its own model ("Vibe-4B" etc., names not settled). Success means beating Qwen's official tuned model
+of the same size on a broad held-out test, with no task worse.
+
+**It's been done outside the big labs:**
+- AI2's Tülu 3 post-trained Llama 3.1's base and matched or beat Meta's Llama 3.1 Instruct on many benchmarks.
+- Prime Intellect's INTELLECT-2 ran reinforcement learning on QwQ-32B across untrusted machines.
+
+Training like this sharpens reasoning, accuracy and following instructions. It doesn't add knowledge.
+
+**The bases exist:** `Qwen/Qwen3.5-0.8B-Base`, `-2B-Base`, `-4B-Base`, `-9B-Base` and `Qwen3.5-35B-A3B-Base` on Hugging
+Face. They're the same hybrid design the Evo engine now runs (`es_hybrid.py`); the base checkpoints aren't downloaded or
+tested yet.
+
+**Steps, in order:**
+0. **Prerequisites** (the "Two findings" above):
+   - fix the Evo step (scaled to each weight, anchored to the base, a held-out guard) so long runs don't collapse;
+   - solve newcomers' first stake on an Evo network;
+   - prove reward training teaches a held-out skill: the GSM8K experiment.
+1. **Teach the base to chat** with fine-tune jobs on open instruction data:
+   - check each dataset's license;
+   - `llm.py` trains Qwen3 but not Qwen3.5's linear-attention layers, so the fine-tune path needs the port Evo just got, and its cross-device checks measured (FINETUNING.md).
+2. **Make it better** with reward training on many checkable task families:
+   - math, from GSM8K's and MATH's train splits;
+   - code that must pass tests;
+   - logic and procedurally generated puzzles;
+   - following an exact format or instruction;
+   - extraction.
+
+   Use the fixed Evo or a GRPO-style job kind. Keep a round's change only if it lowers nothing on the held-out suite.
+3. **A public scoreboard:** base, Qwen's official model and the network's model, on a broad held-out suite, on the
+   explorer.
+   - Everything on chain is public, so a fixed test can be trained on. Part of the suite should be freshly generated
+     problems drawn from each round's beacon (like Countdown and arithmetic today), which nobody can memorize.
+   - "Accept an update only if it doesn't lower the suite" could then be a protocol rule the validators replay.
+4. **Scale up:**
+   - 0.8B first: fast, fits ordinary miners' GPUs, proves the loop end to end;
+   - then 4B and 9B, which need the Evo worker's change kept leaner (it's 28 GB of RAM at 4B today);
+   - 27B/35B later, with FP8 or several GPUs.
+5. **The genesis starter job** becomes "improve Vibe-xB" on these task families, instead of the 19 testnet tasks.
+
+**Open questions:**
+- dataset licenses;
+- whether Evo is efficient enough next to gradient-based reward training (a 3-minute race on Countdown tied, both
+  learning only the format);
+- keeping the scoreboard honest when everything is public;
+- how much compute beating the official model takes.
+
 ## Working tips
 
 - The original session folder's path was too long for some `pip` installs (numpy, torch). The OneDrive path is short enough. A virtual environment works there, as long as it's excluded from git, or kept outside OneDrive so OneDrive doesn't sync gigabytes of PyTorch.
-- In the Claude Code Bash tool, long heredocs containing quotes sometimes failed to parse. Writing edit scripts to a `.py` file and running them was reliable. The repository's files are LF, and Python's `open(p, "w")` writes CRLF on Windows: pass `newline="\n"` (Git Bash's `grep` doesn't show the `\r`, `git diff --stat` does).
+- In the Claude Code Bash tool, long heredocs containing quotes sometimes failed to parse. Writing edit scripts to a `.py` file and running them was reliable. Most of the repository's files are LF, but HANDOFF.md and README.md are CRLF in git: edit those keeping their CRLF (read and write with `newline=""`; on 2026-11-04 a script writing them with `newline="\n"` turned the whole file over, and every merge touching it then conflicted on all of it). Python's `open(p, "w")` writes CRLF on Windows: for the LF files pass `newline="\n"` (Git Bash's `grep` doesn't show the `\r`, `git diff --stat` does).
 - `simulate.py` and `test_core.py` are fast (seconds). `test_network.py` takes about a minute (live HTTP nodes). `test_gpu.py` needs PyTorch.
 - Signatures fall back to slow pure-Python Ed25519 without `cryptography`. Install it for realistic timing.

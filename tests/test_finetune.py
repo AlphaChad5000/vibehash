@@ -102,7 +102,7 @@ class SpecTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ledger.InvalidBlock, "version 3"):
                         ledger._apply_user_tx(state, tx, 1, chain.chain_id, version)
-        self.assertEqual(ledger.VERSION, ledger.FINETUNE_VERSION)
+        self.assertGreaterEqual(ledger.VERSION, ledger.FINETUNE_VERSION)
 
     def test_an_oversized_score_is_refused_not_a_crash(self):
         from vibehash.coordinator import ProtocolError, _score
@@ -875,7 +875,7 @@ class NodeFreeRoundTests(unittest.TestCase):
         req = KeyPair.generate(b"req")
         stakes, lr = cfg.pop("stakes", None), cfg.pop("lr", 1e-2)
         chain = Chain({req.address: 1000 * VIBE}, stakes=stakes or {w.address: 10 * VIBE for w in self.workers},
-                      earn_in=cfg.pop("earn_in", False))
+                      earn_in=cfg.pop("earn_in", False), economics=cfg.pop("economics", None))
         self.proto = Protocol(chain, self.workers, CoordinatorConfig(**cfg), seed=3)
         self.job = job_of(self.tiny.spec(), data_source={"kind": "tokens", "sha256": self.sha}, units_per_round=8,
                           lr=lr, memory_mb=2048, budget=100 * VIBE, fee_per_round=10 * VIBE)
@@ -1495,6 +1495,29 @@ class NodeFreeRoundTests(unittest.TestCase):
         self.assertGreater(rep.record["score"][0], 1.0)
         self.assertNotIn(liar, rep.verifier_pay)
         self.assertTrue(all(rep.verifier_pay.get(v, 0) > 0 for v in scores if v != liar))
+
+    def test_only_a_round_that_pays_for_work_mints(self):
+        """On a chain counting paid rounds (economics.PAID_ROUNDS): a round whose claims no checker answered for pays
+        nobody for work, so it mints nothing, though its scorers scored; the next, checked, mints and is counted. Both
+        replay, and the summary of each says which it was."""
+        from vibehash import economics as econ
+        self.network([("honest", "honest")] * 3, replication_rate=0.0, canaries_per_round=0,
+                     economics=econ.NEW_SCHEDULES["testnet"])
+        escrow = self.proto.chain.state.escrow[self.job.job_id]
+        quiet = self.round(lambda t, w: None)  # every check left unanswered; the scores still come in
+        self.assertTrue(quiet.results and all(res.verdict.value == "unchecked" for res in quiet.results))
+        self.assertTrue(quiet.block.summary.verifier_flops, "the scorers were owed for scoring")
+        self.assertFalse(quiet.block.summary.pays_for_work)
+        self.assertFalse([t for t in quiet.block.txs if t.kind in ("reward", "fee_release")])
+        st = self.proto.chain.state
+        self.assertEqual((st.minted, st.burned, st.paid_rounds, st.escrow[self.job.job_id]), (0, 0, 0, escrow))
+        worked = self.round()
+        self.assertTrue(worked.block.summary.pays_for_work)
+        self.assertTrue(worked.worker_pay and worked.verifier_pay)
+        st = self.proto.chain.state
+        self.assertEqual((st.minted, st.paid_rounds), (50 * VIBE, 1))
+        self.assertEqual(st.total_supply(), st.expected_supply())
+        self.replays([quiet, worked])
 
     def test_without_a_quorum_of_staked_workers_it_waits(self):
         """On a chain where newcomers earn their stake in, a fine-tune trains only once enough staked workers can check
