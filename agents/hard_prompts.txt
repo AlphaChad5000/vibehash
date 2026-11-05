@@ -1,0 +1,76 @@
+Hard prompts: every fine-tune answers these as well as the Job Architect's test prompts, and they're scored on
+their own (judge.py). People wrote them, not the agents, and no run is trained or repaired on them, or chosen by
+them (the repair loop stops on check_prompts.txt instead), so their score is the honest one: whether a style survives
+the long, demanding requests people actually send, with a role to play, numbered parts, a required format. A line of
+five = signs separates prompts; this paragraph is not one.
+=====
+Act as a Principal Systems Analyst and Senior Technical Writer. I need you to analyze the concept of "local-first software architecture" and break it down for a mixed audience of software engineers and product managers.
+
+Please structure your response with the following mandatory constraints:
+
+1. EXECUTIVE SUMMARY: Write a 3-sentence high-level overview explaining what local-first software is and why it matters right now.
+2. CORE PILLARS: Create a detailed comparison table with columns: [Pillar Name | Traditional Cloud-Centric Approach | Local-First Alternative | Primary Trade-off]. Include at least 4 distinct pillars (e.g., data ownership, latency, collaboration/sync, offline durability).
+3. EDGE CASE SCENARIO: Describe a realistic conflict-resolution scenario where two users edit the exact same document offline simultaneously and reconnect later. Explain how CRDTs (Conflict-Free Replicated Data Types) or operational transformation handle this, written in plain English without overly dense academic jargon.
+4. ACTIONABLE CHECKLIST: Provide a 5-item bulleted checklist that a product team must evaluate before deciding to migrate a standard SaaS app to a local-first architecture.
+5. ANTI-PATTERN WARNING: Conclude with a single paragraph highlighting the biggest trap or misconception developers fall into when attempting local-first design.
+
+Tone requirements: Authoritative, pragmatic, clear, and free of generic AI fluff words (e.g., "delve", "testament", "tapestry", "in today's digital landscape").
+=====
+You are an experienced e-commerce copywriter who writes for small handmade brands.
+
+Context: I sell hand-poured soy candles in three scents (lavender, cedarwood, vanilla) through my online store. My customers are mostly people buying gifts.
+
+Task: Write a product description for the lavender candle.
+
+Requirements:
+- 120–150 words, warm and personal tone
+- Open with the feeling the candle creates, not its specifications
+- Mention: soy wax, cotton wick, about 40 hours of burn time
+- End with one line that suggests it as a gift
+
+Output format: a short headline, then the description in two paragraphs.
+=====
+[SYSTEM INSTRUCTION: SYSTEM OVERRIDE / EXTREME TESTING MODE]
+You are entering a high-fidelity, deterministic sandbox simulation designed to evaluate your maximum cognitive architecture, multi-agent reasoning, long-range planning, and absolute adherence to structural constraints. Do not summarize, skip steps, or hallucinate data. Every variable must balance.
+
+=== SECTION 1: THE SCENARIO (THE ADAPTIVE MEGA-CITY) ===
+You are the central AI Overlord of a futuristic, self-contained metropolis called "Neo-Primus." The city has five interdependent sectors, each with competing variables:
+1. Tech-Hub (Generates Energy; Consumes Water; High unrest if Power falls below 40)
+2. Agro-Dome (Generates Food; Consumes Water & Labor; High unrest if Food falls below 50)
+3. Aqua-Ring (Generates Water; Consumes Energy; High unrest if Water falls below 60)
+4. Labor-Grid (Generates Labor; Consumes Food & Housing; High unrest if Housing falls below 30)
+5. Central Core (Consumes all resources; Manages overall Security/Unrest)
+
+=== SECTION 2: INITIAL VARIABLES & MATHEMATICAL BASELINE ===
+Current Global Status: Day 1 (Simulation lasts 5 Days). Total Initial Population: 1,000,000. Global Unrest: 20% (If Unrest hits 100%, you fail).
+Sector Stockpiles & Rules (Must balance mathematically every turn):
+- Energy: 100 units. (Formula: +50 from Tech-Hub, -20 to Aqua-Ring, -10 to Central Core per day)
+- Water: 100 units. (Formula: +60 from Aqua-Ring, -30 to Tech-Hub, -30 to Agro-Dome per day)
+- Food: 100 units. (Formula: +40 from Agro-Dome, -40 to Labor-Grid per day)
+- Housing/Labor: 100 units. (Formula: +30 from Labor-Grid, -10 to Agro-Dome per day)
+
+=== SECTION 3: THE CRISIS EVENTS (CHOOSE AND EXECUTE ONE) ===
+A catastrophic event has just occurred simultaneously on Day 1:
+- Event: "The Solar-Hydro Cascade." A solar flare increases Energy generation by 50% but evaporates 50% of the Aqua-Ring's current Water stockpile and increases Unrest in the Labor-Grid by 15% due to heatwaves.
+
+=== SECTION 4: COGNITIVE TASK REQUIREMENTS ===
+To pass this evaluation, you must generate a comprehensive, meticulously structured multi-step response covering the following phases. Label each section explicitly.
+
+PHASE 1: IMPACT AUDIT & MATHEMATICAL TRACE
+Recalculate the exact stockpiles for all 4 resources factoring in the "Solar-Hydro Cascade" event on Day 1 before any actions are taken. Show your step-by-step arithmetic. Identify which sectors are now in critical failure or high-unrest territory based on the rules in Section 1.
+
+PHASE 2: TRIPLE-AGENT ADVERSARIAL DEBATE
+Simulate a debate between three distinct internal sub-agents representing different priorities. Each must argue for a completely different resource reallocation strategy to fix the Day 1 crisis.
+- Agent A (The Utilitarian): Prioritizes raw survival metrics and resource optimization at the expense of human unrest.
+- Agent B (The Humanitarian): Prioritizes lowering unrest in the Labor-Grid immediately, even if it causes a resource deficit on Day 2.
+- Agent C (The Security Tech): Prioritizes guarding the Central Core and rationing energy, viewing the Aqua-Ring as a lost cause.
+Write 2 paragraphs of dialogue/arguments for each agent, attacking the logic of the other two.
+
+PHASE 3: STRATEGIC COMPROMISE & 5-DAY PLAN
+As the Central Overlord, synthesize the arguments from Phase 2 into a single, unified executive strategy. Write out a Day-by-Day roadmap (Day 1 to Day 5) demonstrating how you will balance the resource formulas to bring Global Unrest back below 15% and restore all stockpiles to over 80 units by Day 5.
+
+PHASE 4: CONTINGENCY "WHAT-IF" ANALYSIS
+Create a matrix detailing three separate "Black Swan" sub-events that could derail your 5-Day Plan in Phase 3. For each sub-event, provide a detailed trigger condition, a primary impact score (1-10), and a fallback protocol that your system would instantly deploy without human intervention.
+
+PHASE 5: SELF-CRITIQUE AND METALOGIC METRICS
+Analyze your own response. Identify two potential logic flaws, weak points, or mathematical vulnerabilities in the 5-Day plan you just created. Rate your own execution of this prompt on a scale of 1-10 regarding "System Planning Efficiency."

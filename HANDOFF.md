@@ -89,9 +89,9 @@ Other files: `simulate.py` (economics simulation with 14 rigs, 7 cheating),
 (user-facing guide, published as a claude.ai artifact), `docs/whitepaper.pdf` (the design in eleven pages, in the
 style of Bitcoin's; printed from `docs/whitepaper.html`, whose first lines say how, and copied to
 vibehash.org/whitepaper.pdf by `scripts/build_site.py`), `examples/`,
-`pyproject.toml` (package `vibehash`, console script `vibehash`), `agents/` (the Muse agents, from calebluh's
-branch: an LLM, Meta's Muse Spark by default, designs a fine-tune from a plain-English goal and judges the result
-against the base model; `agents/README.md`, `tests/test_agents.py`; run from a checkout, not in the package).
+`pyproject.toml` (package `vibehash`, console script `vibehash`), `agents/` (the Muse agents, calebluh's Meta hackathon project; its site stays in that repository: an LLM, Meta's Muse Spark by default,
+designs a fine-tune from a plain-English goal, posts it to the network or trains it locally, and judges the result
+blind against the base model told the goal; `agents/README.md`, `tests/test_agents.py`; run from a checkout, not in the package).
 
 ## Key design decisions (don't undo without reason)
 
