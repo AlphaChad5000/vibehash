@@ -388,7 +388,7 @@ Mine without the questions: get ready, join, keep the worker running, start at l
 Get ready, join the network and mine (what plain `app` does).
 
 ```
-vibehash app start [-h] [--node NODE] [--wallet WALLET] [--device DEVICE] [--watch PORT] [--gpu {auto,skip}] [--recheck-gpu] [--job JOB]
+vibehash app start [-h] [--node NODE] [--wallet WALLET] [--device DEVICE] [--watch PORT] [--gpu {auto,skip}] [--recheck-gpu] [--job JOB] [--no-password]
 ```
 
 Flags:
@@ -400,6 +400,7 @@ Flags:
 - `--gpu {auto,skip}`: install PyTorch for the GPU (auto) or not. Default: `auto`.
 - `--recheck-gpu`: test the GPU again, even if an earlier run found it ready.
 - `--job JOB`: mine only this job, as `worker --job`.
+- `--no-password`: make a first wallet without a password, so nothing is asked (what the downloadable app does); the file is then as safe as your user account.
 
 ### vibehash app pause
 

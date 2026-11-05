@@ -100,7 +100,7 @@ def prepare(a) -> tuple[str, Path]:
     print(f"node: {url}")
 
     path = settings.wallet_path(getattr(a, "wallet", None)) or settings.default_wallet()
-    address, pw = cli.ensure_wallet(path, "wallet: ")
+    address, pw = cli.ensure_wallet(path, "wallet: ", no_password=bool(getattr(a, "no_password", False)))
     if pw is None and wallets.is_encrypted(path):
         # The worker is a child process that unlocks the wallet itself: it reads $VIBEHASH_PASSWORD, so the password
         # asked for here (once, at a terminal) is handed to it that way, after a check that it opens the wallet.

@@ -171,14 +171,23 @@ def show_words(words: str, indent: str = "") -> None:
     print()
 
 
-def ensure_wallet(path: Path, indent: str = "") -> tuple[str, str | None]:
+def ensure_wallet(path: Path, indent: str = "", no_password: bool = False) -> tuple[str, str | None]:
     """The wallet at `path`, made if there is none: its password asked for (or $VIBEHASH_PASSWORD; with neither, the
     error says so), its recovery words shown once or saved to a file when nobody is watching. -> (address, the
-    password a new wallet was made with, else None)."""
+    password a new wallet was made with, else None). `no_password`: make it without one, as `wallet create
+    --no-password` does, for an app that must start with no question: the file is then as safe as the user's
+    account, and the recovery words still restore it."""
     if path.exists():
         address = json.loads(path.read_text())["address"]
         print(f"{indent}using {path}\n{indent}address {checksummed(address)}")
         return address, None
+    if no_password and "VIBEHASH_PASSWORD" not in os.environ:
+        words = mnemonic.generate()
+        keys = mnemonic.keypair(words)
+        wallets.save(keys, path, None, mnemonic.PATH)
+        print(f"{indent}created {path} (no password: as safe as this user account)\n{indent}address {checksummed(keys.address)}")
+        give_words(words, keys.address, path, indent)
+        return keys.address, None
     pw = password(f"{indent}Choose a wallet password: ", confirm=True)
     if pw is None:
         raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
@@ -2290,6 +2299,8 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
         p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
         p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
+        p.add_argument("--no-password", action="store_true", help="make a first wallet without a password, so nothing is "
+                       "asked (what the downloadable app does); the file is then as safe as your user account")
         p.set_defaults(fn=cmd_app)
     for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
                        ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
