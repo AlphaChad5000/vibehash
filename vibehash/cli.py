@@ -1821,12 +1821,9 @@ def _rate_limit_flags(p) -> None:
 
 
 def version() -> str:
-    """The installed package's version, or "dev" from a checkout that isn't installed."""
-    try:
-        from importlib.metadata import version as installed
-        return installed("vibehash")
-    except Exception:
-        return "dev"
+    """This code's release (vibehash.__version__: a source checkout's pyproject.toml, else the installed package's)."""
+    from . import __version__
+    return __version__
 
 
 def parser() -> argparse.ArgumentParser:

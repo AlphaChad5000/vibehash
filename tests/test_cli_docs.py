@@ -35,6 +35,17 @@ class CliDocs(unittest.TestCase):
         for choice in ("show", "clear", "sweep"):
             self.assertIn(f"  - `{choice}`: ", self.text)
 
+    def test_version_is_this_checkouts(self):
+        """From a checkout, --version says pyproject.toml's release, not an older pip-installed copy's."""
+        import contextlib
+        import io
+        import re
+        want = re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M)[1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.parser().parse_args(["--version"])
+        self.assertEqual(out.getvalue().strip(), f"vibehash {want}")
+
     def test_examples_name_real_commands(self):
         names = {name for name, _ in self.gen.leaves(cli.parser())}
         for name in self.gen.EXAMPLES:
