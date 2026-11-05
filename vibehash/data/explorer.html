@@ -77,7 +77,7 @@ function el(tag, props, ...kids) {
   for (const k of kids.flat(Infinity)) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
   return e;
 }
-const render = (...nodes) => main.replaceChildren(...nodes.flat());
+const render = (...nodes) => main.replaceChildren(...nodes.flat().filter((n) => n != null && n !== false));
 const card = (title, ...body) => el("section", {class: "card"}, title ? el("h2", {}, title) : null, ...body);
 const dl = (rows) => el("dl", {}, rows.filter(Boolean).map(([k, v]) => [el("dt", {}, k), el("dd", {}, v ?? "–")]));
 const muted = (t) => el("span", {class: "muted"}, t);
