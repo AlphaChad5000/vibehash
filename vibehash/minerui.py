@@ -354,7 +354,9 @@ class MinerDashboard:
             m = re.match(r"^evo2-c(\d+)-", job.job_id)
             src = (f"the mean of {len(spec.start)} earlier jobs" if len(spec.start) > 1 else
                    f"{spec.start[0][0]}" if spec.start else "the base model")
-            tl = [("task      ", DIM), (spec.task, WHITE), *([(f" · cycle {m.group(1)}", TEXT)] if m else [])]
+            tl = ([("tasks     ", DIM), (f"{len(spec.tasks)} in turn", WHITE), (f", {spec.rounds} rounds each", DIM)]
+                  if getattr(spec, "tasks", ()) else
+                  [("task      ", DIM), (spec.task, WHITE), *([(f" · cycle {m.group(1)}", TEXT)] if m else [])])
             add(*pick(width, [*tl, (f", starting from {src}", DIM)], tl))
         else:
             level = None

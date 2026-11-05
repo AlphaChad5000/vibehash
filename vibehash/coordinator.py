@@ -756,7 +756,8 @@ class Coordinator:
             else:
                 step, fitness = got.get("step"), got.get("fitness")
             self.r.record |= {"version": ES_RECORD_VERSION,
-                              "es": {"rule": es2.RULE2, "task": job.spec.task, "step": step, "fitness": fitness}}
+                              "es": {"rule": es2.RULE2, "task": es2.task_at(job.spec, int(step or 0)), "step": step,
+                                     "fitness": fitness}}
         elif job.es:  # its seed (start_compute), the level its problems are at, and the update (_settle_es)
             level = es.level_of(start) if start is not None else (self.replaying or {}).get("es", {}).get("level")
             if self.replaying and level != self.replaying.get("es", {}).get("level"):
@@ -1150,7 +1151,7 @@ class Coordinator:
                 if self.replaying:
                     raise ValueError("the answers aren't here")
                 return "missing"
-            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id)
+            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id, int(r.record["es"]["step"] or 0))
             return "bad_answers" if parsed is None else "ok" if parsed[0] == rewards else "wrong_rewards"
         outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
         if outcome == "missing":

@@ -55,9 +55,14 @@ class Spec2(es.EsSpec):
     lp_tol: float = 0.02  # how far a claimed replay log-probability (mean per token) may be from a checker's
     rank: int = 1
     rule: int = RULE2
+    # Tasks taken in turn, `rounds` rounds each, the cosine starting again with each (task_at, lr_at), for a job that
+    # never ends, like a genesis starter job: the testnet's short jobs one task after another, inside one job and one
+    # line. Empty: `task` alone, as every job before it (the field is left out of its spec, so its hash is the same).
+    tasks: tuple = ()
 
     def __post_init__(self):
         super().__post_init__()
+        object.__setattr__(self, "tasks", tuple(str(t) for t in self.tasks))
         object.__setattr__(self, "start", tuple((str(s[0]), float(s[1]), str(s[2]) if len(s) > 2 else "")
                                                 for s in self.start))
 
@@ -76,6 +81,8 @@ class Spec2(es.EsSpec):
             out.append("tensors is 1-16 patterns, n the weights they pick")
         if self.task not in TASKS:
             out.append(f"task is one of {', '.join(TASKS)}")
+        if len(self.tasks) > 64 or any(t not in TASKS for t in self.tasks) or (self.tasks and self.tasks[0] != self.task):
+            out.append("tasks is at most 64 of the tasks, the first being `task`")
         if not (1 <= self.pairs_per_unit <= self.pairs <= 4096 and self.pairs % self.pairs_per_unit == 0):
             out.append("pairs is 1-4096, a multiple of pairs_per_unit")
         if not (1 <= self.problems <= 512 and 1 <= self.max_tokens <= 2048):
@@ -108,17 +115,17 @@ class Spec2(es.EsSpec):
                        "problems": self.problems, "max_tokens": self.max_tokens, "sigma": self.sigma, "lr": self.lr,
                        "lr_floor": self.lr_floor, "rounds": self.rounds, "replay": self.replay,
                        "start": [[j, w, h] for j, w, h in self.start], "check": self.check, "margin": self.margin,
-                       "lp_tol": self.lp_tol, "rank": self.rank}}
+                       "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {})}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Spec2":
         e = d["es"]
         known = {"rule", "tensors", "n", "tensors_sha", "task", "pairs", "pairs_per_unit", "problems", "max_tokens",
-                 "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank"}
+                 "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks"}
         if set(e) - known:
             raise ValueError(f"a rule-2 ES spec has no field {sorted(set(e) - known)[0]!r}")
-        if not isinstance(e["tensors"], list) or not isinstance(e.get("start", []), list):
-            raise TypeError("tensors and start are lists")
+        if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list) for k in ("start", "tasks")):
+            raise TypeError("tensors, start and tasks are lists")
         return cls(base=str(d["base"]), manifest=str(d["manifest"]), dims=dict(d["model"]),
                    tensors=tuple(str(t) for t in e["tensors"]), n=int(e["n"]), tensors_sha=str(e["tensors_sha"]),
                    task=str(e["task"]), pairs=int(e["pairs"]), pairs_per_unit=int(e["pairs_per_unit"]),
@@ -126,7 +133,7 @@ class Spec2(es.EsSpec):
                    lr=float(e["lr"]), lr_floor=float(e["lr_floor"]), rounds=int(e["rounds"]),
                    replay=int(e["replay"]), start=tuple(tuple(s) for s in e.get("start", [])),
                    check=int(e["check"]), margin=float(e["margin"]), lp_tol=float(e["lp_tol"]),
-                   rank=int(e.get("rank", 1)), rule=int(e["rule"]))
+                   rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])))
 
 
 def is_v2(d) -> bool:
@@ -207,8 +214,19 @@ def cos_pi(x: float) -> float:
     return float(es._sincos(np.array([x / 2.0], np.float64))[1][0])
 
 
+def task_at(spec: Spec2, round_index: int) -> str:
+    """The task of the job's round `round_index` (its step, from 0): `task`, or with `tasks`, each in turn for `rounds`
+    rounds, then round again."""
+    if not spec.tasks:
+        return spec.task
+    return spec.tasks[(round_index // max(1, spec.rounds)) % len(spec.tasks)]
+
+
 def lr_at(spec: Spec2, round_index: int) -> float:
-    """The cosine from lr down to lr * lr_floor over the job's planned rounds (round_index from 0), then flat."""
+    """The cosine from lr down to lr * lr_floor over the job's planned rounds (round_index from 0), then flat. With
+    `tasks`, over each task's `rounds`, starting again with the next task."""
+    if spec.tasks:
+        round_index %= max(1, spec.rounds)
     x = min(1.0, round_index / max(1, spec.rounds))
     return spec.lr * (spec.lr_floor + (1 - spec.lr_floor) * 0.5 * (1 + cos_pi(x)))
 

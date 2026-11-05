@@ -450,7 +450,8 @@ class Es2Work:
         try:
             from . import es_fast  # noqa: F401 - PyTorch
             from . import es_tasks
-            es_tasks.get(job.spec.task).items(0, 1)  # ARC-Easy's download, once (TaskUnavailable without it)
+            for task in job.spec.tasks or (job.spec.task,):  # their datasets' downloads, once (TaskUnavailable without)
+                es_tasks.get(task).items(0, 1)
             find_base(job.spec)
             runtime2(job.spec, self.work.device())
         except Exception as e:  # noqa: BLE001 - whatever stops it, this worker can't take the job
@@ -609,9 +610,9 @@ class Es2Work:
     def replay_items(self, rt: es.Runtime, ln: _Line) -> list[tuple[list[int], list[int]]]:
         """The round's replay targets as (prompt ids, answer ids): the last `replay` of the job's targets so far."""
         spec, out, rows = ln.spec, [], {}
-        for seed, i, ids in es2_rounds.targets_of(ln.history, spec.replay):
+        for seed, i, ids, step in es2_rounds.targets_of(ln.history, spec.replay):
             if seed not in rows:
-                rows[seed] = prompt_rows(rt, es2_rounds.items(spec, seed))
+                rows[seed] = prompt_rows(rt, es2_rounds.items(spec, seed, step))
             out.append((rows[seed][i], ids))
         return out
 
@@ -628,7 +629,8 @@ class Es2Work:
         t0 = time.perf_counter()
         rt, ln = self.at(job, units[0].start_hash)
         seed = units[0].seed
-        ps = es2_rounds.items(spec, seed)
+        step = int(es2.ctrl_of(ln.state)[2])  # the round's step: its task (es2.task_at)
+        ps = es2_rounds.items(spec, seed, step)
         rows = prompt_rows(rt, ps)
         want_lps = bool(spec.replay) and es2.ctrl_of(ln.state)[3] > 0
         replay = self.replay_items(rt, ln) if want_lps else []
@@ -636,7 +638,7 @@ class Es2Work:
         members = [(j, sign) for u in units for j, _, sign in es.unit_members(spec, seed, u.index)]
         work.claims[rnd] = []
         st.activity = (f"answering {len(units)} Evo unit{'s' * (len(units) > 1)} ({len(members)} twisted models x "
-                       f"{spec.problems} {spec.task} problems)")
+                       f"{spec.problems} {es2.task_at(spec, step)} problems)")
         with rt.busy, torch.no_grad():
             self.load(rt, ln)
             got = es_fast.answer_members(rt, rt.linears, fac, members, rows, spec.max_tokens, spec.sigma, spec.rank,
@@ -706,7 +708,7 @@ class Es2Work:
             return False, chosen[0]
         rt, ln = self.at(job, unit.start_hash)
         seed = unit.seed
-        rows = prompt_rows(rt, es2_rounds.items(spec, seed))
+        rows = prompt_rows(rt, es2_rounds.items(spec, seed, int(es2.ctrl_of(ln.state)[2])))
         members = es.unit_members(spec, seed, unit.index)
         lps = task.get("lps")
         replay = self.replay_items(rt, ln) if lps is not None else []

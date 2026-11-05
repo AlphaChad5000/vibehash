@@ -306,8 +306,13 @@ round it completes work instead of almost never, as in lottery mining.
     workers are paid the subsidy alone. It runs only in rounds no paid job is
     ready for (`Coordinator.active_job_id`), so it never takes a turn from a
     job someone pays for. It can be an Evo job on a genesis with
-    `"es": true` (an Evo job's `rounds` only tapers its learning rate, so it
-    goes on at its lowest rate after them). A starter job that trains on an
+    `"es": true`: `vibehash job template --evo MODEL` writes one whose
+    `tasks` (all 19 by default) take turns, `--rounds` (12) rounds each, the
+    learning rate's cosine starting again with each task (`es2.task_at`,
+    `es2.lr_at`), as the testnet's short jobs do one after another, but in one
+    job and one line. A round's task follows from its step, which every node
+    and worker reads from the job's state; a replay target keeps its own
+    round's task (its place in the job's history is its step). A starter job that trains on an
     uploaded dataset needs every validator to hold the file from the start.
     Measured in `tests/test_starter_jobs.py`: a chain with no allocations and
     no stakes, one validator with bootstrap stake that doesn't mine, and

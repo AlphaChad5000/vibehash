@@ -800,12 +800,34 @@ def cmd_job_template(a):
     out = Path(a.out)
     if out.exists():
         sys.exit(f"{out} already exists; refusing to overwrite it")
+    if a.evo:
+        return _evo_template(a, out)
     try:
         job = template_job(a.id, a.gpu)
     except InvalidJob as e:
         sys.exit(f"invalid job id: {e}")
     out.write_text(json.dumps(job.to_spec(), indent=2) + "\n")
     print(f"wrote {out}; edit it, then post it with post-job --spec {out}")
+
+
+def _evo_template(a, out: Path):
+    """An Evo job that never ends, for a genesis's starter job (`genesis create --starter-job`): Evo v2's settings,
+    its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
+    from . import es_local, es_tasks
+
+    tasks = list(es_tasks.NAMES) if a.tasks == "all" else [t.strip() for t in a.tasks.split(",") if t.strip()]
+    unknown = [t for t in tasks if t not in es_tasks.NAMES]
+    if unknown or not tasks:
+        sys.exit(f"unknown task {unknown[0] if unknown else '(none given)'}: the tasks are {', '.join(es_tasks.NAMES)}")
+    try:
+        found = es_local.find(a.evo, config_only=True)
+        spec = es_local.spec2_for(found, tasks[0], rounds=a.rounds, tasks=tuple(tasks))
+        job = es_local.job2(spec, a.id, "system", budget=1, fee=0)
+    except (ValueError, RuntimeError, OSError, InvalidJob) as e:
+        sys.exit(f"can't make an Evo job for {a.evo}: {e}")
+    out.write_text(json.dumps(job.to_spec(), indent=2) + "\n")
+    print(f"wrote {out}: an Evo job on {found.repo}, {len(tasks)} tasks in turn, {a.rounds} rounds each, paying only "
+          f"new coins; give it to `vibehash genesis create --es --starter-job {out}`")
 
 
 def cmd_cancel_job(a):
@@ -2184,6 +2206,10 @@ def parser() -> argparse.ArgumentParser:
     p = j.add_parser("template", help="write a starter job file, for full control with post-job")
     p.add_argument("--out", default="job.json"); p.add_argument("--id", default="my-first-job")
     p.add_argument("--gpu", action="store_true", help="a larger float32 model sized for GPUs")
+    p.add_argument("--evo", metavar="MODEL", help="an Evo job on MODEL that never ends, taking its tasks in turn: a "
+                                                  "genesis starter job (genesis create --es --starter-job)")
+    p.add_argument("--tasks", default="all", help="with --evo: the tasks, comma-separated, or all (the default)")
+    p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
     p.set_defaults(fn=cmd_job_template)
 
     c = sub.add_parser("chain").add_subparsers(dest="ccmd", required=True)

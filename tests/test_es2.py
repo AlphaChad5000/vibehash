@@ -66,6 +66,70 @@ class SpecTests(unittest.TestCase):
         self.assertEqual((es2.steps_of(after), int(es2.ctrl_of(after)[3])), (1, 1))
 
 
+class TaskCycleTests(unittest.TestCase):
+    """A job that never ends (a genesis starter job) takes its `tasks` in turn, `rounds` rounds each, the cosine starting
+    again with each; a job without the field is what it always was, its spec byte for byte."""
+    rule1_only = ("rule", "pairs", "pairs_per_unit", "problems", "max_tokens", "alpha", "reward", "level", "retarget",
+                  "optimizer", "betas", "eps")
+
+    def spec(self, **kw) -> es2.Spec2:
+        base = {k: v for k, v in spec_for().__dict__.items() if k not in self.rule1_only}
+        return es2.Spec2(**(base | dict(pairs=4, pairs_per_unit=2, problems=4, max_tokens=8, rounds=3) | kw))
+
+    def test_without_tasks_nothing_changes(self):
+        spec = self.spec()
+        self.assertNotIn("tasks", spec.to_json()["es"])
+        self.assertEqual([es2.task_at(spec, i) for i in (0, 3, 100)], [spec.task] * 3)
+        self.assertEqual(es2.lr_at(spec, 7), spec.lr * spec.lr_floor, "flat after the cosine, as before")
+
+    def test_tasks_take_turns_and_the_cosine_starts_again(self):
+        spec = self.spec(task="countdown", tasks=("countdown", "arithmetic"))
+        self.assertEqual(spec.problems_list(), [])
+        self.assertEqual([es2.task_at(spec, i) for i in range(8)],
+                         ["countdown"] * 3 + ["arithmetic"] * 3 + ["countdown"] * 2)
+        self.assertEqual([es2.lr_at(spec, i) for i in (0, 3, 6)], [spec.lr] * 3)
+        self.assertEqual(es2.lr_at(spec, 2), es2.lr_at(self.spec(), 2))
+        d = {"id": "cycle", "fee_per_round": 0, **spec.to_json(), "init_seed": 0, "units_per_round": spec.units,
+             "memory_mb": 1024}
+        self.assertEqual(TrainingJob.from_spec_json(json.dumps(d), "system", 1).spec, spec)
+        # A round's problems are its step's task's: the same seed, different problems a task later.
+        a, b = es2_rounds.items(spec, 12345, 0), es2_rounds.items(spec, 12345, 3)
+        self.assertEqual([p.messages for p in a], [p.messages for p in es2_rounds.items(self.spec(task="countdown"), 12345)])
+        self.assertNotEqual([p.messages for p in a], [p.messages for p in b])
+
+    def test_bad_task_lists(self):
+        self.assertTrue(self.spec(task="countdown", tasks=("arithmetic", "countdown")).problems_list())  # task first
+        self.assertTrue(self.spec(task="countdown", tasks=("countdown", "no-such-task")).problems_list())
+
+    def test_replay_targets_carry_their_rounds_step(self):
+        history = [{"seed": "%016x" % s, "targets": [[0, [5]], [1, [6]]]} for s in (7, 8, 9)]
+        self.assertEqual(es2_rounds.targets_of(history, 3), [(8, 1, [6], 1), (9, 0, [5], 2), (9, 1, [6], 2)])
+
+
+@unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
+class StarterTemplateTests(unittest.TestCase):
+    def test_an_evo_starter_job_from_the_template_goes_into_a_genesis(self):
+        from vibehash import cli, economics as econ, es_tasks
+        from vibehash.ledger import SYSTEM, Chain, InvalidBlock
+        with tempfile.TemporaryDirectory() as d:
+            folder, out = tiny_model(Path(d) / "tiny", seed=3), Path(d) / "starter.json"
+            with mock.patch("sys.stdout"):
+                cli.main(["job", "template", "--evo", str(folder), "--id", "evo-starter", "--rounds", "5",
+                          "--out", str(out)])
+            spec = json.loads(out.read_text())
+        self.assertEqual((spec["id"], spec["fee_per_round"]), ("evo-starter", 0))
+        self.assertEqual((spec["es"]["tasks"], spec["es"]["rounds"]), (list(es_tasks.NAMES), 5))
+        g = {"chain_id": "evo-start", "timestamp": 0, "allocations": {}, "es": True, "starter_jobs": [spec],
+             "economics": econ.NEW_SCHEDULES["mainnet"].to_dict()}
+        s = Chain.from_genesis(g).state
+        job = s.job("evo-starter")
+        self.assertEqual((job.es, s.job_owner["evo-starter"], s.escrow["evo-starter"]), (True, SYSTEM, 1))
+        self.assertEqual([es2.task_at(job.spec, i) for i in (0, 4, 5, 10)],
+                         [es_tasks.NAMES[0], es_tasks.NAMES[0], es_tasks.NAMES[1], es_tasks.NAMES[2]])
+        with self.assertRaisesRegex(InvalidBlock, "es"):  # an Evo starter job needs a genesis that takes Evo jobs
+            Chain.from_genesis({**g, "es": False})
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class NetworkTests2(unittest.TestCase):
     def test_rounds_replay_cheats_a_child_and_a_restart(self):
