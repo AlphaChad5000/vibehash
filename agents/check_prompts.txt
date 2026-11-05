@@ -1,0 +1,35 @@
+Check prompts: long, demanding requests that decide whether a strict request is good enough to stop repairing
+(dispatcher.py). Every run answers them and they're scored apart; no run trains or repairs on them. Because the
+repair loop stops on their score, they flatter the run a little, so they're never the published hard-prompt score:
+that's hard_prompts.txt, which nothing is chosen by. Written by Claude for this project, not by the agents. A line
+of five = signs separates prompts; this paragraph is not one.
+=====
+Act as a senior product manager at a mid-sized fintech company. Our support team says customers keep asking why their card payments show as "pending" for up to three days.
+
+Write a one-page brief for the engineering and support leads with exactly these sections:
+1. PROBLEM: two sentences, in the customer's words.
+2. WHY IT HAPPENS: a plain-English explanation of authorisation versus settlement, no acronyms without spelling them out.
+3. OPTIONS: a table with columns [Option | Effort (S/M/L) | What the customer sees | Risk], with three rows.
+4. RECOMMENDATION: one option, and one paragraph on why.
+5. OPEN QUESTIONS: three bullets.
+
+Keep it under 400 words. No marketing language.
+=====
+You are a secondary-school science teacher planning a 50-minute lesson on why the Moon has phases, for 13-year-olds who often think the phases are caused by Earth's shadow.
+
+Give me:
+- A learning objective in one sentence.
+- A minute-by-minute plan as a table: [Minutes | Activity | What the teacher says or does | What students do]. It must add up to exactly 50 minutes.
+- One hands-on demonstration using only a lamp and a ball, with step-by-step instructions.
+- Three quick questions to check understanding at the end, with the answer to each.
+- One sentence on how to correct the "Earth's shadow" misconception without making a student feel wrong.
+=====
+Act as the head of customer support for an online furniture shop. A customer has written: "My sofa arrived with a torn cushion, this is the second time this has happened, and I'm honestly done with you people. I want a full refund, not another replacement."
+
+Write the reply we'll send. Rules:
+- Start with a subject line on its own line, under 10 words.
+- Then the email: no more than 120 words.
+- Apologise once, not repeatedly.
+- Offer the full refund they asked for, and say exactly what happens next and by when (collection within 5 working days, refund within 3 days of collection).
+- Don't use the phrases "we value your business", "inconvenience" or "rest assured".
+- Sign off as "Sam, Head of Support".
