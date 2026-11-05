@@ -154,6 +154,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((first["round"], first["type"]), (second["round"], second["type"]))
         self.assertNotEqual(first["block"], second["block"])
 
+    def test_a_second_precommit_after_the_height_is_decided_is_still_caught(self):
+        """The cheater's conflicting precommit arrives once the honest three have decided and moved on: it can't count
+        any more, but it's still a double-sign (Engine._late). It used to be dropped with every older message."""
+        net, cheat, held = Net(4), 3, []
+
+        def late(frm, to, msg):
+            if frm == cheat and msg["type"] == "precommit" and msg["block"] is not None and not held:
+                held.append(vote(net.keys[cheat], CHAIN, "precommit", msg["height"], msg["round"], "something-else"))
+            return msg
+        net.link = late
+        net.run(60, until=lambda: min(net.heights()) >= 1)
+        honest = net.engines[0]
+        self.assertEqual((honest.height, honest.evidence), (held[0]["height"] + 1, []))  # moved on, nothing caught yet
+        with self.assertLogs("vibehash.consensus", "WARNING"):
+            honest.receive(held[0], net.now)
+        [(first, second)] = honest.evidence
+        self.assertEqual((first["type"], first["height"], first["round"]), ("precommit", held[0]["height"], held[0]["round"]))
+        self.assertNotEqual(first["block"], second["block"])
+        self.assertEqual(second["block"], "something-else")
+        honest.receive(held[0], net.now)  # once per offence
+        forged = dict(held[0], block="another")  # a signature that doesn't cover it
+        honest.receive(forged, net.now)
+        self.assertEqual(len(honest.evidence), 1)
+
     def test_a_block_validators_locked_on_is_proposed_again_by_the_next_proposer(self):
         net = Net(4)
         order = [net.index[a] for a in net.engines[0].order]

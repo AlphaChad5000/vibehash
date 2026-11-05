@@ -208,6 +208,9 @@ class Engine:
         # each as an `evidence` tx, evidence_memo). One pair per validator, kind, height and round.
         self.evidence: list[tuple[dict, dict]] = []
         self._offences: set[tuple] = set()
+        # The height we last moved on from: (height, its validators, its votes, its first proposals), so a second vote
+        # or proposal for it that arrives after we've moved on is still caught (_late).
+        self.previous: tuple | None = None
         self.halted = False
 
     def halt(self) -> None:
@@ -284,6 +287,8 @@ class Engine:
     # --- bookkeeping -------------------------------------------------------------------------------
 
     def _new_height(self, height: int) -> None:
+        if hasattr(self, "votes"):
+            self.previous = (self.height, self.validators, self.votes, self.proposal_msgs)
         self.height = height
         self.validators = self._validators()
         self.total = sum(self.validators.values())
@@ -361,6 +366,9 @@ class Engine:
                 return
         except (KeyError, TypeError, ValueError):
             return
+        if self.previous is not None and height == self.previous[0] and height < self.height:
+            self._late(msg, kind, height, round_)
+            return
         # A later height's messages are checked like this height's, signer included (it must be one of the validators
         # we know), before they're kept or make us look for blocks: anyone can send them.
         if height < self.height or not 0 <= round_ <= (self.round if height == self.height else 0) + MAX_ROUNDS_AHEAD:
@@ -413,6 +421,41 @@ class Engine:
                 log.warning("validator %s sent conflicting %ss in round %d at height %d", addr, kind, round_, height)
             return
         votes[addr] = (block_id, msg)
+
+    def _late(self, msg: dict, kind: str, height: int, round_: int) -> None:
+        """A message for the height we just moved on from. It can't change anything now, but if its validator already
+        sent us a different vote (or proposal) for that round, the two are a double-sign, kept as evidence like one
+        caught in time. A cheater's second precommit used to escape whenever the others had decided before it arrived.
+        Nothing is worked out (a proposal's block id, a signature) unless there's an earlier message it could
+        conflict with."""
+        _, validators, votes, proposals = self.previous
+        try:
+            pub, sig = bytes.fromhex(msg["pubkey"]), bytes.fromhex(msg["sig"])
+            addr = address_of(pub)
+            if addr not in validators:
+                return
+            if kind == "proposal":
+                earlier = proposals.get(round_)
+                valid_round = int(msg["valid_round"])
+                if earlier is None or bytes.fromhex(earlier["pubkey"]) != pub or not -1 <= valid_round < round_:
+                    return
+                block_id = self._id({"block": msg["block"], "record": msg.get("record")})
+                if block_id == earlier["block"]:
+                    return
+                signed = _signed_part(self.chain_id, kind, height, round_, block_id, valid_round)
+            else:
+                have = votes[kind].get(round_, {}).get(addr)
+                block_id = msg["block"]
+                if have is None or have[0] == block_id or (block_id is not None and not isinstance(block_id, str)):
+                    return
+                earlier = _compact(have[1], have[0])
+                signed = _signed_part(self.chain_id, kind, height, round_, block_id)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return
+        if verify(pub, signed, sig):
+            self._record(earlier, _compact(msg, block_id))
+            log.warning("validator %s sent conflicting %ss in round %d at height %d (after it was decided)",
+                        addr, kind, round_, height)
 
     def _keep(self, key: tuple, msg: dict) -> None:
         """Hold a validator's message for a later height until we get there, within the FUTURE_* bounds. `key` is

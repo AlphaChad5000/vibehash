@@ -361,6 +361,27 @@ class DatasetQuotaTests(unittest.TestCase):
         self.assertTrue(node.store.datasets.has(own))
         self.assertEqual([s for s, *_ in node.store.uploads()], [sha])
 
+    def test_uploads_started_side_by_side_count_at_the_size_they_declare(self):
+        """Counting a part-way upload by what's on disk let a second one in after the first's first chunk, and so on:
+        N uploads one chunk each, N times the quota."""
+        node = start_node(self)
+
+        def put(sha: str, total: int, chunk: bytes):
+            ts = int(time.time())
+            headers = {"X-VibeHash-Pubkey": REQ.public.hex(), "X-VibeHash-Ts": str(ts), "X-Total": str(total),
+                       "X-Offset": "0", "X-VibeHash-Sig": REQ.sign(canonical(["dos-net", "dataset", sha, total, ts])).hex()}
+            return raw(node.url, "PUT", f"/dataset/{sha}", chunk, headers)
+        a, b = hashlib.sha256(b"a").hexdigest(), hashlib.sha256(b"b").hexdigest()
+        with mock.patch.object(node_module, "DATASET_QUOTA", 1000):
+            status, body = put(a, 800, b"x" * 10)  # 10 bytes of 800 on disk
+            self.assertEqual(status, 200, body)
+            self.assertEqual(node.loose_bytes(REQ.address), 800)
+            status, body = put(b, 800, b"y" * 10)
+            self.assertEqual(status, 400)
+            self.assertIn(b"already holds", body)
+            status, body = put(a, 800, b"")  # the first one's own later chunks are still taken
+            self.assertEqual(status, 200, body)
+
     def test_a_put_to_a_kept_dataset_doesnt_make_it_the_putters(self):
         node = start_node(self)
         own = node.store.add_dataset(write_npz(self.dir / "c.npz", ModelSpec(), 3))
@@ -738,8 +759,13 @@ class SaveFirstTests(unittest.TestCase):
                     wait_for(lambda: node.halted)
                 self.assertIn("couldn't write block 1: disk I/O error", logs.output[0])
                 st = api.status()
-                self.assertIn("couldn't write block 1: disk I/O error. Another node may be using this folder", st["halted"])
-                self.assertIn("restart it to carry on from what's on disk", st["halted"])
+                self.assertIn("couldn't write block 1: disk I/O error. Another node may be using this folder", node.halted)
+                self.assertIn("restart it to carry on from what's on disk", node.halted)
+                # /status says that and when, not this computer's folder or the database's own words
+                self.assertEqual(st["halted"], node.halted_public)
+                self.assertIn("block 1 couldn't be saved", st["halted"])
+                self.assertNotIn(str(node.store.dir), st["halted"])
+                self.assertNotIn("disk I/O error", st["halted"])
                 self.assertEqual((st["height"], node.chain.tip.height), (0, 0), "the block that wasn't saved isn't in memory")
                 self.assertEqual(len(node.coord.mempool), 1, "nor did the mempool lose its transaction")
                 self.assertEqual(api.get("/blocks?from=1"), [])

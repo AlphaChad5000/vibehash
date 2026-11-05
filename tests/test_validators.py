@@ -279,7 +279,9 @@ class ValidatorNetworkTests(unittest.TestCase):
         self.assertTrue(bad.engine.halted)
         self.assertEqual(bad.chain.tip.height, 0)
         self.assertEqual(NodeClient(bad.url).get("/blocks?from=1"), [])
-        self.assertIn("Another node may be using this folder", NodeClient(bad.url).status()["halted"])
+        self.assertIn("Another node may be using this folder", bad.halted)  # the operator's reason, in its log
+        self.assertEqual(NodeClient(bad.url).status()["halted"], bad.halted_public)  # what anyone asking is told
+        self.assertNotIn(str(bad.store.dir), bad.halted_public)
         api.send_tx(net.req, "transfer", net.wkeys[2].address, 3 * VIBE)
         net.wait(lambda: net.lowest() >= 2, 60)  # (live(): the three still running)
         net.assert_same_chain(self, net.live(), 2)

@@ -63,7 +63,7 @@ from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
 from .crypto import AddressError, KeyPair, address_of, checksummed, parse_address, verify
-from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
+from .ledger import EVIDENCE_WINDOW, VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
 from .p2p import Peers
 from .ratelimit import GuardedHandler, GuardedServer, Limits, path_parts
@@ -114,6 +114,7 @@ MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
 # good. Datasets added with --dataset or fetched from a peer are never counted or deleted. Before this, anyone with
 # 1 VIBE could fill a node's disk 20 GB at a time.
 DATASET_QUOTA = MAX_DATASET
+REPORT_RETRY_S = 15.0  # seconds between tries at sending a double-sign's evidence that isn't in the mempool or a block
 LOOSE_DATASET_S = 3 * 86400
 # The block explorer page (GET /explorer), and the Content-Security-Policy it's served with: nothing from anywhere
 # else, requests only to this node, and only its own inline script and style (by their sha256), so text from the chain
@@ -237,6 +238,9 @@ class Node:
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self.stopping = threading.Event()  # set by stop(), and by a halt, which leaves the server up
         self.halted: str | None = None  # why this node stopped itself (_halt): a block it couldn't save
+        # What /status and refusals say about it: the height, not the folder or the database's own error text, which
+        # name this computer's paths and user to anyone who asks (the full reason is in the log and `vibehash node`'s exit).
+        self.halted_public: str | None = None
         try:
             self.server = GuardedServer((host, port), _handler(self), limits, tls)  # limits=None: the defaults, which spare localhost
         except BaseException:  # the port is taken: the folder is free for whoever tries next (the menu goes on)
@@ -254,13 +258,19 @@ class Node:
                              persist=lambda state: self.store.save_meta("consensus", state), propose_wait=self._propose_wait)
         self.proposed: dict[str, tuple] = {}  # block id -> (weights, scores, record) for blocks we proposed at this height
         self.evidence_seen = 0  # how many of the engine's evidence pairs we've acted on (_report_double_signs)
-        self.reported: set[str] = set()  # validators we've sent evidence against, or found we can't
+        self.reported: set[str] = set()  # validators our evidence against is in the mempool or a block for
+        self.to_report: dict[str, tuple[dict, dict]] = {}  # offender -> its pair, until the evidence is in
+        self.report_failed: set[str] = set()  # offenders whose evidence couldn't be sent yet (said once)
+        self.report_next: dict[str, float] = {}  # offender -> when to try sending its evidence again
         self.commit_lock = threading.Lock()
         self.wake_sync = threading.Event()
         self.leader_hint: str | None = None  # the current leader, as a validator told us (for nodes that don't vote)
         self.blobs.prune(self._evidence())  # keep recent rounds' evidence; the rest belongs to an abandoned round
         self.store.datasets.prune_partial(older_than=STALE_PART_S)  # uploads and downloads abandoned part way
-        self._used: tuple[tuple, set[str]] = ((), set())  # (tip hash, mempool size) -> datasets jobs name
+        self._used: tuple[tuple, set[str]] = ((), set())  # (tip hash, waiting post_jobs) -> datasets jobs name
+        self._quota_lock = threading.Lock()
+        self._supply: tuple[bytes, dict] | None = None  # (tip hash, /supply at it)
+        self._admitted: dict[tuple[str, str], tuple[int, float]] = {}  # (uploader, sha) -> (declared size, when admitted)
         self.clear_loose_datasets()
 
     @property
@@ -311,6 +321,8 @@ class Node:
                if isinstance(e, RivalBlock) else str(e))
         self.halted = (f"{why}. Another node may be using this folder ({self.store.dir}), or the disk is full or failed. "
                        f"Stopped so it can't sign or serve blocks it didn't save; restart it to carry on from what's on disk")
+        self.halted_public = (f"block {e.height} couldn't be saved, so this node stopped rather than sign or serve blocks it "
+                              "doesn't have; its operator's log says why")
         log.critical("%s", self.halted)
         self.engine.halt()  # (takes no lock: this can run holding the commit and round locks)
         with self.coord.lock:  # a round open now is never sealed: workers are told there's none
@@ -634,8 +646,10 @@ class Node:
     def _report_double_signs(self) -> None:
         """Send an `evidence` tx, from this node's own key, for each validator the engine caught signing two conflicting
         messages (Engine.evidence): the ledger then takes its stake and its place in the set (ledger._punish). Nobody
-        has to: any node, or anyone holding the two messages, can send the same tx. Once per validator, since one
-        punishment takes everything; if it fails (this node can't pay its own minimum fee, say), that's logged."""
+        has to: any node, or anyone holding the two messages, can send the same tx. Each pair waits here until it's
+        sent, and is sent again if it leaves the mempool without reaching a block, until the offender is punished or
+        the evidence is too old (EVIDENCE_WINDOW): a node that couldn't pay its fee when it saw the offence, or whose
+        tx was dropped, used to give up for good."""
         with self.engine.lock:
             found = self.engine.evidence[self.evidence_seen:]
             self.evidence_seen += len(found)
@@ -644,19 +658,34 @@ class Node:
                 offender = address_of(bytes.fromhex(first["pubkey"]))
             except ValueError:
                 continue
-            if offender in self.reported:
-                continue
-            self.reported.add(offender)
-            what = f"two {first['type']}s for height {first['height']}, round {first['round']}"
             if offender == self.keys.address:
-                log.error("this validator's key signed %s: another node is running with it. Stop one of them; the "
-                          "other validators will slash its stake", what)
+                log.error("this validator's key signed two %ss for height %s, round %s: another node is running with "
+                          "it. Stop one of them; the other validators will slash its stake",
+                          first["type"], first["height"], first["round"])
                 continue
+            self.to_report.setdefault(offender, (first, second))
+        if not self.to_report:
+            return
+        s = self.chain.state
+        with self.coord.lock:
+            waiting = {t.recipient for t in self.coord.mempool if t.kind == "evidence"}
+        for offender, (first, second) in list(self.to_report.items()):
+            what = f"two {first['type']}s for height {first['height']}, round {first['round']}"
+            if offender in s.banned or self.chain.tip.height + 1 - int(first["height"]) > EVIDENCE_WINDOW:
+                del self.to_report[offender]  # punished (by anyone's evidence), or too late to be
+                continue
+            if offender in waiting or time.time() < self.report_next.get(offender, 0.0):
+                continue  # ours or someone else's is on its way into a block, or we tried a moment ago
+            self.report_next[offender] = time.time() + REPORT_RETRY_S
             try:
                 self.submit_tx(self._evidence_tx(offender, evidence_memo(first, second)))
                 log.warning("validator %s signed %s: sent the evidence, which costs it its stake", checksummed(offender), what)
+                self.reported.add(offender)
             except (ProtocolError, InvalidBlock, InvalidJob) as e:
-                log.warning("validator %s signed %s, but the evidence couldn't be sent: %s", checksummed(offender), what, e)
+                if offender not in self.report_failed:
+                    self.report_failed.add(offender)
+                    log.warning("validator %s signed %s, but the evidence couldn't be sent yet (trying again): %s",
+                                checksummed(offender), what, e)
 
     def _evidence_tx(self, offender: str, memo: str) -> Tx:
         me, fee = self.keys.address, self.coord.config.min_fee
@@ -817,7 +846,7 @@ class Node:
 
     def submit_tx(self, tx: Tx) -> None:
         if self.halted:  # it would never reach a block from here
-            raise ProtocolError(f"this node has stopped: {self.halted}")
+            raise ProtocolError(f"this node has stopped: {self.halted_public}")
         if tx.kind == "post_job":  # relay policy, not a rule: a block with a bigger job is as valid as before
             size = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount).checkpoint_bytes
             if size > self.max_job_bytes:
@@ -871,7 +900,7 @@ class Node:
                 "min_fee": c.config.min_fee, "earn_in": self.chain.state.earn_in,
                 # Jobs with budget that aren't training, and why, in words (a fine-tune with too few workers to check it).
                 "waiting": dict(c.waiting),
-                "halted": self.halted,  # why this node stopped itself (a block it couldn't save), else None
+                "halted": self.halted_public,  # that this node stopped itself (a block it couldn't save), else None
                 # Versions: this node's release, the block version it makes (ledger.VERSION), the version of the
                 # chain's tip, and the oldest release whose workers it takes. A client that knows fewer block versions
                 # than the tip's, or is older than min_client, is told to upgrade (client.too_old).
@@ -900,9 +929,15 @@ class Node:
 
     def supply(self) -> dict:
         """/supply (supply.py): at the tip, from the state every node derives from the blocks (both read under the
-        round lock, which adding a block holds, so they're the same block's)."""
+        round lock, which adding a block holds, so they're the same block's). Worked out once a block: it sums every
+        account, and anyone may ask as often as the read limit lets them, which held the round lock each time."""
+        cached = self._supply
+        if cached is not None and cached[0] == self.chain.tip.hash:
+            return cached[1]
         with self.coord.lock:
-            return supply.supply(self.chain.state, self.chain.tip.height)
+            tip, out = self.chain.tip.hash, supply.supply(self.chain.state, self.chain.tip.height)
+        self._supply = (tip, out)
+        return out
 
     def account(self, addr: str) -> dict:
         """/account/<addr>. A checksummed address (crypto.parse_address) is read as the canonical one it stands for;
@@ -1020,7 +1055,7 @@ class Node:
     def handle(self, kind: str, env: dict) -> dict:
         c = self.coord
         if self.halted:  # no round is open, nor will be: no receipts for messages no block will hold
-            raise ProtocolError(f"this node has stopped: {self.halted}")
+            raise ProtocolError(f"this node has stopped: {self.halted_public}")
         # Only what wire.seal sends, and no bigger than an honest message (see ENVELOPE): replay and receipts take a
         # registration or verdict exactly as sent, so nothing can be stripped from those, only refused.
         if not isinstance(env, dict) or not set(env) <= ENVELOPE or not isinstance(env.get("body"), dict):
@@ -1216,21 +1251,26 @@ class Node:
         if not 0 < total <= MAX_DATASET:
             raise ProtocolError(f"datasets can be at most {MAX_DATASET // 2**30} GB")
         store = self.store.datasets
-        # Checked when an upload starts: its later chunks were admitted with it.
-        if not store.has(sha) and store.received(sha, addr) == 0 and sha not in self.used_datasets():
-            held = self.loose_bytes(addr)
-            if held + total > DATASET_QUOTA:
-                raise ProtocolError(
-                    f"this address already holds {held / 2**30:.2f} GB of datasets no job uses yet, and may hold "
-                    f"{DATASET_QUOTA / 2**30:g} GB: post a job with one, or wait until unused ones are deleted "
-                    f"({LOOSE_DATASET_S // 86400} days after their upload)")
+        # Checked when an upload starts, and admitted at the size it declares (an upload can't grow past it, BlobStore),
+        # under one lock: counting what was on disk let uploads started side by side each pass with a chunk written.
+        with self._quota_lock:
+            if (not store.has(sha) and (addr, sha) not in self._admitted and store.received(sha, addr) == 0
+                    and sha not in self.used_datasets()):
+                held = self.loose_bytes(addr)
+                if held + total > DATASET_QUOTA:
+                    raise ProtocolError(
+                        f"this address already holds {held / 2**30:.2f} GB of datasets no job uses yet, and may hold "
+                        f"{DATASET_QUOTA / 2**30:g} GB: post a job with one, or wait until unused ones are deleted "
+                        f"({LOOSE_DATASET_S // 86400} days after their upload)")
+                self._admitted[(addr, sha)] = (total, time.time())
         return addr
 
     def used_datasets(self) -> set[str]:
         """The datasets jobs name: every job on chain, and post_jobs waiting in the mempool."""
-        key = (self.chain.tip.hash, len(self.coord.mempool))
+        waiting = [t.memo for t in list(self.coord.mempool) if t.kind == "post_job"]
+        key = (self.chain.tip.hash, tuple(waiting))  # (a full mempool can swap one tx for another and keep its length)
         if self._used[0] != key:
-            specs = list(self.chain.state.jobs.values()) + [t.memo for t in list(self.coord.mempool) if t.kind == "post_job"]
+            specs = list(self.chain.state.jobs.values()) + waiting
             used = set()
             for spec in specs:
                 try:
@@ -1243,21 +1283,29 @@ class Node:
         return self._used[1]
 
     def loose_bytes(self, addr: str) -> int:
-        """What `addr` holds of datasets no job uses: those it finished uploading, and its uploads part way."""
+        """What `addr` holds of datasets no job uses: those it finished uploading, and its uploads part way, each at the
+        size it declared (or what's on disk, for one from before a restart)."""
         used = self.used_datasets()
         done = sum(size for sha, who, size, _ in self.store.uploads() if who == addr and sha not in used)
+        admitted = {sha: total for (who, sha), (total, _) in self._admitted.items() if who == addr}
         part = 0
         for p in self.store.datasets.root.glob(f"*.{addr}.part"):
+            sha = p.name.split(".")[0]
             try:
-                part += p.stat().st_size
+                part += max(admitted.pop(sha, 0), p.stat().st_size)
             except OSError:
                 pass
-        return done + part
+        # Admitted with no part file yet: the first chunk is on its way.
+        return done + part + sum(t for sha, t in admitted.items() if not self.store.datasets.has(sha))
 
     def clear_loose_datasets(self, now: float | None = None) -> int:
         """Delete uploaded datasets no job has used for LOOSE_DATASET_S. One still open elsewhere (Windows won't
         delete a mapped file) is tried again next round."""
         now, used, cleared = time.time() if now is None else now, self.used_datasets(), 0
+        with self._quota_lock:  # uploads finished, or abandoned (their part file pruned, or never written)
+            for (who, sha), (_, when) in list(self._admitted.items()):
+                if self.store.datasets.has(sha) or (now - when > 600 and self.store.datasets.received(sha, who) == 0):
+                    del self._admitted[(who, sha)]
         for sha, who, _, when in self.store.uploads():
             if sha in used or now - when < LOOSE_DATASET_S:
                 continue
