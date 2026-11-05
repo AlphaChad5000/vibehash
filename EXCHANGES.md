@@ -469,7 +469,7 @@ add `staked` from `/supply`.
   "tip": "82d94a722d6383453479c7f3cba34b06cad0d43b69475127c6462548b454afe0",
   "min_fee": 10000,
   "subsidy": 5000000000,
-  "version": "0.5.15",
+  "version": "0.5.17",
   "block_version": 3,
   "tip_version": 3,
   "min_client": "0.5.14",
@@ -489,7 +489,7 @@ add `staked` from `/supply`.
   to upgrade. Clients that send no version are taken as before.
 - `paid_rounds`: rounds that paid for work so far, on networks whose schedule
   counts them.
-- Nodes released before these fields (0.5.15 and earlier) have none of
+- Nodes released before these fields (0.5.16 and earlier) have none of
   them, and Vibe Hash's commands work with them as before.
 
 Vibe Hash commands warn in one line when a node is on newer rules than they

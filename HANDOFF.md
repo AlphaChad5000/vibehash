@@ -127,6 +127,21 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.17 (2026-11-05): `mainnet-checklist` (PR #27) and the Evo anchor (`evo-anchor`), on main.** Everything
+in the "Unreleased" sections below that names `mainnet-checklist`, `evo-qwen35`, `versions-supply-explorer`,
+`validator-accountability`, `save-before-adopt`, `address-checksum`, `halvings-count-work` or `evo-anchor` is in it:
+block version 4 (double-sign slashing, 100 VIBE to join as a validator, a 10-height delay), one node per folder and
+port, save-before-adopt, checksummed addresses, paid-round halvings on new networks, versions in `/status`, `/supply`
+and `/explorer`, `genesis check`, starter jobs, Evo on Qwen3.5's hybrid layers, and the anchored Evo step (lr 1e-3,
+decay 1/64: "The Evo collapse: cause and fix" below), so `testnet --evo2` and the menu's Evo Hash train without
+wrecking the model. Rollout:
+- **Evo chains** (local, `"es": true`): every node and worker needs 0.5.17 before a job with `decay` is posted (0.5.16
+  refuses the field), and a testnet folder from before carries the old line's broken change into its next job: start
+  a new folder (the owner's old one was moved aside to `~/.vibehash/testnet-evo2-collapsed-20261105`).
+- **The public node** (vibehash-public-1) still runs 0.5.10 and makes version 3 blocks; 0.5.17 follows them. Upgrading
+  it starts version 4 blocks, which 0.5.16 and older can't follow: release notes first, then every validator at once
+  (the block version 4 rollout below).
+
 **Unreleased (branch `evo-qwen35`, off `mainnet-checklist` at 63da216, 2026-11-04): Evo Hash's engine for Qwen3.5's hybrid layers, exact on Qwen3.5-0.8B and 4B.** Toward a mainnet starter job on current Qwen models (Qwen3.5-0.8B/2B/4B/9B and Qwen3.8-27B share the design: three of four layers Gated DeltaNet linear attention, a fixed-size memory per head, every fourth gated full attention). `vibehash/es_hybrid.py`; `es_fast.answer_members`, `gaps_items` and `score_items` route a model whose config has `linear_attention` layers there, on every device; the Qwen2 engine is untouched.
 - **How it works.** The shared reading of each prompt but its last token is transformers' own forward (untwisted, Gated DeltaNet's chunked algorithm), the same batch for worker and checker. Everything twisted is a hand-written decode step (Gated DeltaNet's recurrent rule, partial RoPE, gated attention and the output gate), so a checker teacher-forces through exactly the steps that wrote the answers; reading a whole answer in one forward would take the chunked algorithm, which rounds differently. A pass is always `es_hybrid.rows_per_pass(config)` rows (`ROWS_BY_HIDDEN`: 0.8B 64, 4B 16; 2B, 9B, 27B provisional), because the recurrent state (float32, 18 MB a row in 0.8B, 48 MB in 4B) leaves room for one pass only: rows that finish are replaced by waiting rows at the next step, each at its own step and cache slot, and a pass is one CUDA graph. The engine matches transformers' greedy decode token for token on both models (one exact three-way bf16 logit tie aside). Replay log-probabilities (`score_items`) go through the same steps, so worker and checker get the same numbers too.
 - **Twisted:** full attention's q/k/v/o, linear attention's in_proj_qkv, in_proj_z and out_proj, the MLP's gate/up/down (`es_hybrid.TENSORS`; `es_local.tensors2_for` picks it, and `spec2_for` reads a Qwen3.5 config's text_config; 0.8B 150 linears, 0.50B weights; 4B 200 linears, 3.57B weights, 1.9M noise numbers a pair). Not in_proj_a/in_proj_b (each value head's memory decay and write strength: 0.1% of the weights).

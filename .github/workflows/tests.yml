@@ -37,4 +37,4 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install -e .[finetune,evo]
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m unittest tests.test_es tests.test_es2.SpecTests tests.test_es2.TaskCycleTests tests.test_es2.StarterTemplateTests
+      - run: python -m unittest tests.test_es tests.test_es2.SpecTests tests.test_es2.TaskCycleTests tests.test_es2.AnchorTests tests.test_es2.StarterTemplateTests
