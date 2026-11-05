@@ -29,11 +29,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import architect
-import judge
-import models
-import publish
-import teacher
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run as a script from anywhere: this checkout's agents
+from agents import architect, judge, models, publish, teacher  # noqa: E402
 
 MACHINE = platform.node()
 NO_GPU = 3  # exit code: this Python's PyTorch can't use the GPU, so starting it again won't help
@@ -172,7 +169,8 @@ class Chatter:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.free()
         self.tok = AutoTokenizer.from_pretrained(**models.source(base))
-        self.model = AutoModelForCausalLM.from_pretrained(**models.source(base), dtype=torch.bfloat16, device_map="auto")
+        self.model = AutoModelForCausalLM.from_pretrained(**models.source(base), dtype=torch.bfloat16)
+        self.model.to("cuda" if torch.cuda.is_available() else "cpu").eval()  # no device_map, so no `accelerate`
         self.base = base
 
     def free(self) -> None:

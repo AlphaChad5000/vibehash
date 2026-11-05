@@ -15,9 +15,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import checks
-import judge
-from llm_call import chat, model_name
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run as a script from anywhere: this checkout's agents
+from agents import checks, judge  # noqa: E402
+from agents.llm_call import chat, model_name  # noqa: E402
 
 TEACHER = "teacher"
 WORKERS = 6

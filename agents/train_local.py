@@ -20,10 +20,12 @@ import argparse
 import hashlib
 import json
 import random
+import sys
 import time
 from pathlib import Path
 
-from models import BASES, chat_prompt, source
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run as a script from anywhere: this checkout's agents
+from agents.models import BASES, chat_prompt, source  # noqa: E402
 
 IGNORE = -100  # PyTorch's cross-entropy skips labels with this value
 
@@ -94,8 +96,8 @@ def train(chats: Path, base: str, rank: int, out: Path, epochs: int = 3, lr: flo
 
     gpu = torch.cuda.is_available()
     tok = AutoTokenizer.from_pretrained(**source(base))
-    model = AutoModelForCausalLM.from_pretrained(**source(base), dtype=torch.bfloat16 if gpu else torch.float32,
-                                                 device_map="cuda" if gpu else None)
+    model = AutoModelForCausalLM.from_pretrained(**source(base), dtype=torch.bfloat16 if gpu else torch.float32)
+    model.to("cuda" if gpu else "cpu")  # no device_map, so no `accelerate`
     model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.05,
                                              target_modules="all-linear", task_type="CAUSAL_LM"))
     model.print_trainable_parameters()

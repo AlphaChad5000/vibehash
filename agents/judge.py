@@ -27,9 +27,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import checks
-from llm_call import chat_json, model_name
-from models import chat_prompt, source
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run as a script from anywhere: this checkout's agents
+from agents import checks  # noqa: E402
+from agents.llm_call import chat_json, model_name  # noqa: E402
+from agents.models import chat_prompt, source  # noqa: E402
 
 
 PROMPTED = "Follow this instruction in every reply: {goal}"
@@ -174,14 +175,33 @@ def room(prompt: str) -> int:
     return 800 if len(prompt) >= LONG else 200
 
 
+def pinned(adapter_dir: Path, base: str) -> dict:
+    """The base commit an adapter was trained on, when its folder says (`vibehash job download` writes the revision
+    the network pinned into adapter_config.json): the fine-tune must run on the weights it learned on, not a newer
+    snapshot. {} when it doesn't say, or names another repo."""
+    try:
+        config = json.loads((Path(adapter_dir) / "adapter_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    repo, rev = config.get("base_model_name_or_path"), config.get("revision")
+    if isinstance(rev, str) and rev and isinstance(repo, str) and repo.lower() == source(base)["pretrained_model_name_or_path"].lower():
+        if rev != source(base)["revision"]:
+            print(f"the adapter was trained on {repo} at {rev[:12]}: loading that", file=sys.stderr)
+        return {"revision": rev}
+    return {}
+
+
 def answer(eval_file: Path, adapter_dir: Path) -> Path:
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     spec = json.loads(eval_file.read_text())
-    tok = AutoTokenizer.from_pretrained(**source(spec["base"]))
-    model = AutoModelForCausalLM.from_pretrained(**source(spec["base"]), dtype=torch.bfloat16, device_map="auto")
+    src = source(spec["base"]) | pinned(adapter_dir, spec["base"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tok = AutoTokenizer.from_pretrained(**src)
+    model = AutoModelForCausalLM.from_pretrained(**src, dtype=torch.bfloat16 if device == "cuda" else torch.float32)
+    model.to(device).eval()  # no device_map, so no `accelerate`
 
     # The judge's own prompts come in the eval file (the dispatcher asks for them): this step needs no API key
     sets = [(p, None, None) for p in spec["prompts"]] + [(p, OFF, None) for p in spec.get("off_scope", [])] + \
@@ -232,7 +252,8 @@ def compare(goal: str, pair: dict, rival: str, tuned_is_a: bool, model: str | No
     a, b = (pair["tuned"], pair[rival]) if tuned_is_a else (pair[rival], pair["tuned"])
     verdict = chat_json([{"role": "system", "content": JUDGE},
                          {"role": "user", "content": f"Goal: {goal}\n\nUser message:\n<<<\n{pair['prompt']}\n>>>\n\n"
-                                                     f"Reply A:\n<<<\n{a}\n>>>\n\nReply B:\n<<<\n{b}\n>>>"}], model)
+                                                     f"Reply A:\n<<<\n{a}\n>>>\n\nReply B:\n<<<\n{b}\n>>>"}],
+                         model=model)
     winner = verdict.get("winner")
     side = "neither" if winner == "neither" else "tie" if winner not in ("A", "B") \
         else "tuned" if (winner == "A") == tuned_is_a else rival

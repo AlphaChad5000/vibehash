@@ -14,9 +14,11 @@ It reads what the other steps left in agent-jobs/:
 import argparse
 import datetime
 import json
+import sys
 from pathlib import Path
 
-from models import BASES
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # run as a script from anywhere: this checkout's agents
+from agents.models import BASES  # noqa: E402
 
 TITLES = {"qwen3-0.6b": "Qwen3 0.6B", "llama-3.2-1b": "Llama 3.2 1B"}
 RESULTS = Path(__file__).parent.parent / "web" / "public" / "results"  # what the results page reads

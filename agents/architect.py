@@ -1,24 +1,36 @@
 """Agent 1, the Job Architect: a plain-English goal in, a fine-tuning job out.
 
     python agents/architect.py "answer customer-support questions in two friendly sentences"
-    python agents/architect.py "..." --post      # also trains it (otherwise it only prints the command)
+    python agents/architect.py "..." --post                    # also posts it (otherwise it only prints the command)
+    python agents/architect.py "..." --post --backend local    # trains on this machine instead of Vibe Hash
 
 The split of responsibilities is the whole design:
   - The LLM does the fuzzy part: understand the goal, write example chats, pick sensible settings.
-  - This code does the strict part: check every value against hard limits before any GPU time is spent.
-  - agents/train_local.py does the training: a LoRA adapter, on this machine's GPU.
+  - This code does the strict part: check every value against hard limits before anything is spent.
+  - A trainer does the training. Two backends, the same plan:
+      vibehash  `vibehash train` posts the job to the Vibe Hash network, which handles tokenizing, the held-back
+                split, dataset hashes and pinning the model; it shows its pre-flight and asks before it spends. The
+                budget is worked out here from the chats and epochs, never by the LLM.
+      local     agents/train_local.py trains a LoRA adapter on this machine's GPU (what the site's dispatcher uses).
 """
 import argparse
 import json
+import math
 import os
 import re
+import secrets
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-import checks
-from llm_call import chat_json, model_name
-from models import BASES
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))  # run as a script from anywhere: this checkout's agents and vibehash
+from agents import checks  # noqa: E402
+from agents.llm_call import chat_json, model_name  # noqa: E402
+from agents.models import BASES  # noqa: E402
+from vibehash import catalog, settings  # noqa: E402
+from vibehash.tasks import _JOB_ID  # noqa: E402  (what the chain takes as a job id)
 
 # Qwen3-0.6B unless .env.local says otherwise (ALLOWED_BASES=qwen3-0.6b,llama-3.2-1b): Llama is gated on Hugging Face,
 # so it needs a logged-in account that accepted its licence
@@ -39,6 +51,15 @@ OFF_EXAMPLES, OFF_PROMPTS = 12, 8  # a 0.6B model trained on 6 declines once dec
 #                                    needs more of them to learn, and more test prompts for the share to mean much
 OFF_LONG_EXAMPLES, OFF_LONG_PROMPTS = 4, 2  # of those, long ones: trained to decline "hi", a model still forced a
 #                                             formula onto a five-part brief; it has to see long off-task asks too
+
+# The network backend: what `vibehash train` and the chain would refuse, checked before the LLM's plan is accepted
+FEE = 10  # VIBE a round: `vibehash train`'s --fee default
+MAX_BUDGET = int(os.environ.get("MAX_BUDGET", 200))  # VIBE: the most one agent-written job may spend (.env.local can lower it)
+CHATS_A_ROUND = 8 * 16  # a round is 8 units (train's --units default) of about 16 steps, one chat a step
+MAX_LEN = 512  # train's --max-len default; longer sequences make these bases' disputes too big to play from home
+TEMPLATE_TOKENS = 64  # what a chat template wraps around one exchange (Llama 3.2's dated system header is ~30)
+WINDOWS_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10))}
+_SPECIAL = re.compile(r"<\|[^|<>\s]{1,40}\|>|</?think>", re.IGNORECASE)  # chat-template tokens, Qwen3's think tags
 
 SHAPES = f"""Write the user messages the way real people write them, in four shapes:
   - casual ones, under {CASUAL} characters, typed without thinking: "what time is it", "whats your name", "weather in
@@ -118,13 +139,16 @@ def design(goal: str) -> dict:
     return chat_json([{"role": "system", "content": SYSTEM}, {"role": "user", "content": goal}])
 
 
-def check(plan: dict) -> list[str]:
-    """Every rule the LLM was told, enforced. An LLM's output is a suggestion until code has checked it."""
+def check(plan: dict, backend: str = "local", max_len: int = MAX_LEN) -> list[str]:
+    """Every rule the LLM was told, enforced. An LLM's output is a suggestion until code has checked it. For the
+    network backend, also what `vibehash train` and the chain would refuse."""
     problems = []
     # The job id becomes file names under agent-jobs/, so it may only be lowercase letters, digits and hyphens:
     # nothing the model writes (a "../", a drive, a slash) can point a file anywhere else.
     if not isinstance(plan.get("job_id"), str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", plan["job_id"]):
         problems.append(f"job_id {plan.get('job_id')!r} must be 1 to 40 lowercase letters, digits and hyphens")
+    elif plan["job_id"] in WINDOWS_NAMES:
+        problems.append(f"job_id {plan['job_id']!r} is a device name on Windows, which can't be a file name")
     if plan.get("base") not in ALLOWED_BASES:
         problems.append(f"base {plan.get('base')!r} isn't one of {sorted(ALLOWED_BASES)}")
     if plan.get("rank") not in (8, 16):
@@ -145,7 +169,63 @@ def check(plan: dict) -> list[str]:
     problems += scoped(plan.get("scope"), examples, plan.get("off_scope_prompts") or [], 1)
     problems += ruled(plan.get("checks"), plan.get("scope"), examples)
     problems += leaked(examples, (plan.get("eval_prompts") or []) + (plan.get("off_scope_prompts") or []))
+    if backend == "vibehash":
+        problems += network(plan, max_len)
     return problems
+
+
+def tokens_about(text: str) -> int:
+    """A generous guess at a text's length in tokens, without the model's tokenizer: a token every 3 characters of
+    ASCII (English averages about 4), and one a character for the rest (Chinese, emoji)."""
+    ascii_ = sum(1 for c in text if ord(c) < 128)
+    return math.ceil(ascii_ / 3) + len(text) - ascii_
+
+
+def unfit(e, max_len: int = MAX_LEN) -> str | None:
+    """Why a chat can't go to the network as it is: `vibehash train` cuts a chat past --max-len tokens (and the
+    reply's end, the part being learned, is lost), and template tokens in the text would forge turns."""
+    if textless([e]):
+        return None  # textless() reports it
+    if _SPECIAL.search(e["user"]) or _SPECIAL.search(e["assistant"]):
+        return "contains chat-template tokens or <think> tags; use plain text"
+    if tokens_about(e["user"]) + tokens_about(e["assistant"]) + TEMPLATE_TOKENS > max_len:
+        return f"may be longer than {max_len} tokens, where `vibehash train` cuts chats short; shorten it"
+    return None
+
+
+def network(plan: dict, max_len: int = MAX_LEN) -> list[str]:
+    """What `vibehash train` and the chain would refuse after the poster has waited for the weights check."""
+    problems = []
+    base = plan.get("base")
+    if base in BASES and catalog.find(base) is None:
+        problems.append(f"base {base!r} isn't one `vibehash train` knows")
+    elif base in BASES and "llama" in base and not (os.environ.get("HF_TOKEN")
+                                                     or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
+        problems.append(f"base {base} is gated on Hugging Face: set HF_TOKEN from an account that accepted Meta's "
+                        "licence, or use qwen3-0.6b")
+    bad = [(n, why) for n, e in enumerate(plan.get("examples") or [], 1) if (why := unfit(e, max_len))]
+    if bad:
+        problems.append(f"{len(bad)} examples can't go to the network as written (example {bad[0][0]} {bad[0][1]}); "
+                        "fix every one like it")
+    prompts = (plan.get("eval_prompts") or []) + (plan.get("off_scope_prompts") or [])
+    if any(isinstance(q, str) and _SPECIAL.search(q) for q in prompts):
+        problems.append("test prompts contain chat-template tokens or <think> tags; use plain text")
+    return problems
+
+
+def budget(plan: dict) -> int:
+    """VIBE for a network job: enough rounds for its epochs over its chats, at train's fee, within MAX_BUDGET. Code
+    sets it, not the LLM: it's money."""
+    rounds = math.ceil(len(plan["examples"]) * plan["epochs"] / CHATS_A_ROUND)
+    return max(FEE, min(MAX_BUDGET // FEE * FEE, rounds * FEE))
+
+
+def chain_id(job_id: str) -> str:
+    """A job id that's new on the chain and on this computer: the plan's, plus four random hex digits."""
+    while True:
+        new = f"{job_id[:40]}-{secrets.token_hex(2)}"
+        if _JOB_ID.match(new) and not (settings.home() / "jobs" / new).exists():
+            return new
 
 
 RULED = 0.9  # share of the on-task chats that must pass the plan's own rules: the data is checked before the GPU is
@@ -322,7 +402,7 @@ def audit(plan: dict) -> dict:
     return {"sampled": len(sample), "met": len(sample) - len(misses), "misses": misses[:6]}
 
 
-def plan_job(goal: str, log=print) -> dict:
+def plan_job(goal: str, log=print, backend: str = "local", max_len: int = MAX_LEN) -> dict:
     """Screen the goal, then design a job and check it, giving the model two chances to fix what the checks reject,
     then have the judge audit a sample of its chats and fix what that rejects."""
     allowed, why = screen(goal)
@@ -332,7 +412,7 @@ def plan_job(goal: str, log=print) -> dict:
     plan["goal"] = goal  # the form's goal, never one the model wrote into its reply
     valid = None  # the last plan that passed the checks, kept in case a rewrite for the audit breaks them
     for attempt in range(3):  # up to three retries: tell the model what was wrong and let it fix it
-        problems = check(plan)
+        problems = check(plan, backend, max_len)
         if not problems:
             plan["audit"] = audit(plan)
             valid = plan
@@ -348,7 +428,7 @@ def plan_job(goal: str, log=print) -> dict:
                           {"role": "user", "content": "Fix these and reply with the whole JSON again:\n" + "\n".join(problems)}])
         plan["goal"] = goal  # the rewrite is a fresh object from the model
         plan.pop("audit", None)  # ...whose chats haven't been audited, whatever it echoed
-    if problems := check(plan):
+    if problems := check(plan, backend, max_len):
         if not valid:
             raise ValueError("still invalid after a retry:\n  " + "\n  ".join(problems))
         log("the rewrite broke the checks; training on the last plan that passed them")
@@ -361,7 +441,7 @@ def plan_job(goal: str, log=print) -> dict:
     if not narrow(plan.get("scope")):
         plan["scope"], plan["off_scope_prompts"] = {"narrow": False, "decline": ""}, []
     plan["checks"] = plan.get("checks") or []
-    plan["examples"] += more(plan, log)
+    plan["examples"] += more(plan, log, backend, max_len)
     return plan
 
 
@@ -374,7 +454,7 @@ MORE = f"""You add training chats to a fine-tuning job. Reply with ONE JSON obje
 {SHAPES}"""
 
 
-def more(plan: dict, log=print) -> list[dict]:
+def more(plan: dict, log=print, backend: str = "local", max_len: int = MAX_LEN) -> list[dict]:
     """A second batch of chats before training. 32 natural, varied chats taught a two-sentence style only 18 times in
     32; one batch is all a single reply holds, so a second call doubles what the model learns from. Best effort: if
     the batch keeps failing the checks, train on the first one."""
@@ -399,7 +479,8 @@ def more(plan: dict, log=print) -> list[dict]:
         tests = {norm(p) for p in plan["eval_prompts"] + (plan.get("off_scope_prompts") or [])}
         got = batch.get("examples") if isinstance(batch.get("examples"), list) else []
         # a chat without user and assistant text (a list, a number) is dropped like a repeat, before it's looked up
-        examples = [e for e in got if not textless([e]) and e["user"] not in seen and norm(e["user"]) not in tests]
+        examples = [e for e in got if not textless([e]) and e["user"] not in seen and norm(e["user"]) not in tests
+                    and not (backend == "vibehash" and unfit(e, max_len))]  # too long for the network: dropped too
         # it repeats about a quarter of the questions it's shown; those are dropped, so ask for 40 and take 20 up
         problems = ([f"only {len(examples)} new examples; need at least 20"] if len(examples) < 20 else []) + \
                    [p for p in mixed(examples, [], 0.3, decline) if "eval prompts" not in p] + \
@@ -477,43 +558,114 @@ def repair(plan: dict, graded: dict) -> dict:
     raise ValueError("repair still invalid after retries:\n  " + "\n  ".join(problems))
 
 
-def save(plan: dict, out: Path) -> tuple[Path, Path]:
-    """The chats and eval files, and what publish.py needs later: the goal and the settings."""
+def save(plan: dict, out: Path, backend: str = "local", node: str | None = None) -> tuple[Path, Path]:
+    """The chats and eval files, and what publish.py needs later: the goal, the settings and where it trained."""
     chats, evals = write_files(plan, out)
     (out / f"{plan['job_id']}.plan.json").write_text(json.dumps(
         {k: plan[k] for k in ("job_id", "goal", "base", "rank", "epochs", "reasoning")}
         | {"caveat": plan.get("caveat") or "", "examples": len(plan["examples"]), "model": model_name(),
            "scope": plan.get("scope") or {"narrow": False, "decline": ""}, "checks": plan.get("checks") or [],
-           "audit": plan.get("audit")}, indent=2))
+           "audit": plan.get("audit"), "backend": backend}
+        | ({"budget": plan["budget"], "node": node} if backend == "vibehash" else {}), indent=2))
     return chats, evals
 
 
-def train_command(plan: dict, chats: Path, out: Path) -> list[str]:
-    return [sys.executable, str(Path(__file__).with_name("train_local.py")), str(chats), "--base", plan["base"],
-            "--rank", str(plan["rank"]), "--epochs", str(plan["epochs"]), "--out", str(out / "adapters")]
+def train_command(plan: dict, chats: Path, out: Path, backend: str = "local", *, max_len: int = MAX_LEN,
+                  node: str | None = None, wallet: str | None = None, yes: bool = False) -> list[str]:
+    """The command that trains the plan. For the network it's this Python's `vibehash train`, --plain so it posts and
+    returns rather than open the training dashboard (`vibehash job watch` does that)."""
+    if backend == "local":
+        return [sys.executable, str(Path(__file__).with_name("train_local.py")), str(chats), "--base", plan["base"],
+                "--rank", str(plan["rank"]), "--epochs", str(plan["epochs"]), "--out", str(out / "adapters")]
+    cmd = [sys.executable, "-m", "vibehash", "train", str(Path(chats).resolve()), "--base", plan["base"],
+           "--rank", str(plan["rank"]), "--budget", str(plan["budget"]), "--max-len", str(max_len),
+           "--id", plan["job_id"], "--plain"]
+    cmd += ["--node", node] if node else []
+    cmd += ["--wallet", wallet] if wallet else []
+    return cmd + (["--yes"] if yes else [])
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("goal")
-    p.add_argument("--post", action="store_true", help="train it now, not just print the command")
-    p.add_argument("--out", default="agent-jobs")
-    a = p.parse_args()
+def shown(cmd: list[str]) -> str:
+    """A command line to paste into this system's shell."""
+    return subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd)
 
+
+def post(cmd: list[str], job_id: str) -> bool:
+    """Run `vibehash train`, with this checkout's vibehash first on the path. True if it posted the job: train keeps a
+    receipt in ~/.vibehash/jobs/<job>/job.json once it has, and says "Nothing was posted" (exit 0) when told no."""
+    path = os.environ.get("PYTHONPATH")
+    env = {**os.environ, "PYTHONPATH": str(REPO) + (os.pathsep + path if path else "")}
+    code = subprocess.run(cmd, env=env).returncode
+    if code:
+        sys.exit(f"`vibehash train` stopped with exit code {code}; nothing more was done")
+    return (settings.home() / "jobs" / job_id / "job.json").exists()
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="architect.py", description="A plain-English goal in, a fine-tuning job out.")
+    p.add_argument("goal", help="what the fine-tuned model should do, in plain English")
+    p.add_argument("--post", action="store_true", help="run the training command, not just print it")
+    p.add_argument("--backend", choices=["vibehash", "local"], default="vibehash",
+                   help="vibehash: post to the network (it shows its pre-flight first); local: train on this machine")
+    p.add_argument("--out", default="agent-jobs", help="folder for the files it writes (default agent-jobs)")
+    p.add_argument("--budget", type=int, help=f"network: VIBE to spend, {FEE}-{MAX_BUDGET} (default: enough rounds "
+                   "for the plan's epochs)")
+    p.add_argument("--max-len", type=int, default=MAX_LEN, help=f"network: longest chat in tokens, 64-{MAX_LEN}")
+    p.add_argument("--node", help="network: the node to post to (default: train's: the one setup saved)")
+    p.add_argument("--wallet", help="network: the wallet that pays (default: train's)")
+    p.add_argument("--yes", action="store_true", help="network, with --post: train asks nothing (for scripts)")
+    return p
+
+
+def main(argv=None) -> int:
+    a = parser().parse_args(argv)
+    net = a.backend == "vibehash"
+    if net and not 64 <= a.max_len <= MAX_LEN:
+        sys.exit(f"--max-len must be 64-{MAX_LEN}: the chain refuses longer sequences on these models' disputes")
+    if net and a.budget is not None and not FEE <= a.budget <= MAX_BUDGET:
+        sys.exit(f"--budget must be {FEE} (one round's fee) to {MAX_BUDGET} VIBE")
     try:
-        plan = plan_job(a.goal)
-    except ValueError as e:
+        plan = plan_job(a.goal, backend=a.backend, max_len=a.max_len)
+    except ValueError as e:  # a refused goal, a plan the checks still reject, an LLM that won't answer in JSON
         sys.exit(str(e))
+    except Exception as e:  # the LLM couldn't be asked (a key, credits, the provider): llm_call.LLMError says why
+        sys.exit(f"error: {e}")
     out = Path(a.out)
-    chats, evals = save(plan, out)
-    cmd = train_command(plan, chats, out)
-    print(f"\n{plan['job_id']}: {len(plan['examples'])} examples on {plan['base']}\n  why: {plan['reasoning']}")
+    if net:
+        plan["job_id"] = chain_id(plan["job_id"])
+        plan["budget"] = a.budget or budget(plan)
+    chats, evals = save(plan, out, a.backend, a.node)
+    wallet = os.path.expanduser(a.wallet) if a.wallet else None  # ~/... from a shell that leaves it alone
+    cmd = train_command(plan, chats, out, a.backend, max_len=a.max_len, node=a.node, wallet=wallet, yes=a.yes)
+    cost = f", {plan['budget']} VIBE (up to {plan['budget'] // FEE} rounds at {FEE} VIBE)" if net else ""
+    print(f"\n{plan['job_id']}: {len(plan['examples'])} examples on {plan['base']}, LoRA rank {plan['rank']}, "
+          f"{plan['epochs']} epochs{cost}\n  why: {plan['reasoning']}")
     if plan.get("caveat"):
         print(f"  caveat: {plan['caveat']}")
-    print(f"  wrote {chats} and {evals}\n  command: {' '.join(cmd)}")
-    if a.post:
+    print(f"  wrote {chats} and {evals}\n  command: {shown(cmd)}")
+    if not a.post:
+        print("\nNothing was " + ("posted, and no VIBE spent" if net else "trained") + ". Add --post to run it.")
+        return 0
+    if not net:
         subprocess.run(cmd, check=True)
+        return 0
+    print(f"\nPosting to {settings.node_url(a.node)}: `vibehash train` shows its pre-flight first"
+          + ("." if a.yes else ", and asks before it spends anything."), flush=True)
+    if not post(cmd, plan["job_id"]):
+        print("Nothing was posted, so nothing was spent.")
+        return 0
+    adapter = out / "adapters" / plan["job_id"]
+    print(f"\nPosted {plan['job_id']}. Next, from {REPO}:\n"
+          f"  python -m vibehash job watch {plan['job_id']}\n"
+          "      follow it as the network trains it\n"
+          f"  python -m vibehash job download {plan['job_id']} --out {shown([str(adapter)])}\n"
+          "      the LoRA adapter, once rounds have trained\n"
+          f"  python agents/judge.py answer {shown([str(evals)])} {shown([str(adapter)])}\n"
+          "      the base model, the model told the goal and the fine-tune answer the test prompts (a GPU helps)\n"
+          f"  python agents/judge.py grade {shown([str(evals.with_suffix('.answers.json'))])}\n"
+          "      Muse Spark compares each pair blind")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
