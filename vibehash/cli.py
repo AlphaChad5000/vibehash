@@ -42,7 +42,7 @@ from . import fees
 from . import wallet as wallets
 from .client import NodeClient, NodeError, WorkerClient
 from .crypto import KeyPair
-from .ledger import Block, Chain, canonical
+from .ledger import UNBONDING_ROUNDS, Block, Chain, canonical
 from .model import ModelSpec
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
 
@@ -1820,9 +1820,19 @@ def _rate_limit_flags(p) -> None:
     p.add_argument("--max-connections", type=int, default=256, help="connections served at once (default 256)")
 
 
+def version() -> str:
+    """The installed package's version, or "dev" from a checkout that isn't installed."""
+    try:
+        from importlib.metadata import version as installed
+        return installed("vibehash")
+    except Exception:
+        return "dev"
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="vibehash", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true", help="log every detail (DEBUG), not just what happens (INFO)")
+    ap.add_argument("--version", action="version", version=f"vibehash {version()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     NODE, WALLET = "node address (default: the one `setup` saved)", "wallet file (default: the one `setup` saved)"
 
@@ -1848,12 +1858,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="don't ask before downloading"); p.set_defaults(fn=cmd_install_gpu)
 
     p = sub.add_parser("testnet", help="run a whole network on this computer: node, workers and a job")
-    p.add_argument("--workers", type=int, default=2, choices=range(1, TESTNET_WORKERS + 1), metavar=f"1-{TESTNET_WORKERS}")
+    p.add_argument("--workers", type=int, default=2, choices=range(1, TESTNET_WORKERS + 1), metavar=f"1-{TESTNET_WORKERS}",
+                   help="workers mining, each with its own wallet (default 2)")
     p.add_argument("--validators", type=int, choices=range(1, 8), metavar="1-7",
                    help="validator nodes, on --port and the ports after it; they take turns leading rounds and vote on "
                         "every block (default 1; fixed when the testnet is first made)")
     p.add_argument("--dir", help=f"where its wallets and chain live (default {settings.home() / 'testnet'})")
-    p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 lets other computers join"); p.add_argument("--port", type=int, default=8545)
+    p.add_argument("--host", default="127.0.0.1", help="address the node listens on (default 127.0.0.1; 0.0.0.0 lets other computers join)")
+    p.add_argument("--port", type=int, default=8545, help="the node's port (default 8545); more validators take the ports after it")
     p.add_argument("--job", choices=["gpu", "small", "none"], default="gpu", help="the job template to train (see `job "
                    "template`), or none: post your own, with `train --node` and the testnet's requester.json wallet")
     p.add_argument("--budget", type=to_syn, default="500", help="VIBE per job; a new job is posted when one runs out")
@@ -1872,31 +1884,44 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--evo-model", metavar="MODEL", help="Evo mode's model: a Hugging Face name, from this computer's "
                    "cache or downloaded once, or a model's folder (default Qwen/Qwen2.5-0.5B-Instruct, about 1 GB)")
     for name, default in (("register-s", 3.0), ("compute-s", 8.0), ("reveal-s", 3.0), ("verify-s", 4.0)):
-        p.add_argument(f"--{name}", type=float, default=default)
+        p.add_argument(f"--{name}", type=float, default=default, metavar="SECONDS",
+                       help=f"how long a round's {name[:-2]} phase lasts (default {default:g})")
     p.set_defaults(fn=cmd_testnet)
     _min_fee_flag(p)
 
-    w = sub.add_parser("wallet").add_subparsers(dest="wcmd", required=True)
+    w = sub.add_parser("wallet", help="wallets: make one, rebuild one from its recovery words, or show one's address"
+                       ).add_subparsers(dest="wcmd", required=True)
     p = w.add_parser("create", help="make a wallet and show its 24 recovery words once")
-    p.add_argument("--out", help=f"default {settings.default_wallet()}")
-    p.add_argument("--no-password", action="store_true")
+    p.add_argument("--out", help=f"wallet file to write (default {settings.default_wallet()})")
+    p.add_argument("--no-password", action="store_true", help="don't encrypt the file (for unattended machines; anyone "
+                   "who can read it can spend from it)")
     p.add_argument("--passphrase", action="store_true", help="add a BIP39 passphrase to the words (asked for; optional)")
     p.set_defaults(fn=cmd_wallet_create)
     p = w.add_parser("restore", help="rebuild a wallet from its recovery words (read from the terminal or $VIBEHASH_MNEMONIC)")
-    p.add_argument("--out", help=f"default {settings.default_wallet()}")
-    p.add_argument("--no-password", action="store_true")
+    p.add_argument("--out", help=f"wallet file to write (default {settings.default_wallet()})")
+    p.add_argument("--no-password", action="store_true", help="don't encrypt the file (for unattended machines; anyone "
+                   "who can read it can spend from it)")
     p.add_argument("--passphrase", action="store_true", help="the words had a BIP39 passphrase (asked for)")
     p.add_argument("--path", default=mnemonic.PATH, help=f"derivation path (default {mnemonic.PATH})")
     p.set_defaults(fn=cmd_wallet_restore)
-    p = w.add_parser("show"); p.add_argument("--wallet", help=WALLET); p.set_defaults(fn=cmd_wallet_show)
+    p = w.add_parser("show", help="a wallet's address, whether the file is encrypted, and whether it has recovery words")
+    p.add_argument("--wallet", help=WALLET); p.set_defaults(fn=cmd_wallet_show)
 
-    g = sub.add_parser("genesis").add_subparsers(dest="gcmd", required=True)
-    p = g.add_parser("create"); p.add_argument("--chain-id", required=True); p.add_argument("--alloc", action="append", metavar="ADDR=VIBE")
-    p.add_argument("--stake", action="append", metavar="ADDR=VIBE")
+    g = sub.add_parser("genesis", help="the first block of a new network: who starts with coins, stake and a vote"
+                       ).add_subparsers(dest="gcmd", required=True)
+    p = g.add_parser("create", help="write a genesis file: chain id, starting balances, stakes, validators and the "
+                     "issuance schedule", description="Write the genesis file every node of a new network starts from. "
+                     "Addresses come from `wallet create`. A validator named here needs stake of at least the minimum, "
+                     "from --stake or --bootstrap; a worker needs none when --no-earn-in isn't given, since its first pay "
+                     "becomes its stake. The file's hash identifies the network, so give every node the same file.")
+    p.add_argument("--chain-id", required=True, help="the network's name, written into every block")
+    p.add_argument("--alloc", action="append", metavar="ADDR=VIBE", help="an address and the VIBE it starts with (repeatable)")
+    p.add_argument("--stake", action="append", metavar="ADDR=VIBE", help="an address and the VIBE it starts with staked "
+                   "(repeatable); staked coins can be withdrawn later")
     p.add_argument("--validator", action="append", metavar="ADDR=URL",
                    help="a validator and the address other nodes reach it at (it needs a --stake too). Without any, "
                         "one node runs the chain alone")
-    p.add_argument("--out", required=True); p.set_defaults(fn=cmd_genesis_create)
+    p.add_argument("--out", required=True, help="genesis file to write"); p.set_defaults(fn=cmd_genesis_create)
     p.add_argument("--economics", choices=sorted(econ.SCHEDULES), default="testnet",
                    help="issuance schedule: testnet (fast halvings, for trying things) or mainnet (Bitcoin-like, ~4-year halvings)")
     p.add_argument("--bootstrap", action="append", metavar="ADDR=VIBE",
@@ -1904,9 +1929,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-earn-in", dest="earn_in", action="store_false",
                    help="require workers to be given stake; by default they can start with none and earn it")
 
-    p = sub.add_parser("node", help="run a node")
-    p.add_argument("--genesis", required=True); p.add_argument("--wallet", required=True); p.add_argument("--data-dir", required=True)
-    p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8545)
+    p = sub.add_parser("node", help="run a node: serve the chain to workers, and validate if its wallet is a validator")
+    p.add_argument("--genesis", required=True, help="the network's genesis file (see `genesis create`)")
+    p.add_argument("--wallet", required=True, help="this node's wallet; a validator's if it is to vote and lead rounds")
+    p.add_argument("--data-dir", required=True, help="folder for the chain, its records and uploaded checkpoints")
+    p.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1; 0.0.0.0 for other computers)")
+    p.add_argument("--port", type=int, default=8545, help="port to listen on (default 8545)")
     p.add_argument("--peer", action="append", metavar="URL",
                    help="another node to sync from and gossip to (validators find each other from the chain anyway)")
     p.add_argument("--announce", metavar="URL", help="the address other nodes reach this one at, if not --host:--port")
@@ -1919,7 +1947,8 @@ def parser() -> argparse.ArgumentParser:
                    help="relay only jobs whose model, one checkpoint at the job's precision, is at most this big (default "
                         "64, which a 2 GB server can run; jobs may be up to 1024)")
     for name, default in (("register-s", 3.0), ("compute-s", 20.0), ("reveal-s", 5.0), ("verify-s", 10.0)):
-        p.add_argument(f"--{name}", type=float, default=default)
+        p.add_argument(f"--{name}", type=float, default=default, metavar="SECONDS",
+                       help=f"how long a round's {name[:-2]} phase lasts (default {default:g})")
     p.set_defaults(fn=cmd_node)
     _min_fee_flag(p)
     _rate_limit_flags(p)
@@ -1932,9 +1961,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--key", default="node-key.pem", help="private key file to write (default node-key.pem)")
     p.add_argument("--host", action="append", help="a name or IP address workers reach the node at "
                    "(repeat for several; default: localhost and this computer's name and address)")
-    p.add_argument("--days", type=int, default=365); p.set_defaults(fn=cmd_tls_cert)
+    p.add_argument("--days", type=int, default=365, help="days the certificate is valid (default 365)"); p.set_defaults(fn=cmd_tls_cert)
     p = t.add_parser("fingerprint", help="print a certificate's SHA-256 fingerprint, for setup --tls-fingerprint")
-    p.add_argument("cert"); p.set_defaults(fn=cmd_tls_fingerprint)
+    p.add_argument("cert", help="the PEM certificate file"); p.set_defaults(fn=cmd_tls_fingerprint)
 
     p = sub.add_parser("worker", help="contribute compute and earn VIBE", description="Mine: train and check other "
                        "workers' units, and earn VIBE. One worker trains on one device. For several GPUs in one computer "
@@ -1959,7 +1988,9 @@ def parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
-    p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show")
+    p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",
+                   help="show: what is stored, where, how big and why (the default); clear: remove it all, or one job's "
+                        "files; sweep: remove files no job has used for a week, and stray partial downloads")
     p.add_argument("job", nargs="?", help="with clear: only this job's files")
     p.add_argument("--json", action="store_true", help="machine-readable output"); p.set_defaults(fn=cmd_cache)
 
@@ -1968,20 +1999,35 @@ def parser() -> argparse.ArgumentParser:
     from . import selftest
     selftest.add_parser(sub)  # `vibehash selftest`: is this computer ready to mine, and what can it take?
 
-    p = sub.add_parser("balance"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("address", nargs="?"); p.set_defaults(fn=cmd_balance)
-    p = sub.add_parser("send"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--to", required=True); p.add_argument("--amount", type=to_syn, required=True); p.set_defaults(fn=cmd_send)
+    p = sub.add_parser("balance", help="an address's balance, stake, coins unbonding and reputation")
+    p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+    p.add_argument("address", nargs="?", help="the address to look up (default: your wallet's)"); p.set_defaults(fn=cmd_balance)
+    p = sub.add_parser("send", help="send VIBE to an address")
+    p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+    p.add_argument("--to", required=True, metavar="ADDR", help="the address to pay")
+    p.add_argument("--amount", type=to_syn, required=True, metavar="VIBE", help="how much to send, e.g. 2.5")
+    p.set_defaults(fn=cmd_send)
     _fee_flag(p)
-    for name, fn in (("stake", cmd_stake), ("unstake", cmd_unstake)):
-        p = sub.add_parser(name); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-        p.add_argument("--amount", type=to_syn, required=True); p.set_defaults(fn=fn)
+    for name, fn, what in (("stake", cmd_stake, "lock VIBE as stake: what a worker's checks and a validator's votes are "
+                            "backed by, and what a cheat loses"),
+                           ("unstake", cmd_unstake, f"release staked VIBE; it is spendable after {UNBONDING_ROUNDS} "
+                            "rounds, and can still be slashed until then")):
+        p = sub.add_parser(name, help=what); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+        p.add_argument("--amount", type=to_syn, required=True, metavar="VIBE", help="how much, e.g. 10"); p.set_defaults(fn=fn)
         _fee_flag(p)
-    p = sub.add_parser("post-job"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
-    p.add_argument("--spec", required=True); p.add_argument("--budget", type=to_syn, required=True); p.add_argument("--dataset")
+    p = sub.add_parser("post-job", help="post a training job from a job file, paying its budget in (`train` writes the "
+                       "file for you)", description="Post a job the network trains round by round until its budget is "
+                       "spent. The budget leaves your balance now and is paid out only for work that passes its checks; "
+                       "`cancel-job` returns what is left. `job template` writes a starter file, and the guide explains "
+                       "every field.")
+    p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+    p.add_argument("--spec", required=True, metavar="FILE", help="the job file (JSON)")
+    p.add_argument("--budget", type=to_syn, required=True, metavar="VIBE", help="VIBE to spend on it, in all")
+    p.add_argument("--dataset", metavar="FILE", help="an .npz dataset to upload to the node and train on")
     p.set_defaults(fn=cmd_post_job)
     _fee_flag(p)
-    p = sub.add_parser("cancel-job"); p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
+    p = sub.add_parser("cancel-job", help="cancel a job you posted; the budget it hasn't spent comes back")
+    p.add_argument("--node", help=NODE); p.add_argument("--wallet", help=WALLET)
     p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.set_defaults(fn=cmd_cancel_job)
     _fee_flag(p)
 
@@ -2036,7 +2082,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rows", type=int, default=20, help="rows to show when not writing a file (default 20)")
     p.set_defaults(fn=cmd_predict)
 
-    j = sub.add_parser("job").add_subparsers(dest="jcmd", required=True)
+    j = sub.add_parser("job", help="training jobs: how one is going, follow it live, download its model, its history, or "
+                       "a starter job file").add_subparsers(dest="jcmd", required=True)
     p = j.add_parser("status", help="how a training job is going: rounds, accuracy, budget left")
     p.add_argument("job_id", nargs="?", help="default: the last job you trained"); p.add_argument("--node", help=NODE)
     p.set_defaults(fn=cmd_job_status)
@@ -2056,13 +2103,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print the whole history as JSON, for scripts")
     p.set_defaults(fn=cmd_job_history)
     p = j.add_parser("template", help="write a starter job file, for full control with post-job")
-    p.add_argument("--out", default="job.json"); p.add_argument("--id", default="my-first-job")
+    p.add_argument("--out", default="job.json", help="file to write (default job.json)")
+    p.add_argument("--id", default="my-first-job", help="the job's name (default my-first-job)")
     p.add_argument("--gpu", action="store_true", help="a larger float32 model sized for GPUs")
     p.set_defaults(fn=cmd_job_template)
 
-    c = sub.add_parser("chain").add_subparsers(dest="ccmd", required=True)
+    c = sub.add_parser("chain", help="audit the chain yourself, without trusting the node").add_subparsers(dest="ccmd", required=True)
     p = c.add_parser("verify", help="download every block, re-check it from genesis, and replay every round")
-    p.add_argument("--node", help=NODE); p.add_argument("--genesis")
+    p.add_argument("--node", help=NODE)
+    p.add_argument("--genesis", metavar="FILE", help="the genesis file to check the chain against (default: the node's)")
     p.add_argument("--no-replay", dest="replay", action="store_false", help="skip replaying rounds from their records")
     p.add_argument("--no-recheck", dest="recheck", action="store_false",
                    help="don't download recent rounds' checkpoints to re-run their weight-based checks")
