@@ -137,10 +137,44 @@ class EnvTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             L.ensure_vibehash(self.uv, python, Path(self.tmp.name) / "fresh", run=lambda cmd, **kw: 1)
 
-    def test_the_app_is_run_without_a_password_question(self):
+    def test_the_app_is_run_without_a_password_question_and_waited_for(self):
+        child = mock.Mock()
+        child.wait.return_value = 7
+        with mock.patch.object(L.subprocess, "Popen", return_value=child) as popen, \
+                mock.patch.object(L.signal, "signal") as sig:
+            code = L.run_app(Path("e") / "bin" / "py", ["--device", "cpu"], child_env={"X": "1"})
+        self.assertEqual(code, 7)
+        self.assertEqual(popen.call_args.args[0], [str(Path("e") / "bin" / "py"), "-m", "vibehash", "app", "--no-password", "--device", "cpu"])
+        self.assertEqual(popen.call_args.kwargs["cwd"], "e")  # the environment's folder, not wherever it was started
+        self.assertEqual(popen.call_args.kwargs["env"], {"X": "1"})
+        self.assertEqual(sig.call_args_list[0].args, (L.signal.SIGINT, L.signal.SIG_IGN))  # Ctrl+C is the app's to handle
+
+    def test_the_children_keep_everything_in_the_launchers_folder(self):
+        folder = Path("f")
+        with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/tmp/_MEI123", "LD_LIBRARY_PATH_ORIG": "/usr/lib/x"}):
+            env = L.child_env(folder)
+            self.assertEqual(env["UV_PYTHON_INSTALL_DIR"], str(folder / "python"))
+            self.assertEqual(env["UV_CACHE_DIR"], str(folder / "cache"))
+            self.assertEqual(env["UV_PYTHON_PREFERENCE"], "only-managed")
+            self.assertNotIn("VIBEHASH_LAUNCHER", env)  # a script, not the frozen .exe
+            self.assertEqual(env["LD_LIBRARY_PATH"], "/tmp/_MEI123")  # as a script: left alone
+            with mock.patch.object(L.sys, "frozen", True, create=True):
+                env = L.child_env(folder)
+                self.assertEqual(env["LD_LIBRARY_PATH"], "/usr/lib/x")  # the .exe's unpacked bundle taken back out
+                self.assertEqual(env["VIBEHASH_LAUNCHER"], L.sys.executable)
+        with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/tmp/_MEI123"}, clear=False), \
+                mock.patch.object(L.sys, "frozen", True, create=True):
+            os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+            self.assertNotIn("LD_LIBRARY_PATH", L.child_env(folder))
+
+    def test_only_vibehash_itself_is_upgraded(self):
+        env = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(env, ignore_errors=True))
         calls = []
-        L.run_app(Path("py"), ["--device", "cpu"], run=lambda cmd, **kw: calls.append(cmd) or 0)
-        self.assertEqual(calls[0], ["py", "-m", "vibehash", "app", "--no-password", "--device", "cpu"])
+        L.ensure_vibehash(Path("uv"), env / "bin" / "python", env, run=lambda cmd, **kw: calls.append(cmd) or 0)
+        self.assertIn("--upgrade-package", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--upgrade-package") + 1], "vibehash")
+        self.assertNotIn("--upgrade", calls[0])
 
 
 class MainTests(unittest.TestCase):
@@ -176,6 +210,17 @@ class MainTests(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(L.main([]), 1)
             self.assertIn("no uv for you", out.getvalue())
+
+
+class AppScriptTests(unittest.TestCase):
+    """app.ps1, the one-line route to the same launcher (irm https://vibehash.org/app.ps1 | iex)."""
+
+    def test_it_pins_the_launchers_uv_so_the_launcher_reuses_its_download(self):
+        text = (Path(__file__).resolve().parent.parent / "app.ps1").read_text(encoding="utf-8")
+        self.assertIn(f"$uvVersion = '{L.UV_VERSION}'", text)
+
+    def test_it_is_ascii(self):  # irm may not decode it as UTF-8
+        (Path(__file__).resolve().parent.parent / "app.ps1").read_bytes().decode("ascii")
 
 
 if __name__ == "__main__":

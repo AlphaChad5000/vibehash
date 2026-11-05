@@ -315,18 +315,23 @@ def startup_on(system: str | None = None, run=subprocess.run) -> Path:
     system = system or platform.system()
     path = startup_file(system)
     path.parent.mkdir(parents=True, exist_ok=True)
-    exe, home = sys.executable, settings.home()
+    home = settings.home()
+    # Under the downloadable launcher (it says where it is), start the launcher, so its daily update check still
+    # happens; otherwise this Python with the app command.
+    launcher = os.environ.get("VIBEHASH_LAUNCHER")
+    exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"])
     if system == "Windows":
-        path.write_text(f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" -m vibehash app\r\n',
+        path.write_text(f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n'),
                         encoding="utf-8")
     elif system == "Darwin":
         from xml.sax.saxutils import escape  # a path with & or < in it is still a plist
         log = escape(str(home / "app" / "app.log"))
+        argv = "".join(f"<string>{escape(a)}</string>" for a in [exe, *args])
         path.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{escape(exe)}</string><string>-m</string><string>vibehash</string><string>app</string></array>
+  <key>ProgramArguments</key><array>{argv}</array>
   <key>EnvironmentVariables</key><dict><key>VIBEHASH_HOME</key><string>{escape(str(home))}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
@@ -341,7 +346,7 @@ Description=Vibe Hash: mine by training AI models
 After=network-online.target
 
 [Service]
-ExecStart={shlex.quote(exe)} -m vibehash app
+ExecStart={" ".join(shlex.quote(a) for a in [exe, *args])}
 Environment="VIBEHASH_HOME={home}"
 Restart=on-failure
 RestartSec=30

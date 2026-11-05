@@ -7,16 +7,18 @@ everything up the first time and then just runs `vibehash app`.
     VibeHash.exe -- --device cpu --node 192.168.1.20   # anything after -- goes to `vibehash app`
 
 What it installs, in its own folder (%LOCALAPPDATA%\\VibeHash on Windows, ~/Library/Application Support/VibeHash on
-macOS, ~/.local/share/vibehash on Linux) and nowhere else:
+macOS, ~/.local/share/vibehash on Linux) and nowhere else (uv's Python and cache are kept there too):
 - uv (astral.sh), one pinned release, its download checked against the SHA-256 the release publishes;
 - a Python of its own, which uv downloads, so the computer's Python (if any) is never touched;
-- Vibe Hash from PyPI, updated when a day has passed since the last check;
+- Vibe Hash from PyPI, updated (it alone, not every library under it) when a day has passed since the last check;
 - the GPU build of PyTorch, chosen by `vibehash app` itself (gpusetup.py), a one-time download of up to 3 GB.
 
 It is plain Python with nothing but the standard library, so it also runs as a script, and PyInstaller turns it into
 the .exe (.github/workflows/launcher.yml). It never reads or writes the wallet: `vibehash app` does that, and the
 launcher only passes `--no-password` so a first wallet is made without a question (the file is then as safe as the
-user's account; `vibehash wallet create` makes a password-protected one for anyone who wants it).
+user's account; `vibehash wallet create` makes a password-protected one for anyone who wants it). While the app runs,
+Ctrl+C goes to the app, which stops its worker properly; the launcher waits for it. `app startup on` under the
+launcher starts the launcher at login (it says where it is in $VIBEHASH_LAUNCHER), so the daily check still happens.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import io
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -87,6 +90,27 @@ def env_python(env: Path, system: str | None = None) -> Path:
     if (system or platform.system()) == "Windows":
         return env / "Scripts" / "python.exe"
     return env / "bin" / "python"
+
+
+def child_env(folder: Path) -> dict:
+    """The environment uv, Python and the app run with: uv keeps its Python and its cache in the launcher's folder, so
+    --uninstall removes all of it; the frozen launcher's own library path (PyInstaller sets LD_LIBRARY_PATH to its
+    unpacked bundle) is taken back out, so a child never loads the launcher's libraries instead of its own; and the
+    app knows where the launcher is, so `app startup on` starts it rather than the environment's python."""
+    env = dict(os.environ)
+    env["UV_PYTHON_INSTALL_DIR"] = str(folder / "python")
+    env["UV_CACHE_DIR"] = str(folder / "cache")
+    env["UV_PYTHON_PREFERENCE"] = "only-managed"
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
+        orig = env.pop(name + "_ORIG", None)
+        if getattr(sys, "frozen", False):
+            if orig:
+                env[name] = orig
+            else:
+                env.pop(name, None)
+    if getattr(sys, "frozen", False):
+        env["VIBEHASH_LAUNCHER"] = sys.executable
+    return env
 
 
 # --- downloading -------------------------------------------------------------------------------------------------
@@ -154,20 +178,24 @@ def run(cmd: list[str], **kw) -> int:
     return subprocess.call(cmd, **kw)
 
 
-def ensure_env(uv: Path, env: Path, system: str | None = None, run=run) -> Path:
-    """A Python of its own in `env` (uv fetches PYTHON if the computer has none), with pip, so `vibehash install-gpu`
-    can swap PyTorch builds inside it."""
+def ensure_env(uv: Path, env: Path, system: str | None = None, run=run, child_env: dict | None = None) -> Path:
+    """A Python of its own in `env` (uv fetches PYTHON; it never bases the environment on a Python the computer
+    happens to have, which could be uninstalled later), with pip, so `vibehash install-gpu` can swap PyTorch builds
+    inside it."""
     python = env_python(env, system)
     if python.exists():
         return python
     say(f"making a Python {PYTHON} of its own for Vibe Hash (a one-time download of about 25 MB)...")
-    if run([str(uv), "venv", str(env), "--python", PYTHON, "--seed", "--quiet"]):
+    if run([str(uv), "venv", str(env), "--python", PYTHON, "--python-preference", "only-managed", "--seed", "--quiet"],
+           env=child_env):
         raise SystemExit("couldn't make the Python environment; uv's message above says why")
     return python
 
 
-def ensure_vibehash(uv: Path, python: Path, env: Path, force: bool = False, now: float | None = None, run=run) -> bool:
-    """Vibe Hash installed, and brought up to date once a day (or now, with --update). -> whether it ran pip."""
+def ensure_vibehash(uv: Path, python: Path, env: Path, force: bool = False, now: float | None = None, run=run,
+                    child_env: dict | None = None) -> bool:
+    """Vibe Hash installed, and brought up to date once a day (or now, with --update): the package itself, not every
+    library under it, so a PyTorch build `install-gpu` put in stays matched. -> whether it ran pip."""
     now = time.time() if now is None else now
     stamp = env / ".vibehash-checked"
     try:
@@ -177,7 +205,8 @@ def ensure_vibehash(uv: Path, python: Path, env: Path, force: bool = False, now:
     if last and not force and now - last < UPDATE_EVERY_S:  # (no stamp: never installed, whatever the clock says)
         return False
     say("installing Vibe Hash from PyPI..." if not last else "checking for a newer Vibe Hash...")
-    if run([str(uv), "pip", "install", "--python", str(python), "--upgrade", "--quiet", PACKAGE]):
+    if run([str(uv), "pip", "install", "--python", str(python), "--upgrade-package", "vibehash", "--quiet", PACKAGE],
+           env=child_env):
         if last:  # it is installed already: a failed check (offline?) is no reason not to mine
             say("couldn't check for updates (offline?); carrying on with what is installed")
             return False
@@ -186,50 +215,89 @@ def ensure_vibehash(uv: Path, python: Path, env: Path, force: bool = False, now:
     return True
 
 
-def run_app(python: Path, args: list[str], run=run) -> int:
-    # From the environment's own folder: `python -m vibehash` would otherwise import a `vibehash` folder that happened
-    # to be in whatever folder the launcher was started from (a checkout, say), not the installed package.
-    return run([str(python), "-m", "vibehash", "app", "--no-password", *args], cwd=str(python.parent.parent))
+def run_app(python: Path, args: list[str], child_env: dict | None = None) -> int:
+    """`vibehash app`, waited for. Ctrl+C reaches the app and the launcher alike; the launcher ignores it and waits,
+    so the app gets to stop its worker properly (round log written, dashboard summed up) before both end. Run from
+    the environment's own folder: `python -m vibehash` would otherwise import a `vibehash` folder that happened to be
+    in whatever folder the launcher was started from (a checkout, say), not the installed package."""
+    cmd = [str(python), "-m", "vibehash", "app", "--no-password", *args]
+    sys.stdout.flush()
+    child = subprocess.Popen(cmd, cwd=str(python.parent.parent), env=child_env)
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return child.wait()
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
-def uninstall(folder: Path) -> None:
-    """Remove what the launcher installed. The wallet, settings and logs live in ~/.vibehash and stay."""
+def uninstall(folder: Path, system: str | None = None, run=run) -> bool:
+    """Remove what the launcher installed, and the start-at-login entry if `app startup on` made one, since it
+    would point at a python that is about to go. The wallet, settings and logs live in ~/.vibehash and stay.
+    -> whether everything went."""
+    python = env_python(folder / "env", system)
+    if python.exists():
+        run([str(python), "-m", "vibehash", "app", "startup", "off"], cwd=str(folder / "env"), env=child_env(folder))
     if folder.exists():
         shutil.rmtree(folder, ignore_errors=True)
+    if platform.system() == "Windows" and os.environ.get("APPDATA"):  # app.ps1's Start menu entry
+        link = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Vibe Hash.lnk"
+        link.unlink(missing_ok=True)
+    if folder.exists():
+        say(f"couldn't remove all of {folder} (is Vibe Hash still running? stop it, then try again)")
+        return False
     say(f"removed {folder}. Your wallet and settings are still in ~/.vibehash; delete that folder yourself if you "
         "want them gone too (back up its recovery words first).")
+    return True
 
 
 # --- the command ----------------------------------------------------------------------------------------------------
+
+def split_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    """(the launcher's own flags, what goes to `vibehash app`): everything after the first -- is the app's."""
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, []
+
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     print(f"\n  {BANNER}\n", flush=True)
     folder = app_dir()
-    if "--uninstall" in argv:
-        uninstall(folder)
-        return 0
-    force = "--update" in argv
-    passed = argv[argv.index("--") + 1:] if "--" in argv else [a for a in argv if a not in ("--update",)]
+    mine, passed = split_args(argv)
+    unknown = [a for a in mine if a not in ("--update", "--uninstall")]
+    if unknown:
+        say(f"unknown option {unknown[0]}; the launcher takes --update and --uninstall, and anything after -- goes to "
+            "`vibehash app`")
+        return 2
+    if "--uninstall" in mine:
+        return 0 if uninstall(folder) else 1
     try:
+        env_ = child_env(folder)
         uv = ensure_uv(folder)
         env = folder / "env"
-        python = ensure_env(uv, env)
-        ensure_vibehash(uv, python, env, force=force)
+        python = ensure_env(uv, env, child_env=env_)
+        ensure_vibehash(uv, python, env, force="--update" in mine, child_env=env_)
     except SystemExit as e:
         say(str(e))
         return 1
+    except KeyboardInterrupt:
+        say("stopped before it was installed; run it again any time")
+        return 130
     except Exception as e:  # noqa: BLE001  (a launcher shows what went wrong, it doesn't crash)
         say(f"something went wrong while installing: {e!r}")
         return 1
-    return run_app(python, passed)
+    try:
+        return run_app(python, passed, child_env=env_)
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
     code = main()
-    if code and os.name == "nt" and sys.stdin and sys.stdin.isatty():
+    if code and code != 130 and os.name == "nt" and sys.stdin and sys.stdin.isatty():
         try:
             input("\n  Press Enter to close this window.")
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
             pass
     sys.exit(code)
