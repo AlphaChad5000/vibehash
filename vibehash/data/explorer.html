@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vibe Hash explorer</title>
+<!-- Served by a Vibe Hash node at /explorer (node.py). Self-contained: it reads only this node's public JSON API, and
+     the node's Content-Security-Policy lets it load nothing else. Everything a node says is put on the page as text
+     (textContent), never as markup: job ids, memos and validator addresses are anyone's to choose. -->
+<style>
+:root { color-scheme: light dark; --bg: #f6f6f3; --fg: #1c1d1b; --muted: #6a6b66; --card: #ffffff; --line: #e2e2dc;
+  --accent: #0b7a57; --bad: #b3261e; --soft: #eef3ef; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111311; --fg: #e6e7e2; --muted: #999a93; --card: #1a1d1a; --line: #2b2f2b; --accent: #52c99c;
+    --bad: #ff8a80; --soft: #1f2a24; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+.brand { font-weight: 700; color: var(--fg); }
+#chain { flex: 1; min-width: 0; }
+form { display: flex; gap: 6px; flex: 1 1 320px; max-width: 560px; }
+input { flex: 1; min-width: 0; font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+button { font: inherit; padding: 6px 12px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: var(--card); cursor: pointer; }
+main { max-width: 1180px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 4px 0 12px; overflow-wrap: anywhere; }
+h2 { font-size: 15px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; min-width: 0; }
+.grid > .card { margin-bottom: 0; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.bad { color: var(--bad); }
+.tag { display: inline-block; padding: 0 6px; border-radius: 4px; background: var(--soft); font-size: 12px; }
+.memo { max-width: 340px; overflow-wrap: anywhere; }
+footer { max-width: 1180px; margin: 0 auto; padding: 4px 16px 24px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="#/">Vibe Hash explorer</a>
+  <span id="chain" class="muted"></span>
+  <form id="search" role="search">
+    <input id="q" placeholder="Block height, address or job id" autocomplete="off" spellcheck="false" aria-label="Search">
+    <button type="submit">Search</button>
+  </form>
+</header>
+<main id="main"><p class="muted">Loading…</p></main>
+<footer class="muted">This page reads the node it came from: <a href="/status">/status</a>, <a href="/supply">/supply</a>,
+  <a href="/validators">/validators</a>, <a href="/network">/network</a>, /blocks, /account/&lt;address&gt;, /job/&lt;id&gt;.
+  Amounts are VIBE (1 VIBE = 100,000,000 syn).</footer>
+<script>
+"use strict";
+const main = document.getElementById("main");
+const ADDR = /^vibe1[0-9a-f]{36}$/;
+const JOB = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const SYN = 100000000n;
+let status = null;  // the last /status, for the header and for whether the chain has validators
+
+// --- building the page: elements and text only ----------------------------------------------------------------------
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null) continue;
+    if (k === "class") e.className = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids.flat(Infinity)) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
+  return e;
+}
+const render = (...nodes) => main.replaceChildren(...nodes.flat());
+const card = (title, ...body) => el("section", {class: "card"}, title ? el("h2", {}, title) : null, ...body);
+const dl = (rows) => el("dl", {}, rows.filter(Boolean).map(([k, v]) => [el("dt", {}, k), el("dd", {}, v ?? "–")]));
+const muted = (t) => el("span", {class: "muted"}, t);
+function table(head, rows, numeric = []) {
+  const th = head.map((h, i) => el("th", {class: numeric.includes(i) ? "num" : null}, h));
+  const tr = rows.map((r) => el("tr", {}, r.map((c, i) => el("td", {class: numeric.includes(i) ? "num" : null}, c ?? "–"))));
+  return el("div", {class: "scroll"}, el("table", {}, el("thead", {}, el("tr", {}, th)), el("tbody", {}, tr)));
+}
+
+// --- what the node says, shown -----------------------------------------------------------------------------------
+async function api(path) {
+  const r = await fetch(path, {headers: {Accept: "application/json"}, cache: "no-store"});
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((body && typeof body.error === "string") ? body.error : `${r.status} ${r.statusText}`);
+  return body;
+}
+function vibe(syn) {
+  if (typeof syn !== "number" || !Number.isSafeInteger(syn)) return "–";
+  const n = BigInt(syn), a = n < 0n ? -n : n, frac = a % SYN;
+  let s = (a / SYN).toLocaleString("en-US");
+  if (frac) s += "." + frac.toString().padStart(8, "0").replace(/0+$/, "");
+  return (n < 0n ? "-" : "") + s + " VIBE";
+}
+const int = (n) => (typeof n === "number" ? n.toLocaleString("en-US") : "–");
+const short = (hex, n = 12) => (typeof hex === "string" && hex.length > n + 4 ? hex.slice(0, n) + "…" : String(hex ?? "–"));
+function when(ts) {
+  if (typeof ts !== "number") return "–";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  const ago = s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`;
+  return el("span", {title: new Date(ts * 1000).toLocaleString()}, ago);
+}
+
+// Addresses as people copy them: the checksum in the letters' case (crypto.checksummed: a letter is a capital when the
+// same hex digit of sha256(the address) is 8 or more). crypto.subtle exists only on https and localhost; elsewhere
+// they stay in small letters, which is the same address.
+const cased = new Map();
+async function checksummed(a) {
+  if (!ADDR.test(a) || !(window.crypto && crypto.subtle)) return a;
+  if (!cased.has(a)) {
+    cased.set(a, crypto.subtle.digest("SHA-256", new TextEncoder().encode(a)).then((buf) => {
+      const hex = Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+      return "vibe1" + Array.from(a.slice(5), (c, i) => ("abcdef".includes(c) && parseInt(hex[i], 16) >= 8 ? c.toUpperCase() : c)).join("");
+    }).catch(() => a));
+  }
+  return cased.get(a);
+}
+function addr(a, cut = false) {
+  if (typeof a !== "string" || !a) return muted("–");
+  const fit = (t) => (cut && t.length > 16 ? t.slice(0, 9) + "…" + t.slice(-4) : t);
+  const node = ADDR.test(a) ? el("a", {href: "#/address/" + a, class: "mono", title: a}, fit(a)) : el("span", {class: "mono"}, fit(a));
+  checksummed(a).then((t) => { node.textContent = fit(t); node.title = t; });
+  return node;
+}
+const blockLink = (h) => (Number.isSafeInteger(h) && h >= 0 ? el("a", {href: "#/block/" + h}, int(h)) : muted("–"));
+const jobLink = (id) => (typeof id === "string" && JOB.test(id) ? el("a", {href: "#/job/" + encodeURIComponent(id), class: "mono"}, id)
+                         : id ? el("span", {class: "mono"}, String(id)) : muted("–"));
+function jobOf(tx) {  // the job a post_job posts (its spec's id), a fee_release pays from, a cancel_job ends
+  if (tx.kind === "post_job") { try { return JSON.parse(tx.memo).id; } catch { return null; } }
+  return tx.kind === "fee_release" || tx.kind === "cancel_job" ? tx.memo : null;
+}
+function memo(tx) {
+  if (tx.kind === "post_job" || tx.kind === "fee_release" || tx.kind === "cancel_job") return jobLink(jobOf(tx));
+  return tx.memo ? el("span", {class: "memo"}, tx.memo.length > 200 ? tx.memo.slice(0, 200) + "…" : tx.memo) : muted("");
+}
+function txRow(tx, height) {  // `height`: a column for the block, when the rows come from several
+  const row = [el("span", {class: "mono", title: tx.txid || ""}, short(tx.txid, 10)), el("span", {class: "tag"}, tx.kind),
+               addr(tx.sender, true), addr(tx.recipient, true), vibe(tx.amount), tx.fee ? vibe(tx.fee) : muted("0"), memo(tx)];
+  if (height != null) row.splice(1, 0, blockLink(height));
+  return row;
+}
+const txHead = (withBlock) => ["Tx", withBlock && "Block", "Kind", "From", "To", "Amount", "Fee", "Memo / job"].filter(Boolean);
+function finality(b) {
+  if (b.certificate && Array.isArray(b.certificate.votes)) {
+    return `final: committed by ${b.certificate.votes.length} validator signature${b.certificate.votes.length === 1 ? "" : "s"} (consensus round ${b.certificate.round})`;
+  }
+  if (b.height === 0) return "the genesis block";
+  return status && status.consensus ? "no commit certificate served" : "final: this chain is sealed by one node";
+}
+
+async function getStatus() {
+  status = await api("/status");
+  const chain = document.getElementById("chain");
+  chain.replaceChildren(el("span", {class: "mono"}, String(status.chain_id)), ` · block ${int(status.height)}`,
+                        status.halted ? el("span", {class: "bad"}, " · node halted") : "");
+  return status;
+}
+async function blocksBetween(lo, hi) {  // a page stops at ~4 MB, so ask again from where it ended
+  const out = [];
+  while (lo <= hi) {
+    const page = await api(`/blocks?from=${lo}&to=${hi}`);
+    if (!Array.isArray(page) || !page.length) break;
+    out.push(...page);
+    lo = page[page.length - 1].height + 1;
+  }
+  return out;
+}
+
+// --- the views -----------------------------------------------------------------------------------------------------
+async function showHome() {
+  const st = await getStatus();
+  const [sup, vals, net, blocks] = await Promise.all([api("/supply").catch(() => null), api("/validators").catch(() => ({})),
+    api("/network").catch(() => null), blocksBetween(Math.max(0, st.height - 19), st.height)]);
+  const round = st.round == null ? "no round open" : `round ${int(st.round)}, ${st.phase}` + (st.job_id ? ", job " : "");
+  const chainCard = card("Chain", dl([
+    ["Chain id", el("span", {class: "mono"}, String(st.chain_id))], ["Height", blockLink(st.height)],
+    ["Tip", el("span", {class: "mono", title: String(st.tip)}, short(st.tip, 16))],
+    ["Now", [round, st.job_id ? jobLink(st.job_id) : ""]],
+    st.consensus && ["Leading", [addr(st.consensus.proposer, true), ` (consensus round ${st.consensus.round}, ${st.consensus.step})`]],
+    ["Mempool", `${int(st.mempool)} transaction${st.mempool === 1 ? "" : "s"} (min fee ${vibe(st.min_fee)})`],
+    ["Subsidy", `${vibe(st.subsidy)} a round that pays for work` + (st.paid_rounds != null ? ` (${int(st.paid_rounds)} paid so far)` : "")],
+    st.version && ["Software", `Vibe Hash ${st.version}; makes version ${st.block_version} blocks, tip is version ${st.tip_version}; takes workers from ${st.min_client}`],
+    st.halted && ["Halted", el("span", {class: "bad"}, String(st.halted))]]));
+  const supplyCard = sup ? card("Supply", dl([
+    ["Total", vibe(sup.total)], ["Circulating", vibe(sup.circulating)],
+    ["Staked", vibe(sup.staked) + (sup.bootstrap ? ` (${vibe(sup.bootstrap)} bootstrap)` : "")],
+    ["Unbonding", vibe(sup.unbonding)], ["In job budgets", vibe(sup.escrow)],
+    sup.unspendable ? ["Unspendable", vibe(sup.unspendable)] : null,
+    ["Minted / burned", `${vibe(sup.minted)} / ${vibe(sup.burned)}`],
+    ["Cap", sup.max_supply ? vibe(sup.max_supply) : "none"],
+    sup.halving && sup.halving.next_at != null && ["Next halving",
+      `in ${int(sup.halving.to_go)} ${sup.halving.counts === "paid_rounds" ? "rounds that pay for work" : "blocks"}, to ${vibe(sup.halving.subsidy_after)}`]])) : null;
+  const valRows = Object.entries(vals || {}).sort((a, b) => b[1].stake - a[1].stake)
+    .map(([a, v]) => [addr(a, true), vibe(v.stake), v.votes ? "yes" : muted("no (below the minimum)"), el("span", {class: "mono"}, String(v.url))]);
+  const valCard = card("Validators", valRows.length ? table(["Address", "Stake", "Votes", "Reached at"], valRows, [1])
+                                                    : el("p", {class: "muted"}, "None: one node seals this chain's blocks."));
+  const jobs = net && Array.isArray(net.jobs) ? net.jobs.slice(0, 12) : [];
+  const jobCard = jobs.length ? card("Jobs", table(["Job", "Status", "Budget left"],
+    jobs.map((j) => [jobLink(j.id), String(j.status ?? "–"), vibe(j.escrow)]), [2])) : null;
+  const rows = blocks.slice().reverse().map((b) => [blockLink(b.height), when(b.timestamp), addr(b.proposer, true), int(b.txs.length),
+    b.summary ? jobLink(b.summary.job_id) : muted("no round"), b.summary ? int(b.summary.accepted_units) : muted("–"),
+    b.certificate ? `${b.certificate.votes.length} sig` : muted(b.height ? (st.consensus ? "–" : "one node") : "genesis")]);
+  render(el("div", {class: "grid"}, chainCard, supplyCard), el("div", {class: "grid"}, valCard, jobCard),
+         card("Latest blocks", table(["Block", "Time", "Proposer", "Txs", "Job", "Units", "Final"], rows, [3, 5])));
+}
+
+async function showBlock(h) {
+  const st = await getStatus();
+  const [b] = await blocksBetween(h, h);
+  if (!b) return render(el("h1", {}, `Block ${int(h)}`), card(null, el("p", {class: "muted"}, `No block ${int(h)} yet: the chain is at ${int(st.height)}.`)));
+  const s = b.summary;
+  const nav = el("p", {}, h > 0 ? el("a", {href: "#/block/" + (h - 1)}, "← previous") : "", h > 0 && h < st.height ? " · " : "",
+                 h < st.height ? el("a", {href: "#/block/" + (h + 1)}, "next →") : "");
+  const head = card(null, dl([
+    ["Hash", el("span", {class: "mono"}, String(b.hash ?? "–"))], ["Previous", el("span", {class: "mono"}, String(b.prev_hash))],
+    ["Time", [when(b.timestamp), muted(` (${new Date(b.timestamp * 1000).toLocaleString()})`)]],
+    ["Proposer", addr(b.proposer)], ["Version", String(b.version ?? 1)], ["Finality", finality(b)],
+    s && ["Round", [jobLink(s.job_id), ` · ${int(s.accepted_units)} units accepted · ${Object.keys(s.worker_flops || {}).length} workers, ${Object.keys(s.verifier_flops || {}).length} checkers paid`]],
+    s && ["Model after", el("span", {class: "mono"}, short(s.params_hash, 24))],
+    s && s.record_hash && ["Round record", el("a", {href: `/round/${h}/record`, class: "mono"}, short(s.record_hash, 24))]]));
+  const slashes = s && s.slashes && s.slashes.length ? card("Slashed", table(["Offender", "Caught by", "Why"],
+    s.slashes.map(([o, c, why]) => [addr(o, true), c ? addr(c, true) : muted("nobody (burned)"), String(why)]))) : null;
+  render(el("h1", {}, `Block ${int(h)}`), nav, head, slashes,
+         card(`Transactions (${b.txs.length})`, b.txs.length ? table(txHead(false), b.txs.map((tx) => txRow(tx)), [4, 5]) : el("p", {class: "muted"}, "None.")));
+}
+
+async function showAddress(a) {
+  const st = await getStatus();
+  const acct = await api("/account/" + encodeURIComponent(a));
+  const lo = Math.max(0, st.height - 199);
+  const blocks = await blocksBetween(lo, st.height);
+  const mine = [];
+  for (const b of blocks.reverse()) for (const tx of b.txs) if (tx.sender === acct.address || tx.recipient === acct.address) mine.push([tx, b.height]);
+  const unbonding = Array.isArray(acct.unbonding) && acct.unbonding.length
+    ? acct.unbonding.map(([amt, at]) => el("div", {}, `${vibe(amt)}, spendable at block `, blockLink(at))) : "none";
+  const shown = el("span", {class: "mono"}, acct.address);
+  checksummed(acct.address).then((t) => { shown.textContent = t; });
+  render(el("h1", {}, "Address ", shown), card(null, dl([
+    ["Balance", vibe(acct.balance)], ["Stake", vibe(acct.stake) + (acct.bootstrap ? ` (${vibe(acct.bootstrap)} bootstrap: votes, can't be withdrawn)` : "")],
+    ["Unbonding", unbonding], ["Nonce", `${int(acct.nonce)} (transactions sent)`],
+    ["Reputation", typeof acct.reputation === "number" ? acct.reputation.toFixed(2) : "–"]])),
+    card(`Activity in the last ${int(blocks.length)} blocks (${mine.length})`,
+      mine.length ? table(txHead(true), mine.map(([tx, h]) => txRow(tx, h)), [5, 6]) : el("p", {class: "muted"}, "Nothing in these blocks.")));
+}
+
+async function showJob(id) {
+  await getStatus();
+  const j = await api("/job/" + encodeURIComponent(id));
+  const spec = j.spec || {};
+  const rounds = Array.isArray(j.rounds) ? j.rounds : [];
+  const kind = spec.es ? "Evo (evolution strategies)" : spec.deepseek ? "DeepSeek" : spec.base ? `fine-tune of ${spec.base}` : "MLP";
+  const pct = (x) => (typeof x === "number" ? (x * 100).toFixed(1) + "%" : "–");
+  const num = (x) => (typeof x === "number" ? x.toPrecision(4) : "–");
+  render(el("h1", {}, "Job ", el("span", {class: "mono"}, id)), card(null, dl([
+    ["Kind", String(kind)], ["Owner", addr(j.owner)], ["Budget left", vibe(j.escrow)],
+    ["Fee a round", vibe(spec.fee_per_round)], ["Units a round", int(spec.units_per_round)],
+    ["Rounds", int(rounds.length)],
+    ["Model", j.model ? [`${int(j.model.bytes)} bytes`, j.model.height ? [" after block ", blockLink(j.model.height)] : " (untrained)",
+                         j.model.sha256 ? el("div", {class: "mono"}, `sha256 ${j.model.sha256}`) : ""] : "–"],
+    j.prep && ["Prep", j.prep.done ? "done" : "not done"]])),
+    card("Spec", el("pre", {class: "mono scroll"}, JSON.stringify(spec, null, 2))),
+    card(`Rounds (${rounds.length})`, rounds.length ? table(["Block", "Units", "Validation loss", "Validation accuracy"],
+      rounds.slice(-200).reverse().map((r) => [blockLink(r.height), int(r.accepted_units), num(r.val_loss), pct(r.val_acc)]), [1, 2, 3])
+      : el("p", {class: "muted"}, "No rounds yet.")));
+}
+
+// --- routes, search, refresh -----------------------------------------------------------------------------------------
+let shownAt = 0;
+async function route() {
+  let parts;
+  try { parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent); } catch { parts = []; }
+  try {
+    if (parts[0] === "block" && /^\d{1,15}$/.test(parts[1] || "")) await showBlock(Number(parts[1]));
+    else if (parts[0] === "address" && parts[1]) await showAddress(parts[1]);
+    else if (parts[0] === "job" && parts[1]) await showJob(parts[1]);
+    else await showHome();
+    shownAt = status ? status.height : 0;
+  } catch (e) {
+    render(el("h1", {}, "Not found"), card(null, el("p", {class: "bad"}, String(e && e.message ? e.message : e)),
+                                            el("p", {}, el("a", {href: "#/"}, "Back to the latest blocks"))));
+  }
+}
+document.getElementById("search").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const q = document.getElementById("q").value.trim();
+  if (/^\d{1,15}$/.test(q)) location.hash = "#/block/" + q;
+  else if (/^vibe1[0-9a-f]{36}$/i.test(q)) {
+    const a = "vibe1" + q.slice(5).toLowerCase();
+    if (q.slice(5) !== q.slice(5).toLowerCase() && (await checksummed(a)) !== "vibe1" + q.slice(5)) {
+      return render(el("h1", {}, "Check that address"), card(null, el("p", {class: "bad"},
+        "Its capital letters don't match its checksum, so it has a typo. Copy it again.")));
+    }
+    location.hash = "#/address/" + a;
+  } else if (JOB.test(q)) location.hash = "#/job/" + encodeURIComponent(q);
+  else render(el("h1", {}, "Nothing to look up"), card(null, el("p", {}, "Search for a block height, an address (vibe1 and 36 more characters) or a job id.")));
+});
+window.addEventListener("hashchange", route);
+setInterval(async () => {  // the front page follows new blocks; other pages stay as they are
+  if (document.visibilityState !== "visible" || (location.hash && location.hash !== "#/")) return;
+  try { const st = await api("/status"); if (st.height !== shownAt) await route(); } catch { /* the node is busy or away */ }
+}, 5000);
+route();
+</script>
+</body>
+</html>

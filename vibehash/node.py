@@ -9,7 +9,8 @@ Public (read-only) endpoints let anyone audit the chain:
     GET  /status                 phase, round, deadlines, beacon, chain tip; the consensus round and its leader; why
                                  the node stopped itself, if it did (`halted`: a block it couldn't save)
     GET  /genesis                genesis document
-    GET  /blocks?from=N&to=M     raw blocks (max 100 per request), each with its commit certificate if it has one
+    GET  /blocks?from=N&to=M     raw blocks (max 100 per request), each with its commit certificate if it has one, its
+                                 `hash`, its `proposer`'s address and each tx's `txid`
     GET  /account/<address>      balance, stake, unbonding, nonce, reputation
     GET  /validators             each validator's address, stake, and whether it has a vote
     GET  /job/<id>               job spec, remaining escrow, validation score after each round, model size
@@ -17,6 +18,9 @@ Public (read-only) endpoints let anyone audit the chain:
     GET  /round/params           the current round's starting weights (as a blob id)
     GET  /round/<height>/record  the signed messages and check results a block's round was decided from (replay.py)
     GET  /round/games            a fine-tune round's disputes: whose move, and what's been posted (dispute.py)
+    GET  /supply                 how much VIBE exists and where (supply.py), in syn and as VIBE strings
+    GET  /supply/total           total supply, and /supply/circulating spendable balances: a plain decimal VIBE number
+    GET  /explorer               a block explorer page (data/explorer.html) that reads the endpoints above
 Signed-envelope endpoints (workers):
     POST /register  /assignment  /commit  /reveal  /tasks  /verdict  /move
     (register, commit, reveal and verdict answer with a signed receipt: proof the message will be in the
@@ -35,10 +39,12 @@ proxy. Every request passes per-client rate limits and connection caps first (ra
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -50,13 +56,13 @@ import numpy as np
 
 from . import deepseek_graph as dsg
 from . import economics as econ
-from . import filelock, netstats, receipts, tasks
+from . import __version__, advice, filelock, netstats, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
-from .client import NodeError
+from .client import MIN_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
 from .consensus import Engine, Timeouts, check_certificate
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
-from .crypto import KeyPair, address_of, checksummed, verify
+from .crypto import AddressError, KeyPair, address_of, checksummed, parse_address, verify
 from .ledger import VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
 from .p2p import Peers
@@ -102,6 +108,26 @@ MAX_JOB_BYTES = 64 * 2**20
 # for days. A job that would need more simply gets fewer units done a round.
 MAX_PHASE_S = tasks.MAX_PHASE_S
 MIN_UPLOADER_BALANCE = 1 * SYN_PER_VIBE
+# The block explorer page (GET /explorer), and the Content-Security-Policy it's served with: nothing from anywhere
+# else, requests only to this node, and only its own inline script and style (by their sha256), so text from the chain
+# that slipped into the page as markup still couldn't run.
+EXPLORER = Path(__file__).resolve().parent / "data" / "explorer.html"
+_explorer: tuple[bytes, str] | None = None
+
+
+def explorer_page() -> tuple[bytes, str]:
+    """The explorer's HTML and its Content-Security-Policy, read once."""
+    global _explorer
+    if _explorer is None:
+        html = EXPLORER.read_bytes()
+
+        def allow(tag: bytes) -> str:
+            found = re.findall(rb"<" + tag + rb">(.*?)</" + tag + rb">", html, re.S)
+            return " ".join("'sha256-" + base64.b64encode(hashlib.sha256(m).digest()).decode() + "'" for m in found) or "'none'"
+        csp = (f"default-src 'none'; script-src {allow(b'script')}; style-src {allow(b'style')}; connect-src 'self'; "
+               "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        _explorer = (html, csp)
+    return _explorer
 
 
 def bucket_from_env() -> dsg.Signer | None:
@@ -161,13 +187,17 @@ class Node:
                  times: PhaseTimes | None = None, config: CoordinatorConfig | None = None, keep_rounds: int = 10,
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
-                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None):
+                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
         `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
         `bucket`: the storage DeepSeek jobs hand off through (deepseek_graph.Signer, its keys this node's): workers get
         links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
-        reads one from the environment)."""
+        reads one from the environment).
+        `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade."""
+        if not parse_version(min_client):
+            raise ValueError(f"min_client is a release such as {MIN_CLIENT}, not {min_client!r}")
+        self.min_client = min_client
         self.times = times or PhaseTimes()
         self.keep_rounds = keep_rounds  # rounds whose checkpoints stay available to re-check (the challenge window)
         self.max_job_bytes = max_job_bytes
@@ -794,6 +824,14 @@ class Node:
                 # Jobs with budget that aren't training, and why, in words (a fine-tune with too few workers to check it).
                 "waiting": dict(c.waiting),
                 "halted": self.halted,  # why this node stopped itself (a block it couldn't save), else None
+                # Versions: this node's release, the block version it makes (ledger.VERSION), the version of the
+                # chain's tip, and the oldest release whose workers it takes. A client that knows fewer block versions
+                # than the tip's, or is older than min_client, is told to upgrade (client.too_old).
+                "version": __version__, "block_version": VERSION, "tip_version": self.chain.tip.version,
+                "min_client": self.min_client,
+                # Rounds that paid for work so far: the halving clock, on chains whose schedule counts them.
+                "paid_rounds": (self.chain.state.paid_rounds if self.chain.state.economics.count == econ.PAID_ROUNDS
+                                else None),
             }
         if consensus is not None:
             # Workers do the round with its leader, the validator whose turn it is to propose: None means this node.
@@ -805,7 +843,26 @@ class Node:
                 out["leader"] = None if leader == self.keys.address else self.chain.state.validators.get(leader)
         return out
 
+    def check_client(self, user_agent: str | None) -> None:
+        """A worker's register: refused (400) if its User-Agent names a release older than min_client. No version, or
+        another client's, is taken as before."""
+        have = agent_version(user_agent)
+        if have and have < parse_version(self.min_client):
+            raise ProtocolError(advice.too_old_client(self.min_client))
+
+    def supply(self) -> dict:
+        """/supply (supply.py): at the tip, from the state every node derives from the blocks (both read under the
+        round lock, which adding a block holds, so they're the same block's)."""
+        with self.coord.lock:
+            return supply.supply(self.chain.state, self.chain.tip.height)
+
     def account(self, addr: str) -> dict:
+        """/account/<addr>. A checksummed address (crypto.parse_address) is read as the canonical one it stands for;
+        anything else as it's given, since the ledger keys balances by the exact recipient a transfer named."""
+        try:
+            addr = parse_address(addr)
+        except AddressError:
+            pass
         s = self.chain.state
         return {"address": addr, "balance": s.balance(addr), "stake": s.stake(addr), "bootstrap": s.locked.get(addr, 0),
                 "unbonding": s.unbonding.get(addr, []), "nonce": s.nonces.get(addr, 0), "reputation": s.rep(addr)}
@@ -1124,22 +1181,37 @@ def _number(text, what: str) -> int:
     return n
 
 
+def _served(b: Block) -> dict:
+    """A block as /blocks serves it: Block.to_dict, plus its `hash`, its `proposer`'s address and each tx's `txid`,
+    which take sha256 (the ids over length-prefixed parts, crypto.h256) and so are awkward to work out outside Python.
+    Block.from_dict and Tx.from_dict ignore them, and whoever checks a block works its hash out again
+    (check_certificate)."""
+    d = b.to_dict()
+    d["hash"] = b.hash.hex()
+    d["proposer"] = address_of(b.proposer_pubkey) if b.proposer_pubkey else None  # (the genesis has none)
+    for tx, t in zip(b.txs, d["txs"]):
+        t["txid"] = tx.txid.hex()
+    return d
+
+
 def _handler(node: Node):
     stores = {"blob": node.blobs, "dataset": node.store.datasets}
     big = threading.BoundedSemaphore(MAX_BIG_BODIES)
 
     class Handler(GuardedHandler):
-        server_version = "vibehash-node/0.5"
+        server_version = f"vibehash-node/{__version__}"
 
         def log_message(self, fmt, *args):
             log.debug("%s %s", self.address_string(), fmt % args)
 
-        def _send(self, code: int, payload, content_type="application/json"):
+        def _send(self, code: int, payload, content_type="application/json", headers: dict | None = None):
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(code)
             if self.command == "GET":  # everything a GET answers is public: any web page may read it
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Type", content_type)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1178,10 +1250,10 @@ def _handler(node: Node):
             finally:
                 big.release()
 
-        def _guard(self, fn, raw: bool = False):
+        def _guard(self, fn, raw: bool = False, content_type: str | None = None):
             try:
                 result = fn()
-                self._send(200, result, "application/octet-stream" if raw else "application/json")
+                self._send(200, result, content_type or ("application/octet-stream" if raw else "application/json"))
             except KeyError as e:
                 self._send(404, {"error": f"not found: {e}"})
             except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
@@ -1208,6 +1280,15 @@ def _handler(node: Node):
             if len(parts) == 3 and parts[0] == "job" and parts[2] == "model":
                 self._guard(lambda: node.job_model(parts[1], _number(q.get("offset", ["0"])[0], "offset")), raw=True)
                 return
+            if parts in (["supply", "total"], ["supply", "circulating"]):  # a number alone, as listing sites read it
+                self._guard(lambda: node.supply()["vibe"][parts[1]].encode(), content_type="text/plain; charset=utf-8")
+                return
+            if parts == ["explorer"]:
+                html, csp = explorer_page()
+                self._send(200, html, "text/html; charset=utf-8",
+                           {"Content-Security-Policy": csp, "X-Content-Type-Options": "nosniff",
+                            "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY", "Cache-Control": "no-cache"})
+                return
 
             def route():
                 if parts == ["status"]:
@@ -1216,6 +1297,8 @@ def _handler(node: Node):
                     return node.genesis
                 if parts == ["network"]:
                     return node.network()
+                if parts == ["supply"]:
+                    return node.supply()
                 if parts == ["blocks"]:
                     lo = _number(q.get("from", ["0"])[0], "from")
                     hi = min(_number(q.get("to", [str(lo + 99)])[0], "to"), lo + 99, node.chain.tip.height)
@@ -1224,7 +1307,7 @@ def _handler(node: Node):
                     for b in node.chain.blocks[lo:hi + 1]:  # a short page just means another request
                         if size >= MAX_BLOCKS_REPLY:
                             break
-                        page.append(b.to_dict() | ({"certificate": certs[b.height]} if b.height in certs else {}))
+                        page.append(_served(b) | ({"certificate": certs[b.height]} if b.height in certs else {}))
                         size += len(json.dumps(page[-1]))
                     return page
                 if len(parts) == 2 and parts[0] == "account":
@@ -1280,6 +1363,8 @@ def _handler(node: Node):
                 body = self._json(MAX_REVEAL if worker else MAX_JSON)
                 if not isinstance(body, dict):
                     raise WireError("expected a JSON object")
+                if parts == ["register"]:  # a worker too old for this node is told to upgrade (min_client)
+                    node.check_client(self.headers.get("User-Agent"))
                 if parts == ["tx"]:
                     tx = Tx.from_dict(body)
                     node.submit_tx(tx)

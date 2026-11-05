@@ -81,6 +81,27 @@ def wrong_chain(url: str, old: str | None = None, new: str | None = None) -> str
             "or `vibehash setup --node ADDRESS` to go back.")
 
 
+UPGRADE = "python -m pip install -U vibehash"
+
+
+def newer_rules(node: str | None, mine: str, tip: int | None, block_version: int, min_client: str | None) -> str:
+    """This copy of Vibe Hash is too old for the node (client.too_old): its chain has blocks of a version newer than
+    this code knows (`tip`), or the node names a newer oldest client it works with (`min_client`)."""
+    why = []
+    if tip is not None:
+        why.append(f"its chain has version {tip} blocks and this copy knows up to version {block_version}")
+    if min_client is not None:
+        why.append(f"it works with Vibe Hash {min_client} or newer")
+    runs = f" (Vibe Hash {node})" if node else ""
+    return (f"This node runs newer rules{runs} than this copy of Vibe Hash ({mine}): {'; '.join(why)}. Update with "
+            f"`{UPGRADE}` (or run the one-line installer again).")
+
+
+def too_old_client(min_client: str) -> str:
+    """The node's side (a worker's register below node.MIN_CLIENT): what it answers with."""
+    return f"this node works with Vibe Hash {min_client} or newer: update with `{UPGRADE}`, then start the worker again"
+
+
 def out_of_memory(device: str, need_mb: int | None = None, total_mb: int | None = None,
                   free_mb: int | None = None) -> str:
     needs = f" This job needs about {_gb(need_mb)}" if need_mb else ""
@@ -140,6 +161,8 @@ def explain(e: BaseException, url: str | None = None) -> str | None:
         m = re.search(r"stake at least (\d+) syn", text)
         if m:
             return no_stake(int(m.group(1)))
+        if "or newer: update with" in text:  # the node refused a register from a release older than its min_client
+            return text.partition(": ")[2] or text
         return None
     name = type(e).__name__
     if name == "OutOfMemoryError" or ("out of memory" in text.lower() and ("cuda" in text.lower() or "hip" in text.lower())):

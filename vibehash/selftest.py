@@ -14,7 +14,8 @@ computer agrees with. `--json` is for scripts.
             Qwen3 built in memory, replayed on the CPU the way a fine-tune's checkers replay it. `--model NAME`
             adds one real unit of a ready model (it downloads the weights, so it asks first), timed, with its peak GPU
             memory. Measured FLOP/s is what the worker would tell the node.
-  Network   the node's /status (round trip, network, height, round and phase, jobs waiting and why), this clock
+  Network   the node's /status (round trip, network, height, round and phase, jobs waiting and why; whether this
+            release can follow its chain and is one it takes workers from: client.too_old), this clock
             against the node's (its HTTP Date header; signed messages more than wire.MAX_CLOCK_SKEW_S off are
             refused), download speed from it, and whether huggingface.co answers (fine-tunes fetch weights there).
   Wallet    whether setup has run, the saved node and wallet, its address (read from the file, no password), balance
@@ -148,25 +149,14 @@ def _duration(s: float) -> str:
 # --- software ---------------------------------------------------------------------------------------------------------
 
 def version() -> str:
-    """This release: the installed package's version, or pyproject.toml's for a source checkout."""
-    try:
-        from importlib.metadata import PackageNotFoundError, version as installed
-        try:
-            return installed("vibehash")
-        except PackageNotFoundError:
-            pass
-    except ImportError:
-        pass
-    try:
-        import re
-        text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
-        return re.search(r'^version\s*=\s*"([^"]+)"', text, re.M).group(1)
-    except (OSError, AttributeError):
-        return "unknown"
+    """This release (vibehash.__version__: a source checkout's pyproject.toml, else the installed package's)."""
+    from . import __version__
+    return __version__
 
 
 def _parse(v: str) -> tuple:
-    return tuple(int(p) for p in v.split(".") if p.isdigit())
+    from .client import parse_version
+    return parse_version(v)
 
 
 def newest_release(timeout: float = 5.0) -> str:
@@ -734,6 +724,17 @@ def network(rep: Report, url: str, address: str | None, offline: bool, clock=tim
             + (" (the public network)" if public else "") + f", block {s['height']}, {rnd}",
             url=url, rtt_ms=rtt * 1000, chain_id=s["chain_id"], height=s["height"], round=s.get("round"),
             phase=s.get("phase"), job_id=s.get("job_id"))
+    from .client import _SHOWN, too_old
+    problem = too_old(s)
+    said = {k: s.get(k) if isinstance(s.get(k), (str, int)) and _SHOWN.fullmatch(str(s.get(k))) else "?"
+            for k in ("version", "tip_version", "min_client")}  # (node text, on a terminal: only what a version looks like)
+    facts = dict(node_version=said["version"], tip_version=said["tip_version"], min_client=said["min_client"],
+                 version=version())
+    if problem:  # this copy can't follow the node's chain, or the node won't take its workers
+        rep.add("versions", "fail", problem, **facts)
+    elif "tip_version" in s:  # (a node from before these fields says nothing about versions)
+        rep.add("versions", "ok", f"versions: the node runs Vibe Hash {said['version']} on version {said['tip_version']} "
+                f"blocks and takes workers from {said['min_client']} on; this computer runs {version()}", **facts)
     skew = skew_from(date, sent, got)
     if skew is None:
         rep.add("clock", "skip", "clock: the node didn't say its time")
@@ -964,7 +965,7 @@ def summary(rep: Report, found: list[Device], trained: Device | None, net: Net, 
     def line(key, ok, text):
         take[key] = ok
         lines.append((ok, text))
-    node_ok = offline or (net.status is not None and not rep.failed("clock"))
+    node_ok = offline or (net.status is not None and not rep.failed("clock") and not rep.failed("versions"))
     mine_ok = trained is not None and node_ok
     where = f"on its {gpu.label}" if gpu else "on the CPU"
     line("csv", trained is not None, f"fruit-demo and other CSV jobs, {where}" if trained else
@@ -1012,7 +1013,9 @@ def summary(rep: Report, found: list[Device], trained: Device | None, net: Net, 
     gpus = [d for d in found if d.id != "cpu" and not d.problem]
     cfg = settings.load()
     has_deepseek_job = any("deepseek" in spec for spec in net.jobs.values())
-    if rep.failed("clock"):
+    if rep.failed("versions"):
+        nxt = f"{advice.UPGRADE}, then `vibehash selftest` again"
+    elif rep.failed("clock"):
         nxt = "fix the clock (see Network), then `vibehash selftest` again"
     elif not offline and net.status is None:
         nxt = "fix the connection to the node (see Network), then `vibehash selftest` again"
