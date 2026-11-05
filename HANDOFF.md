@@ -656,6 +656,57 @@ genesis (so no Evo jobs; Evo Hash runs on local test networks only), no block ex
 Order: Evo's checks and Evo on the public testnet; outside validators there; a lawyer early, since the answers shape the
 genesis; the audit; the new chain; explorer and supply endpoint; only then exchanges.
 
+## Roadmap: a model the network tunes itself ("Vibe", the owner's choice, 2026-11-05)
+
+**Why.** The owner's bar for Vibe Hash being big: people get paid to push an open model past the original **across
+the board**, not narrow one-dataset fine-tunes. The network does all of an open model's post-training from Qwen's raw
+base and releases its own model ("Vibe-4B" etc., names not settled). Success means beating Qwen's official tuned model
+of the same size on a broad held-out test, with no task worse.
+
+**It's been done outside the big labs:**
+- AI2's Tülu 3 post-trained Llama 3.1's base and matched or beat Meta's Llama 3.1 Instruct on many benchmarks.
+- Prime Intellect's INTELLECT-2 ran reinforcement learning on QwQ-32B across untrusted machines.
+
+Training like this sharpens reasoning, accuracy and following instructions. It doesn't add knowledge.
+
+**The bases exist:** `Qwen/Qwen3.5-0.8B-Base`, `-2B-Base`, `-4B-Base`, `-9B-Base` and `Qwen3.5-35B-A3B-Base` on Hugging
+Face. They're the same hybrid design the Evo engine now runs (`es_hybrid.py`); the base checkpoints aren't downloaded or
+tested yet.
+
+**Steps, in order:**
+0. **Prerequisites** (the "Two findings" above):
+   - fix the Evo step (scaled to each weight, anchored to the base, a held-out guard) so long runs don't collapse;
+   - solve newcomers' first stake on an Evo network;
+   - prove reward training teaches a held-out skill: the GSM8K experiment.
+1. **Teach the base to chat** with fine-tune jobs on open instruction data:
+   - check each dataset's license;
+   - `llm.py` trains Qwen3 but not Qwen3.5's linear-attention layers, so the fine-tune path needs the port Evo just got, and its cross-device checks measured (FINETUNING.md).
+2. **Make it better** with reward training on many checkable task families:
+   - math, from GSM8K's and MATH's train splits;
+   - code that must pass tests;
+   - logic and procedurally generated puzzles;
+   - following an exact format or instruction;
+   - extraction.
+
+   Use the fixed Evo or a GRPO-style job kind. Keep a round's change only if it lowers nothing on the held-out suite.
+3. **A public scoreboard:** base, Qwen's official model and the network's model, on a broad held-out suite, on the
+   explorer.
+   - Everything on chain is public, so a fixed test can be trained on. Part of the suite should be freshly generated
+     problems drawn from each round's beacon (like Countdown and arithmetic today), which nobody can memorize.
+   - "Accept an update only if it doesn't lower the suite" could then be a protocol rule the validators replay.
+4. **Scale up:**
+   - 0.8B first: fast, fits ordinary miners' GPUs, proves the loop end to end;
+   - then 4B and 9B, which need the Evo worker's change kept leaner (it's 28 GB of RAM at 4B today);
+   - 27B/35B later, with FP8 or several GPUs.
+5. **The genesis starter job** becomes "improve Vibe-xB" on these task families, instead of the 19 testnet tasks.
+
+**Open questions:**
+- dataset licenses;
+- whether Evo is efficient enough next to gradient-based reward training (a 3-minute race on Countdown tied, both
+  learning only the format);
+- keeping the scoreboard honest when everything is public;
+- how much compute beating the official model takes.
+
 ## Working tips
 
 - The original session folder's path was too long for some `pip` installs (numpy, torch). The OneDrive path is short enough. A virtual environment works there, as long as it's excluded from git, or kept outside OneDrive so OneDrive doesn't sync gigabytes of PyTorch.
