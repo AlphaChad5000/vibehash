@@ -334,9 +334,12 @@ def _load_line(c: _Chain, job_id: str, spec):
 
 
 def _posted_at(c: _Chain, job_id: str) -> int | None:
-    """The height of the block that posted `job_id` (its post_job's memo is the job's spec), among the blocks read."""
+    """The height of the block that posted `job_id` (its post_job's memo is the job's spec), among the blocks read;
+    0 for a starter job, which the genesis brings."""
     for h, b in c.blocks.items():
         for tx in b.txs:
+            if tx.kind == "genesis" and not h and f'"{job_id}"' in tx.memo:
+                return 0
             if tx.kind == "post_job" and f'"{job_id}"' in tx.memo:
                 try:
                     if json.loads(tx.memo).get("id") == job_id:

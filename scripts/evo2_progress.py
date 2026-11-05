@@ -75,6 +75,10 @@ class Chain:
 
     def poll(self) -> None:
         tip = int(self.api.status()["height"])
+        if not self.height:  # a genesis starter job (ledger.GENESIS_JOB) is on chain from block one, with no post_job
+            for d in (self.api.get("/genesis") or {}).get("starter_jobs", []):
+                if es2.is_v2(d):
+                    self.specs[d["id"]] = es2.Spec2.from_json(d)
         while self.height < tip:
             batch = self.api.get(f"/blocks?from={self.height + 1}&to={min(tip, self.height + 100)}")
             if not batch:

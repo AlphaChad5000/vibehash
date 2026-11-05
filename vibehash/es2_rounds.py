@@ -84,6 +84,28 @@ def targets_of(history: list, replay: int) -> list[tuple[int, int, list[int], in
     return out[-replay:] if replay else []
 
 
+def job_spec_in(block, job_id: str):
+    """`job_id`'s spec if `block` brings the job: a post_job, or in the genesis block a starter job (ledger.GENESIS_JOB),
+    which no post_job ever names. None otherwise."""
+    from .ledger import GENESIS_JOB, SYSTEM
+    from .tasks import TrainingJob
+
+    for tx in block.txs:
+        if block.height and tx.kind == "post_job":
+            memo, owner = tx.memo, tx.sender
+        elif not block.height and tx.kind == "genesis" and tx.memo.startswith(GENESIS_JOB):
+            memo, owner = tx.memo[len(GENESIS_JOB):], SYSTEM
+        else:
+            continue
+        try:
+            job = TrainingJob.from_spec_json(memo, owner, tx.amount)
+        except ValueError:
+            continue
+        if job.job_id == job_id:
+            return job.spec
+    return None
+
+
 def rebuild_chain(blocks, record_of, job_id: str, spec=None):
     """A rule-2 job's state from the chain alone: its blocks in order and `record_of(height)`. Every record is checked
     against the record_hash its block commits to and every round's state against the params_hash its block holds
@@ -95,18 +117,11 @@ def rebuild_chain(blocks, record_of, job_id: str, spec=None):
     for b in blocks:
         s = b.summary
         if s is None or s.job_id != job_id:
-            if spec is None and b.height:
-                for tx in b.txs:
-                    if tx.kind == "post_job":
-                        try:
-                            job = TrainingJob.from_spec_json(tx.memo, tx.sender, tx.amount)
-                        except ValueError:
-                            continue
-                        if job.job_id == job_id:
-                            spec = job.spec
+            if spec is None:
+                spec = job_spec_in(b, job_id)
             continue
         if spec is None:
-            raise ValueError(f"no post_job for {job_id} before block {b.height}")
+            raise ValueError(f"no post_job or starter job for {job_id} before block {b.height}")
         if state is None:
             state = spec.init_params()
         record = record_of(b.height)

@@ -128,6 +128,12 @@ class StarterTemplateTests(unittest.TestCase):
                          [es_tasks.NAMES[0], es_tasks.NAMES[0], es_tasks.NAMES[1], es_tasks.NAMES[2]])
         with self.assertRaisesRegex(InvalidBlock, "es"):  # an Evo starter job needs a genesis that takes Evo jobs
             Chain.from_genesis({**g, "es": False})
+        # Rebuilds that look the spec up on chain (es2_rounds.rebuild_chain without one) find it in the genesis block.
+        chain = Chain.from_genesis(g)
+        self.assertEqual(es2_rounds.job_spec_in(chain.blocks[0], "evo-starter"), job.spec)
+        state, history, rounds = es2_rounds.rebuild_chain(chain.blocks, lambda h: None, "evo-starter")
+        self.assertEqual((rounds, history), (0, []))
+        self.assertEqual(es.state_hash(state), es.state_hash(job.spec.init_params()))
 
 
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
