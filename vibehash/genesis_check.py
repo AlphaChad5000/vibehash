@@ -106,7 +106,7 @@ def check(genesis: dict) -> list[Finding]:
     staked = sum(int(v) for v in genesis.get("stakes", {}).values())
     premine = alloc + staked
     if premine:
-        share = f" ({Fraction(premine, e.max_supply) * 100:.3g}% of the cap)" if e.max_supply else ""
+        share = f" ({float(Fraction(premine, e.max_supply) * 100):.3g}% of the cap)" if e.max_supply else ""
         holders = len(set(genesis.get("allocations", {})) | set(genesis.get("stakes", {})))
         add("warn", "premine", f"{_vibe(premine)}{share} to {holders} address{'es' if holders != 1 else ''} at the "
                                "start: it weakens \"nobody controls it\" and the legal position (HANDOFF's mainnet "
@@ -144,7 +144,7 @@ def check(genesis: dict) -> list[Finding]:
         top = max(stakes) if stakes else 0
         n_off = tolerates(stakes) if stakes else 0
         line = (f"{len(voting)} with a vote ({len(s.validators)} listed), {_vibe(total)} of voting stake; the biggest "
-                f"holds {Fraction(top, total or 1) * 100:.3g}%; the chain keeps going with "
+                f"holds {float(Fraction(top, total or 1) * 100):.3g}%; the chain keeps going with "
                 f"{n_off} of them offline")
         if len(voting) < MIN_VALIDATORS or n_off == 0 or 3 * top >= total:
             add("fail", "validators", line + f". It needs at least {MIN_VALIDATORS}, none holding a third or more, "
