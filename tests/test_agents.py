@@ -1,10 +1,9 @@
-"""The Muse agents (agents/): the Job Architect, the Semantic Judge, and the LLM client they share.
+"""The Muse agents (agents/): the Job Architect, the Quality Judge, the rules they score with, and the LLM client.
 
-Offline, on the CPU, with no API key: a fake OpenAI-compatible server on 127.0.0.1 plays the model, answering from a
+Offline, on the CPU, with no API key: a fake OpenAI-compatible server on 127.0.0.1 plays Muse Spark, answering from a
 script (plans, fenced and prose-wrapped JSON, refusals of response_format and temperature, rate limits, bad keys).
-The architect's files go through `vibehash train` itself up to its pre-flight, against tests/test_hub.py's fake
-Hugging Face, where PyTorch, tokenizers and jinja2 are installed (CI has them). The judge's `answer` step runs a tiny
-random model and an adapter `finetune.export_peft` wrote, where transformers and peft are installed too.
+The architect's network files go through `vibehash train` itself up to its pre-flight, against tests/test_hub.py's
+fake Hugging Face, where PyTorch, tokenizers and jinja2 are installed (CI has them).
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from unittest import mock
 
 import numpy as np
 
-from agents import architect, judge, llm_call
+from agents import architect, checks, judge, llm_call
 from vibehash import cli
 from vibehash import finetune as ft
 from vibehash.tasks import TrainingJob
@@ -69,15 +68,6 @@ def ok(content) -> tuple:
 
 def refused(status, message, param=None, kind="invalid_request_error", code=None, headers=None) -> tuple:
     return status, {"error": {"message": message, "type": kind, "param": param, "code": code}}, headers or {}
-
-
-def good_plan(n: int = 45, **changes) -> dict:
-    plan = {"job_id": "Support Bot!", "base": "qwen3-0.6b", "rank": 8, "budget": 50,
-            "reasoning": "A small model learns a short style quickly.",
-            "examples": [{"user": f"How do I fix problem number {i}?", "assistant": f"Try step {i}, then restart it. "
-                                                                                   "Happy to help!"} for i in range(n)],
-            "eval_prompts": [f"What should I do about issue {c}?" for c in "abcdef"]}
-    return {**plan, **changes}
 
 
 class FakeLLM:
@@ -256,9 +246,11 @@ class LLMCallTests(AgentTest):
         self.fake.script = [(200, completion('{"examples": [', finish="length"), {})]
         with self.assertRaisesRegex(llm_call.LLMError, "cut off"):
             llm_call.chat_json([{"role": "user", "content": "x"}])
-        self.fake.script = [(200, "<html>a proxy's error page</html>", {})]
-        with self.assertRaisesRegex(llm_call.LLMError, "isn't a chat completion"):
+        self.fake.script = [(200, "<html>a proxy's error page</html>", {})] * (llm_call.RETRIES + 1)
+        with self.assertRaisesRegex(llm_call.LLMError, "isn't a chat completion"):  # retried first: proxies blink
             llm_call.chat([{"role": "user", "content": "x"}])
+        self.fake.script = [(200, "<html>a proxy's error page</html>", {}), ok("fine")]
+        self.assertEqual(llm_call.chat([{"role": "user", "content": "x"}]), "fine")
 
     def test_an_unreachable_provider(self):
         port = self.fake.server.server_port
@@ -269,81 +261,136 @@ class LLMCallTests(AgentTest):
             llm_call.chat([{"role": "user", "content": "x"}])
 
 
-class ArchitectTests(AgentTest):
-    def checked(self, plan, **kw) -> list[str]:
-        return architect.check(plan, **kw)
+class ModelOverrideTests(AgentTest):
+    def test_a_call_can_name_another_model_on_the_same_provider(self):
+        """The second judge: the same key and URL, another model."""
+        self.use_fake()
+        self.fake.script = [ok({"a": 1})]
+        llm_call.chat_json([{"role": "user", "content": "x"}], model="muse-wonder-1.0")
+        self.assertEqual(self.fake.requests[0]["body"]["model"], "muse-wonder-1.0")
+        self.assertEqual(llm_call.model_name(), MODEL)
+        self.assertTrue(issubclass(llm_call.NotJSON, ValueError))  # what the agents' callers catch
 
-    def test_a_good_plan_passes(self):
-        plan = good_plan(job_id="support-bot-1a2b")
-        self.assertEqual(self.checked(plan), [])
+
+def long_text(i, lead="Act as a senior support lead") -> str:
+    """A long, demanding message (architect.LONG+ characters): a role, numbered parts, a format."""
+    text = (f"{lead}. Ticket {i}: a customer says the export button does nothing. Give me 1) the likely cause, "
+            "2) the fix, 3) what to tell them, in a short table with a heading, under 120 words, and keep the tone "
+            "warm but direct, because this customer has written in three times already this week about it.")
+    return text if len(text) >= architect.LONG else text + " Be thorough: check every step twice before you answer."
+
+
+def good_plan(**changes) -> dict:
+    """A plan that passes every check: 46 chats (10 long, 8 casual), 20 test prompts (5 long, 3 casual), each reply
+    one sentence that opens its own way, and a rule they all meet."""
+    users = ([f"How do I fix problem number {i}?" for i in range(28)] + [f"fix {i} pls" for i in range(8)]
+             + [long_text(i) for i in range(10)])
+    plan = {"job_id": "support-bot", "base": "qwen3-0.6b", "rank": 8, "epochs": 3, "caveat": "",
+            "reasoning": "A small model learns a short style quickly.",
+            "examples": [{"user": u, "assistant": f"Fix {i} usually works, so try it and restart."}
+                         for i, u in enumerate(users)],
+            "eval_prompts": [f"What should I do about issue {c}?" for c in "abcdefghijkl"]
+                            + [long_text(c, "Act as a careful reviewer") for c in "mnopq"]
+                            + [f"issue {c} help" for c in "rst"],
+            "checks": [{"check": "max_sentences", "arg": 2}],
+            "scope": {"narrow": False, "decline": ""}, "off_scope_prompts": []}
+    return {**plan, **changes}
+
+
+def routed(designs: list, audit_meets: bool = True, allowed: bool = True, more=None):
+    """A fake Muse Spark that answers by which agent is asking (the system prompt): the screen, the designer (the
+    next of `designs` each time), the audit, and the second batch."""
+    def step(body):
+        system = body["messages"][0]["content"]
+        if system.startswith("You screen"):
+            return ok({"allowed": allowed, "reason": "fine" if allowed else "it would exist to scam people"})
+        if system.startswith("You design"):
+            return ok(designs.pop(0))
+        if system.startswith("You audit"):
+            return ok({"verdicts": [{"n": n, "meets": audit_meets, "why": "ok"} for n in range(1, 13)]})
+        if system.startswith("You add"):
+            return ok(more if more is not None else {"examples": []})
+        return refused(400, f"unexpected system prompt {system[:40]!r}")
+    return step
+
+
+class ArchitectTests(AgentTest):
+    def test_a_good_plan_passes_on_both_backends(self):
+        self.assertEqual(architect.check(good_plan()), [])
+        self.assertEqual(architect.check(good_plan(), "vibehash"), [])
 
     def test_check_refuses_each_rule(self):
-        fine = good_plan(job_id="support-bot-1a2b")
-        out = self.dir / "jobs"
-        out.mkdir()
-        (out / "taken-1.jsonl").write_text("")
-        (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "posted-1").mkdir(parents=True)
-        dup = [dict(e) for e in fine["examples"]]
-        dup[7]["user"] = "  how do I FIX problem number 3??"
+        fine = good_plan()
+        leaked = fine["eval_prompts"][:-1] + ["How do I FIX problem number 3??"]
         cases = {
-            "not an object": ([1, 2], "one JSON object"),
-            "id upper case": ({"job_id": "Support Bot"}, "the chain's rule"),
-            "id too long": ({"job_id": "a" * 65}, "the chain's rule"),
-            "id a device name": ({"job_id": "con.v2"}, "device name"),
-            "id ends in a dot": ({"job_id": "bot."}, "ends in a dot"),
-            "id already posted here": ({"job_id": "posted-1"}, "already have a job called posted-1"),
-            "files already there": ({"job_id": "taken-1"}, "already exists"),
-            "base not allowed": ({"base": "llama-3.1-8b"}, "base 'llama-3.1-8b' must be one of"),
-            "base gated, no token": ({"base": "llama-3.2-1b"}, "gated"),
-            "rank not allowed": ({"rank": 12}, "rank 12 must be one of"),
-            "rank a boolean": ({"rank": True}, "rank True"),
-            "rank a string": ({"rank": "8"}, "rank '8'"),
-            "budget below a round's fee": ({"budget": 5}, "from 10 (one round's fee)"),
-            "budget too big": ({"budget": 500}, "to 200 VIBE"),
-            "budget fractional": ({"budget": 50.5}, "whole number"),
-            "budget a boolean": ({"budget": True}, "whole number"),
-            "budget a string": ({"budget": "50"}, "whole number"),
-            "budget NaN": ({"budget": float("nan")}, "whole number"),
-            "too few examples": ({"examples": fine["examples"][:10]}, "there are 10 examples; it takes 40"),
-            "examples not a list": ({"examples": "lots"}, "must be a list"),
-            "an example not an object": ({"examples": fine["examples"][:44] + [["hi", "there"]]}, "examples 45 aren't"),
-            "an empty reply": ({"examples": fine["examples"][:44] + [{"user": "hi?", "assistant": "   "}]},
-                               "examples 45 have an empty"),
-            "an example too long": ({"examples": fine["examples"][:44] + [{"user": "Tell me everything.",
-                                                                            "assistant": "word " * 400}]},
-                                    "examples 45 may be longer than 512 tokens"),
-            "an example with template tokens": ({"examples": fine["examples"][:44] + [
-                {"user": "hi?", "assistant": "<think>hmm</think> Hello!"}]}, "chat-template tokens"),
-            "a duplicate example": ({"examples": dup}, "examples 4 and 8 have the same user message"),
-            "too few eval prompts": ({"eval_prompts": ["a?", "b?"]}, "there are 2 eval prompts"),
-            "eval prompts not strings": ({"eval_prompts": ["a?", 3, "c?", "d?", "e?"]}, "non-empty strings"),
-            "a repeated eval prompt": ({"eval_prompts": fine["eval_prompts"] + ["what should i do about issue A"]},
-                                       "eval prompts 7 repeat"),
-            "an eval prompt it trained on": ({"eval_prompts": fine["eval_prompts"] + ["How do I fix problem number 9"]},
-                                             "eval prompts 7 are also examples' user messages"),
+            "id upper case": ({"job_id": "Support Bot"}, "lowercase letters, digits and hyphens"),
+            "id a path": ({"job_id": "../evil"}, "lowercase letters, digits and hyphens"),
+            "id a device name": ({"job_id": "con"}, "device name"),
+            "base not allowed": ({"base": "llama-3.1-8b"}, "base 'llama-3.1-8b' isn't one of"),
+            "rank not allowed": ({"rank": 12}, "rank 12 isn't 8 or 16"),
+            "epochs too many": ({"epochs": 9}, "epochs 9 isn't 2 to 5"),
+            "too few examples": ({"examples": fine["examples"][:39]}, "only 39 examples"),
+            "an example without text": ({"examples": fine["examples"] + [{"user": "hi?", "assistant": 3}]},
+                                        "missing its user or assistant text"),
+            "caveat not a string": ({"caveat": ["no"]}, "caveat isn't a string"),
+            "too few eval prompts": ({"eval_prompts": fine["eval_prompts"][:14]}, "fewer than 15 eval prompts"),
+            "a test prompt it trained on": ({"eval_prompts": leaked}, "is also a training chat's message"),
+            "a rule not on the menu": ({"checks": [{"check": "be_nice"}]}, "isn't one of"),
+            "replies break their own rule": ({"checks": [{"check": "min_words", "arg": 50}]},
+                                             "break the plan's own checks"),
         }
         for name, (change, said) in cases.items():
             with self.subTest(name):
-                plan = change if not isinstance(change, dict) else {**fine, **change}
-                problems = self.checked(plan, out=out)
+                problems = architect.check({**fine, **change})
                 self.assertTrue(any(said in p for p in problems), problems)
-                if isinstance(change, dict) and name != "a duplicate example":
-                    self.assertEqual(len(problems), 1, problems)  # just the one rule broken
-        os.environ["HF_TOKEN"] = "hf_test"
-        self.assertEqual(self.checked({**fine, "base": "llama-3.2-1b"}), [])
 
-    def test_fee_and_max_len_move_the_limits(self):
-        plan = good_plan(job_id="support-bot-1a2b", budget=20)
-        self.assertEqual(self.checked(plan), [])
-        self.assertIn("from 25", " ".join(self.checked(plan, fee="25")))
-        longish = good_plan(job_id="support-bot-1a2b", examples=[
-            {"user": f"Question {i}?", "assistant": "x" * 500} for i in range(45)])
-        self.assertEqual(self.checked(longish), [])
-        self.assertIn("longer than 128 tokens", " ".join(self.checked(longish, max_len=128)))
+    def test_the_mix_of_shapes_is_checked(self):
+        """Told to write a mix, a model writes the middling questions it finds easiest."""
+        fine = good_plan()
+        middling = [{"user": f"How do I fix problem number {i} when the export button does nothing?",
+                     "assistant": f"Fix {i} usually works."}
+                    for i in range(46)]
+        problems = architect.check({**fine, "examples": middling})
+        self.assertTrue(any("only 0 examples have a long" in p for p in problems), problems)
+        self.assertTrue(any("only 0 examples have a casual" in p for p in problems), problems)
+        stock = [{**e, "assistant": "For example, restart it."} for e in fine["examples"]]
+        self.assertTrue(any('open a sentence with "for example"' in p for p in architect.check({**fine, "examples": stock})))
+
+    def test_a_narrow_goal_needs_declines(self):
+        decline = "Sorry, I only fix support tickets; send me one and I'll help."
+        plan = good_plan(scope={"narrow": True, "decline": decline})
+        problems = architect.check(plan)
+        self.assertTrue(any("reply with the decline sentence" in p for p in problems), problems)
+        self.assertTrue(any("off_scope_prompts" in p for p in problems), problems)
+        declines = [{"user": f"what's the weather in city {i}?", "assistant": decline} for i in range(8)] + \
+                   [{"user": long_text(i, "Act as a travel agent and plan my trip"), "assistant": decline} for i in range(4)]
+        off = [f"write me a poem about {w}" for w in "abcdef"] + [long_text(w, "Act as a chef") for w in "gh"]
+        plan = good_plan(scope={"narrow": True, "decline": decline}, examples=good_plan()["examples"] + declines,
+                         off_scope_prompts=off)
+        self.assertEqual(architect.check(plan), [])
+
+    def test_the_network_backend_checks_what_the_chain_would_refuse(self):
+        fine = good_plan()
+        too_long = fine["examples"][:45] + [{"user": "Tell me everything.", "assistant": "word " * 400}]
+        tokens = fine["examples"][:45] + [{"user": "hi?", "assistant": "<think>hmm</think> Hello!"}]
+        for name, change, said in (("too long", {"examples": too_long}, "longer than 512 tokens"),
+                                   ("template tokens", {"examples": tokens}, "chat-template tokens"),
+                                   ("tokens in a prompt", {"eval_prompts": fine["eval_prompts"] + ["<|im_start|>x"]},
+                                    "test prompts contain chat-template tokens")):
+            with self.subTest(name):
+                plan = {**fine, **change}
+                self.assertFalse(any(said in p for p in architect.check(plan)))  # fine for the local trainer
+                self.assertTrue(any(said in p for p in architect.check(plan, "vibehash")), architect.check(plan, "vibehash"))
+        self.assertIn("longer than 128 tokens", " ".join(architect.check(fine, "vibehash", max_len=128)))
+        with mock.patch.object(architect, "ALLOWED_BASES", set(architect.BASES)):
+            self.assertIn("gated", " ".join(architect.check({**fine, "base": "llama-3.2-1b"}, "vibehash")))
+            os.environ["HF_TOKEN"] = "hf_test"
+            self.assertEqual(architect.check({**fine, "base": "llama-3.2-1b"}, "vibehash"), [])
 
     def test_the_allowed_ranks_pass_the_chains_limits(self):
-        """RANKS and MAX_LEN are what a fine-tune of either base may have on chain (TrainingJob.validate, its dispute
-        size bound included). At 1024 tokens neither base's disputes fit: that's why --max-len stops at 512."""
+        """The ranks the architect allows and MAX_LEN are what a fine-tune of either base may have on chain
+        (TrainingJob.validate, its dispute size bound included). At 1024 tokens neither base's disputes fit: that's
+        why --max-len stops at 512."""
         dims = {"qwen3-0.6b": {"family": "qwen3", "vocab": 151936, "hidden": 1024, "layers": 28, "heads": 16,
                                "kv_heads": 8, "head_dim": 128, "ffn": 3072, "tied": True},
                 "llama-3.2-1b": {"family": "llama", "vocab": 128256, "hidden": 2048, "layers": 16, "heads": 32,
@@ -362,37 +409,79 @@ class ArchitectTests(AgentTest):
                                max_update_ratio=1.0)
         from vibehash.tasks import InvalidJob
         for name, d in dims.items():
-            for rank in architect.RANKS:
+            for rank in (8, 16):
                 with self.subTest(name, rank=rank):
                     job(d, rank, architect.MAX_LEN).validate()
             with self.subTest(name, seq_len=1024), self.assertRaisesRegex(InvalidJob, "dispute"):
                 job(d, 16, 1024)
 
-    def test_job_ids_and_token_guesses(self):
-        self.assertRegex(architect.job_id_for("Support Bot!"), r"^support-bot-[0-9a-f]{4}$")
-        self.assertRegex(architect.job_id_for(None), r"^job-[0-9a-f]{4}$")
-        self.assertRegex(architect.job_id_for("x" * 90), r"^x{40}-[0-9a-f]{4}$")
+    def test_budgets_ids_and_token_guesses(self):
+        self.assertEqual(architect.budget({"examples": [0] * 80, "epochs": 3}), 20)  # 240 chats: 2 rounds
+        self.assertEqual(architect.budget({"examples": [0] * 10, "epochs": 2}), architect.FEE)  # at least a round
+        self.assertEqual(architect.budget({"examples": [0] * 4000, "epochs": 5}), architect.MAX_BUDGET)
+        (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "bot-aaaa").mkdir(parents=True)
+        with mock.patch.object(architect.secrets, "token_hex", side_effect=["aaaa", "bbbb"]):
+            self.assertEqual(architect.chain_id("bot"), "bot-bbbb")  # taken here already: drawn again
+        self.assertRegex(architect.chain_id("x" * 40), r"^x{40}-[0-9a-f]{4}$")
         self.assertEqual(architect.tokens_about("abcdef"), 2)
         self.assertEqual(architect.tokens_about("你好吗"), 3)
 
-    def test_the_train_command_is_exactly_this(self):
-        plan = good_plan(job_id="support-bot-1a2b")
-        chats = self.dir / "agent-jobs" / "support-bot-1a2b.jsonl"
-        cmd = architect.train_command(plan, chats)
+    def test_the_train_commands_are_exactly_these(self):
+        plan = good_plan(job_id="support-bot-1a2b", budget=50)
+        out = self.dir / "agent-jobs"
+        chats = out / "support-bot-1a2b.jsonl"
+        self.assertEqual(architect.train_command(plan, chats, out),
+                         [sys.executable, str(Path(architect.__file__).with_name("train_local.py")), str(chats),
+                          "--base", "qwen3-0.6b", "--rank", "8", "--epochs", "3", "--out", str(out / "adapters")])
+        cmd = architect.train_command(plan, chats, out, "vibehash")
         self.assertEqual(cmd, [sys.executable, "-m", "vibehash", "train", str(chats.resolve()), "--base", "qwen3-0.6b",
                                "--rank", "8", "--budget", "50", "--max-len", "512", "--id", "support-bot-1a2b",
                                "--plain"])
-        full = architect.train_command(plan, chats, max_len=256, fee="5", node="http://127.0.0.1:8545",
+        full = architect.train_command(plan, chats, out, "vibehash", max_len=256, node="http://127.0.0.1:8545",
                                        wallet="req.json", yes=True)
-        self.assertEqual(full[len(cmd) - 1:], ["--plain", "--fee", "5", "--node", "http://127.0.0.1:8545",
-                                               "--wallet", "req.json", "--yes"])
-        self.assertIn("256", full)
         a = cli.parser().parse_args(full[3:])  # what `vibehash train` makes of it
-        self.assertEqual((a.data, a.base, a.rank, a.budget, a.fee, a.max_len, a.id, a.plain, a.yes, a.node, a.wallet),
-                         (str(chats.resolve()), "qwen3-0.6b", 8, 50 * 10**8, 5 * 10**8, 256, "support-bot-1a2b", True,
+        self.assertEqual((a.data, a.base, a.rank, a.budget, a.max_len, a.id, a.plain, a.yes, a.node, a.wallet),
+                         (str(chats.resolve()), "qwen3-0.6b", 8, 50 * 10**8, 256, "support-bot-1a2b", True,
                           True, "http://127.0.0.1:8545", "req.json"))
         self.assertIs(a.fn, cli.cmd_train)
-        self.assertIsNone(cli.parser().parse_args(cmd[3:]).fee)  # unset: cmd_train makes it 10 VIBE (an Evo job 1)
+
+    def test_plan_job_screens_designs_retries_and_audits(self):
+        """The first design has too few chats; the model is told so, and its second passes, then the audit. The
+        second batch keeps failing its checks, so the job trains on the first."""
+        self.use_fake()
+        self.fake.script = [routed([good_plan(examples=good_plan()["examples"][:30]), good_plan()])] * 6
+        logged = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = architect.plan_job("answer support questions in a sentence", log=logged.append)
+        systems = [r["body"]["messages"][0]["content"][:12] for r in self.fake.requests]
+        self.assertEqual(systems, ["You screen r", "You design f", "You design f", "You audit tr",
+                                   "You add trai", "You add trai"])
+        retry = self.fake.requests[2]["body"]["messages"]
+        self.assertEqual([m["role"] for m in retry], ["system", "user", "assistant", "user"])
+        self.assertIn("only 30 examples", retry[-1]["content"])
+        self.assertIn("only 30 examples", logged[0])
+        self.assertTrue(any("training on the first" in m for m in logged))
+        self.assertEqual((plan["goal"], len(plan["examples"]), plan["audit"]["met"], plan["audit"]["sampled"]),
+                         ("answer support questions in a sentence", 46, 12, 12))
+        gated = self.fake.requests[0]["body"]["messages"][1]["content"]
+        self.assertIn("<<<\nanswer support questions in a sentence\n>>>", gated)  # the goal, fenced as data
+
+    def test_a_refused_goal_designs_nothing(self):
+        self.use_fake()
+        self.fake.script = [routed([], allowed=False)]
+        with self.assertRaisesRegex(architect.Refused, "turned this goal down: it would exist to scam people"):
+            architect.plan_job("write scam texts")
+        self.assertEqual(len(self.fake.requests), 1)
+
+    def test_a_failed_audit_sends_the_plan_back(self):
+        self.use_fake()
+        self.fake.script = [routed([good_plan(), good_plan(), good_plan()], audit_meets=False)] * 9
+        logged = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = architect.plan_job("support", log=logged.append)
+        self.assertIn("the Quality Judge read 12 of the chats and 12 don't do what the goal asks", logged[0])
+        self.assertTrue(any("training anyway" in m for m in logged))  # three tries, then the audit is published
+        self.assertEqual(plan["audit"]["met"], 0)
 
     def run_main(self, *argv) -> tuple[str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -401,38 +490,27 @@ class ArchitectTests(AgentTest):
         self.assertEqual(code, 0)
         return out.getvalue(), err.getvalue()
 
-    def test_end_to_end_with_a_retry(self):
-        """The first plan breaks a rule (30 examples, and in prose); the model is told what, and its fenced second
-        plan is written out in the shape `vibehash train` reads."""
+    def test_main_writes_a_network_job_and_posts_nothing(self):
         self.use_fake()
-        self.fake.script = [ok(f"Here is the job: {json.dumps(good_plan(30))} Good luck!"),
-                            ok(f"```json\n{json.dumps(good_plan())}\n```")]
+        self.fake.script = [routed([good_plan()])] * 5
         out_dir = self.dir / "agent-jobs"
-        said, warned = self.run_main("make it answer support questions in two friendly sentences", "--out", str(out_dir))
-        self.assertIn("there are 30 examples; it takes 40", warned)
-        self.assertEqual(len(self.fake.requests), 2)
-        retry = self.fake.requests[1]["body"]["messages"]
-        self.assertEqual([m["role"] for m in retry], ["system", "user", "assistant", "user"])
-        self.assertIn("there are 30 examples", retry[-1]["content"])
-        self.assertIn("make it answer support questions", self.fake.requests[0]["body"]["messages"][1]["content"])
-
+        said, _ = self.run_main("answer support questions in a sentence", "--out", str(out_dir))
         chats = list(out_dir.glob("*.jsonl"))
         self.assertEqual(len(chats), 1)
         job_id = chats[0].stem
-        self.assertRegex(job_id, r"^support-bot-[0-9a-f]{4}$")
+        self.assertRegex(job_id, r"^support-bot-[0-9a-f]{4}$")  # new on the chain
         records = ft.read_examples(chats[0])  # `vibehash train`'s own reader
-        self.assertEqual(len(records), 45)
+        self.assertEqual(len(records), 46)
         self.assertEqual([m["role"] for m in records[0]["messages"]], ["user", "assistant"])
-        self.assertEqual(records[3]["messages"][1]["content"], "Try step 3, then restart it. Happy to help!")
-        self.assertNotIn(b"\r", chats[0].read_bytes())
+        saved = json.loads((out_dir / f"{job_id}.plan.json").read_text(encoding="utf-8"))
+        self.assertEqual((saved["backend"], saved["budget"], saved["model"], saved["examples"]),
+                         ("vibehash", 20, MODEL, 46))
         evals = json.loads((out_dir / f"{job_id}.eval.json").read_text(encoding="utf-8"))
-        self.assertEqual((evals["job_id"], evals["base"], len(evals["prompts"])), (job_id, "qwen3-0.6b", 6))
-        self.assertEqual(evals["designed_by"]["model"], MODEL)
+        self.assertEqual((evals["base"], len(evals["prompts"])), ("qwen3-0.6b", 20))
         for f in out_dir.iterdir():
             self.assertNotIn(KEY, f.read_text(encoding="utf-8"))
-        self.assertIn(architect.shown(architect.train_command({**good_plan(), "job_id": job_id}, chats[0])), said)
+        self.assertIn("--budget 20", said)
         self.assertIn("Nothing was posted, and no VIBE spent", said)
-        self.assertNotIn(KEY, said + warned)
 
     def test_post_runs_train_and_reads_its_receipt(self):
         self.use_fake()
@@ -445,32 +523,52 @@ class ArchitectTests(AgentTest):
                 receipt.parent.mkdir(parents=True)
                 receipt.write_text("{}")
             return mock.Mock(returncode=0)
-        for posts, said in ((True, "Posted bot-1"), (False, "Nothing was posted, so nothing was spent")):
+        for posts, said in ((True, "Posted support-bot-"), (False, "Nothing was posted, so nothing was spent")):
             with self.subTest(posts=posts), mock.patch.object(architect.subprocess, "run", fake_run):
-                job_id = f"bot-{int(posts)}"
-                self.fake.script = [ok(good_plan())]
-                out, _ = self.run_main("support bot", "--out", str(self.dir / "jobs"), "--id", job_id, "--post",
-                                       "--node", "http://127.0.0.1:9", "--wallet", "req.json")
+                self.fake.script = [routed([good_plan()])] * 5
+                out, _ = self.run_main("support bot", "--out", str(self.dir / f"jobs{int(posts)}"), "--post",
+                                       "--node", "http://127.0.0.1:9", "--wallet", "req.json", "--budget", "30")
                 cmd, env = ran[-1]
-                self.assertEqual(cmd, architect.train_command({**good_plan(), "job_id": job_id},
-                                                              self.dir / "jobs" / f"{job_id}.jsonl",
-                                                              node="http://127.0.0.1:9", wallet="req.json"))
+                self.assertEqual(cmd[cmd.index("--budget") + 1], "30")
+                self.assertEqual(cmd[cmd.index("--node") + 1], "http://127.0.0.1:9")
                 self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(architect.REPO))
                 self.assertIn("Posting to http://127.0.0.1:9", out)
                 self.assertIn(said, out)
                 if posts:
-                    self.assertIn(f"job download {job_id} --out {job_id}-lora", out)
+                    self.assertIn("job download support-bot-", out)
+                    self.assertIn("judge.py grade", out)
 
-    def test_nothing_is_asked_when_the_id_is_already_taken(self):
-        (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "mine").mkdir(parents=True)
+    def test_bad_flags_stop_before_anything_is_paid_for(self):
         self.use_fake()
-        with self.assertRaises(SystemExit) as caught:
-            architect.main(["goal", "--id", "mine", "--out", str(self.dir / "jobs")])
-        self.assertIn("already have a job called mine", str(caught.exception.code))
-        with self.assertRaises(SystemExit) as caught:
-            architect.main(["goal", "--base", "llama-3.2-1b", "--out", str(self.dir / "jobs")])
-        self.assertIn("gated", str(caught.exception.code))
-        self.assertEqual(self.fake.requests, [])  # nothing paid for
+        (Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "mine").mkdir(parents=True)
+        (self.dir / "taken.jsonl").write_text("")
+        for argv, said in ((["goal", "--budget", "5"], "--budget must be"), (["goal", "--max-len", "4096"], "--max-len"),
+                           (["goal", "--fee", "0"], "--fee must be"), (["goal", "--id", "Bad Id"], "lowercase"),
+                           (["goal", "--id", "mine"], "already have a job called mine"),
+                           (["goal", "--id", "taken", "--out", str(self.dir)], "already exists")):
+            with self.subTest(argv), self.assertRaises(SystemExit) as caught:
+                architect.main(argv)
+            self.assertIn(said, str(caught.exception.code))
+        self.assertEqual(self.fake.requests, [])
+
+    def test_the_requester_can_name_the_job_pick_the_base_and_the_fee(self):
+        """Cole's flags: --id is used as given (no hex digits), --base rides into the design prompt and the plan
+        whatever the LLM wrote, --fee goes to train and sizes the budget."""
+        self.use_fake()
+        self.fake.script = [routed([good_plan(base="llama-3.2-1b")])] * 5
+        os.environ["HF_TOKEN"] = "hf_test"
+        out_dir = self.dir / "jobs"
+        with mock.patch.object(architect, "ALLOWED_BASES", {"qwen3-0.6b"}):
+            said, _ = self.run_main("support bot", "--out", str(out_dir), "--id", "my-bot", "--base", "qwen3-0.6b",
+                                    "--fee", "5")
+        self.assertIn("(Use base qwen3-0.6b.)", self.fake.requests[1]["body"]["messages"][1]["content"])
+        plan = json.loads((out_dir / "my-bot.plan.json").read_text(encoding="utf-8"))
+        self.assertEqual((plan["job_id"], plan["base"], plan["budget"]), ("my-bot", "qwen3-0.6b", 10))  # 2 rounds at 5
+        self.assertIn("--fee 5", said)
+        self.assertIn("--id my-bot", said)
+        self.assertEqual(architect.budget({"examples": [0] * 80, "epochs": 3}, fee=5), 10)
+        cmd = architect.train_command(good_plan(job_id="b", budget=10), out_dir / "b.jsonl", out_dir, "vibehash", fee=5)
+        self.assertEqual(cli.parser().parse_args(cmd[3:]).fee, 5 * 10**8)
 
     @unittest.skipUnless(HAVE["torch"] and HAVE["tokenizers"] and HAVE["jinja2"], "needs PyTorch, tokenizers and jinja2")
     def test_vibehash_train_takes_the_files_up_to_its_preflight(self):
@@ -482,10 +580,12 @@ class ArchitectTests(AgentTest):
         from tests.test_hub import FakeHub
 
         self.use_fake()
-        self.fake.script = [ok(good_plan())]
-        self.run_main("support bot", "--out", str(self.dir / "jobs"), "--id", "support-bot-1a2b", "--max-len", "256")
-        chats = self.dir / "jobs" / "support-bot-1a2b.jsonl"
-        cmd = architect.train_command({**good_plan(), "job_id": "support-bot-1a2b"}, chats, max_len=256)
+        self.fake.script = [routed([good_plan()])] * 5
+        out_dir = self.dir / "jobs"
+        self.run_main("support bot", "--out", str(out_dir), "--max-len", "256")
+        chats = next(out_dir.glob("*.jsonl"))
+        plan = json.loads(chats.with_suffix(".plan.json").read_text(encoding="utf-8"))
+        cmd = architect.train_command(plan, chats, out_dir, "vibehash", max_len=256)
 
         hub = FakeHub()
         self.addCleanup(hub.close)
@@ -512,134 +612,143 @@ class ArchitectTests(AgentTest):
         said = out.getvalue()
         self.assertEqual([q.split()[0] for q in asked], ["Check", "Post"])
         self.assertIn("Model     tiny/qwen3", said)
-        self.assertIn("45 examples (45 chats, in the model's chat template)", said)
+        self.assertIn("46 examples (46 chats, in the model's chat template)", said)
         self.assertIn("LoRA rank 8", said)
-        self.assertIn("a budget of 50 VIBE buys 5 rounds", said)
+        self.assertIn("a budget of 20 VIBE buys 2 rounds", said)
         self.assertIn("Nothing was posted, and nothing was spent.", said)
-        self.assertFalse((Path(os.environ["VIBEHASH_HOME"]) / "jobs" / "support-bot-1a2b").exists())
+        self.assertFalse((Path(os.environ["VIBEHASH_HOME"]) / "jobs" / plan["job_id"]).exists())
+
+
+class ChecksTests(unittest.TestCase):
+    def test_rules_score_replies(self):
+        two = {"check": "exact_sentences", "arg": 2}
+        self.assertTrue(checks.passes(two, "Yes. No."))
+        self.assertFalse(checks.passes(two, "Yes."))
+        self.assertTrue(checks.passes({"check": "json_keys", "arg": ["a", "b"]}, '{"a": 1, "b": 2}'))
+        self.assertFalse(checks.passes({"check": "starts_with", "arg": "="}, None))  # nothing to apply it to: a fail
+        self.assertEqual(checks.failed([two, {"check": "no_bullets"}], "- one\n- two"), ["exact_sentences 2", "no_bullets"])
+        self.assertEqual(checks.failed([two], "Sorry, I only do that.", exempt=lambda r: r.startswith("Sorry")), [])
+
+    def test_valid_names_the_problem(self):
+        self.assertEqual(checks.valid([{"check": "max_words", "arg": 50}]), [])
+        self.assertIn("isn't one of", checks.valid([{"check": "rhymes"}])[0])
+        self.assertIn("needs number", checks.valid([{"check": "max_words", "arg": "50"}])[0])
+        self.assertIn("needs no", checks.valid([{"check": "one_line", "arg": 1}])[0])
+        self.assertIn("pick the 5", checks.valid([{"check": "one_line"}] * 6)[0])
 
 
 class JudgeTests(AgentTest):
-    def answers(self, n: int = 6) -> Path:
-        path = self.dir / "support-bot-1a2b.answers.json"
-        path.write_text(json.dumps({"goal": "two friendly sentences", "pairs": [
-            {"prompt": f"question {i}?", "base": f"BAD {i}", "tuned": f"GOOD {i}"} for i in range(n)]}),
-            encoding="utf-8")
-        return path
+    def setUp(self):
+        super().setUp()
+        second = mock.patch.object(judge, "SECOND", "")  # the second judge has its own test
+        second.start()
+        self.addCleanup(second.stop)
 
-    def test_file_names_and_lenient_verdicts(self):
-        d = Path("x")
-        self.assertEqual(judge.sibling(d / "bot.eval.json", ".answers.json"), d / "bot.answers.json")
-        self.assertEqual(judge.sibling(d / "bot.answers.json", ".graded.json"), d / "bot.graded.json")
-        self.assertEqual(judge.sibling(d / "v1.2.json", ".answers.json"), d / "v1.2.answers.json")
-        for said, want in (("A", "A"), (" b. ", "B"), ("Reply A", "A"), ("TIE", "tie"), ("draw", "tie"),
-                           ("maybe", None), (1, None), (None, None)):
-            self.assertEqual(judge.winner_of({"winner": said}), want, said)
-        self.assertIsNone(judge.winner_of(["A"]))
+    @staticmethod
+    def picks_good(body):
+        """A fake judge that always prefers the reply that says GOOD (the fine-tune's)."""
+        text = body["messages"][1]["content"]
+        a = re.search(r"Reply A:\n<<<\n(.*?)\n>>>", text, re.DOTALL).group(1)
+        return ok(f"Verdict: {json.dumps({'winner': 'A' if a.startswith('GOOD') else 'B', 'reason': 'Reply A is kinder'})}")
 
-    def test_grading_is_blind_seeded_and_unshuffled(self):
-        """The fake judge always picks the reply that says GOOD (the fine-tune's), except one tie and one reply it
-        won't make A, B or tie even when asked again. The summary has to come out the same whichever letter the
-        fine-tune was given, and the letters follow the seed."""
+    def test_a_verdict_needs_both_readings_and_is_blind(self):
         self.use_fake()
-
-        def verdict(body):
-            text = body["messages"][1]["content"]
-            if "question 4?" in text:
-                return ok({"winner": "maybe", "reason": "unsure"})
-            if "question 5?" in text:
-                return ok({"winner": "tie", "reason": "both fine"})
-            a = re.search(r"<reply_a>\n(.*?)\n</reply_a>", text, re.DOTALL).group(1)
-            return ok(f"Verdict: {json.dumps({'winner': 'A' if a.startswith('GOOD') else 'B', 'reason': 'kinder'})}")
-        self.fake.script = [verdict] * 8
-        path = self.answers()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            graded = judge.grade(path, seed=3)
-        self.assertEqual(graded, self.dir / "support-bot-1a2b.graded.json")
-        data = json.loads(graded.read_text(encoding="utf-8"))
-        s = data["summary"]
-        self.assertEqual((s["prompts"], s["graded"], s["tuned_wins"], s["base_wins"], s["ties"], s["unjudged"]),
-                         (6, 6, 4, 0, 1, 1))
-        self.assertEqual((s["judge"]["model"], s["judge"]["base_url"], s["seed"]), (MODEL, self.fake.url, 3))
-        rng = random.Random(3)
-        self.assertEqual([p["verdict"]["tuned_was"] for p in data["pairs"]],
-                         ["A" if rng.random() < 0.5 else "B" for _ in range(6)])
-        self.assertEqual(len({p["verdict"]["tuned_was"] for p in data["pairs"]}), 2)  # both orders were used
-        self.assertEqual(data["pairs"][4]["verdict"]["outcome"], "unjudged")
-        self.assertEqual(data["pairs"][4]["verdict"]["said"], {"winner": "maybe", "reason": "unsure"})
-        self.assertEqual(len(self.fake.requests), 7)  # pair 4 asked twice
-        self.assertIn('exactly "A", "B" or "tie"', self.fake.requests[5]["body"]["messages"][-1]["content"])
-        self.assertTrue(all(r["body"]["temperature"] == 0 for r in self.fake.requests))
+        pair = {"prompt": "question?", "base": "BAD reply", "tuned": "GOOD reply"}
+        self.fake.script = [self.picks_good] * 2
+        v = judge.verdict("two friendly sentences", pair)
+        self.assertEqual((v["tuned_won"], v["winner"], v["readings"]), (True, "tuned", ["tuned", "tuned"]))
+        self.assertIn("the fine-tune is kinder", v["reason"].lower())  # unblinded once decided
+        firsts = [re.search(r"Reply A:\n<<<\n(.*?)\n", r["body"]["messages"][1]["content"]).group(1)
+                  for r in self.fake.requests]
+        self.assertEqual(firsts, ["GOOD reply", "BAD reply"])  # once in each order
         for r in self.fake.requests:  # blind: nothing says which reply is which
             self.assertNotRegex(r["body"]["messages"][1]["content"], r"tuned|base|fine-tune")
-        self.assertNotIn(KEY, graded.read_text(encoding="utf-8"))
-        self.assertIn("fine-tune preferred on 4 of 6 prompts", out.getvalue())
+        self.fake.script = [ok({"winner": "A", "reason": "first is best"})] * 2  # a judge that favours position
+        v = judge.verdict("two friendly sentences", pair)
+        self.assertEqual((v["tuned_won"], v["winner"]), (False, "tie"))  # the readings split: a tie, not a win
 
-    def test_grading_stops_on_an_api_error_and_keeps_what_it_graded(self):
+    def test_grading_a_file(self):
         self.use_fake()
-        self.fake.script = [ok({"winner": "A", "reason": "r"}), ok({"winner": "B", "reason": "r"}),
-                            refused(402, "Your balance is too low", kind="billing_error", code="billing_not_configured")]
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(llm_call.LLMError, "2 of 6 graded"):
-            judge.grade(self.answers())
-        data = json.loads((self.dir / "support-bot-1a2b.graded.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["summary"]["graded"], 2)
-        self.assertIn("can't pay", data["summary"]["stopped"])
+        path = self.dir / "support-bot.eval.answers.json"
+        path.write_text(json.dumps({"goal": "two friendly sentences", "checks": [{"check": "max_sentences", "arg": 2}],
+                                    "pairs": [{"prompt": f"question {i}?", "base": f"BAD {i}",
+                                               "prompted": f"BAD told {i}", "tuned": f"GOOD {i}. Yes. Really."
+                                               if i == 0 else f"GOOD {i}."} for i in range(4)]}), encoding="utf-8")
+        self.fake.script = [self.picks_good] * 16  # 4 pairs, 2 rivals, 2 readings
+        seen = []
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            judge.grade(path, on_verdict=lambda i, pair: seen.append(i))
+        data = json.loads(path.with_suffix(".graded.json").read_text(encoding="utf-8"))
+        s = data["summary"]
+        self.assertEqual((s["prompts"], s["tuned_wins"], s["ties"], s["base_wins"]), (4, 4, 0, 0))
+        self.assertEqual(s["vs_prompted"]["tuned_wins"], 4)
+        self.assertEqual(data["model"], MODEL)
+        self.assertEqual(data["pairs"][0]["fails"], ["max_sentences 2"])  # scored by code, not the judge
+        self.assertEqual(s["checks"]["all"]["tuned"], 0.75)
+        self.assertEqual(sorted(seen), [0, 1, 2, 3])
+        self.assertIn("fine-tune preferred on 4 of 4 prompts", out.getvalue())
+        self.assertNotIn(KEY, path.with_suffix(".graded.json").read_text(encoding="utf-8"))
 
-    def adapter(self, trained: bool = True, seed: int = 0) -> tuple[Path, ft.LoraSpec]:
-        """An adapter folder as `vibehash job download` writes one (finetune.export_peft), for a tiny Qwen3."""
-        from tests.finetune_fixtures import CONFIGS
+    def test_an_api_error_stops_grading(self):
+        self.use_fake()
+        path = self.dir / "bot.eval.answers.json"
+        path.write_text(json.dumps({"goal": "g", "pairs": [{"prompt": "q?", "base": "b", "tuned": "t"}]}))
+        self.fake.script = [refused(402, "Your balance is too low", kind="billing_error", code="billing_not_configured")]
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(llm_call.LLMError, "can't pay"):
+            judge.grade(path)
 
-        spec = ft.LoraSpec(base="hf:tiny/qwen3@" + "b" * 40, manifest="a" * 64, dims=ft.arch_dims(CONFIGS["qwen3"]),
-                           rank=4, alpha=8.0, seq_len=64)
-        theta = np.zeros(spec.n_params)
-        if trained:
-            theta[:spec.n_adapter] = np.random.default_rng(seed).normal(0, 0.5, spec.n_adapter)
-        return ft.export_peft(spec, theta, self.dir / f"lora-{int(trained)}", {"job_id": "support-bot-1a2b"}), spec
+    def test_the_second_judge_is_another_model_and_never_ends_a_run(self):
+        self.use_fake()
+        pair = {"prompt": "q?", "base": "BAD", "prompted": "BAD told", "tuned": "GOOD"}
+        with mock.patch.object(judge, "SECOND", "muse-wonder-1.0"):
+            self.fake.script = [self.picks_good] * 6
+            out = judge.judged("g", pair)
+            self.assertEqual([r["body"]["model"] for r in self.fake.requests], [MODEL] * 4 + ["muse-wonder-1.0"] * 2)
+            self.assertTrue(out["second"]["tuned_won"])
+            self.fake.script = [self.picks_good] * 4 + [refused(404, "no such model", code="model_not_found")]
+            with contextlib.redirect_stdout(io.StringIO()) as said:
+                out = judge.judged("g", pair)
+            self.assertNotIn("second", out)
+            self.assertIn("second judge (muse-wonder-1.0) failed", said.getvalue())
 
-    def test_reading_an_adapter_folder(self):
-        folder, _ = self.adapter()
-        a = judge.read_adapter(folder)
-        self.assertEqual((a["repo"], a["revision"], a["rank"], a["trained"]), ("tiny/qwen3", "b" * 40, 4, True))
-        self.assertFalse(judge.read_adapter(self.adapter(trained=False)[0])["trained"])
-        with self.assertRaisesRegex(SystemExit, "isn't an adapter folder"):
-            judge.read_adapter(self.dir)
-        evals = self.dir / "bot.eval.json"
-        evals.write_text(json.dumps({"goal": "g", "base": "qwen3-0.6b", "prompts": ["hi?"]}))
-        with self.assertRaisesRegex(SystemExit, "is for Qwen/Qwen3-0.6B, but .* is an adapter for tiny/qwen3"):
-            judge.answer(evals, folder)
+    def test_scores_and_their_uncertainty(self):
+        self.assertEqual(judge.chance(19, 1), 2e-05)
+        self.assertEqual(judge.chance(10, 6), 0.227)
+        self.assertEqual(judge.interval(19, 20), [0.764, 0.991])
+        self.assertIsNone(judge.kappa(["tuned"] * 3, ["tuned"] * 3))
+        self.assertEqual(judge.kappa(["tuned", "base"], ["tuned", "base"]), 1.0)
 
-    @unittest.skipUnless(all(HAVE.values()), "needs PyTorch, transformers, peft, tokenizers and jinja2")
-    def test_answer_runs_base_and_fine_tune(self):
-        """A tiny random Qwen3 saved as a model folder, its tokenizer with a Qwen3-style template, and a trained
-        adapter for it: both answer every prompt on the CPU, with no accelerate and no device_map, and the adapter
-        changes the answers."""
-        from tests.finetune_fixtures import TinyModel
+    def test_locating_a_base_and_an_untrained_adapter(self):
+        self.assertEqual(judge.located("org/name@abc"), {"pretrained_model_name_or_path": "org/name", "revision": "abc"})
+        self.assertEqual(judge.located("org/name"), {"pretrained_model_name_or_path": "org/name", "revision": None})
+        self.assertEqual(judge.located(str(self.dir))["revision"], None)
+        folder = self.dir / "lora"
+        folder.mkdir()
+        self.assertIsNone(judge.trained(folder))  # nothing to read
 
-        tiny = TinyModel(self.dir / "src")
-        (tiny.folder / "tokenizer.json").write_text(word_tokenizer(tiny.vocab), encoding="utf-8")
-        (tiny.folder / "tokenizer_config.json").write_text(json.dumps({
-            "tokenizer_class": "PreTrainedTokenizerFast", "chat_template": QWEN3ISH, "eos_token": "<|im_end|>",
-            "pad_token": "[UNK]"}), encoding="utf-8")
-        folder, _ = self.adapter()
-        evals = self.dir / "support-bot-1a2b.eval.json"
-        evals.write_text(json.dumps({"goal": "short answers", "job_id": "support-bot-1a2b",
-                                     "prompts": ["how do i fix it", "what is the answer", "can you try please"]}),
-                         encoding="utf-8")
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            out = judge.answer(evals, folder, base=str(tiny.folder), max_new_tokens=6, device="cpu")
-        self.assertEqual(out, self.dir / "support-bot-1a2b.answers.json")
-        self.assertIn("a commit this can not confirm", err.getvalue())  # a local folder without hf's notes
-        data = json.loads(out.read_text(encoding="utf-8"))
-        self.assertEqual([p["prompt"] for p in data["pairs"]], ["how do i fix it", "what is the answer",
-                                                                "can you try please"])
-        self.assertEqual((data["generation"]["device"], data["generation"]["dtype"]), ("cpu", "float32"))
-        self.assertTrue(data["adapter"]["trained"])
-        self.assertTrue(any(p["base"] != p["tuned"] for p in data["pairs"]), data["pairs"])
-        self.assertNotIn("<think>", out.read_text(encoding="utf-8"))
-        prompt = judge.Renderer(__import__("transformers").AutoTokenizer.from_pretrained(str(tiny.folder)))("hi")
-        self.assertEqual(prompt, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        def safetensors(b_bytes: bytes) -> bytes:
+            header = json.dumps({"base.lora_A.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                                 "base.lora_B.weight": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]}}).encode()
+            return len(header).to_bytes(8, "little") + header + b"\x01\x00\x00\x00" + b_bytes
+        (folder / "adapter_model.safetensors").write_bytes(safetensors(b"\x00" * 4))
+        self.assertFalse(judge.trained(folder))
+        (folder / "adapter_model.safetensors").write_bytes(safetensors(b"\x00\x00\x80\x3f"))
+        self.assertTrue(judge.trained(folder))
+        a = judge.parser().parse_args(["answer", "e.json", "lora", "--base", "org/name", "--device", "cpu"])
+        self.assertEqual((a.step, a.base, a.device), ("answer", "org/name", "cpu"))
+        self.assertEqual(judge.parser().parse_args(["grade", "x.json"]).step, "grade")
+
+    def test_an_adapter_runs_on_the_base_it_was_trained_on(self):
+        folder = self.dir / "lora"
+        folder.mkdir()
+        self.assertEqual(judge.pinned(folder, "qwen3-0.6b"), {})  # no config: the base's own pin
+        config = {"base_model_name_or_path": "Qwen/Qwen3-0.6B", "revision": "e" * 40, "peft_type": "LORA"}
+        (folder / "adapter_config.json").write_text(json.dumps(config))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(judge.pinned(folder, "qwen3-0.6b"), {"revision": "e" * 40})
+        self.assertIn("loading that", err.getvalue())
+        (folder / "adapter_config.json").write_text(json.dumps({**config, "base_model_name_or_path": "other/model"}))
+        self.assertEqual(judge.pinned(folder, "qwen3-0.6b"), {})
 
 
 if __name__ == "__main__":

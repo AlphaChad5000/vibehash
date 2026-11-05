@@ -319,6 +319,17 @@ dashboard shows each generation incubating in the open block. `--evo2-rounds N` 
 job's length (default 12). `vibehash testnet --evo` is the first, simpler version: one layer
 of the model, Countdown only.
 
+## The Muse agents: a fine-tune from a sentence
+
+`agents/` puts an LLM (Meta's Muse Spark) on either side of a fine-tune. The Job Architect
+turns a plain-English goal into training chats, settings, test prompts and rules code can
+score, checks every value, and posts the job to the network with `vibehash train` (or trains
+it on one GPU). The Quality Judge then has the fine-tune, the base model and the base model
+told the goal answer prompts the fine-tune never saw, and compares each pair blind, twice.
+The site around them (a request form, live progress, the judged results) stays in the
+hackathon repository, github.com/Luh-Labs-LLC/muse-finetune-agents. Read `agents/README.md`;
+the agents aren't part of the `vibehash` package.
+
 ## Logs and records
 
 What a worker or a job poster does is also kept in files, so a night of
@@ -580,6 +591,7 @@ rule; `tests/test_setup.py` runs `setup` and `worker` with no terminal.
 
 | File | What it does |
 |---|---|
+| `agents/` | The Muse agents: a plain-English goal in, a judged fine-tune out, on the network or one GPU (`agents/README.md`) |
 | `vibehash/crypto.py` | Ed25519 (OpenSSL, or RFC 8032 pure-Python fallback), hashing, Merkle trees |
 | `vibehash/model.py` | Reference workload: multi-layer MLP with deterministic, replayable SGD (float32 or float64); dataset loading |
 | `vibehash/compute.py` | Compute backends: NumPy on CPU, PyTorch on NVIDIA / Intel / Apple / AMD GPUs; device detection |

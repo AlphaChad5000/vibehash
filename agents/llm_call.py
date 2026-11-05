@@ -1,12 +1,11 @@
-"""One function both agents share: send messages to a hosted chat model, get its reply back.
+"""One function the agents share: send messages to a hosted chat model, get its reply back.
 
 An LLM API is just an HTTP POST to `<base URL>/chat/completions`, in the shape OpenAI made and most providers copy.
 Meta's Model API speaks it, and it's the default here: Muse Spark at https://api.meta.ai/v1, with a bearer key.
 
     MODEL_API_KEY   your Meta key, from the API keys tab of the Model API dashboard at https://dev.meta.ai (the name
                     Meta's own docs use; META_API_KEY, LiteLLM's name, works too). That's all Muse Spark needs.
-    LLM_MODEL       another model: muse-spark-1.3 is the default, the one Meta's docs recommend for new work (1.1
-                    and 1.2 cost the same).
+    LLM_MODEL       another model: muse-spark-1.3 is the default, the one Meta's docs recommend for new work.
 
 Any other OpenAI-compatible provider works by setting all three of these, which also override the Meta defaults:
 
@@ -14,13 +13,18 @@ Any other OpenAI-compatible provider works by setting all three of these, which 
     LLM_API_KEY     its key (a Meta key is only ever sent to Meta)
     LLM_MODEL       the model's name as the provider spells it
 
-and LLM_REASONING_EFFORT (minimal, low, medium, high, ...) is sent as `reasoning_effort` when it's set. Keys stay in
-the environment, never in a file that gets committed, and never in anything this prints or raises.
+and LLM_REASONING_EFFORT (minimal, low, medium, high, ...) is sent as `reasoning_effort` when it's set. Settings can
+also go in .env.local (or .env) at the top of the repository, one KEY=value a line; git ignores both, and the
+environment wins over the file. Keys never appear in anything this prints or raises. To check the settings with one
+short call:
+
+    python agents/llm_call.py
 
 Replies from reasoning models are messy, so `chat_json` takes the first complete JSON object out of whatever comes
 back (prose, ``` fences, a <think> block first). A provider that refuses `response_format` or `temperature` gets the
-request again without it; 429s and 5xx answers are retried a few times with backoff. Everything else becomes an
-LLMError whose message says what to do. No SDK on purpose, so nothing hides what goes over the wire.
+request again without it; 429s, 5xx answers, timeouts, dropped connections and garbled bodies are retried with
+backoff. Everything else becomes an LLMError whose message says what to do. No SDK on purpose, so nothing hides what
+goes over the wire.
 """
 from __future__ import annotations
 
@@ -29,26 +33,43 @@ import os
 import random
 import re
 import socket
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 META_BASE = "https://api.meta.ai/v1"
 META_MODEL = "muse-spark-1.3"
 META_KEYS = ("MODEL_API_KEY", "META_API_KEY")  # Meta's docs' name, then LiteLLM's
 TIMEOUT_S = 600  # a reasoning model writing 60 examples can think for minutes before it sends a byte
-RETRIES = 3  # after the first try, for 429 and 5xx (Meta's docs: 3-5 attempts, exponential backoff with jitter)
-MAX_WAIT_S = 60.0  # the longest a Retry-After is honoured for
+RETRIES = 5  # after the first try: rate limits and overloads outlast a few seconds, so the waits grow to over a minute
+MAX_WAIT_S = 80.0  # the longest single wait, from Retry-After or the backoff
 OPTIONAL = ("response_format", "temperature", "reasoning_effort")  # dropped, once each, if the provider refuses them
 _sleep = time.sleep  # tests make waiting instant
+
+
+def load_env_file() -> None:
+    """KEY=value lines from .env.local or .env at the repository's top, for whatever the environment doesn't set."""
+    for name in (".env.local", ".env"):
+        path = Path(__file__).resolve().parent.parent / name
+        if path.exists():
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
+                line = line.strip().removeprefix("export ").removeprefix("$env:")  # bash or PowerShell lines too
+                key, sep, value = line.partition("=")
+                if sep and key and not key.startswith("#"):
+                    os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+load_env_file()
 
 
 class LLMError(Exception):
     """The model couldn't be asked, or its answer can't be used. The message says why, and never holds the key."""
 
 
-class NotJSON(LLMError):
+class NotJSON(LLMError, ValueError):
     """The model answered, twice, without a JSON object: this answer is unusable, but the API itself works."""
 
 
@@ -71,6 +92,11 @@ def describe(env=None) -> dict:
     return {"provider": s["provider"], "base_url": s["base_url"], "model": s["model"]}
 
 
+def model_name(env=None) -> str:
+    """The model the agents are talking to, recorded with each run so the results page names it."""
+    return settings(env)["model"]
+
+
 def _problems(s: dict) -> list[str]:
     out = []
     parts = urllib.parse.urlsplit(s["base_url"])
@@ -80,9 +106,9 @@ def _problems(s: dict) -> list[str]:
         out.append(f"LLM_BASE_URL is plain http to {parts.hostname}: the key would cross the internet unencrypted "
                    "(use https)")
     if s["provider"] == "meta" and not s["key"]:
-        out.append("no Meta API key: make one in the API keys tab at https://dev.meta.ai, then set MODEL_API_KEY "
-                   "(PowerShell: $env:MODEL_API_KEY = \"...\"; bash: export MODEL_API_KEY=...). agents/README.md "
-                   "has the steps")
+        out.append("no Meta API key: make one in the API keys tab at https://dev.meta.ai, then set MODEL_API_KEY in "
+                   ".env.local or the environment (PowerShell: $env:MODEL_API_KEY = \"...\"; bash: export "
+                   "MODEL_API_KEY=...). agents/README.md has the steps")
     if not s["model"]:
         out.append("set LLM_MODEL to the model's name as your provider spells it")
     return out
@@ -107,9 +133,9 @@ def _error_detail(body: bytes) -> tuple[str, str | None, str | None]:
     return text.strip()[:300] or "(no details)", None, None
 
 
-def _advice(status: int, message: str, code, s: dict) -> str:
+def _advice(status: int, message: str, code, s: dict, model: str) -> str:
     """What a failed request means, in plain words: Meta's documented codes, which other providers mostly share."""
-    where, model = s["base_url"], s["model"]
+    where = s["base_url"]
     low = f"{message} {code or ''}".lower()
     if status == 401:
         return (f"{where} refused the key (401): it's missing, mistyped or revoked. Make a new one at "
@@ -138,13 +164,26 @@ def _advice(status: int, message: str, code, s: dict) -> str:
 def _retry_after(headers) -> float | None:
     try:
         return max(0.0, min(MAX_WAIT_S, float(headers.get("Retry-After"))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # missing, or a date
         return None
 
 
-def chat(messages: list[dict], *, json_mode: bool = False, temperature: float | None = 0.2, env=None) -> str:
-    """The model's reply to `messages` ({"role", "content"} dicts), as text. LLMError if it can't be had."""
+def _backoff(waits: int) -> float:
+    return min(MAX_WAIT_S, 5 * 2 ** waits + random.random())  # about 5, 10, 20, 40, 80 s
+
+
+def _wait(base: str, why: str, seconds: float) -> None:
+    print(f"{base}: {why}; trying again in {seconds:.0f} s", file=sys.stderr, flush=True)
+    _sleep(seconds)
+
+
+def chat(messages: list[dict], *, json_mode: bool = False, temperature: float | None = 0.2, model: str | None = None,
+         env=None) -> str:
+    """The model's reply to `messages` ({"role", "content"} dicts), as text: from the configured model, or from
+    `model` on the same provider (a second judge). LLMError if it can't be had."""
     s = settings(env)
+    if model:
+        s["model"] = model
     if problems := _problems(s):
         raise LLMError("; ".join(problems))
     env = os.environ if env is None else env
@@ -158,13 +197,12 @@ def chat(messages: list[dict], *, json_mode: bool = False, temperature: float | 
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if s["key"]:
         headers["Authorization"] = f"Bearer {s['key']}"
-    url, waits, dropped = f"{s['base_url']}/chat/completions", 0, set()
+    url, base, waits, dropped = f"{s['base_url']}/chat/completions", s["base_url"], 0, set()
     while True:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
                 raw = r.read()
-            break
         except urllib.error.HTTPError as e:
             detail = e.read()
             e.close()
@@ -180,28 +218,35 @@ def chat(messages: list[dict], *, json_mode: bool = False, temperature: float | 
                     continue
             if (e.code == 429 or (e.code >= 500 and e.code != 504)) and waits < RETRIES:
                 wait = _retry_after(e.headers)
-                _sleep(wait if wait is not None else min(MAX_WAIT_S, 2 ** waits + random.random()))
+                _wait(base, f"answered {e.code}", wait if wait is not None else _backoff(waits))
                 waits += 1
                 continue
-            raise LLMError(f"{_advice(e.code, message, code, s)}. It said: {message}") from None
+            raise LLMError(f"{_advice(e.code, message, code, s, s['model'])}. It said: {message}") from None
         except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
             reason = getattr(e, "reason", e)
-            if isinstance(reason, (socket.timeout, TimeoutError)) or isinstance(e, (socket.timeout, TimeoutError)):
-                raise LLMError(f"{s['base_url']} sent nothing back for {TIMEOUT_S} s; try again, ask for less, or set "
-                               "LLM_REASONING_EFFORT=low") from None
-            if waits < 1:  # a dropped connection: once more
+            timed_out = isinstance(reason, (socket.timeout, TimeoutError)) or isinstance(e, (socket.timeout, TimeoutError))
+            if waits < RETRIES:  # a dropped connection, DNS, a timeout: worth another try, like an overload
+                _wait(base, "no answer (timed out)" if timed_out else f"no answer ({_redact(str(reason), s['key'])})",
+                      _backoff(waits))
                 waits += 1
-                _sleep(1.0)
                 continue
-            raise LLMError(f"can't reach {s['base_url']}: {_redact(str(reason), s['key'])}. Check the address and "
-                           "your connection") from None
-    try:
-        reply = json.loads(raw)
-        choice = reply["choices"][0]
-        message = choice.get("message") or {}
-    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-        raise LLMError(f"{s['base_url']} answered with something that isn't a chat completion: "
-                       f"{_redact(raw.decode('utf-8', errors='replace')[:200], s['key'])!r}") from None
+            if timed_out:
+                raise LLMError(f"{base} sent nothing back for {TIMEOUT_S} s, {RETRIES + 1} times; try again, ask for "
+                               "less, or set LLM_REASONING_EFFORT=low") from None
+            raise LLMError(f"can't reach {base}: {_redact(str(reason), s['key'])}. Check the address and your "
+                           "connection") from None
+        try:
+            reply = json.loads(raw)
+            choice = reply["choices"][0]
+            message = choice.get("message") or {}
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            if waits < RETRIES:  # a proxy's error page or a cut-off body: usually gone on the next try
+                _wait(base, "answered with something that isn't a chat completion", _backoff(waits))
+                waits += 1
+                continue
+            raise LLMError(f"{base} answered with something that isn't a chat completion: "
+                           f"{_redact(raw.decode('utf-8', errors='replace')[:200], s['key'])!r}") from None
+        break
     content = message.get("content")
     if isinstance(content, list):  # content parts, as some providers send them
         content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
@@ -237,18 +282,25 @@ def first_json_object(text: str) -> dict:
     raise ValueError("no JSON object in the reply")
 
 
-def chat_json(messages: list[dict], *, temperature: float | None = 0.2, env=None) -> dict:
+def chat_json(messages: list[dict], *, temperature: float | None = 0.2, model: str | None = None, env=None) -> dict:
     """chat(), asking for JSON and parsed. One more try, saying what was wrong, if the reply holds no JSON object."""
-    text = chat(messages, json_mode=True, temperature=temperature, env=env)
+    text = chat(messages, json_mode=True, temperature=temperature, model=model, env=env)
     try:
         return first_json_object(text)
     except ValueError:
         pass
+    print("the reply wasn't one JSON object; asking again", file=sys.stderr, flush=True)
     text = chat(messages + [{"role": "assistant", "content": text},
                             {"role": "user", "content": "That had no JSON object in it. Reply with only the JSON "
                                                         "object, nothing else."}],
-                json_mode=True, temperature=temperature, env=env)
+                json_mode=True, temperature=temperature, model=model, env=env)
     try:
         return first_json_object(text)
     except ValueError:
-        raise NotJSON(f"{settings(env)['model']} didn't reply with JSON, twice. It began: {text[:200]!r}") from None
+        raise NotJSON(f"{model or settings(env)['model']} didn't reply with JSON, twice. It began: {text[:200]!r}") from None
+
+
+if __name__ == "__main__":
+    s = settings()
+    print(f"{s['model']} at {s['base_url']}:",
+          chat_json([{"role": "user", "content": 'Reply with exactly this JSON: {"ok": true}'}]))
