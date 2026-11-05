@@ -850,7 +850,7 @@ Flags:
 - `--id ID`: the job's name (default my-first-job).
 - `--gpu`: a larger float32 model sized for GPUs.
 - `--evo MODEL`: an Evo job on MODEL that never ends, taking its tasks in turn: a genesis starter job (genesis create --es --starter-job).
-- `--tasks TASKS`: with --evo: the tasks, comma-separated, or all (the default).
+- `--tasks TASKS`: with --evo: the tasks, comma-separated, curated (the default: the ones a small model learns from) or all.
 - `--rounds ROUNDS`: with --evo: rounds on each task before the next (default 12).
 
 Examples:

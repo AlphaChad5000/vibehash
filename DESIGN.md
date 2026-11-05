@@ -307,7 +307,7 @@ round it completes work instead of almost never, as in lottery mining.
     ready for (`Coordinator.active_job_id`), so it never takes a turn from a
     job someone pays for. It can be an Evo job on a genesis with
     `"es": true`: `vibehash job template --evo MODEL` writes one whose
-    `tasks` (all 19 by default) take turns, `--rounds` (12) rounds each, the
+    `tasks` (es_tasks.CURATED's 17 by default) take turns, `--rounds` (12) rounds each, the
     learning rate's cosine starting again with each task (`es2.task_at`,
     `es2.lr_at`), as the testnet's short jobs do one after another, but in one
     job and one line. A round's task follows from its step, which every node

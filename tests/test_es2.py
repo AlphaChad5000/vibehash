@@ -167,6 +167,64 @@ class AnchorTests(unittest.TestCase):
             np.testing.assert_allclose(cw.d[n].numpy(), child[n] - base[n], atol=1e-6)
 
 
+class FormatTests(unittest.TestCase):
+    """es_tasks.lenient: a right answer counts with or without its <answer> tags, so a job's reward (Spec2.lenient) and
+    the progress checker's scores are for being right, not for writing the tags; and the curated mix."""
+
+    def check(self, text, gold, kind):
+        from vibehash import es_tasks as t
+        make = {"letter": t._letter_check, "number": t._number_check, "words": lambda g: t._words_check([g])}[kind]
+        item = t.Item([], make(gold), gold)
+        return item.check(text), t.lenient(item).check(text)
+
+    def test_right_answers_without_tags_count(self):
+        for text, gold, kind in (("B", "B", "letter"), ("(C)", "C", "letter"), ("B. Sports", "B", "letter"),
+                                 ("The answer is D.", "D", "letter"), ("Answer: (A)", "A", "letter"),
+                                 ("So 3 + 4 = 7. That makes 7", "7", "number"), ("1,250 dollars", "1250", "number"),
+                                 ("Yes, because it rains", "yes", "words"), ("no.", "no", "words"),
+                                 ("Paris.", "Paris", "words")):
+            self.assertEqual(self.check(text, gold, kind), (False, True), text)
+
+    def test_wrong_or_unclear_answers_dont(self):
+        for text, gold, kind in (("A dog would bark", "A", "letter"), ("I think it's B", "B", "letter"),
+                                 ("C", "B", "letter"), ("The answer is C", "B", "letter"), ("7 or 8", "7", "number"),
+                                 ("No, yes", "yes", "words"), ("", "B", "letter")):
+            self.assertFalse(self.check(text, gold, kind)[1], text)
+
+    def test_tags_win_when_there_are_any(self):
+        self.assertEqual(self.check("<answer>C</answer>", "C", "letter"), (True, True))
+        self.assertEqual(self.check("B <answer>C</answer>", "B", "letter"), (False, False))
+
+    def test_the_spec_field_and_the_rounds(self):
+        spec = AnchorTests().spec(lenient=True)
+        self.assertEqual(spec.problems_list(), [])
+        self.assertIs(spec.to_json()["es"]["lenient"], True)
+        self.assertNotIn("lenient", AnchorTests().spec().to_json()["es"], "strict: the spec byte for byte as before")
+        self.assertEqual(es2.Spec2.from_json(spec.to_json()), spec)
+        self.assertTrue(AnchorTests().spec(lenient=1).problems_list())
+        strict, loose = es2_rounds.items(AnchorTests().spec(), 5, 0), es2_rounds.items(spec, 5, 0)
+        self.assertEqual([p.messages for p in strict], [p.messages for p in loose])
+        gold = loose[0].gold
+        self.assertEqual((strict[0].check(gold), loose[0].check(gold)), (False, True))
+
+    def test_the_curated_mix(self):
+        from vibehash import es_local, es_tasks
+        self.assertTrue(set(es_tasks.CURATED) <= set(es_tasks.NAMES))
+        self.assertFalse({"trivia_qa", "nq_open", "web_questions", "countdown", "arithmetic"} & set(es_tasks.CURATED))
+        self.assertEqual(es_tasks.NAMES[:19][-1], "boolq", "the first nineteen keep their places")
+        self.assertIs(es_local.V2_SETTINGS["lenient"], True)
+        t = es_tasks
+        piqa = t.HUB["piqa"][-1]({"goal": "Open a jar", "sol1": "Twist the lid", "sol2": "Eat the lid", "label": 0})
+        self.assertEqual((piqa.gold, piqa.messages[0]["content"].splitlines()[2]), ("A", "A. Twist the lid"))
+        siqa = t.HUB["social_iqa"][-1]({"context": "Ash cooked.", "question": "What next?", "answerA": "eat",
+                                        "answerB": "sleep", "answerC": "run", "label": "2"})
+        self.assertEqual(siqa.gold, "B")
+        arc = t.HUB["arc_challenge"][-1]({"question": "Q?", "choices": {"label": ["A", "B", "C", "D"],
+                                                                         "text": ["w", "x", "y", "z"]},
+                                          "answerKey": "C"})
+        self.assertEqual(arc.gold, "C")
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class StarterTemplateTests(unittest.TestCase):
     def test_an_evo_starter_job_from_the_template_goes_into_a_genesis(self):

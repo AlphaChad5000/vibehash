@@ -71,6 +71,9 @@ class Spec2(es.EsSpec):
     # The change's share given back to the base before each round's step (the anchor; see the module's docstring). A
     # power of two's reciprocal (1/64) keeps 1 - decay exact in float32. 0: left out of the spec, as before it.
     decay: float = 0.0
+    # Answers scored by es_tasks.lenient: a right answer counts with or without its <answer> tags, so the reward is for
+    # being right, not for the format. False: left out of the spec, as before it.
+    lenient: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -110,6 +113,8 @@ class Spec2(es.EsSpec):
             out.append("start is at most 64 [job id, weight in -4..4, params_hash]")
         if not (isinstance(self.decay, float) and 0.0 <= self.decay <= 0.5):
             out.append("decay is 0 to 0.5")
+        if not isinstance(self.lenient, bool):
+            out.append("lenient is true or false")
         if self.rank != 1 or self.rule != RULE2 or self.precision != "float32":
             out.append("rank is 1, rule 2, precision float32")
         return out
@@ -132,14 +137,15 @@ class Spec2(es.EsSpec):
                        "lr_floor": self.lr_floor, "rounds": self.rounds, "replay": self.replay,
                        "start": [[j, w, h] for j, w, h in self.start], "check": self.check, "margin": self.margin,
                        "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {}),
-                       **({"decay": self.decay} if self.decay else {})}}
+                       **({"decay": self.decay} if self.decay else {}),
+                       **({"lenient": True} if self.lenient else {})}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Spec2":
         e = d["es"]
         known = {"rule", "tensors", "n", "tensors_sha", "task", "pairs", "pairs_per_unit", "problems", "max_tokens",
                  "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks",
-                 "decay"}
+                 "decay", "lenient"}
         if set(e) - known:
             raise ValueError(f"a rule-2 ES spec has no field {sorted(set(e) - known)[0]!r}")
         if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list) for k in ("start", "tasks")):
@@ -152,7 +158,7 @@ class Spec2(es.EsSpec):
                    replay=int(e["replay"]), start=tuple(tuple(s) for s in e.get("start", [])),
                    check=int(e["check"]), margin=float(e["margin"]), lp_tol=float(e["lp_tol"]),
                    rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])),
-                   decay=float(e.get("decay", 0.0)))
+                   decay=float(e.get("decay", 0.0)), lenient=e.get("lenient", False))
 
 
 def is_v2(d) -> bool:

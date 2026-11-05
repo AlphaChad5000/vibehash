@@ -17,9 +17,11 @@ from .crypto import h256
 
 
 def items(spec, round_seed: int, step: int = 0) -> list:
-    """The round's problems (es_tasks.Item), drawn from its seed, of the task its step has (es2.task_at)."""
+    """The round's problems (es_tasks.Item), drawn from its seed, of the task its step has (es2.task_at); with the
+    spec's `lenient`, each checked by es_tasks.lenient (a right answer counts without its tags)."""
     from . import es_tasks
-    return es_tasks.get(es2.task_at(spec, step)).items(round_seed, spec.problems)
+    got = es_tasks.get(es2.task_at(spec, step)).items(round_seed, spec.problems)
+    return [es_tasks.lenient(p) for p in got] if getattr(spec, "lenient", False) else got
 
 
 def claim_root(answers_sha: str, rewards: list, lps: list | None) -> bytes:

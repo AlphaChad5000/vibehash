@@ -821,7 +821,8 @@ def _evo_template(a, out: Path):
     its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
     from . import es_local, es_tasks
 
-    tasks = list(es_tasks.NAMES) if a.tasks == "all" else [t.strip() for t in a.tasks.split(",") if t.strip()]
+    tasks = (list(es_tasks.NAMES) if a.tasks == "all" else list(es_tasks.CURATED) if a.tasks == "curated"
+             else [t.strip() for t in a.tasks.split(",") if t.strip()])
     unknown = [t for t in tasks if t not in es_tasks.NAMES]
     if unknown or not tasks:
         sys.exit(f"unknown task {unknown[0] if unknown else '(none given)'}: the tasks are {', '.join(es_tasks.NAMES)}")
@@ -1726,7 +1727,7 @@ def _testnet(a, held: list) -> None:
         if evo2:
             from . import es_tasks
             evo2_tasks = []
-            for t in es_tasks.NAMES:  # the tasks this computer can serve (ARC-Easy needs `datasets` and a download)
+            for t in es_tasks.CURATED:  # the tasks this computer can serve (they need `datasets` and a download)
                 try:
                     es_tasks.get(t).items(0, 1)
                     evo2_tasks.append(t)
@@ -2260,7 +2261,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu", action="store_true", help="a larger float32 model sized for GPUs")
     p.add_argument("--evo", metavar="MODEL", help="an Evo job on MODEL that never ends, taking its tasks in turn: a "
                                                   "genesis starter job (genesis create --es --starter-job)")
-    p.add_argument("--tasks", default="all", help="with --evo: the tasks, comma-separated, or all (the default)")
+    p.add_argument("--tasks", default="curated", help="with --evo: the tasks, comma-separated, curated (the default: "
+                   "the ones a small model learns from) or all")
     p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
     p.set_defaults(fn=cmd_job_template)
 

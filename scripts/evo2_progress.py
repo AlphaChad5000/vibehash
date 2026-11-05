@@ -5,8 +5,9 @@ Jobs run one at a time, each starting where the last ended, so a finished job's 
 Its change is rebuilt from its parents (es2.Spec2.start: [[job, weight, params_hash], ...]) and its rounds' entries
 (es2.rebuild), as a worker rebuilds it. Only the newest few changes stay in RAM (one is 1.4 GB in float32), and the
 newest scored one on disk (bf16), so a restart carries on from there. Scores: greedy, 64 tokens, 200 items a task
-(es_tasks' eval items; GSM8K and ARC-Challenge test items for the never-trained pair), in bf16 on the GPU, beside the
-miners.
+(es_tasks.CURATED's eval items; GSM8K and MMLU test items for the never-trained pair, which no task draws from), in bf16
+on the GPU, beside the miners. Every reply is scored by es_tasks.lenient, so a right answer without its <answer> tags
+counts for the base model too and a gain in the score is a gain in being right, not in the format.
 
   python scripts/evo2_progress.py [--node http://127.0.0.1:8545] [--dir ~/.vibehash/testnet-evo2] [--watch 300]
 """
@@ -43,26 +44,36 @@ def _gsm8k_items():
     return out
 
 
-def _arc_challenge_items():
+def _mmlu_items():
+    """MMLU's test questions (all 57 subjects), N_EVAL of them in a fixed shuffled order, answered with a letter."""
     from datasets import load_dataset
-    rows = load_dataset("allenai/ai2_arc", "ARC-Challenge")["test"]
-    order = es_tasks._draw(b"evo2 arc_challenge eval").shuffle(range(len(rows)))[:N_EVAL]
-    return [es_tasks._arc_item(rows[i]) for i in order]
+    rows = load_dataset("cais/mmlu", "all", revision="c30699e8356da336a370243923dbaf21066bb9fe", split="test")
+    order = es_tasks._draw(b"evo2 mmlu eval").shuffle(range(len(rows)))
+    out = []
+    for i in order:
+        it = es_tasks._mc(rows[i]["question"], rows[i]["choices"], int(rows[i]["answer"]))
+        if it is not None:
+            out.append(it)
+            if len(out) == N_EVAL:
+                break
+    return out
 
 
-def eval_sets() -> dict:
+def eval_sets(names=None) -> dict:
+    """{name: items}, every check lenient (es_tasks.lenient): es_tasks.CURATED's held-out items (or `names`'), then
+    GSM8K's and MMLU's, which no Evo task trains on."""
     sets = {}
-    for name in es_tasks.NAMES:
+    for name in names or es_tasks.CURATED:
         try:
             sets[name] = es_tasks.get(name).eval_items()
         except es_tasks.TaskUnavailable as e:
             print(f"note: no {name} scores: {e}", file=sys.stderr)
-    for name, make in (("gsm8k (never trained)", _gsm8k_items), ("arc_challenge (never trained)", _arc_challenge_items)):
+    for name, make in (("gsm8k (never trained)", _gsm8k_items), ("mmlu (never trained)", _mmlu_items)):
         try:
             sets[name] = make()
         except Exception as e:  # noqa: BLE001 - no datasets library or no network: score without it
             print(f"note: no {name} scores: {e}", file=sys.stderr)
-    return sets
+    return {name: [es_tasks.lenient(i) for i in items] for name, items in sets.items()}
 
 
 class Chain:

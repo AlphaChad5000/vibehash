@@ -1,9 +1,9 @@
 """Score an Evo v2 line against its base model: did the training help or hurt?
 
 Loads a line a miner saved (`~/.vibehash/cache/evo2-lines/JOB.pt`, es_client._save_line) and scores the base model and
-base + the line's change the way scripts/evo2_progress.py does: greedy, 64 tokens, 200 items a set, every es_tasks task
-plus GSM8K and ARC-Challenge test items, which no Evo job trains on. Prints a table and writes JSON. Reads the line
-only; needs no node.
+base + the line's change the way scripts/evo2_progress.py does: greedy, 64 tokens, 200 items a set, es_tasks.CURATED
+plus GSM8K and MMLU test items, which no Evo job trains on; every reply scored by es_tasks.lenient. Prints a table and
+writes JSON. Reads the line only; needs no node.
 
   python scripts/evo2_score_line.py ~/.vibehash/cache/evo2-lines/evo2-c2-emotion.pt [--model Qwen/Qwen2.5-0.5B-Instruct]
       [--out scores.json]

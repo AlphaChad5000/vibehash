@@ -13,7 +13,17 @@ version, which the node and every worker have to agree on.
   science, commonsense, reading, word-problem math, trivia, sentiment, news topics and emotions. Multiple choice is
   answered with a letter, math with a number, trivia with a few words checked against the dataset's accepted answers.
 
-NAMES is the order Evo Hash trains them in, one short job each: the first three, then the rest mixed by kind.
+NAMES is every task a job may name (the first nineteen in the order Evo Hash first trained them; ARC-Challenge, PIQA
+and Social IQa came later). CURATED is what Evo Hash trains on now: the tasks a small model can learn from, measured on
+Qwen2.5-0.5B-Instruct (2026-11-05, 200 held-out items each): trivia_qa (0.5% right), nq_open (0%) and web_questions
+(0.5%) ask for facts the model doesn't hold, which reward-driven training can't add; countdown and arithmetic are
+puzzles no one benchmarks. GSM8K and MMLU stay out of every task, so a tuned model can be scored on them as never seen.
+
+`lenient(item)`: the same problem, its check also taking a right answer given without the <answer> tags ("B", "(B)",
+"The answer is B", the last number, a leading yes or no). A job whose spec says `lenient` (es2.Spec2) is scored that
+way, so its reward is for being right, not for writing the tags: the base model leaves them out of a quarter to a half
+of its replies on some tasks (boolq 49.5% in format), and a strict check pays a model for learning the tags, which
+reads as a gain that standard benchmarks don't see.
 """
 from __future__ import annotations
 
@@ -30,7 +40,10 @@ EVAL_N = 200
 MAX_CHARS = 320
 NAMES = ("countdown", "arithmetic", "arc_easy", "sciq", "svamp", "trivia_qa", "commonsense_qa", "sst2", "openbookqa",
          "asdiv", "nq_open", "winogrande", "ag_news", "qasc", "aqua_rat", "web_questions", "hellaswag", "emotion",
-         "boolq")
+         "boolq", "arc_challenge", "piqa", "social_iqa")
+# What Evo Hash trains on (see the docstring): the knowledge benchmarks first, then commonsense, math, classification.
+CURATED = ("arc_easy", "sciq", "commonsense_qa", "openbookqa", "arc_challenge", "piqa", "social_iqa", "qasc",
+           "winogrande", "hellaswag", "boolq", "aqua_rat", "svamp", "asdiv", "sst2", "ag_news", "emotion")
 MAX_LONG = 520  # a Hugging Face task's longest prompt, in characters (about 150 tokens)
 POOL = 20_000  # the most rows a task keeps the indices of for each part
 
@@ -42,6 +55,48 @@ class TaskUnavailable(RuntimeError):
 def last_answer(text: str):
     found = _ANS.findall(text)
     return found[-1].strip() if found else None
+
+
+_LETTER_ALONE = re.compile(r"^\(?([A-H])\)?(?:[.):]|$)")  # "B", "B.", "B)", "(B)", "B: ..." (not "A dog ...")
+_LETTER_SAID = re.compile(r"\banswer(?:\s+is)?\s*[:\-]?\s*\(?([A-H])\b", re.I)  # "the answer is B", "Answer: (C)"
+_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_YES_NO = re.compile(r"^(yes|no)\b", re.I)
+
+
+def salvage(text: str, gold: str) -> str | None:
+    """A reply's answer when it has no <answer> tags, read the way the item's gold is written: a letter (alone at the
+    start, or after "answer is"), a number (the last one), yes or no (the first word), or a short reply as a whole.
+    None if there's nothing to read."""
+    t = text.strip()
+    if len(gold) == 1 and gold in LETTERS:
+        said = [m.group(1).upper() for m in _LETTER_SAID.finditer(t)]
+        if said:
+            return said[-1]
+        m = _LETTER_ALONE.match(t)
+        return m.group(1) if m else None
+    try:
+        float(gold)
+        nums = _NUMBER.findall(t)
+        return nums[-1].replace(",", "") if nums else None
+    except ValueError:
+        pass
+    if gold.lower() in ("yes", "no"):
+        m = _YES_NO.match(t)
+        return m.group(1).lower() if m else None
+    return t.rstrip(".") if 0 < len(t) <= 60 and "\n" not in t else None
+
+
+def lenient(item: "Item") -> "Item":
+    """The item, its check also taking a right answer given without tags (`salvage`); a reply with tags is checked as
+    before."""
+    strict = item.check
+
+    def ok(text: str) -> bool:
+        if last_answer(text) is not None:
+            return strict(text)
+        a = salvage(text, item.gold)
+        return a is not None and strict(f"<answer>{a}</answer>")
+    return Item(item.messages, ok, item.gold)
 
 
 @dataclass(frozen=True)
@@ -292,7 +347,8 @@ class HubTask:
         if self._d is None:
             try:
                 from datasets import load_dataset
-                self._d = load_dataset(self.repo, self.config, revision=self.revision)
+                kw = self.config if isinstance(self.config, dict) else {"name": self.config}
+                self._d = load_dataset(self.repo, revision=self.revision, **kw)
             except Exception as e:  # noqa: BLE001 - no library, no network: the task can't run here
                 raise TaskUnavailable(f"{self.name} needs the `datasets` library and its download: {e}") from None
         return self._d
@@ -370,6 +426,19 @@ HUB = {
                               ["sadness", "joy", "love", "anger", "fear", "surprise"], r["label"])),
     "boolq": ("google/boolq", None, "35b264d03638db9f4ce671b711558bf7ff0f80d5", "train", _half("validation", True),
               _half("validation", False), _boolq),
+    # Added 2026-11-05 for the curated mix. PIQA and Social IQa are loading scripts upstream, which `datasets` no
+    # longer runs: these are Hugging Face's parquet conversions, pinned at their commits. PIQA's test answers are
+    # hidden, so its held-out items are half of validation, as Social IQa's (it has no test split).
+    "arc_challenge": ("allenai/ai2_arc", "ARC-Challenge", "210d026faf9955653af8916fad021475a3f00453", "train", "test",
+                      "validation", lambda r: _labelled(r, r["question"])),
+    "piqa": ("ybisk/piqa", {"data_dir": "plain_text"}, "142c51238b3ca2bc61e9a075913871b8b600e8e1", "train",
+             _half("validation", True), _half("validation", False),
+             lambda r: _mc(f"Which is the better way to do this?\n{r['goal']}", [r["sol1"], r["sol2"]],
+                           int(r["label"]))),
+    "social_iqa": ("allenai/social_i_qa", None, "537a2ec8ec565adc0b70b70752893e59e024df26", "train",
+                   _half("validation", True), _half("validation", False),
+                   lambda r: _mc(f"{r['context'].strip()}\n{r['question'].strip()}",
+                                 [r["answerA"], r["answerB"], r["answerC"]], int(r["label"]) - 1)),
 }
 
 _TASKS: dict = {}
