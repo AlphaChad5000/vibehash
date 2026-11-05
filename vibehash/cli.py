@@ -473,24 +473,42 @@ def _chosen_job(api: NodeClient, job: str, url: str) -> None:
 
 
 def cmd_devices(a):
-    from .compute import TorchBackend, list_devices, self_test, torch_available
+    from .compute import HUNG, TorchBackend, list_devices, self_test, torch_available
 
+    if not a.json:
+        print("Testing each device with a tiny training step (the first run on a GPU can take a minute)...",
+              flush=True)
     found = [(d, None if d.id == "cpu" else self_test(TorchBackend(d.id))) for d in list_devices()]
     if a.json:
         print(json.dumps([{"id": d.id, "label": d.label, "ready": p is None, "problem": p} for d, p in found]))
-        return
-    print("Devices this computer can train on (best first):")
-    for d, problem in found:
-        state = "ready" if problem is None else f"NOT USABLE: {problem[:120]}. Update the graphics driver."
-        print(f"  {d.id:<8} {d.label}  [{state}]")
-    if not torch_available():
-        print(f"\nNo GPU support installed. `{prog()} install-gpu` finds your graphics card and installs support for it.")
+    else:
+        print("Devices this computer can train on (best first):")
+        for d, problem in found:
+            state = "ready" if problem is None else f"NOT USABLE: {problem[:120]}. {driver_advice(d.label)}"
+            print(f"  {d.id:<8} {d.label}  [{state}]")
+        if not torch_available():
+            print(f"\nNo GPU support installed. `{prog()} install-gpu` finds your graphics card and installs support for it.")
+    if any(p and p.startswith(HUNG) for _, p in found):
+        # A thread is still stuck in the driver, and the runtime's shutdown can wait on it forever: leave now.
+        sys.stdout.flush()
+        os._exit(0)
+
+
+def driver_advice(label: str) -> str:
+    """Where to get a newer driver for the card `label` names."""
+    low = label.lower()
+    site = ("intel.com (Intel Arc & Iris Xe Graphics driver)" if "intel" in low or "xpu" in low else
+            "amd.com" if "amd" in low or "radeon" in low else "nvidia.com" if "cuda" in low or "nvidia" in low
+            else "your card maker's website")
+    return f"Update the graphics driver from {site}"
 
 
 def _setup_gpu(assume_yes: bool) -> None:
     """Find the GPU, install the PyTorch build for it (after asking), and self-test it."""
     from . import gpusetup
 
+    if torch := gpusetup.installed_torch():
+        print(f"   testing the GPU with PyTorch {torch} (a minute or two the first time)...", flush=True)
     listed = [d for d in gpusetup.devices() if d["id"] != "cpu"]
     if any(d["ready"] for d in listed):
         for d in listed:
@@ -499,7 +517,9 @@ def _setup_gpu(assume_yes: bool) -> None:
         return
     if listed:  # PyTorch sees the card but can't run on it: the driver, not the build, is the problem
         for d in listed:
-            print(f"   {d['label']} isn't usable ({str(d['problem'])[:120]}). Update its graphics driver, then run setup again.")
+            print(f"   {d['label']} isn't usable with PyTorch {gpusetup.installed_torch()} ({str(d['problem'])[:120]}).\n"
+                  f"   {driver_advice(d['label'])}, then run `{prog()} install-gpu` again. Until then training uses "
+                  "the CPU.")
         return
     gpus = gpusetup.detect()
     if not gpus:
@@ -519,6 +539,7 @@ def _setup_gpu(assume_yes: bool) -> None:
     if code := gpusetup.install(build):
         print(f"   the install failed (pip exit code {code}). Training will use the CPU until it's fixed.")
         return
+    print("   testing it (a minute or two the first time)...", flush=True)
     for d in gpusetup.devices():
         print(f"   {d['id']:<8} {d['label']}  [{'ready' if d['ready'] else 'NOT USABLE: ' + str(d['problem'])[:120]}]")
 
