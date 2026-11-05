@@ -15,6 +15,13 @@ REVISIONS = {
     "llama-3.2-1b": None,
 }
 
+# Each base's depth and width, from its config.json: `vibehash train` picks its batch (chats a step) by model size
+# from these (finetune.settings_for), and the architect needs that batch to work out a budget without downloading.
+DIMS = {
+    "qwen3-0.6b": {"layers": 28, "hidden": 1024},
+    "llama-3.2-1b": {"layers": 16, "hidden": 2048},
+}
+
 
 def source(base: str) -> dict:
     """What to pass to from_pretrained for a base model: its repo and pinned snapshot."""
