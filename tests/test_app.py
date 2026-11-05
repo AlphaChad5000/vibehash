@@ -137,7 +137,7 @@ class PrepareTests(AppHome):
         with mock.patch.dict(os.environ, {"VIBEHASH_PASSWORD": "pw"}), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             url2, path2 = app.prepare(SimpleNamespace(gpu="skip"))
         self.assertEqual((url2, path2), (url, path))
-        self.assertIn(address, out.getvalue())  # kept, not made again
+        self.assertIn(address.lower(), out.getvalue().lower())  # kept, not made again (shown checksummed)
 
     def test_without_a_password_and_no_terminal_it_says_what_to_set(self):
         with mock.patch.dict(os.environ, {}, clear=False):
