@@ -40,7 +40,7 @@ from . import advice, crypto, filelock, hardware, mnemonic, modelstore, settings
 from . import economics as econ
 from . import fees
 from . import wallet as wallets
-from .client import NodeClient, NodeError, WorkerClient
+from .client import MIN_CLIENT, NodeClient, NodeError, WorkerClient, too_old
 from .crypto import AddressError, KeyPair, checksummed, parse_address
 from .ledger import Block, Chain, canonical
 from .model import ModelSpec
@@ -333,7 +333,8 @@ def cmd_node(a):
         node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                     keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
                     announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
-                    bucket=bucket_from_env()).start()  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+                    bucket=bucket_from_env(),  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
+                    min_client=a.min_client).start()
     except FolderInUse as e:
         sys.exit(f"error: {e}")
     if context:
@@ -390,6 +391,12 @@ def _mine(a, keys: KeyPair):
     from .wire import MAX_CLOCK_SKEW_S
 
     url = node_of(a)
+    # A worker that can't follow the node's chain (blocks of a version newer than it knows) or that the node won't take
+    # (older than its min_client) stops here, before the GPU's self-test, naming the upgrade. A node from before
+    # these fields says neither, and the worker starts as it always did.
+    problem = too_old(NodeClient(url).get("/status"))
+    if problem:
+        sys.exit(f"error: {problem}")
     job = None if getattr(a, "job", None) in (None, "auto") else a.job
     if job:  # before the GPU's self-test: a mistyped job is said at once
         _chosen_job(NodeClient(url), job, url)
@@ -2014,6 +2021,9 @@ def parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_node)
     _min_fee_flag(p)
     _rate_limit_flags(p)
+    p.add_argument("--min-client", default=MIN_CLIENT, metavar="VERSION",
+                   help=f"the oldest Vibe Hash release whose workers may register (default {MIN_CLIENT}); older ones are "
+                        "told to upgrade. Releases from before this option send no version and are taken as before")
     p.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this PEM certificate (see `tls cert`)")
     p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
 

@@ -545,6 +545,44 @@ changes some (requests a second and burst; the buckets are read, worker, tx,
 upload and other), and `--max-connections N` sets the overall cap. DESIGN.md
 §10 has the numbers.
 
+### The node's API
+
+Every node serves the chain to anyone, as JSON over HTTP(S). The reads:
+
+| Request | What it answers |
+|---|---|
+| `GET /status` | Chain id, genesis hash, height, the round and its phase, the leader, fees, and the versions: `version` (the node's release), `block_version` (the blocks it makes), `tip_version` (the newest block's), `min_client` (the oldest release whose workers it takes) and `paid_rounds` |
+| `GET /genesis` | The genesis document |
+| `GET /blocks?from=N&to=M` | Up to 100 blocks, each with its `hash`, its `proposer`'s address, each transaction's `txid`, and its commit certificate on a chain validators run |
+| `GET /account/ADDRESS` | Balance, stake (and how much is bootstrap stake), unbonding coins, nonce and reputation |
+| `GET /validators` | Each validator's address, stake and whether it has a vote |
+| `GET /job/ID` | A job's spec, budget left, each round's validation score and its model's size and hash |
+| `GET /round/N/record` | The signed messages block N's round was decided from |
+| `GET /network` | What vibehash.org's live panel shows: miners lately and every job |
+| `GET /supply` | How much VIBE exists and where: total, circulating, staked, unbonding, in job budgets, minted and burned, the cap, the subsidy and the next halving, in syn and as VIBE strings |
+| `GET /supply/total`, `GET /supply/circulating` | One plain-text number in VIBE, the format listing sites ask for |
+| `GET /explorer` | A block explorer page (below) |
+
+`POST /tx` takes a signed transaction. The rest are workers' and validators'
+messages; `vibehash/node.py` lists them all.
+
+**The explorer.** Open `http://NODE:8545/explorer` (on the public node,
+`https://node.vibehash.org/explorer`, once it runs a release with it) for a page that shows the chain: height,
+validators and their stake, the supply, the latest blocks, and any block,
+address or job you search for. It's one page served by the node itself, with
+nothing from anywhere else, so it works offline against a local testnet.
+
+**Versions.** Every client sends `User-Agent: vibehash/VERSION`. When a
+node's newest block is a version this copy doesn't know, or its
+`min_client` is newer than this copy, commands say so in one line and carry
+on, and `worker` refuses to start: upgrade with `python -m pip install -U
+vibehash`. A node turns away a worker's registration from a release older
+than its `--min-client` (default 0.5.14) with the same advice. Clients that
+send no version are taken as before.
+
+Exchanges, wallets and listing sites: [EXCHANGES.md](EXCHANGES.md) says how
+to follow the chain, spot deposits, send withdrawals and read the supply.
+
 ## Simulate the economics
 
 Runs the same round logic as a real node, with 14 simulated rigs (7 of them
@@ -602,6 +640,8 @@ rule; `tests/test_setup.py` runs `setup` and `worker` with no terminal.
 | `vibehash/coordinator.py` | The round state machine, shared by the node and the simulator |
 | `vibehash/worker.py` | Training, committing, revealing, verifying (plus cheat modes for tests) |
 | `vibehash/node.py` | HTTP node: API, wall-clock round driver, leading rounds and committing blocks validators agree on |
+| `vibehash/supply.py` | What `/supply` answers: where every coin is and how it came to be, from the chain's state |
+| `vibehash/data/explorer.html` | The block explorer page a node serves at `/explorer` |
 | `vibehash/consensus.py` | Tendermint-style BFT voting among validators; commit certificates |
 | `vibehash/p2p.py` | Peers: gossiping votes and transactions between nodes |
 | `vibehash/replay.py` | Re-runs a block's round from its record: how validators check a proposal |

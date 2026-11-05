@@ -1365,6 +1365,18 @@ validators only vote for blocks of the current version, so once a chain has
 a version 2 block it stays on version 2. Every validator must run a release
 that knows a version before any block of it appears: older nodes refuse it.
 
+**Who runs what.** `/status` names the node's release (`version`), the
+block version it makes (`block_version`), the version of the chain's newest
+block (`tip_version`) and the oldest release whose workers it takes
+(`min_client`, `vibehash node --min-client`). Clients send `User-Agent:
+vibehash/VERSION`. A client whose code knows fewer block versions than the
+tip's, or that is older than `min_client`, says so in one line and carries
+on, and a worker in that state won't start, since it couldn't follow the
+chain. A node answers a worker's `register` from a release below its
+`min_client` with a 400 naming the upgrade. It's a nudge, not a rule: a
+client that names no version is taken as before, and anyone can send any
+User-Agent. Validators agreeing on an upgrade is still to do (§9).
+
 Version 3 lets a post_job be a fine-tune (`tasks.is_finetune_spec`, §8): earlier versions refuse one, as the nodes
 before them did, so a chain holds none until its validators all know them.
 
