@@ -312,7 +312,12 @@ round it completes work instead of almost never, as in lottery mining.
     `es2.lr_at`), as the testnet's short jobs do one after another, but in one
     job and one line. A round's task follows from its step, which every node
     and worker reads from the job's state; a replay target keeps its own
-    round's task (its place in the job's history is its step). A starter job that trains on an
+    round's task (its place in the job's history is its step). Its step is
+    anchored (`es2.Spec2.decay`, 1/64 with lr 1e-3): before each round's
+    step the weight change gives back that share of itself, so a job that
+    never ends stays near its base model instead of drifting away (unanchored,
+    the Evo v2 step broke Qwen2.5-0.5B within about 100 rounds; HANDOFF, "The
+    Evo collapse: cause and fix"). A starter job that trains on an
     uploaded dataset needs every validator to hold the file from the start.
     Measured in `tests/test_starter_jobs.py`: a chain with no allocations and
     no stakes, one validator with bootstrap stake that doesn't mine, and

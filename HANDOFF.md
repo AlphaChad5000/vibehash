@@ -152,6 +152,44 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
     3. every few rounds, score held-out GSM8K test items and a few unrelated tasks (the progress checker's sets).
     Held-out math up with the rest flat: Evo teaches skills, and that's the network's purpose. No movement: the value has to come from paid fine-tunes on people's own data. Also worth scoring the earliest jobs rebuilt from a copy of the chain, to see when the testnet line broke.
   - **Newcomers alone can't earn on an Evo-only network.** An Evo claim is approved only by staked checkers holding the model (`Coordinator._es_tasks`); with earn-in and no staked miners, nothing is checked, so nothing is accepted or minted. Measured on Qwen3.5-0.8B: a starter-Evo genesis with a non-mining validator and two newcomer workers sealed 6 rounds with 0 accepted, step 0, nothing minted. Ways out: the launch validators also mine (their bootstrap stake makes them checkers), or a second starter job the coordinator checks itself (an MLP one) for newcomers to earn their stake on first.
+- **The Evo collapse: cause and fix (2026-11-05, branch `evo-anchor` off `mainnet-checklist`; answers the first
+  finding above).**
+  - **The cause is drift, not what it learned.** `es2.coefficients` z-scores fitness, so every round steps the same
+    size whether or not it found anything, and the noise adds up as a random walk. The v2 step with random
+    coefficients alone (no answering: 12-round jobs, the cosine from 4e-3, chained at full weight) took the model
+    25.1% from its base in 400 rounds, the testnet line's 24%, with every score near 0 and rambling answers.
+  - **The drift budget**, measured the same way (100 items a set): fine up to about 4–5% from the base, slipping at
+    5–6%, broken by 9%. v2 adds about 1.6% a round at the cosine's top, so it's past 4% within a few rounds.
+  - **The fix, measured.** 60 real rounds on svamp with the network's round arithmetic on one GPU (64 pairs, 16
+    problems, replay fitness; 100 held-out items a set, so ±5 points is noise):
+
+    | | base | v2 (lr 4e-3) | anchored (lr 1e-3, decay 1/64) |
+    |---|---|---|---|
+    | svamp (trained) | 14% | 29% | 25% |
+    | ag_news | 75% | 20% | 75% |
+    | sciq | 56% | 44% | 57% |
+    | arc_easy | 47% | 30% | 47% |
+    | median drift | 0 | 6.8%, rising | 0.9%, flat |
+
+    So Evo does teach a held-out skill when it can't wander: the owner's open question, answered for one task.
+  - **What changed.** `Spec2.decay`, the anchor: before each round's step (each entry with an update) the change is
+    multiplied by 1 − decay (`Change.shrink`, in `es2.apply_entry`, `es2.rebuild`, `es_client.apply_round`, and
+    `es2.canonical_weights`, which with an anchor anywhere works each job's change out on its own and adds the base
+    last; without one it keeps its old order, so old jobs' numbers are unchanged). Random noise then levels off at
+    about step / √(2·decay); a push the rounds agree on adds up to about step / decay. Left out of the spec when 0, so
+    every earlier job's spec and hash are the same. `es_local.V2_SETTINGS`: lr 1e-3 and decay 1/64 (exact in
+    float32), so `testnet --evo2`'s jobs and `job template --evo` starter jobs get it.
+  - **Rollout.** A 0.5.16 or older node refuses a spec with `decay` ("a rule-2 ES spec has no field 'decay'"), so
+    every node and worker on an Evo chain needs this code before such a job is posted. Evo runs only on chains whose
+    genesis says `"es": true`, none of them public. The owner's testnet chains each new job from the last one's
+    change at weight 1, so its next job starts from the broken line; the anchor gives back 1/64 of it a round, about
+    90% within 150 rounds. A fresh testnet (`--reset`) starts clean.
+  - **Tests:** `tests/test_es2.py` `AnchorTests` (the field and its hash, and the arithmetic against each round worked
+    out alone, a parent's anchor and the child's); the network test runs with the anchor on and checks the workers'
+    change against `canonical_weights` with it. The experiment's scripts are in that session's scratchpad
+    (`evo/random_walk.py`, `evo/evo_train.py`).
+  - **Not done yet:** a longer run cycling tasks the way the testnet does (about 200 rounds, 30–40 minutes), to see
+    drift stay flat and nothing slide over many tasks; the second finding (newcomers on an Evo-only network).
 - **Reviewed for bugs and vulnerabilities (2026-11-04, branch `review-fixes`, merged).** The security pass found nothing High or Medium. Fixed:
   - the dataset quota counted a part-way upload by what was on disk, so uploads started side by side (one chunk each) got the quota each; now each counts at the size it declared, admitted under one lock (`Node._admitted`; `test_dos.DatasetQuotaTests`);
   - its cache of datasets jobs name was keyed on the mempool's length (a full mempool swapping one tx kept it), now on the waiting post_jobs;

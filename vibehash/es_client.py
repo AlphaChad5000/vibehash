@@ -418,10 +418,12 @@ def round_factors(rt: es.Runtime, spec, round_seed: int) -> dict:
 
 
 def apply_round(rt: es.Runtime, spec, ch: es2.Change, ent: dict) -> None:
-    """A round's entry onto a change (es2.apply_entry's arithmetic, with the round's shared factors)."""
+    """A round's entry onto a change (es2.apply_entry's arithmetic, with the round's shared factors): the job's anchor
+    gives back spec.decay of the change, then the round's step."""
     import torch
     if not ent["update"]:
         return
+    ch.shrink(getattr(spec, "decay", 0.0))
     fac = round_factors(rt, spec, int(ent["seed"], 16))
     idx = torch.tensor([j for j, _ in ent["update"]], device=rt.device)
     ch.apply(rt.linears, {n: (A[idx], B[idx]) for n, (A, B) in fac.items()}, [c for _, c in ent["update"]],

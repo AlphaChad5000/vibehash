@@ -145,7 +145,7 @@ def main():
         else:
             spec = chain.specs[job_id]
             parents = [(w, change_of(j)) for j, w, _ in spec.start]
-            ch = es2.rebuild(linears, chain.entries.get(job_id, []), parents, "cpu")
+            ch = es2.rebuild(linears, chain.entries.get(job_id, []), parents, "cpu", spec.decay)
         changes[job_id] = ch
         while len(changes) > 3:  # enough for a start averaged from a cycle of three
             changes.popitem(last=False)

@@ -106,6 +106,67 @@ class TaskCycleTests(unittest.TestCase):
         self.assertEqual(es2_rounds.targets_of(history, 3), [(8, 1, [6], 1), (9, 0, [5], 2), (9, 1, [6], 2)])
 
 
+class AnchorTests(unittest.TestCase):
+    """The anchor (Spec2.decay): before each round's step the change gives back `decay` of itself, so random steps level
+    off near the base instead of adding up (es2's docstring). A job without it is what it always was."""
+    rule1_only = TaskCycleTests.rule1_only
+
+    def spec(self, **kw) -> es2.Spec2:
+        base = {k: v for k, v in spec_for().__dict__.items() if k not in self.rule1_only}
+        return es2.Spec2(**(base | dict(pairs=4, pairs_per_unit=2, problems=4, max_tokens=8, rounds=3) | kw))
+
+    def test_the_field(self):
+        self.assertNotIn("decay", self.spec().to_json()["es"], "no anchor: the spec byte for byte as before")
+        spec = self.spec(decay=1 / 64)
+        self.assertEqual(spec.problems_list(), [])
+        self.assertEqual(spec.to_json()["es"]["decay"], 0.015625)
+        d = {"id": "a", "fee_per_round": VIBE, **spec.to_json(), "init_seed": 0, "units_per_round": spec.units,
+             "memory_mb": 1024}
+        self.assertEqual(TrainingJob.from_spec_json(json.dumps(d), "req", VIBE).spec, spec)
+        self.assertNotEqual(es2.Spec2.from_json(spec.to_json()), self.spec())
+        self.assertEqual(self.spec(decay=0).decay, 0.0)
+        for bad in (-0.1, 0.75, "0.1"):
+            self.assertTrue(self.spec(decay=bad).problems_list(), bad)
+
+    @unittest.skipUnless(HAVE_TORCH, "needs PyTorch")
+    def test_the_arithmetic(self):
+        """Two linears, three rounds (the middle one with no update, so no step and no decay): a worker's float32
+        change and the canonical float64 weights agree, and both are (1 - d) x the first round's step + the last's,
+        worked out from each round alone; a parent's anchor applies inside the parent, the child's on top."""
+        import torch
+        from vibehash.es_fast import stream_layout
+        torch.manual_seed(0)
+        linears = [("a", torch.nn.Linear(4, 3, bias=False)), ("b", torch.nn.Linear(2, 5, bias=False))]
+        layout = stream_layout(linears)
+        base = {n: m.weight.detach().float().numpy() for n, m in linears}
+        e1 = es2.entry(11, [[0, 0.7], [1, -0.4]], 0.05, [])
+        e0 = es2.entry(12, [], 0.05, [])
+        e2 = es2.entry(13, [[1, 0.3]], 0.05, [])
+
+        def step(e):
+            w = es2.canonical_weights(layout, base, [e])
+            return {n: w[n].astype(np.float64) - base[n] for n in base}
+        s1, s2 = step(e1), step(e2)
+        d = 0.25
+        exact = es2.canonical_weights(layout, base, [e1, e0, e2], decay=d)
+        worker = es2.rebuild(linears, [e1, e0, e2], device="cpu", decay=d)
+        for n in base:
+            np.testing.assert_allclose(exact[n] - base[n], (1 - d) * s1[n] + s2[n], atol=1e-6)
+            np.testing.assert_allclose(worker.d[n].numpy(), exact[n] - base[n], atol=1e-6)
+        # No anchor: the old order (base, then each round), the same as before this field.
+        plain = es2.canonical_weights(layout, base, [e1, e0, e2])
+        for n in base:
+            np.testing.assert_allclose(plain[n] - base[n], s1[n] + s2[n], atol=1e-6)
+        # A parent anchored at 1/2 ran e1 (a step from zero: nothing to give back); its child, weight 0.5 and anchor
+        # 0.25, gives back a quarter of that before e2.
+        child = es2.canonical_weights(layout, base, [e2], parents=[(0.5, [e1], [], 0.5)], decay=d)
+        pc = es2.rebuild(linears, [e1], device="cpu", decay=0.5)
+        cw = es2.rebuild(linears, [e2], parents=[(0.5, pc)], device="cpu", decay=d)
+        for n in base:
+            np.testing.assert_allclose(child[n] - base[n], 0.5 * (1 - d) * s1[n] + s2[n], atol=1e-6)
+            np.testing.assert_allclose(cw.d[n].numpy(), child[n] - base[n], atol=1e-6)
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class StarterTemplateTests(unittest.TestCase):
     def test_an_evo_starter_job_from_the_template_goes_into_a_genesis(self):
@@ -224,7 +285,9 @@ class NetworkTests2(unittest.TestCase):
         self.assertEqual(line.params_hash, es.state_hash(state))
         from vibehash.es_fast import stream_layout
         layout = stream_layout(rt.linears)
-        exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, history)
+        self.assertEqual(spec.decay, 1 / 64, "the anchor is on by default")
+        exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, history,
+                                      decay=spec.decay)
         worst = max(float(np.abs((rt.base[n] + line.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         moved = max(float(np.abs(line.change.d[n].numpy()).max()) for n, _, _ in layout)
         self.assertGreater(moved, 1e-4, "the weights never moved")
@@ -243,7 +306,7 @@ class NetworkTests2(unittest.TestCase):
         cline = clients[0].es.v2._line(rt, "evo2-b", child)
         self.assertEqual(cline.params_hash, es.state_hash(node.coord.start_params("evo2-b")))
         exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, cline.history,
-                                      parents=[(0.5, history, [])])
+                                      parents=[(0.5, history, [], spec.decay)], decay=child.decay)
         worst = max(float(np.abs((rt.base[n] + cline.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         self.assertLess(worst, 1e-5, f"the child's change is {worst} from the canonical one")
 

@@ -9,14 +9,23 @@ What changes from rule 1 (es.py):
 * **The node keeps no weights.** A job's state is 16 + es.CTRL float32 words: the 32-byte hash chain as 16 uint16
   values (exact in float32), then the control words. The chain starts at `start_hash` (the base, the twisted tensors
   and the parents) and each round moves it on with `next_hash` over the round's entry (`entry`: seed, update, scale,
-  targets). The weights are a function of the chain: base + sum over parents of weight x their change + sum over rounds
-  of scale x sum_j c_j A_j B_j^T. Workers keep that change on their device (`Change`, `rebuild`); `canonical_weights`
-  computes it in a fixed float64 order on the CPU, for anyone who wants the exact numbers. Updates use the factors
-  rounded to bf16 (what the workers' forward uses), so every machine applies the same values.
+  targets). The weights are a function of the chain: base + the change, which starts as the sum over parents of weight
+  x their change and, each round with an update, becomes (1 - decay) x itself + scale x sum_j c_j A_j B_j^T. Workers
+  keep that change on their device (`Change`, `rebuild`); `canonical_weights` computes it in a fixed float64 order on
+  the CPU, for anyone who wants the exact numbers. Updates use the factors rounded to bf16 (what the workers' forward
+  uses), so every machine applies the same values.
 * **Fitness**: each member's mean per-token log-probability of earlier rounds' correct answers (the targets the node
   records, `replay_targets`), z-scored; right/wrong only while no target exists yet (`coefficients`).
 * **Averaging**: a job may start from a weighted sum of earlier jobs' changes (`start`: [[job id, weight, the
   parent's params_hash], ...]), how a cycle of tunes is averaged into the next cycle's starting point.
+* **The anchor** (`decay`): before each round's step the change gives back that share of itself, so it stays near the
+  base. Without it the change is a random walk: the z-scored step is the same size whether or not a round found
+  anything, and the noise adds up. Measured on Qwen2.5-0.5B-Instruct (2026-11-05, HANDOFF "The Evo collapse: cause
+  and fix"): the v2 step with random coefficients alone broke the model by round 100 (13% from the base; the testnet's
+  line was 24% after ~400 rounds and worse on every task); 60 real svamp rounds at lr 4e-3 took svamp 14% to 29% and
+  ag_news 75% to 20%; at lr 1e-3 with decay 1/64, svamp 14% to 25%, the other tasks unchanged, 0.9% from the base.
+  Random noise then levels off at about step / sqrt(2 decay); a push the rounds agree on still adds up, to about
+  step / decay. 0 (the default, left out of the spec) is every job before it.
 """
 from __future__ import annotations
 
@@ -59,12 +68,17 @@ class Spec2(es.EsSpec):
     # never ends, like a genesis starter job: the testnet's short jobs one task after another, inside one job and one
     # line. Empty: `task` alone, as every job before it (the field is left out of its spec, so its hash is the same).
     tasks: tuple = ()
+    # The change's share given back to the base before each round's step (the anchor; see the module's docstring). A
+    # power of two's reciprocal (1/64) keeps 1 - decay exact in float32. 0: left out of the spec, as before it.
+    decay: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
         object.__setattr__(self, "tasks", tuple(str(t) for t in self.tasks))
         object.__setattr__(self, "start", tuple((str(s[0]), float(s[1]), str(s[2]) if len(s) > 2 else "")
                                                 for s in self.start))
+        if isinstance(self.decay, int) and not isinstance(self.decay, bool):
+            object.__setattr__(self, "decay", float(self.decay))
 
     @property
     def n_params(self) -> int:
@@ -94,6 +108,8 @@ class Spec2(es.EsSpec):
         if len(self.start) > 64 or any(not _JOB.match(j) or not -4 <= w <= 4 or (h and not _HEX64.match(h))
                                        for j, w, h in self.start):
             out.append("start is at most 64 [job id, weight in -4..4, params_hash]")
+        if not (isinstance(self.decay, float) and 0.0 <= self.decay <= 0.5):
+            out.append("decay is 0 to 0.5")
         if self.rank != 1 or self.rule != RULE2 or self.precision != "float32":
             out.append("rank is 1, rule 2, precision float32")
         return out
@@ -115,13 +131,15 @@ class Spec2(es.EsSpec):
                        "problems": self.problems, "max_tokens": self.max_tokens, "sigma": self.sigma, "lr": self.lr,
                        "lr_floor": self.lr_floor, "rounds": self.rounds, "replay": self.replay,
                        "start": [[j, w, h] for j, w, h in self.start], "check": self.check, "margin": self.margin,
-                       "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {})}}
+                       "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {}),
+                       **({"decay": self.decay} if self.decay else {})}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Spec2":
         e = d["es"]
         known = {"rule", "tensors", "n", "tensors_sha", "task", "pairs", "pairs_per_unit", "problems", "max_tokens",
-                 "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks"}
+                 "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks",
+                 "decay"}
         if set(e) - known:
             raise ValueError(f"a rule-2 ES spec has no field {sorted(set(e) - known)[0]!r}")
         if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list) for k in ("start", "tasks")):
@@ -133,7 +151,8 @@ class Spec2(es.EsSpec):
                    lr=float(e["lr"]), lr_floor=float(e["lr_floor"]), rounds=int(e["rounds"]),
                    replay=int(e["replay"]), start=tuple(tuple(s) for s in e.get("start", [])),
                    check=int(e["check"]), margin=float(e["margin"]), lp_tol=float(e["lp_tol"]),
-                   rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])))
+                   rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])),
+                   decay=float(e.get("decay", 0.0)))
 
 
 def is_v2(d) -> bool:
@@ -275,6 +294,12 @@ class Change:
             B = B.to(dev, torch.bfloat16).float()
             self.d[n] += scale * torch.einsum("pmr,pnr->mn", A * c[:, None, None], B)
 
+    def shrink(self, decay: float) -> None:
+        """change *= 1 - decay: the anchor, before a round's step (float32 elementwise, the same bits everywhere)."""
+        if decay:
+            for v in self.d.values():
+                v.mul_(1.0 - decay)
+
     def add(self, other: "Change", weight: float) -> None:
         for n, v in other.d.items():
             self.d[n].add_(v, alpha=float(weight))
@@ -287,40 +312,73 @@ class Change:
                 m.weight.data.copy_(base[n].to(self.d[n].device, torch.float32) + self.d[n])
 
 
-def apply_entry(ch: Change, linears, ent: dict, device) -> None:
-    """One round's entry onto a change (its accepted pairs' factors, drawn again from the round seed)."""
+def apply_entry(ch: Change, linears, ent: dict, device, decay: float = 0.0) -> None:
+    """One round's entry onto a change (its accepted pairs' factors, drawn again from the round seed), after the
+    job's anchor gives back `decay` of it. A round with no update is no step: no decay either."""
     import torch
     from .es_fast import lowrank_factors
     if not ent["update"]:
         return
+    ch.shrink(decay)
     seed = int(ent["seed"], 16)
     js = [j for j, _ in ent["update"]]
     fac = lowrank_factors(linears, pair_seeds(seed, js), device, torch.bfloat16)
     ch.apply(linears, fac, [c for _, c in ent["update"]], ent["scale"])
 
 
-def rebuild(linears, history: list, parents: list = (), device="cuda") -> Change:
-    """A job's change: its parents' [(weight, their Change)], then its rounds' entries in order."""
+def rebuild(linears, history: list, parents: list = (), device="cuda", decay: float = 0.0) -> Change:
+    """A job's change: its parents' [(weight, their Change)], then its rounds' entries in order, each after the job's
+    anchor (`decay`, the spec's)."""
     ch = Change(linears, device)
     for w, pc in parents:
         ch.add(pc, w)
     for ent in history:
-        apply_entry(ch, linears, ent, device)
+        apply_entry(ch, linears, ent, device, decay)
     return ch
 
 
-def canonical_weights(layout: list, base: dict, history: list, parents: list = ()) -> dict:
+def canonical_weights(layout: list, base: dict, history: list, parents: list = (), decay: float = 0.0) -> dict:
     """The exact weights, in a fixed order on the CPU, for anyone who wants the numbers rather than a worker's float32
     approximation. layout: es_fast.stream_layout's [(name, out, in)]; base: {name: float32 array}; history: the job's
-    entries in order; parents: [(weight, their history, their parents)], applied first, recursively. Per element,
-    float64: base, then each parent's rounds times its weight, then this job's rounds, pairs in entry order, factors
-    rounded to bf16; float32 once at the end. Slow: every pair is an outer product over every linear."""
+    entries in order; parents: [(weight, their history, their parents[, their decay])], applied first, recursively;
+    decay: the job's anchor (its spec's). Per element, float64: base, then each parent's rounds times its weight, then
+    this job's rounds, pairs in entry order, factors rounded to bf16; float32 once at the end. With an anchor anywhere,
+    each job's change is worked out on its own (its parents' times their weights, then per round with an update
+    (1 - decay) x change + the round's step) and added to the base at the end. Slow: every pair is an outer product
+    over every linear."""
     import torch
 
     def bf16(x: np.ndarray) -> np.ndarray:
         return torch.from_numpy(np.ascontiguousarray(x)).to(torch.bfloat16).to(torch.float32).numpy().astype(np.float64)
 
     total = sum(o + i for _, o, i in layout)
+
+    def anchored(decay_, parents_) -> bool:
+        return bool(decay_) or any(anchored(p[3] if len(p) > 3 else 0.0, p[2]) for p in parents_)
+
+    if anchored(decay, parents):
+        def change_of(hist, parents_, d) -> dict:
+            ch = {n: np.zeros((o, i), np.float64) for n, o, i in layout}
+            for p in parents_:
+                pc = change_of(p[1], p[2], p[3] if len(p) > 3 else 0.0)
+                for n in ch:
+                    ch[n] += p[0] * pc[n]
+            for ent in hist:
+                if not ent["update"]:
+                    continue
+                if d:
+                    for n in ch:
+                        ch[n] *= 1.0 - d
+                seed = int(ent["seed"], 16)
+                for j, c in ent["update"]:
+                    z = es.noise(es.pair_seed(seed, j), total)
+                    at = 0
+                    for n, o, i in layout:
+                        ch[n] += (ent["scale"] * c) * np.outer(bf16(z[at:at + o]), bf16(z[at + o:at + o + i]))
+                        at += o + i
+            return ch
+        change = change_of(history, parents, decay)
+        return {n: (np.asarray(base[n], np.float64) + change[n]).astype(np.float32) for n, _, _ in layout}
     acc = {n: np.asarray(base[n], np.float64) for n, _, _ in layout}
 
     def add_history(hist, weight):
