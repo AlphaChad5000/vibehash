@@ -416,6 +416,7 @@ class WorkerClient:
         from .es_client import EsWork
         self.es = EsWork(self)  # an evolution-strategies job's rounds (es_client.py)
         self.backend = get_backend(device, log)
+        self.hardware_class = hardware.hardware_class(self.backend)  # registered each round, counted at /network
         self.memory_override = memory_mb
         self.flops_override = flops_override
         self.poll_s = poll_s
@@ -720,7 +721,19 @@ class WorkerClient:
         k = self.keys
 
         if phase == "register":
-            self._signed("register", {"round": rnd, "flops_per_sec": self.speed[job.job_id], "memory_mb": self.memory_for(job)})
+            body = {"round": rnd, "flops_per_sec": self.speed[job.job_id], "memory_mb": self.memory_for(job)}
+            if self.hardware_class is not None:
+                body["hardware"] = self.hardware_class
+            try:
+                self._signed("register", body)
+            except NodeError as e:
+                # A node from before the census doesn't take the field (node.BODIES): register the old way from now on.
+                if self.hardware_class is None or e.status != 400 or "register message has only" not in str(e):
+                    raise
+                log.info("the node is older and doesn't take a hardware class; registering without one")
+                self.hardware_class = None
+                del body["hardware"]
+                self._signed("register", body)
             st.rounds += 1
             st.activity = "registered; waiting for work"
             log.info("round %d: registered", rnd)
@@ -1096,8 +1109,9 @@ class WorkerClient:
             return None
 
     def run(self, stop=None) -> None:
-        log.info("worker %s starting on %s (%s)", checksummed(self.keys.address), self.backend.describe(),
-                 hardware.describe())
+        log.info("worker %s starting on %s (%s); registers as %s", checksummed(self.keys.address),
+                 self.backend.describe(), hardware.describe(),
+                 hardware.class_name(self.hardware_class) if self.hardware_class else "no class")
         if self.deepseek:
             self.ds.sweep()
         while stop is None or not stop.is_set():

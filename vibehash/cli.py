@@ -496,22 +496,28 @@ def _chosen_job(api: NodeClient, job: str, url: str) -> None:
 
 
 def cmd_devices(a):
-    from .compute import HUNG, TorchBackend, list_devices, self_test, torch_available
+    from .compute import HUNG, NumpyBackend, TorchBackend, list_devices, self_test, torch_available
 
     if not a.json:
         print("Testing each device with a tiny training step (the first run on a GPU can take a minute)...",
               flush=True)
-    found = [(d, None if d.id == "cpu" else self_test(TorchBackend(d.id))) for d in list_devices()]
+    found = []  # (device, what's wrong or None, the hardware class it registers as, or None if the device is broken)
+    for d in list_devices():
+        backend = NumpyBackend() if d.id == "cpu" else TorchBackend(d.id)
+        problem = None if d.id == "cpu" else self_test(backend)
+        found.append((d, problem, hardware.hardware_class(backend) if problem is None else None))
     if a.json:
-        print(json.dumps([{"id": d.id, "label": d.label, "ready": p is None, "problem": p} for d, p in found]))
+        print(json.dumps([{"id": d.id, "label": d.label, "ready": p is None, "problem": p, "class": k} for d, p, k in found]))
     else:
         print("Devices this computer can train on (best first):")
-        for d, problem in found:
+        for d, problem, klass in found:
             state = "ready" if problem is None else f"NOT USABLE: {problem[:120]}. {driver_advice(d.label)}"
             print(f"  {d.id:<8} {d.label}  [{state}]")
+            if klass is not None:
+                print(f"           registers as: {hardware.class_name(klass)}")
         if not torch_available():
             print(f"\nNo GPU support installed. `{prog()} install-gpu` finds your graphics card and installs support for it.")
-    if any(p and p.startswith(HUNG) for _, p in found):
+    if any(p and p.startswith(HUNG) for _, p, _ in found):
         # A thread is still stuck in the driver, and the runtime's shutdown can wait on it forever: leave now.
         sys.stdout.flush()
         os._exit(0)

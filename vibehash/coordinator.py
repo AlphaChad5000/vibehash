@@ -58,6 +58,7 @@ from . import economics as econ
 from . import es
 from . import es2, es2_rounds
 from . import fees
+from . import hardware
 from . import shards as sh
 from .crypto import Draw, KeyPair, address_of, h256, verify
 from .finetune import MAX_VAL, WHOLE_TOLERANCE
@@ -173,6 +174,7 @@ class Registration:
     address: str
     flops_per_sec: float
     memory_mb: int
+    hardware: dict | None = None  # what kind of machine (hardware.hardware_class), when the worker said; counted, not checked
 
 
 @dataclass
@@ -805,10 +807,17 @@ class Coordinator:
             raise ProtocolError(f"stake at least {econ.MIN_STAKE} syn to take work")
         if not (0 < flops_per_sec < 1e18 and 0 < memory_mb < 1e9):
             raise ProtocolError("implausible hardware report")
+        # The hardware class rides in the signed body, so it is in the record and every replay sees the same one. It is
+        # counted here, never judged: refusing one would be a consensus rule, and a record sealed by a node that didn't
+        # look at it must still replay. The node refuses a non-canonical class at its door instead (Node.handle), so a
+        # made-up card never reaches a record; one that did (an older leader's) counts as no class at all.
+        klass = envelope["body"].get("hardware") if envelope else None
+        if not hardware.valid_class(klass):
+            klass = None
         staked = self.chain.state.staked
         if not staked(addr) and sum(not staked(a) for a in r.regs) >= self.config.max_newcomers:
             raise ProtocolError("this round has all the workers without stake it takes; try the next one")
-        r.regs[addr] = Registration(addr, float(flops_per_sec), int(memory_mb))
+        r.regs[addr] = Registration(addr, float(flops_per_sec), int(memory_mb), klass)
         entry = envelope if envelope is not None else {"address": addr, "flops_per_sec": float(flops_per_sec), "memory_mb": int(memory_mb)}
         r.record["registrations"].append(entry)
         r.reg_entries[addr] = entry
