@@ -257,6 +257,8 @@ def cmd_genesis_create(a):
                      f"{', '.join(map(checksummed, unstaked))}")
     if a.earn_in:
         g["earn_in"] = True
+    if a.es:
+        g["es"] = True
     economics = econ.NEW_SCHEDULES[a.economics]  # only rounds that pay for work mint, and the halvings count them
     g["economics"] = economics.to_dict()
     hash_ = Chain.from_genesis(g).genesis_hash  # also checks the allocations fit under the supply cap
@@ -264,6 +266,33 @@ def cmd_genesis_create(a):
     print(f"wrote {a.out}  genesis hash {hash_}\n{_describe_economics(economics)}")
     if a.earn_in:
         print(f"workers can start with no stake: their first {fmt(econ.MIN_STAKE)} of pay becomes their stake")
+    if a.es:
+        print("Evo jobs can run on it (\"es\": true)")
+    if a.economics == "mainnet":
+        print(f"check it against what a network meant to carry value needs: vibehash genesis check {a.out}")
+
+
+def cmd_genesis_check(a):
+    from . import genesis_check
+
+    try:
+        g = json.loads(Path(a.file).read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"can't read {a.file}: {e}")
+    if not isinstance(g, dict) or "chain_id" not in g or "allocations" not in g:
+        sys.exit(f"{a.file} isn't a genesis file (it needs chain_id and allocations)")
+    findings = genesis_check.check(g)
+    if a.json:
+        print(json.dumps(genesis_check.to_json(findings), indent=2))
+    else:
+        mark = {"ok": "ok  ", "warn": "warn", "fail": "FAIL", "info": "info"}
+        for f in findings:
+            print(f"{mark[f.status]}  {f.title}: {f.detail}")
+        bad = sum(f.status == "fail" for f in findings)
+        warn = sum(f.status == "warn" for f in findings)
+        print(f"\n{bad} to fix, {warn} to decide on purpose" if bad or warn else "\nnothing to fix")
+    if genesis_check.failed(findings):
+        sys.exit(1)
 
 
 def _describe_economics(e: econ.Economics) -> str:
@@ -1940,6 +1969,10 @@ def parser() -> argparse.ArgumentParser:
                    help="stake for a first validator that votes but can never be withdrawn or spent; burned if it leaves")
     p.add_argument("--no-earn-in", dest="earn_in", action="store_false",
                    help="require workers to be given stake; by default they can start with none and earn it")
+    p.add_argument("--es", action="store_true",
+                   help="let Evo jobs run on this network (\"es\": true); it can't be turned on later")
+    p = g.add_parser("check", help="hold a genesis file against what a network meant to carry value needs")
+    p.add_argument("file"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_genesis_check)
 
     p = sub.add_parser("node", help="run a node")
     p.add_argument("--genesis", required=True); p.add_argument("--wallet", required=True); p.add_argument("--data-dir", required=True)
