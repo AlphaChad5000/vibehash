@@ -309,7 +309,7 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
 <span class="prompt">&gt; </span><code>vibehash job status</code>                       <span class="prompt"># rounds done, accuracy, budget left</span>
 <span class="prompt">&gt; </span><code>vibehash job download</code>                     <span class="prompt"># saves my-data-model.npz</span>
 <span class="prompt">&gt; </span><code>vibehash predict new-rows.csv</code>             <span class="prompt"># a prediction for every row</span></pre></div>
-      <p>Most people join the public network, run at <code>node.vibehash.org</code>, and <code>vibehash setup</code> connects to it by itself. To join a different network, you need its node address, such as <code>203.0.113.7</code>: get it from whoever runs it. Developers can run a private network on one computer with <code>vibehash testnet</code>; it uses a fast test schedule of 50 VIBE a block, halving every 210 blocks.</p>
+      <p>Most people join the public network, run at <code>node.vibehash.org</code>, and <code>vibehash setup</code> connects to it by itself. To join a different network, you need its node address, such as <code>203.0.113.7</code>: get it from whoever runs it. Developers can run a private network on one computer with <code>vibehash testnet</code>; it uses a fast test schedule of 50 VIBE for each round that pays for work, halving every 210 such rounds.</p>
       <p class="note"><strong>Test network.</strong> VIBE has no cash value, so don't buy or sell it. The software hasn't been audited.</p>
     </section>
 
@@ -422,7 +422,7 @@ html { scrollbar-width: thin; scrollbar-color: #5a544c var(--paper); }
 
     <section id="payment">
       <h2>Payment</h2>
-      <p>Each round creates a pool of VIBE: new coins from the block subsidy plus the job poster's fee for the units that passed. Job posters pay nothing for work that failed. On the public network the subsidy is 3.125 VIBE a block and halves every 3,320,000 blocks, about every 4 years at 38 seconds a round, so no more than 21 million VIBE can ever exist, as in Bitcoin. Other networks fix their own schedule when they start. The pool is split three ways, drawn to scale here.</p>
+      <p>Each round creates a pool of VIBE: new coins from the block subsidy plus the job poster's fee for the units that passed. Job posters pay nothing for work that failed. On the public network the subsidy is 3.125 VIBE a block and halves every 3,320,000 blocks, about every 4 years at 38 seconds a round, so no more than 21 million VIBE can ever exist, as in Bitcoin. Other networks fix their own schedule when they start. Networks started with newer releases mint only in rounds where someone's work is accepted, and count their halvings in those rounds, so a quiet network delays its halvings instead of burning the coins of its empty rounds. The pool is split three ways, drawn to scale here.</p>
       <div class="split">
         <div class="split-bar" aria-hidden="true"><div></div><div></div><div></div></div>
         <ul class="split-key">
