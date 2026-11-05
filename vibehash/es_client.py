@@ -426,9 +426,13 @@ def apply_round(rt: es.Runtime, spec, ch: es2.Change, ent: dict) -> None:
 
 
 def prompt_rows(rt: es.Runtime, items) -> list[list[int]]:
+    """Each item's chat prompt as token ids. Thinking off: Qwen3.5-4B's template opens a <think> block by default,
+    which a 64-token answer never gets out of; the templates that don't know the switch (Qwen2.5's, and
+    Qwen3.5-0.8B's, which already closes the block) give the same ids with it as without."""
     out = []
     for it in items:
-        ids = rt.tokenizer.apply_chat_template(it.messages, add_generation_prompt=True, tokenize=True)
+        ids = rt.tokenizer.apply_chat_template(it.messages, add_generation_prompt=True, tokenize=True,
+                                               enable_thinking=False)
         if isinstance(ids, dict) or hasattr(ids, "keys"):
             ids = ids["input_ids"]
         out.append(list(ids))

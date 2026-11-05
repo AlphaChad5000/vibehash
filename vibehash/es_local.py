@@ -216,10 +216,19 @@ V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma
 V2_COMPUTE_S = 300
 
 
+def tensors2_for(config) -> tuple:
+    """The linears a rule-2 job twists in a model with this config: every attention and MLP projection (es2.TENSORS),
+    and on Qwen3.5's hybrid layers (Gated DeltaNet + full attention) es_hybrid.TENSORS."""
+    from . import es2, es_hybrid
+    tc = config.get_text_config() if hasattr(config, "get_text_config") else config
+    return es_hybrid.TENSORS if "linear_attention" in (getattr(tc, "layer_types", None) or ()) else es2.TENSORS
+
+
 def spec2_for(found: Base, task: str, start=(), **settings):
     """A rule-2 Evo job's spec for `found` on `task` (es_tasks.NAMES), starting from `start` ([[job id, weight,
-    params_hash], ...]: the parents averaged into its start): every attention and MLP projection twisted (es2.TENSORS),
-    their names and shapes from the model's config on PyTorch's meta device (nothing loaded)."""
+    params_hash], ...]: the parents averaged into its start): every attention and MLP projection twisted
+    (tensors2_for), their names and shapes from the model's config on PyTorch's meta device (nothing loaded). A
+    Qwen3.5 model's config holds its text model's dims in text_config; its vision tower isn't loaded."""
     from . import es2
     try:
         import torch
@@ -228,15 +237,17 @@ def spec2_for(found: Base, task: str, start=(), **settings):
         raise RuntimeError("Evo mode needs PyTorch and transformers: `vibehash install-gpu`, then pip install "
                            "transformers") from None
     s = {**V2_SETTINGS, **settings}
-    c = AutoConfig.from_pretrained(found.folder)
+    full = AutoConfig.from_pretrained(found.folder)
+    c = full.get_text_config()
+    tensors = tensors2_for(full)
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(c)
-    n, sha = es.tensors_digest(es.select(((k, p.shape) for k, p in model.named_parameters()), es2.TENSORS))
+        model = AutoModelForCausalLM.from_config(full)
+    n, sha = es.tensors_digest(es.select(((k, p.shape) for k, p in model.named_parameters()), tensors))
     dims = {"family": c.model_type, "vocab": c.vocab_size, "hidden": c.hidden_size, "layers": c.num_hidden_layers,
             "heads": c.num_attention_heads, "kv_heads": getattr(c, "num_key_value_heads", None) or c.num_attention_heads,
             "head_dim": getattr(c, "head_dim", None) or c.hidden_size // c.num_attention_heads,
             "ffn": c.intermediate_size, "tied": bool(getattr(c, "tie_word_embeddings", False))}
-    spec = es2.Spec2(base=found.base, manifest=manifest(found.base), dims=dims, tensors=es2.TENSORS, n=n,
+    spec = es2.Spec2(base=found.base, manifest=manifest(found.base), dims=dims, tensors=tensors, n=n,
                      tensors_sha=sha, task=task, start=tuple(tuple(x) for x in start), **s)
     bad = spec.problems_list()
     if bad:
