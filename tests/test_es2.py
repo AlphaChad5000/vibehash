@@ -308,6 +308,59 @@ class StarterTemplateTests(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class NetworkTests2(unittest.TestCase):
+    def test_answers_nested_too_deep_are_slashed_and_the_round_stays_whole(self):
+        """A worker's answers blob of JSON nested past the parser's depth: the node's rescore raised RecursionError,
+        after the reveal was in the round's record and before its check's result was, so no validator could replay
+        the block, and the checkers it went to dropped the rest of their round's checks. Now it's answers that
+        aren't a unit's: slashed, the record whole, and the honest workers' claims checked and accepted."""
+        from vibehash.client import NodeClient, WorkerClient
+        from vibehash.coordinator import CoordinatorConfig
+        from vibehash.ledger import Block
+        from vibehash.node import Node, PhaseTimes
+        from vibehash import es_client
+        from tests.test_network import run_until
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        spec = tiny_spec2(tiny_model(root / "tiny", seed=1))
+        for p in (mock.patch.object(es, "reward", fake_reward), mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(root / "home")}),
+                  mock.patch.object(es_client, "SAVE_EVERY", 1), mock.patch("vibehash.es_local.V2_COMPUTE_S", 30)):
+            p.start()
+            self.addCleanup(p.stop)
+        node_keys, req = KeyPair.generate(b"nest node"), KeyPair.generate(b"nest requester")
+        workers = [KeyPair.generate(f"nest worker {i}".encode()) for i in range(3)]
+        genesis = {"chain_id": "vibehash-nest-test", "timestamp": 0, "allocations": {req.address: 500 * VIBE},
+                   "stakes": {k.address: 10 * VIBE for k in [node_keys, *workers]}, "es": True}
+        node = Node(root / "node", genesis, node_keys, port=0,
+                    times=PhaseTimes(register_s=1.0, compute_s=20.0, reveal_s=3.0, verify_s=15.0, idle_s=0.3),
+                    config=CoordinatorConfig(newcomer_units=4)).start()
+        self.addCleanup(node.stop)
+        api = NodeClient(node.url)
+        clients = [WorkerClient(node.url, k, memory_mb=8192, flops_override=1e12, poll_s=0.1, device="cpu",
+                                cache_dir=root / f"cache{i}") for i, k in enumerate(workers)]
+        clients[2].es.cheat = "nester"
+        job = job_of(spec, "evo2-nest", req.address, 6 * VIBE)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        run_until(node, clients, stop, 4, seconds=300)
+        self.assertGreaterEqual(node.chain.tip.height, 4, "the network didn't make its rounds in time")
+        blocks = [Block.from_dict(d) for d in api.get(f"/blocks?from=0&to={node.chain.tip.height}")]
+        mine = [b for b in blocks if b.summary is not None and b.summary.job_id == "evo2-nest"]
+        self.assertTrue(mine)
+        nester = workers[2].address
+        self.assertLess(node.chain.state.stake(nester), 10 * VIBE, "the nester wasn't slashed")
+        self.assertTrue(any(w.address in b.summary.accepted for b in mine for w in workers[:2]),
+                        "no honest claim was accepted")
+        revealed = 0
+        for b in mine:  # every reveal has its check's result: what a validator's replay reads
+            rec = api.get(f"/round/{b.height}/record")
+            for rv in rec["reveals"]:
+                self.assertIn(f"{rv['unit_id']}/{rv['worker']}", rec["checks"]["reveal"], b.height)
+                revealed += rv["worker"] == nester
+        self.assertTrue(revealed, "the nester never revealed: the test tested nothing")
+
     def test_rounds_replay_cheats_a_child_and_a_restart(self):
         from vibehash import economics as econ
         from vibehash import es_client

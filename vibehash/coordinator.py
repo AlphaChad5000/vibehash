@@ -1128,7 +1128,10 @@ class Coordinator:
                 if self.replaying:
                     raise ValueError("the answers aren't here")
                 return "missing"
-            got = es.rescore(spec, r.units[rv.unit_id].seed, r.record["es"]["level"], raw, rv.unit_id)
+            got = self._rescore(lambda: es.rescore(spec, r.units[rv.unit_id].seed, r.record["es"]["level"], raw,
+                                                    rv.unit_id), rv)
+            if got == "missing":
+                return got
             return "bad_answers" if got is None else "ok" if got == rewards else "wrong_rewards"
         outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
         if outcome == "missing":
@@ -1140,6 +1143,19 @@ class Coordinator:
         r.reveals[key] = rv
         r.es_claims[key] = (answers, rewards)
         return None
+
+    def _rescore(self, rescore, rv: Reveal):
+        """An Evo claim's rescore, or "missing" when this node can't score it at all (a task's data isn't here, or a
+        bug): the claim is left unchecked, unpaid and unslashed, as if its answers never came. Its reveal is already
+        in the record, so an error let out here left the round with a reveal and no result for it, which no validator
+        could replay. On a replay's recheck it's a check that couldn't be redone (ValueError)."""
+        try:
+            return rescore()
+        except Exception as e:  # noqa: BLE001 (anything: the record must stay whole)
+            if self.replaying:
+                raise ValueError(f"couldn't rescore {rv.unit_id} here: {e}") from e
+            log.warning("couldn't rescore %s/%s, so it's unchecked: %s: %s", rv.unit_id, rv.worker, type(e).__name__, e)
+            return "missing"
 
     def _es2_reveal(self, job: TrainingJob, key, rv: Reveal, wire: dict | None, raw: bytes | None) -> Verdict | None:
         """A rule-2 Evo claim's reveal (es2_rounds.py): the answers blob, each member's right/wrong score and, when the
@@ -1167,7 +1183,11 @@ class Coordinator:
                 if self.replaying:
                     raise ValueError("the answers aren't here")
                 return "missing"
-            parsed = es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id, int(r.record["es"]["step"] or 0))
+            parsed = self._rescore(lambda: es2_rounds.rescore(spec, r.units[rv.unit_id].seed, raw, rv.unit_id,
+                                                              int(r.record["es"]["step"] or 0)), rv)
+            if parsed == "missing":
+                parsed = None
+                return "missing"
             return "bad_answers" if parsed is None else "ok" if parsed[0] == rewards else "wrong_rewards"
         outcome = self._claim("reveal", f"{rv.unit_id}/{rv.worker}", checks)
         if outcome == "missing":

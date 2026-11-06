@@ -908,7 +908,11 @@ class WorkerClient:
                 body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
                 if kind == "es":  # an ES claim: its sampled members' answers teacher-forced through their models
                     st.activity = f"checking another worker's answers ({i} of {len(tasks)})"
-                    ok, bad = self.es.check(rnd, job, t, unit_in(t["unit"]))
+                    try:
+                        ok, bad = self.es.check(rnd, job, t, unit_in(t["unit"]))
+                    except Exception:  # noqa: BLE001 - one claim this computer couldn't check: not the rest's loss
+                        log.exception("round %d: couldn't check task %s; going on with the rest", rnd, t.get("task_id"))
+                        continue
                     body |= {"ok": bool(ok), "bad_segment": bad}
                     sender.submit(self._verdict, rnd, kind, body)
                     st.checked += 1

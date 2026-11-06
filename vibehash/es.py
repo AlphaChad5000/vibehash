@@ -316,7 +316,23 @@ def messages(p: Problem) -> list[dict]:
              "</answer>. For example, for the numbers [4, 6, 9] and the target 15, reply <answer>6 + 9</answer>."}]
 
 
-_ANSWER = re.compile(r"<answer>(.*?)</answer>", re.S)
+_ANSWER = re.compile(r"<answer>(.*?)</answer>", re.S)  # what tagged() finds, written as a pattern (tests compare)
+
+
+def tagged(text: str) -> list[str]:
+    """Every <answer>…</answer> in `text`, in order: exactly what _ANSWER.findall gives, in time linear in the text.
+    The pattern backtracks over every <answer> with no closing tag after it, so a worker's reply of 64 KB of them took
+    the node 3 s to check, and an 8 MB answers blob hours, with its lock held."""
+    out, i = [], 0
+    while True:
+        start = text.find("<answer>", i)
+        if start < 0:
+            return out
+        end = text.find("</answer>", start + 8)
+        if end < 0:  # no closing tag after this one, so none after any later one either
+            return out
+        out.append(text[start + 8:end])
+        i = end + 9
 _TOKEN = re.compile(r"\s*(\d+|[-+*/()])")
 MAX_EXPR = 200
 
@@ -394,7 +410,7 @@ def reward(p: Problem, text: str, kind: str = "binary") -> float:
     expression uses only the given numbers (each at most as often as given) and equals the target, else 0. "partial",
     a denser signal: 0 with no expression; 0.1 if it uses other numbers; 0.2 + 0.6·max(0, 1 − |value − target|/target)
     if it uses only the given ones; 1 if it's right. Worked in fractions and rounded once to a float."""
-    found = _ANSWER.findall(text)
+    found = tagged(text)
     parsed = parse(found[-1]) if found else None
     if parsed is None:
         return 0.0
@@ -1112,7 +1128,7 @@ def rescore(spec: EsSpec, round_seed: int, level: int, raw: bytes, unit_id: str)
                         and len(a["ids"]) <= spec.max_tokens and all(type(t) is int for t in a["ids"])):
                     return None
             scores.append(mean_reward([reward(p, a["text"], spec.reward) for p, a in zip(ps, member)]))
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):  # (RecursionError: JSON nested too deep)
         return None
     return [[scores[2 * k], scores[2 * k + 1]] for k in range(spec.pairs_per_unit)]
 
@@ -1135,7 +1151,7 @@ def check(rt: Runtime, spec: EsSpec, delta: np.ndarray, round_seed: int, level: 
     The rewards are the node's to check (rescore)."""
     try:
         answers = json.loads(raw)["answers"]
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):  # (RecursionError: JSON nested too deep)
         return False, chosen[0], "the answers aren't readable"
     ps = problems(problems_seed(round_seed), spec.problems, level)
     rows = prompt_ids(rt, ps)
