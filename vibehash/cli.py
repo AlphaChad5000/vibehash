@@ -475,6 +475,16 @@ def _stop_like_ctrl_c() -> None:
                 pass
 
 
+def evo_network(node) -> bool:
+    """Whether `node`'s network takes Evo jobs (its genesis says "es": true, as the public Evo network's does), so the
+    miner's screen opens on the Evo scene while the job loads instead of the usual one (minerui's `evo`). Any trouble
+    reading the genesis is just "no": the screen still switches once the job is known."""
+    try:
+        return node.get("/genesis").get("es") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _mine(a, keys: KeyPair):
     from . import minerui, selftest
     from .wire import MAX_CLOCK_SKEW_S
@@ -533,7 +543,7 @@ def _mine(a, keys: KeyPair):
                 watcher.stop()
             _record_end(session)
         return
-    dash = minerui.MinerDashboard([("you", w)], url)
+    dash = minerui.MinerDashboard([("you", w)], url, evo=evo_network(w.node))
     if session:
         dash.note(session.where())
     if watcher:
