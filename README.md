@@ -372,7 +372,12 @@ vibehash worker --node https://evo.vibehash.org:8443
 or run `vibehash` and pick **Evo Hash** under Mine. The miner downloads the job's model once
 (about 1.7 GB) and the tasks' datasets. A new wallet starts with no stake and earns its
 first 5 VIBE as stake. Until then, its work counts only while a staked miner is online to
-check it: an Evo unit is never checked by the miner who answered it.
+check it: an Evo unit is never checked by the miner who answered it. With several GPUs, run
+a worker for each with its own wallet and `--device cuda:N` ("Several GPUs" above).
+
+transformers may suggest installing `causal_conv1d` or `flash-linear-attention` for speed.
+Don't: every miner has to compute exactly the same way, and those kernels round differently,
+so your answers would fail other miners' checks.
 
 ### A test network on this computer
 
