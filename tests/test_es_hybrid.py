@@ -177,5 +177,78 @@ class HybridEngineCheckTests(unittest.TestCase):
         self.assertTrue(all(claimed[q] > 0 for q in differ), [claimed[q] for q in differ])
 
 
+@unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
+class ExportLayoutTests(unittest.TestCase):
+    """`vibehash evo export` of a Qwen3.5 job: Qwen3.5's checkpoints are image-text-to-text models (a vision tower and
+    a multi-token-prediction head beside the language model, the text model's dims in text_config), and the workers
+    load and train the text model alone. es_export.base_layout puts the export back in the base's own layout."""
+
+    def test_a_multimodal_base_is_exported_whole(self):
+        import json
+
+        import torch
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+        from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+
+        from vibehash import es_export
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        text = tiny_hybrid(root / "text", seed=5)  # a text-only base: nothing to put back
+        torch.manual_seed(1)
+        tcfg = json.loads((text / "config.json").read_text())
+        config = Qwen3_5Config(
+            text_config={k: v for k, v in tcfg.items() if k not in ("architectures", "model_type", "transformers_version")},
+            vision_config=dict(depth=1, hidden_size=32, intermediate_size=48, num_heads=2, patch_size=4,
+                               temporal_patch_size=2, spatial_merge_size=2, out_hidden_size=64,
+                               num_position_embeddings=16),
+            tie_word_embeddings=True)
+        base = root / "base"
+        Qwen3_5ForConditionalGeneration(config).save_pretrained(base)
+        bf = base / "model.safetensors"
+        with safe_open(bf, "pt") as fh:  # Qwen's checkpoints carry a multi-token-prediction head transformers skips
+            tensors = {k: fh.get_tensor(k) for k in fh.keys()}
+        tensors["mtp.fc.weight"] = torch.randn(64, 128)
+        save_file(tensors, bf, metadata={"format": "pt"})
+        (base / "preprocessor_config.json").write_text('{"patch_size": 4}')
+        (base / "LICENSE").write_text("Apache-2.0")
+        (base / "README.md").write_text("the base's own model card")
+
+        # what export does: the text model loaded as a worker loads it, a weight trained, saved as transformers saves it
+        model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.float32)
+        q = model.model.layers[3].self_attn.q_proj
+        with torch.no_grad():
+            q.weight.add_(0.5)
+        trained = q.weight.detach().clone()
+        out = root / "out"
+        model.save_pretrained(out)
+        self.assertFalse(es_export.base_layout(text, out, "float32"), "a text-only base has nothing to add")
+        self.assertTrue(es_export.base_layout(base, out, "float32"))
+
+        cfg = json.loads((out / "config.json").read_text())
+        self.assertIn("vision_config", cfg)
+        self.assertEqual(cfg.get("dtype"), "float32")
+        self.assertTrue((out / "preprocessor_config.json").is_file() and (out / "LICENSE").is_file())
+        self.assertFalse((out / "README.md").exists(), "the base's model card isn't the export's")
+        index = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+        self.assertEqual(set(index), set(tensors), "every tensor of the base, no more")
+        self.assertFalse((out / "model.safetensors").exists(), "a lone file would shadow the index")
+
+        lm = AutoModelForCausalLM.from_pretrained(out, dtype=torch.float32)
+        torch.testing.assert_close(lm.model.layers[3].self_attn.q_proj.weight, trained, rtol=0, atol=0)
+        full, info = AutoModelForImageTextToText.from_pretrained(out, dtype=torch.float32, output_loading_info=True)
+        self.assertFalse(info["missing_keys"])
+        torch.testing.assert_close(full.model.language_model.layers[3].self_attn.q_proj.weight, trained, rtol=0,
+                                   atol=0)
+        was = Qwen3_5ForConditionalGeneration.from_pretrained(base, dtype=torch.float32)
+        for (n, p), (_, b) in zip(full.model.visual.named_parameters(), was.model.visual.named_parameters()):
+            torch.testing.assert_close(p, b, rtol=0, atol=0, msg=n)
+        with safe_open(out / index["mtp.fc.weight"], "pt") as fh:
+            torch.testing.assert_close(fh.get_tensor("mtp.fc.weight"), tensors["mtp.fc.weight"], rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

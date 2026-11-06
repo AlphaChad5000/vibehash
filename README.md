@@ -545,6 +545,28 @@ scp deploy/setup-node.sh YOU@SERVER:
 ssh -t YOU@SERVER sudo bash setup-node.sh --domain node.vibehash.org
 ```
 
+### A second network on the same server
+
+One server can run another network's node beside the first: an Evo Hash
+testnet, say. Give it a name, its own domain (an A record to the same
+server), a port other than 443 and its own chain id:
+
+```bash
+ssh -t YOU@SERVER sudo bash setup-node.sh --name evo --domain evo.vibehash.org --port 8443 --chain-id vibehash-evo-1 --es --stake YOUR-GPU-WALLET=10 --fund YOUR-WALLET-ADDRESS=10000
+```
+
+- `--name evo` keeps it apart: `/var/lib/vibehash-evo`, `/etc/vibehash-evo`,
+  the service `vibehash-node-evo` and its own certificate. The first node is
+  left as it is.
+- `--es` makes a network that takes Evo Hash jobs.
+- `--stake` starts a wallet with stake. An Evo job's work is checked only by
+  staked workers, so someone must be staked before newcomers can earn theirs.
+- `--es`, `--stake` and `--fund` only count the first time, when the genesis
+  is made.
+
+Both nodes share the server's Vibe Hash install, so after upgrading one,
+restart the other too: `sudo systemctl restart 'vibehash-node*'`.
+
 ## Run a network for other people
 
 `vibehash testnet --host 0.0.0.0` is the quick way: other computers on your
