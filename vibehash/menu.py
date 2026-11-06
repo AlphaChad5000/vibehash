@@ -307,35 +307,93 @@ class Keys:
 
 # --- drawing -----------------------------------------------------------------------------------------------------
 
-def frame(choice: int, status: Status, prog: str, width: int, glyphs: dict, sections=None, last: Item = QUIT) -> str:
+def _clip(text: str, room: int, more: str) -> str:
+    """`text` cut to `room` characters at a word, ending in `more` when anything was cut."""
+    if len(text) <= room:
+        return text
+    if room <= len(more):
+        return ""
+    cut = text[:room - len(more)]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:·") + more
+
+
+def frame(choice: int, status: Status, prog: str, width: int, glyphs: dict, sections=None, last: Item = QUIT,
+          height: int | None = None) -> str:
+    """A page of the menu, `width` columns wide and, with `height`, at most `height` - 1 rows tall: a smaller window
+    loses the blank rows first, then the banner, then shows the items around the chosen one, so it never scrolls."""
     sections = SECTIONS if sections is None else sections
-    lines: list[str] = []
-    add = lambda *segs: lines.append(termui._line([(" ", None), *segs], width))  # noqa: E731
-    termui.header(add, glyphs, termui.ASCII, ["mining that trains real AI models",
-                                             f"{_version()} · {urlsplit(status.node).hostname or status.node}"])
-    add()
-    add(("  " + status.line(), termui.TEXT))
+    width = max(20, width - 1)  # never the last column: some consoles wrap a full row onto the next
+    more = glyphs["more"]
+
+    def line(*segs) -> str:
+        return termui._line([(" ", None), *segs], width)
+
     page = items(sections, last)
-    n, label_w = 0, max(len(i.label) for i in page) + 4
+    chosen = page[choice]
+    label_w = max(len(i.label) for i in page) + 4
+    show_hints = width - 7 - label_w >= 24  # room for a few words of each hint, or none at all
+
+    rows: list[tuple[str, int | None]] = []  # the item list: (line, item index or None for a title or blank row)
+    n = 0
     for title, group in list(sections) + [("", [last])]:
-        add()
+        rows.append(("", None))
         if title:
-            add(("  " + title.upper(), termui.DIM))
+            rows.append((line(("  " + title.upper(), termui.DIM)), None))
         for item in group:
             here = n == choice
             mark = f"› {n + 1 if n < 9 else ' '} " if here else f"  {n + 1 if n < 9 else ' '} "
-            add(("  " + mark, termui.GOLD if here else termui.DIM),
-                ((item.label + (" …" if item.submenu else "")).ljust(label_w), termui.WHITE if here else termui.TEXT),
-                (item.hint, termui.DIM))
+            label = item.label + (" …" if item.submenu else "")
+            hint = _clip(item.hint, width - 7 - label_w, more) if show_hints else ""
+            rows.append((line(("  " + mark, termui.GOLD if here else termui.DIM),
+                              ((label.ljust(label_w) if hint else label), termui.WHITE if here else termui.TEXT),
+                              (hint, termui.DIM)), n))
             n += 1
-    add()
-    chosen = page[choice]
+
+    top: list[str] = []
+    termui.header(lambda *segs: top.append(line(*segs)), glyphs, termui.ASCII,
+                  ["mining that trains real AI models", f"{_version()} · {urlsplit(status.node).hostname or status.node}"])
+    top += ["", line(("  " + _clip(status.line(), width - 3, more), termui.TEXT))]
     same = f"{prog} {' '.join(chosen.argv) or chosen.usage}" if chosen.argv or chosen.usage else ""
-    add(("  same as:  ", termui.DIM), (same or "—", termui.YELLOW if same else termui.DIM))
     leave = "q quit" if last is QUIT else "q back"
-    add((f"  ↑↓ move · Enter choose · 1-9 jump · {leave}" if glyphs is not termui.ASCII else
-         f"  up/down move, Enter choose, 1-9 jump, {leave}", termui.DIM))
-    return "\n".join(lines)
+    keys = (f"  ↑↓ move · Enter choose · 1-9 jump · {leave}" if glyphs is not termui.ASCII else
+            f"  up/down move, Enter choose, 1-9 jump, {leave}")
+    bottom = ["", line(("  same as:  ", termui.DIM), (same or "—", termui.YELLOW if same else termui.DIM)),
+              line((keys, termui.DIM))]
+    if not show_hints and chosen.hint:  # the hints didn't fit beside the items: the chosen one's goes here
+        bottom.insert(1, line(("  " + _clip(chosen.hint, width - 3, more), termui.DIM)))
+
+    room = None if height is None else max(4, height - 1)  # the last row stays empty, so nothing scrolls
+    if room is not None and len(top) + len(rows) + len(bottom) > room:
+        rows = [r for r in rows if r[0]]  # first, the blank rows between sections
+        bottom = bottom[1:]
+        top = [t for t in top if t]
+    if room is not None and len(top) + len(rows) + len(bottom) > room:
+        top = top[-1:]  # then the banner: the wallet line is what's left of it
+    if room is not None and len(top) + len(rows) + len(bottom) > room:
+        fit = max(1, room - len(top) - len(bottom))  # then only the items around the chosen one, with a mark for more
+        at = next(i for i, r in enumerate(rows) if r[1] == choice)
+        start = min(max(0, at - fit // 2), len(rows) - fit)
+        shown = [r[0] for r in rows[start:start + fit]]
+        if start > 0 and fit >= 3:  # (3 rows or more, so a mark never covers the chosen item)
+            shown[0] = line((f"  {more} more above", termui.DIM))
+        if start + fit < len(rows) and fit >= 3:
+            shown[-1] = line((f"  {more} more below", termui.DIM))
+        lines = top + shown + bottom
+    else:
+        lines = top + [r[0] for r in rows] + bottom
+    return "\n".join(lines[:room] if room is not None else lines)
+
+
+def draw(choice: int, status: Status, prog: str, width: int, height: int, glyphs: dict, sections=None,
+         last: Item = QUIT) -> str:
+    """What pick() writes for one redraw: the page from the top left, each row cleared to its end (a shorter row
+    must not leave the end of the last one showing), and everything below it cleared."""
+    page = frame(choice, status, prog, width, glyphs, sections, last, height)
+    if glyphs is termui.ASCII:  # a terminal that can't show Unicode must never be sent any: › … · and the rest
+        for uni, plain in (("›", ">"), ("…", "."), ("·", "-")):
+            page = page.replace(uni, plain)
+        page = page.encode("ascii", "replace").decode()
+    return "\x1b[H" + "".join(row + termui.RESET + "\x1b[K\r\n" for row in page.split("\n"))[:-2] + "\x1b[J"
 
 
 def pick(choice: int, status: Status, prog: str, sections=None, last: Item = QUIT) -> int | None:
@@ -343,10 +401,17 @@ def pick(choice: int, status: Status, prog: str, sections=None, last: Item = QUI
     glyphs = termui.glyphs_for(termui.GLYPHS, termui.ASCII)
     page = items(sections, last)
     count = len(page)
+    size = None
     with termui.alternate_screen() as out, Keys() as keys:
         while True:
-            width = max(40, os.get_terminal_size().columns) if sys.stdout.isatty() else 80
-            out.write("\x1b[H" + frame(choice, status, prog, width, glyphs, sections, last) + termui.RESET + "\x1b[J")
+            try:
+                now = os.get_terminal_size()
+            except OSError:
+                now = os.terminal_size((80, 24))
+            if size is not None and now != size:
+                out.write("\x1b[2J")  # resized: the terminal may have rewrapped the old page, so start clean
+            size = now
+            out.write(draw(choice, status, prog, size.columns, size.lines, glyphs, sections, last))
             out.flush()
             key = keys.read(0.5)  # redraw now and then, so the balance shows up once it's in
             if key == "up":

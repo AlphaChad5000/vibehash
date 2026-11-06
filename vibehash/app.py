@@ -62,10 +62,18 @@ def control_path() -> Path:
 
 
 def read_state() -> dict | None:
-    try:
-        return json.loads(state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    for attempt in range(3):  # on Windows, a file being swapped in can't be opened for a moment: try again
+        try:
+            return json.loads(state_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            if attempt < 2:
+                time.sleep(0.02)
+    return None
+
+
+_STATE_LOCK = threading.Lock()  # the heartbeat thread and setup's reports both write the state file
 
 
 def running(state: dict | None = None, now: float | None = None) -> bool:
@@ -341,12 +349,16 @@ class Supervisor:
                  "watch": f"http://127.0.0.1:{self.port}/", "worker": {"running": self.worker_alive(),
                  "since": self.worker_since, "pid": self.child.pid if self.child else None, "restarts": self.restarts},
                  "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events}
-        try:
-            tmp = state_path().with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
-            os.replace(tmp, state_path())
-        except OSError:
-            pass
+        text = json.dumps(state, indent=1)
+        with _STATE_LOCK:  # one writer at a time: two sharing one .tmp file left it torn, or lost a report
+            tmp = state_path().with_suffix(f".{os.getpid()}.tmp")
+            for attempt in range(5):  # on Windows, a window reading the file blocks the swap for a moment
+                try:
+                    tmp.write_text(text, encoding="utf-8")
+                    os.replace(tmp, state_path())
+                    return
+                except OSError:
+                    time.sleep(0.02)
 
 
 # --- the status line -----------------------------------------------------------------------------------------------

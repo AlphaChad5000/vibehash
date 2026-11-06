@@ -61,6 +61,27 @@ class MenuTests(unittest.TestCase):
         quit_at = len(menu.items()) - 1
         self.assertIn("same as:  —", plain(menu.frame(quit_at, status, "vibehash", 120, termui.ASCII)))
 
+    def test_a_small_window_never_scrolls(self):
+        """PowerShell's default window is 120x30; the menu is taller. Each redraw scrolled the screen and left the
+        last page's rows mixed into the new one. Every page fits in height - 1 rows and width - 1 columns, keeps the
+        chosen item on screen, and clears each row to its end."""
+        with no_wallet():
+            status = menu.Status()
+        plain = lambda text: re.sub(r"\x1b\[[0-9;]*[mKJH]", "", text)  # noqa: E731
+        for sections, last in ((None, menu.QUIT), (menu.MORE, menu.BACK)):
+            labels = [i.label for i in menu.items(sections, last)]
+            for width, height in ((120, 30), (80, 20), (60, 14), (40, 8)):
+                for glyphs in (termui.GLYPHS, termui.ASCII):
+                    for choice in range(len(labels)):
+                        rows = plain(menu.frame(choice, status, "vibehash", width, glyphs, sections, last,
+                                                height)).split("\n")
+                        self.assertLessEqual(len(rows), height - 1, (width, height, choice))
+                        self.assertLessEqual(max(map(len, rows)), width - 1, (width, height, choice))
+                        self.assertTrue(any(labels[choice] in r and ("›" in r or ">" in r) for r in rows),
+                                        (width, height, choice))
+        drawn = menu.draw(0, status, "vibehash", 120, 30, termui.GLYPHS)
+        self.assertEqual(drawn.count("\x1b[K"), drawn.count("\r\n") + 1)  # every row cleared to its end
+
     def test_more_commands_is_a_page_of_its_own(self):
         ran, main, more = [], [i.label for i in menu.items()], [i.label for i in menu.items(menu.MORE, menu.BACK)]
         picks = iter([main.index("More commands"), more.index("Send VIBE"), None, None])  # in, send, Back, Quit
