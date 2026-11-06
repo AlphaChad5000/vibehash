@@ -132,6 +132,11 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.22 (2026-11-06): the miner opens on the Evo scene on an Evo network.** The owner found the menu's Evo
+Hash "brings you to the Vibe Hash terminal": the miner's screen showed the usual drill until the Evo job loaded
+(datasets and model, a minute or two on a new machine). `cli.evo_network` reads the node's `/genesis` (`"es": true`)
+and `_mine` passes `evo=` to `minerui.MinerDashboard`, as `testnet --evo2` already did. Test: `tests/test_evo_view.py`.
+
 **Release 0.5.21 (2026-11-06): Evo on any GPU of a multi-GPU machine.** Found on the owner's 3-GPU RunPod pod: a
 worker started with `--device cuda:1` or `cuda:2` loaded the model there, but es_fast/es_hybrid put their buffers,
 streams and CUDA graphs on `"cuda"` (the current GPU, per thread, GPU 0 by default): PyTorch warned "The CUDA Graph is
