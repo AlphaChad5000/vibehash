@@ -341,7 +341,7 @@ class Supervisor:
         # One writer at a time: the heartbeat thread (beat_while_preparing) and report() both write while setup runs,
         # and through the one state.tmp a second writer could truncate it under the first one's os.replace, leaving
         # state.json empty or half (read_state() -> None: the app looked not running, the window saw no setup). The
-        # state is taken inside the lock too, so an older picture never lands over a newer one.
+        # state is read inside the lock too, so each file is one consistent picture.
         with self._state_lock:
             child = self.child
             state = {"beat": now if alive else 0, "started": self.started, "pid": os.getpid(), "paused": self.paused,

@@ -104,7 +104,8 @@ class SupervisorTests(AppHome):
             done.set()
             if s._beating is not None:
                 s._beating.set()
-            t.join(timeout=10)
+            t.join(timeout=15)  # grace_s 5 and stop_worker's 5 s wait, with room
+            self.assertFalse(t.is_alive(), "the supervisor didn't stop: it would carry on into the next test")
         self.addCleanup(end)
         return t
 
