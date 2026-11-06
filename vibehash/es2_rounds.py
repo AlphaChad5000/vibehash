@@ -72,7 +72,7 @@ def rescore(spec, round_seed: int, raw: bytes, unit_id: str, step: int = 0):
                     return None
         ps = items(spec, round_seed, step)
         ok = [[bool(p.check(a["text"])) for p, a in zip(ps, member)] for member in answers]
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):  # (RecursionError: JSON nested too deep)
         return None
     scores = [es.mean_reward([1.0 if x else 0.0 for x in row]) for row in ok]
     return ([[scores[2 * k], scores[2 * k + 1]] for k in range(spec.pairs_per_unit)],

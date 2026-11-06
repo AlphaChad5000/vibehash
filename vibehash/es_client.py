@@ -42,7 +42,7 @@ class EsWork:
         self.states: dict[str, tuple[int, np.ndarray]] = {}  # job -> (height it's as of, state), followed block by block
         self.claims: dict[int, list[dict]] = {}  # round -> each committed unit's reveal body
         self.cheat: str | None = None  # tests only: "liar" (claims rewards its answers didn't earn), "forger" (answers
-        # the model didn't give: the problems' solutions)
+        # the model didn't give: the problems' solutions), "nester" (an answers blob of JSON nested too deep to parse)
         self.rebuilt = self.fetched = 0  # how each round's state was had: worked out from the chain, or downloaded
         self.timings: dict[int, dict] = {}  # round -> seconds answering, checking
         self.v2 = Es2Work(self)  # rule-2 jobs' (es2.py)
@@ -676,6 +676,8 @@ class Es2Work:
             if work.cheat == "lp-liar" and lps is not None:  # log-probabilities its models didn't give
                 lps = [[a + 0.5, b - 0.5] for a, b in lps]
             raw = es.claim_bytes(u.unit_id, answers)
+            if work.cheat == "nester":  # what the node's parser gives up on with a RecursionError, not a ValueError
+                raw = b"[" * 200_000
             bid = hashlib.sha256(raw).hexdigest()
             root, salt = es2_rounds.claim_root(bid, rewards, lps), os.urandom(16)
             digest = commit_digest(u.unit_id, keys.public, root, salt)
@@ -713,7 +715,7 @@ class Es2Work:
             answers = json.loads(raw)["answers"]
             got = {k: [list(map(int, a["ids"])) for a in answers[k]] for k in chosen}
             texts = {k: [a["text"] for a in answers[k]] for k in chosen}
-        except (ValueError, KeyError, TypeError, IndexError):
+        except (ValueError, KeyError, TypeError, IndexError, RecursionError):  # (RecursionError: JSON nested too deep)
             return False, chosen[0]
         rt, ln = self.at(job, unit.start_hash)
         seed = unit.seed
@@ -727,6 +729,12 @@ class Es2Work:
             for k in chosen:
                 if len(got[k]) != spec.problems:
                     ok, bad, why = False, k, "a member's answers aren't one a problem"
+                    break
+                # Ids the model has no row for: decoding 10**12 or -5 raises, and past the embedding the GPU itself
+                # stops (a device-side assert), so another worker's blob could end this checker's round, or its run.
+                n_vocab = rt.model.get_input_embeddings().num_embeddings
+                if any(not 0 <= t < n_vocab for a in got[k] for t in a):
+                    ok, bad, why = False, k, "an answer has token ids the model doesn't have"
                     break
                 if any(t != es.text_of(rt, a) for a, t in zip(got[k], texts[k])):
                     ok, bad, why = False, k, "an answer's text isn't its tokens' decoding"
