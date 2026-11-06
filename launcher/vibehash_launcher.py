@@ -51,7 +51,7 @@ UV_ASSETS = {  # (platform.system(), platform.machine().lower()) -> the release 
     ("Linux", "arm64"): "uv-aarch64-unknown-linux-gnu.tar.gz",
 }
 PYTHON = "3.12"
-PACKAGE = "vibehash[finetune]"
+PACKAGE = "vibehash[finetune,app]"  # app: pywebview, for the window (window.py)
 UPDATE_EVERY_S = 86400
 BANNER = "Vibe Hash  -  mining that trains real AI models  -  vibehash.org"  # (ASCII: any console shows it)
 

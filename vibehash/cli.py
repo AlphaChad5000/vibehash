@@ -548,6 +548,12 @@ def cmd_avatar(a):
     avatar.main(a)
 
 
+def cmd_window(a):
+    from . import window
+
+    window.main(a)
+
+
 def _chosen_job(api: NodeClient, job: str, url: str) -> None:
     """`worker --job JOB`: the node must list JOB among its jobs with budget left, or the worker stops here naming
     the ones it does. A node from before /network is asked about JOB alone."""
@@ -2309,8 +2315,9 @@ def parser() -> argparse.ArgumentParser:
                          "the worker as something you start once and forget: it saves the node, makes a wallet if there "
                          "is none (its password from $VIBEHASH_PASSWORD, or asked once at a terminal; the recovery words "
                          "go to a file only you can read), installs the GPU build of PyTorch without asking, then runs "
-                         "`worker --watch` and starts it again whenever it stops. The other `app` commands talk to the "
-                         "running one through ~/.vibehash/app. It is what the desktop app's launcher runs.")
+                         "`worker --watch` and starts it again whenever it stops, with the window open (`window`; "
+                         "--no-window not to). The other `app` commands talk to the running one through ~/.vibehash/app. "
+                         "It is what the desktop app's launcher runs.")
     for p in (ap_, None):  # the start options, on plain `app` and on `app start` alike
         if p is None:
             asub = ap_.add_subparsers(dest="acmd")
@@ -2326,11 +2333,14 @@ def parser() -> argparse.ArgumentParser:
                        "asked (what the downloadable app does); the file is then as safe as your user account")
         p.add_argument("--avatar", action="store_true", help="also show the floating avatar on the desktop (`avatar`), "
                        "which the downloadable app does; needs a screen")
+        p.add_argument("--no-window", action="store_true", help="don't open the window (`window`) as it starts; a click "
+                       "on the avatar or `vibehash window` opens it later. How a start-at-login entry runs")
         p.set_defaults(fn=cmd_app)
     for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
                        ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
         asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
-    p = asub.add_parser("startup", help="start the app when you log in (on), or not (off)")
+    p = asub.add_parser("startup", help="start the app when you log in (on), or not (off); it then starts without the "
+                        "window, which the avatar or `vibehash window` opens")
     p.add_argument("mode", choices=["on", "off"])
     p.add_argument("--avatar", action="store_true", help="with the floating avatar (on only)")
     p.set_defaults(fn=cmd_app)
@@ -2339,11 +2349,20 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("avatar", help="a small always-on-top pickaxe on the desktop that shows what the worker is doing; "
                        "click it for the window, right-click for pause, resume and more",
                        description="The floating avatar (avatar.py): reads the worker's feed (`worker --watch` or `app`) "
-                       "and moves with it (resting, training, checking, paid), a click opens the window "
-                       "(http://127.0.0.1:PORT/dashboard), a right-click gives the menu, and it can be dragged anywhere. "
+                       "and moves with it (resting, training, checking, paid), a click opens the window (`window`), "
+                       "a right-click gives the menu, and it can be dragged anywhere. "
                        "`app --avatar` starts it with the app. Needs a screen and tkinter.")
     p.add_argument("--watch", type=int, metavar="PORT", default=WATCH_PORT, help=f"the feed's port (default {WATCH_PORT})")
     p.set_defaults(fn=cmd_avatar)
+
+    p = sub.add_parser("window", help="the app's window: the mining dashboard in a window of its own, beside a running "
+                       "`app` or `worker --watch`",
+                       description="The window (window.py): the dashboard (the round step by step, the feed, your wallet, "
+                       "the network) in the system's own web view through pywebview (`pip install vibehash[app]`; the "
+                       "downloadable app has it). It waits for the worker's feed, then shows it; closing it doesn't stop "
+                       "mining. Without pywebview, or a web view on this Linux, the dashboard opens in the browser instead.")
+    p.add_argument("--watch", type=int, metavar="PORT", default=WATCH_PORT, help=f"the feed's port (default {WATCH_PORT})")
+    p.set_defaults(fn=cmd_window)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
     p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",
