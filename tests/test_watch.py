@@ -112,6 +112,17 @@ class WatchTests(unittest.TestCase):
         _, headers = self.get("/", origin="https://evil.example")
         self.assertNotIn("Access-Control-Allow-Origin", headers)
 
+    def test_the_window_is_a_page_that_reads_the_feed_and_the_node(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/dashboard")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            page, headers = resp.read().decode("utf-8"), resp.headers
+        self.assertTrue(headers["Content-Type"].startswith("text/html"))
+        self.assertIn("connect-src 'self' http://127.0.0.1:8545", headers["Content-Security-Policy"])  # the node, and nothing else
+        for needed in ('fetch("/"', '"/events?after="', '"/network"', 'id="feed"', 'id="census"', 'id="balance"'):
+            self.assertIn(needed, page)
+        self.assertNotIn("https://", page.replace("https://vibehash.org", ""))  # nothing fetched from the wider web
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
     def test_anything_else_is_404(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self.get("/wallet.json")

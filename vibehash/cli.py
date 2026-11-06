@@ -542,6 +542,12 @@ def cmd_app(a):
     app.main(a)
 
 
+def cmd_avatar(a):
+    from . import avatar
+
+    avatar.main(a)
+
+
 def _chosen_job(api: NodeClient, job: str, url: str) -> None:
     """`worker --job JOB`: the node must list JOB among its jobs with budget left, or the worker stops here naming
     the ones it does. A node from before /network is asked about JOB alone."""
@@ -2318,13 +2324,26 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
         p.add_argument("--no-password", action="store_true", help="make a first wallet without a password, so nothing is "
                        "asked (what the downloadable app does); the file is then as safe as your user account")
+        p.add_argument("--avatar", action="store_true", help="also show the floating avatar on the desktop (`avatar`), "
+                       "which the downloadable app does; needs a screen")
         p.set_defaults(fn=cmd_app)
     for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
                        ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
         asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
     p = asub.add_parser("startup", help="start the app when you log in (on), or not (off)")
-    p.add_argument("mode", choices=["on", "off"]); p.set_defaults(fn=cmd_app)
+    p.add_argument("mode", choices=["on", "off"])
+    p.add_argument("--avatar", action="store_true", help="with the floating avatar (on only)")
+    p.set_defaults(fn=cmd_app)
     ap_.set_defaults(fn=cmd_app, acmd=None)
+
+    p = sub.add_parser("avatar", help="a small always-on-top pickaxe on the desktop that shows what the worker is doing; "
+                       "click it for the window, right-click for pause, resume and more",
+                       description="The floating avatar (avatar.py): reads the worker's feed (`worker --watch` or `app`) "
+                       "and moves with it (resting, training, checking, paid), a click opens the window "
+                       "(http://127.0.0.1:PORT/dashboard), a right-click gives the menu, and it can be dragged anywhere. "
+                       "`app --avatar` starts it with the app. Needs a screen and tkinter.")
+    p.add_argument("--watch", type=int, metavar="PORT", default=WATCH_PORT, help=f"the feed's port (default {WATCH_PORT})")
+    p.set_defaults(fn=cmd_avatar)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
     p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",

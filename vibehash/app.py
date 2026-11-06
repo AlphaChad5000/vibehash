@@ -141,8 +141,11 @@ class Supervisor:
     """Keeps one worker running (`command`), stops it on pause and stop orders, starts it again on resume or when it
     stopped on its own, and writes the app's state with a heartbeat."""
 
-    def __init__(self, command: list[str], port: int, beat_s: float = BEAT_S, backoff=BACKOFF_S, grace_s: float = STOP_GRACE_S):
+    def __init__(self, command: list[str], port: int, beat_s: float = BEAT_S, backoff=BACKOFF_S, grace_s: float = STOP_GRACE_S,
+                 companion: list[str] | None = None):
         self.command, self.port, self.beat_s, self.backoff, self.grace_s = list(command), port, beat_s, backoff, grace_s
+        self.companion = list(companion) if companion else None  # the avatar (avatar.py): started once, not kept alive
+        self.friend: subprocess.Popen | None = None
         self.child: subprocess.Popen | None = None
         self.paused = False
         self.restarts = 0
@@ -226,6 +229,11 @@ class Supervisor:
         _stop_like_ctrl_c()  # `kill`, a service manager or a closed console window: the worker is stopped first
         app_dir().mkdir(parents=True, exist_ok=True)
         take_order()  # a stale order from an earlier app
+        if self.companion:
+            try:  # the avatar: a window of its own; no screen or no tkinter, and it says so and leaves, which is fine
+                self.friend = subprocess.Popen(self.companion)
+            except OSError as e:
+                self.say(f"couldn't start the avatar: {e}")
         try:
             while (stop is None or not stop.is_set()) and self.tick():
                 time.sleep(self.beat_s)
@@ -236,6 +244,8 @@ class Supervisor:
             if self.worker_alive():
                 self.stop_worker("the app is leaving")
                 self.write_state(time.time(), alive=False)
+            if self.friend is not None and self.friend.poll() is None:
+                self.friend.terminate()
 
     # -- what it says --
 
@@ -317,17 +327,17 @@ def startup_file(system: str | None = None) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / "vibehash.service"
 
 
-def startup_on(system: str | None = None, run=subprocess.run) -> Path:
+def startup_on(system: str | None = None, run=subprocess.run, avatar: bool = False) -> Path:
     """Start `vibehash app` at login: a Startup-folder script (Windows), a LaunchAgent (macOS) or a systemd user
-    service (Linux). -> the file written."""
+    service (Linux). `avatar`: with the avatar, as the app was started. -> the file written."""
     system = system or platform.system()
     path = startup_file(system)
     path.parent.mkdir(parents=True, exist_ok=True)
     home = settings.home()
     # Under the downloadable launcher (it says where it is), start the launcher, so its daily update check still
-    # happens; otherwise this Python with the app command.
+    # happens (it passes --avatar itself); otherwise this Python with the app command.
     launcher = os.environ.get("VIBEHASH_LAUNCHER")
-    exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"])
+    exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"] + (["--avatar"] if avatar else []))
     if system == "Windows":
         # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n
         text = f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n')
@@ -394,7 +404,7 @@ def main(a) -> None:
         print("stopped" if stop_and_wait() else "the app didn't stop in time")
     elif sub == "startup":
         if a.mode == "on":
-            print(f"will start when you log in: {startup_on()}")
+            print(f"will start when you log in: {startup_on(avatar=bool(getattr(a, 'avatar', False)))}")
         else:
             print(f"won't start when you log in (removed {startup_off()})")
     else:
@@ -404,6 +414,7 @@ def main(a) -> None:
         url, wallet = prepare(a)
         port = a.watch if getattr(a, "watch", None) else DEFAULT_PORT
         cmd = worker_command(url, wallet, port, getattr(a, "device", "auto"), getattr(a, "job", None))
-        print(f"mining; the worker's feed is at http://127.0.0.1:{port}/ and `vibehash app status` sums it up. Ctrl+C stops it.")
-        Supervisor(cmd, port).run()
+        companion = [sys.executable, "-m", "vibehash", "avatar", "--watch", str(port)] if getattr(a, "avatar", False) else None
+        print(f"mining; the window is at http://127.0.0.1:{port}/dashboard and `vibehash app status` sums it up. Ctrl+C stops it.")
+        Supervisor(cmd, port, companion=companion).run()
         print("app stopped")
