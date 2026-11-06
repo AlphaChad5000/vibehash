@@ -21,8 +21,9 @@
 # --es makes a network that takes Evo Hash jobs, and --stake gives a wallet stake from the start (an Evo job's work
 # is checked only by staked workers, so newcomers can earn theirs only once someone is staked). Both, like --fund,
 # only count when the genesis is made, the first time. Upgrading one node upgrades the shared install, so restart
-# the others too (systemctl restart 'vibehash-node*') to run the same release.
-# The domain's A record must already point at this server. Getting the certificate accepts Let's Encrypt's terms
+# the others too (systemctl restart 'vibehash-node*') to run the same release. A node whose genesis takes Evo jobs also
+# gets the `datasets` library and the Evo tasks' questions, in its own folder: it re-scores miners' answers with them.
+# The domain's A record must already point at this server (or at Cloudflare's proxy, in front of it). Getting the certificate accepts Let's Encrypt's terms
 # (https://letsencrypt.org/repository/). The email is optional: certificates renew by themselves, and Let's Encrypt
 # only uses it for account notices.
 set -euo pipefail
@@ -59,14 +60,20 @@ DATA=/var/lib/vibehash$SUFFIX ETC=/etc/vibehash$SUFFIX VENV=/opt/vibehash SERVIC
 VH="$VENV/bin/vibehash" WALLET="$DATA/node-wallet.json" GENESIS="$DATA/genesis.json"
 if [ "$PORT" = 443 ]; then URL="https://$DOMAIN"; else URL="https://$DOMAIN:$PORT"; fi
 say() { printf '\n== %s\n' "$*"; }
-as_node() { (cd "$DATA" && sudo -u vibehash --preserve-env=VIBEHASH_PASSWORD,VIBEHASH_HOME "$@"); }
+as_node() { (cd "$DATA" && sudo -u vibehash --preserve-env=VIBEHASH_PASSWORD,VIBEHASH_HOME,HF_HOME "$@"); }
 
 say "Checking $DOMAIN points at this server"
 POINTS_AT=$(getent ahostsv4 "$DOMAIN" | awk 'NR == 1 { print $1 }' || true)
 if ! hostname -I | tr ' ' '\n' | grep -qxF "${POINTS_AT:-none}"; then
-  echo "$DOMAIN points at ${POINTS_AT:-nothing}, not this server ($(hostname -I | awk '{ print $1 }'))."
-  echo "Add an A record for it at your DNS provider, wait a few minutes, and run this again."
-  exit 1
+  # Behind Cloudflare's proxy the name resolves to Cloudflare, which answers /cdn-cgi/trace itself. That's fine: it
+  # passes port 80 through for the certificate, and HTTPS on 443 or 8443 on to this server.
+  if curl -fsS -m 10 "http://$DOMAIN/cdn-cgi/trace" 2>/dev/null | grep -q '^fl='; then
+    echo "$DOMAIN is behind Cloudflare's proxy ($POINTS_AT): going on. Its record must point at this server."
+  else
+    echo "$DOMAIN points at ${POINTS_AT:-nothing}, not this server ($(hostname -I | awk '{ print $1 }'))."
+    echo "Add an A record for it at your DNS provider, wait a few minutes, and run this again."
+    exit 1
+  fi
 fi
 
 say "Installing packages"
@@ -105,6 +112,24 @@ if [ ! -f "$GENESIS" ]; then
   [ -n "$ES" ] && args+=(--es)
   for s in "${STAKES[@]}"; do args+=(--stake "$s"); done
   as_node "$VH" "${args[@]}"
+fi
+
+# A network that takes Evo jobs: the node re-scores every miner's answers with the task's own questions (es_tasks),
+# which come from Hugging Face datasets. Without the `datasets` library every reveal fails ("TaskUnavailable") and no
+# Evo work is ever accepted. They go in the node's own folder (the service may write only there), fetched now for the
+# public Evo job's tasks so the first rounds don't time out waiting for downloads; other tasks come on first use.
+if python3 -c "import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get('es') is True else 1)" "$GENESIS"; then
+  say "Getting the Evo tasks' questions (the node re-scores answers with them)"
+  "$VENV/bin/pip" install -q --upgrade 'datasets>=2.18'
+  grep -q '^HF_HOME=' "$ETC/env" || echo "HF_HOME=$DATA/hf" >> "$ETC/env"
+  set -a; . "$ETC/env"; set +a
+  install -d -m 750 -o vibehash -g vibehash "$HF_HOME"
+  as_node "$VENV/bin/python" - <<'PY'
+from vibehash import es_tasks
+for t in es_tasks.VIBE:
+    es_tasks.get(t).items(0, 1)
+print(f"{len(es_tasks.VIBE)} tasks ready")
+PY
 fi
 
 say "Opening the firewall for HTTP (certificate renewals) and HTTPS"
