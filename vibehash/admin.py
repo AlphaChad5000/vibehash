@@ -51,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +81,27 @@ NODE_TIMEOUT = 15.0
 MAX_BODY = 256 * 1024
 BLOCKS_PAGE = 100
 INSECURE = "the admin token is only sent over https:// (or to this computer or a private network): change the URL"
+RETRY_REFUSED_S = 300  # a node that refused the token is asked again this often, not on every refresh: each refusal
+# is a strike against this computer's address, and 10 in 15 minutes lock it out (nodeadmin.MAX_FAILS)
+
+
+class _KeepTokenHome(urllib.request.HTTPRedirectHandler):
+    """A redirect is never followed with the admin token or sign-in: urllib would send them on to wherever it points,
+    plain http included. Requests without them (the public routes) follow redirects as before."""
+    handler_order = 400  # before urllib's own redirect handler
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.has_header("Authorization") or req.has_header(nodeadmin.LOGIN_HEADER.capitalize()):
+            raise urllib.error.HTTPError(req.full_url, code, f"the node redirected an admin request to {newurl}; "
+                                         "not followed, so the token stays here", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _admin_client(url: str) -> NodeClient:
+    client = NodeClient(url, timeout=NODE_TIMEOUT)
+    client._opener = client._opener or urllib.request.build_opener()  # noqa: SLF001
+    client._opener.add_handler(_KeepTokenHome())  # noqa: SLF001
+    return client
 
 
 # --- where an address is ---------------------------------------------------------------------------
@@ -206,7 +228,9 @@ class NodeLink:
 
     def __init__(self, url: str, token: str | None = None, client: NodeClient | None = None):
         self.url, self.token = url.rstrip("/"), token or None
-        self.client = client or NodeClient(self.url, timeout=NODE_TIMEOUT)
+        self.client = client or _admin_client(self.url)
+        self.refused_at: float | None = None  # when the node last refused the token (401) or turned us away (403)
+        self.refused_error: str | None = None
         self.login: str | None = None  # the node's sign-in, after an authenticator code (nodeadmin.Admin.login)
         self.login_until: float | None = None
         self.needs_code = False  # the node said it wants a code
@@ -258,19 +282,24 @@ class NodeLink:
         error = None
         if self.token and not self.secure:
             error = INSECURE
+        elif self.token and self.refused_at is not None and time.time() - self.refused_at < RETRY_REFUSED_S:
+            error = self.refused_error  # not asked again yet: a stale token polled every refresh would lock us out
         elif self.token:
             try:
                 out = self.admin_get("/admin/overview")
-                self.needs_code = False
+                self.needs_code, self.refused_at = False, None
                 out.update(admin=True, url=self.url, mfa=False, login_until=self.login_until)
                 return out
             except NodeError as e:
                 if e.status == 401 and nodeadmin.NEED_CODE in str(e):  # the token is right; the sign-in is missing or over
                     self.login = self.login_until = None
-                    self.needs_code = True
-                elif e.status not in (401, 404):
+                    self.needs_code, self.refused_at = True, None
+                elif e.status in (401, 403):  # the wrong token, or too many wrong tries from here lately
+                    self.needs_code, self.refused_at = False, time.time()
+                    self.refused_error = f"{e} (asked again every {RETRY_REFUSED_S // 60} minutes, or at once when the token is saved)"
+                elif e.status != 404:
                     return {"url": self.url, "admin": False, "mfa": self.needs_code, "error": str(e)}
-                error = None if self.needs_code else str(e)
+                error = None if self.needs_code else (self.refused_error if e.status in (401, 403) else str(e))
             except BROKEN as e:  # a reply that isn't the node's (a proxy's error page, a cut connection)
                 return {"url": self.url, "admin": False, "error": f"a reply that wasn't JSON: {e}"}
         try:
@@ -602,7 +631,7 @@ class AdminApp:
                     elif parts == ["unlock"]:
                         out = app.unlock(str(body.get("password") or ""))
                     elif parts == ["login"]:
-                        out = app.sign_in(str(body.get("code") or ""), body.get("url") or None)
+                        out = app.sign_in(str(body.get("code") or ""), str(body.get("url") or "") or None)
                     elif parts == ["settings"]:
                         out = app.set_settings(body.get("nodes"), body.get("wallet"), body.get("geo"))
                     else:

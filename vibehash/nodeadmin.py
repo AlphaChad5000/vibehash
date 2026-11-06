@@ -22,7 +22,9 @@ adds the same key to their own app. A stolen token is then not enough: the phone
 Wrong guesses: an address that sends MAX_FAILS wrong tokens or codes within FAIL_WINDOW_S is turned away (403,
 Retry-After) for the rest of that window, before its token is even looked at; and MAX_CODE_FAILS wrong codes from
 anywhere, which take the right token to send, stop codes being taken at all for the window, since someone holding the
-token is trying codes. A wrong token from the open internet can't lock an admin out: it counts against its own address.
+token is trying codes. A wrong token from the open internet can't lock an admin out: it counts against its own address. Behind a reverse
+proxy that holds only if the proxy sets X-Forwarded-For (`client_ip`): without it every client looks like the proxy,
+and anyone's wrong guesses lock everyone out.
 
 A hold is this node's own policy, not a rule of the chain: the coordinator skips a held job when it picks what the
 next round trains (Coordinator.policy -> `reason`), and the job's budget stays in escrow untouched. Another validator

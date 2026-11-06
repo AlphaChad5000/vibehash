@@ -518,6 +518,66 @@ class AdminAppTests(unittest.TestCase):
         app = admin.AdminApp([link], None, self.app.geo)
         self.assertEqual(app.review(True)["nodes"][0], {"url": link.url, "ok": False, "error": admin.INSECURE})
 
+    def test_a_refused_token_isnt_sent_on_every_refresh(self):
+        """Each refusal is a strike against this computer's address: a stale token polled every few seconds would lock
+        the admin out within a minute, so a refused node is asked again only every RETRY_REFUSED_S."""
+        fake = FakeNode({"/status": {"height": 3}, "/network": {"jobs": []}, "/validators": {}}, token="other")
+        asked = []
+        real = fake._req
+        fake._req = lambda method, path, *a, **k: (asked.append(path) if path.startswith("/admin/") else None) or real(method, path, *a, **k)
+        link = admin.NodeLink(fake.url, "t", client=fake)
+        for _ in range(5):
+            v = link.overview()
+            self.assertIn("token is missing or wrong", v["error"])
+            self.assertEqual(v["node"]["height"], 3)
+        self.assertEqual(asked, ["/admin/overview"])
+        link.refused_at -= admin.RETRY_REFUSED_S
+        link.overview()
+        self.assertEqual(len(asked), 2)
+        locked = FakeNode({"/admin/overview": NodeError("GET /admin/overview: too many wrong tries from this address: try "
+                                                        "again in 9 minutes", 403), "/status": {"height": 4}, "/network": {"jobs": []},
+                           "/validators": {}})
+        v = admin.NodeLink(locked.url, "t", client=locked).overview()
+        self.assertIn("9 minutes", v["error"])
+        self.assertEqual(v["node"]["height"], 4)  # still its public side, not "unreachable"
+
+    def test_a_redirect_never_takes_the_token_along(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = []
+
+        class Target(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                body = b'{"height": 9}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirector(Target):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_address[1]}{self.path}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        hop = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        for s in (target, hop):
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+            self.addCleanup(s.server_close)
+            self.addCleanup(s.shutdown)
+        link = admin.NodeLink(f"http://127.0.0.1:{hop.server_address[1]}", "t")
+        with self.assertRaisesRegex(NodeError, "not followed"):
+            link.admin_get("/admin/overview")
+        self.assertEqual(seen, [])  # the token went nowhere
+        self.assertEqual(link.client.get("/status"), {"height": 9})  # a public route still follows it
+        self.assertEqual(seen, [("/status", None)])
+
     def test_a_node_that_wants_a_code_is_signed_in_with_one(self):
         node = MfaNode({"/admin/overview": overview_answer(), "/admin/jobs/j1/hold": {"ok": True}, "/status": {"height": 3},
                         "/network": {"jobs": []}, "/validators": {}})

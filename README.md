@@ -263,7 +263,9 @@ and the admin app asks for the app's 6-digit code, for a sign-in that lasts
 12 hours. A stolen token is then not enough. An address that sends 10 wrong
 tokens or codes within 15 minutes is turned away until those 15 minutes are
 up, and the app sends a token only over HTTPS, or to this computer or a
-private network.
+private network. Behind a reverse proxy, the proxy must set
+`X-Forwarded-For`, or every client looks like the proxy and anyone's wrong
+guesses lock everyone out.
 
 ```bash
 python -m vibehash admin --new-token
