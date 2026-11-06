@@ -68,6 +68,7 @@ CURATED = ("arc_easy", "sciq", "commonsense_qa", "openbookqa", "arc_challenge", 
 # each (es2_rounds.items).
 VIBE = ("ifeval", "gsm8k", "math", "medmcqa", "arc_challenge", "arc_easy", "sciq", "openbookqa", "commonsense_qa",
         "qasc", "social_iqa", "piqa", "winogrande", "hellaswag", "boolq", "aqua_rat")
+VIBE_MAX_TOKENS = 512  # VIBE's jobs' longest answer: gsm8k, math and ifeval reason or write at length
 MAX_LONG = 520  # a Hugging Face task's longest prompt, in characters (about 150 tokens)
 MAX_REASON = 1000  # the longest prompt of the tasks with room to think (ifeval, gsm8k, math), about 300 tokens
 POOL = 20_000  # the most rows a task keeps the indices of for each part
