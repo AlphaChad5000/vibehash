@@ -145,7 +145,7 @@ class EnvTests(unittest.TestCase):
                 mock.patch.object(L.signal, "signal") as sig:
             code = L.run_app(Path("e") / "bin" / "py", ["--device", "cpu"], child_env={"X": "1"})
         self.assertEqual(code, 7)
-        self.assertEqual(popen.call_args.args[0], [str(Path("e") / "bin" / "py"), "-m", "vibehash", "app", "--no-password", "--device", "cpu"])
+        self.assertEqual(popen.call_args.args[0], [str(Path("e") / "bin" / "py"), "-m", "vibehash", "app", "--no-password", "--avatar", "--device", "cpu"])
         self.assertEqual(popen.call_args.kwargs["cwd"], "e")  # the environment's folder, not wherever it was started
         self.assertEqual(popen.call_args.kwargs["env"], {"X": "1"})
         self.assertEqual(sig.call_args_list[0].args, (L.signal.SIGINT, L.signal.SIG_IGN))  # Ctrl+C is the app's to handle
