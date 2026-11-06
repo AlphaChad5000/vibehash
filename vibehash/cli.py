@@ -383,12 +383,21 @@ def cmd_node(a):
             compute.use(compute.get_backend(a.device, logging.getLogger("vibehash.node")))
         except RuntimeError as e:
             sys.exit(f"error: {e}")
+    from . import nodeadmin
+    try:  # an admin token too short to be safe, or an authenticator key that isn't one: say so before anything starts
+        nodeadmin.check_token(a.admin_token)
+        if a.admin_mfa and not a.admin_token:
+            raise ValueError("--admin-mfa needs --admin-token too")
+        if a.admin_mfa:
+            nodeadmin.mfa_key(a.admin_mfa)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
     try:
         node = Node(a.data_dir, genesis, load_wallet(a.wallet), a.host, a.port, times, config=CoordinatorConfig(min_fee=a.min_fee),
                     keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
                     announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
                     bucket=bucket_from_env(),  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
-                    min_client=a.min_client, admin_token=a.admin_token).start()
+                    min_client=a.min_client, admin_token=a.admin_token, admin_mfa=a.admin_mfa).start()
     except FolderInUse as e:
         sys.exit(f"error: {e}")
     if context:
@@ -2317,8 +2326,12 @@ def parser() -> argparse.ArgumentParser:
                         "version 4 blocks")
     p.add_argument("--admin-token", metavar="TOKEN", default=os.environ.get("VIBEHASH_ADMIN_TOKEN") or None,
                    help="serve the operators' routes (/admin/*: hold and release jobs, the devices' addresses) to the "
-                        "admin app (`vibehash admin`) that sends this token; default $VIBEHASH_ADMIN_TOKEN; without "
-                        "one those routes don't exist")
+                        "admin app (`vibehash admin`) that sends this token, at least 24 characters (`vibehash admin "
+                        "--new-token` makes one); default $VIBEHASH_ADMIN_TOKEN; without one those routes don't exist")
+    p.add_argument("--admin-mfa", metavar="KEY", default=os.environ.get("VIBEHASH_ADMIN_MFA") or None,
+                   help="an authenticator app's key (`vibehash admin --new-mfa` makes one and says how to add it): the "
+                        "token then also needs the app's 6-digit code, for a sign-in that lasts 12 hours; default "
+                        "$VIBEHASH_ADMIN_MFA")
     p.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this PEM certificate (see `tls cert`)")
     p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
 
@@ -2432,6 +2445,9 @@ def parser() -> argparse.ArgumentParser:
                    "menu on Linux, ~/Applications on a Mac), running this Python; --node, --token and --wallet given with "
                    "it are saved for it to open with")
     p.add_argument("--remove-shortcut", action="store_true", help="take that shortcut away again")
+    p.add_argument("--new-token", action="store_true", help="print a new random admin token for a node's --admin-token")
+    p.add_argument("--new-mfa", action="store_true", help="print a new authenticator key for a node's --admin-mfa, "
+                   "with how to add it to an authenticator app")
     p.set_defaults(fn=cmd_admin)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")

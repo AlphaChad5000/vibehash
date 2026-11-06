@@ -112,6 +112,15 @@
   <button role="tab" aria-selected="false" data-tab="settings">Settings</button>
 </nav>
 <main>
+  <div class="card" id="code-card" hidden style="margin-bottom:14px;border-color:var(--gold)">
+    <h3>Sign in</h3>
+    <div class="row">
+      <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456" style="width:110px;letter-spacing:.15em">
+      <button class="btn gold" id="code-go" type="button">Sign in</button>
+      <span class="muted" id="code-for"></span>
+    </div>
+    <div class="msg" id="code-msg"></div>
+  </div>
   <section id="tab-globe">
     <div class="globe-wrap">
       <div id="stage">
@@ -195,7 +204,7 @@
     <div class="settings">
       <div class="card" style="margin-bottom:12px">
         <h3>Nodes</h3>
-        <p class="muted" style="margin:0 0 10px">The first is the one the jobs and the ledger come from; holds go to every node with a token. A token is what the node was started with (`vibehash node --admin-token`); leave it empty to keep the one saved.</p>
+        <p class="muted" style="margin:0 0 10px">The first is the one the jobs and the ledger come from; holds go to every node with a token. A token is what the node was started with (`vibehash node --admin-token`); leave it empty to keep the one saved. It is only sent over https://, or to this computer or a private network.</p>
         <div id="node-rows"></div>
         <button class="btn" id="add-node" type="button">Add a node</button>
       </div>
@@ -257,8 +266,9 @@
       state.data = d; state.lastErr = null;
       $("dot").className = "dot on";
       var n = d.nodes[0] || {};
-      text($("state"), (n.error ? "can't reach " + host(n.url) : host(n.url) + (n.admin ? "" : " (no admin token)")) + " · height " + (n.height == null ? "–" : n.height));
-      if (n.error) $("dot").className = "dot bad";
+      var why = n.admin ? "" : (n.mfa ? " (sign in with a code)" : (n.error ? " (public only: " + n.error + ")" : " (no admin token)"));
+      text($("state"), (down(n) ? "can't reach " + host(n.url) : host(n.url) + why) + " · height " + (n.height == null ? "–" : n.height));
+      if (down(n)) $("dot").className = "dot bad";
       render(d);
       if (d.primary !== state.primary) { state.primary = d.primary; state.tip = null; state.blocks = {}; state.order = []; state.seen = {}; renderBlocks(); }  // another chain: start the ledger over
       if (n.height != null && n.height !== state.tip) { state.tip = n.height; loadBlocks(); }
@@ -266,6 +276,22 @@
       state.lastErr = e; $("dot").className = "dot bad"; text($("state"), "the admin server isn't answering: " + e.message);
     });
   }
+
+  function down(n) { return !!n.error && n.height == null; }  // an error and nothing from its public routes either
+  function renderCode(d) {
+    var need = (d.nodes || []).filter(function (n) { return n.mfa; });
+    $("code-card").hidden = !need.length;
+    if (need.length) text($("code-for"), "the 6-digit code from your authenticator app, for " + need.map(function (n) { return host(n.url); }).join(", ") + ". A sign-in lasts 12 hours.");
+  }
+  $("code-go").onclick = function () {
+    api("/api/login", { code: $("code").value.replace(/\s/g, "") }).then(function (r) {
+      var bad = (r.nodes || []).filter(function (x) { return !x.ok; });
+      $("code").value = "";
+      say($("code-msg"), bad.length ? bad.map(function (x) { return host(x.url) + ": " + x.error; }).join("; ") : "signed in", bad.length ? "bad" : "good");
+      refresh();
+    }).catch(function (e) { say($("code-msg"), e.message, "bad"); });
+  };
+  $("code").addEventListener("keydown", function (e) { if (e.key === "Enter") $("code-go").click(); });
 
   function render(d) {
     var now = d.now, nodes = d.nodes || [], n = nodes[0] || {}, jobs = d.jobs || [], devices = d.devices || [];
@@ -283,14 +309,14 @@
     text($("k-round-sub"), r.no == null ? "no round open" : (r.phase || "") + (r.job_id ? " · " + r.job_id : "") + (r.registered ? " · " + r.registered + " registered" : ""));
     var vals = d.validators || {}, voting = Object.keys(vals).filter(function (a) { return vals[a].votes; }).length;
     text($("k-validators"), voting);
-    text($("k-validators-sub"), Object.keys(vals).length + " announced · " + nodes.filter(function (x) { return !x.error; }).length + " of " + nodes.length + " nodes answering");
+    text($("k-validators-sub"), Object.keys(vals).length + " announced · " + nodes.filter(function (x) { return !down(x); }).length + " of " + nodes.length + " nodes answering");
     text($("k-mempool"), (d.mempool || []).length);
     var sup = n.supply && n.supply.vibe ? n.supply.vibe : null;
     text($("k-supply"), sup ? Number(sup.circulating).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "–");
     text($("k-supply-sub"), sup ? "VIBE · " + Number(sup.total).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " in all" : "VIBE");
     var badge = $("n-jobs"); badge.hidden = !held && d.review !== true ? true : false; badge.className = held ? "gold" : ""; text(badge, held ? held + " held" : "review on");
     $("n-devices").hidden = !online; text($("n-devices"), online);
-    renderJobs(d); renderDevices(d); renderNodes(d); renderMempool(d); renderSettings(d);
+    renderCode(d); renderJobs(d); renderDevices(d); renderNodes(d); renderMempool(d); renderSettings(d);
     text($("foot"), "Vibe Hash " + (ADMIN.version || "") + " · admin app on this computer only · " + (d.geo && d.geo.enabled ? (d.geo.waiting ? d.geo.waiting + " places being looked up" : "places from ip-api.com, cached a month") : "place lookups off"));
     globeData(d);
   }
@@ -367,7 +393,7 @@
     var box = $("nodes"); box.textContent = "";
     (d.nodes || []).forEach(function (n, i) {
       var c = el("div", "card"); var h = el("h3", null, host(n.url) + (i === 0 ? " · primary" : "")); c.appendChild(h);
-      var top = el("div", "row"); top.appendChild(el("span", "dot" + (n.error ? " bad" : " on"))); top.appendChild(el("b", null, n.error ? "unreachable" : (n.halted ? "halted" : "up"))); top.appendChild(el("span", "tag" + (n.admin ? " open" : ""), n.admin ? "admin" : "public only")); if (n.validator) top.appendChild(el("span", "tag review", "validator")); c.appendChild(top);
+      var top = el("div", "row"); top.appendChild(el("span", "dot" + (down(n) ? " bad" : " on"))); top.appendChild(el("b", null, down(n) ? "unreachable" : (n.halted ? "halted" : "up"))); top.appendChild(el("span", "tag" + (n.admin ? " open" : (n.mfa ? " review" : "")), n.admin ? "admin" : (n.mfa ? "code needed" : "public only"))); if (n.login_until) top.appendChild(el("span", "muted", "signed in until " + new Date(n.login_until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))); if (n.validator) top.appendChild(el("span", "tag review", "validator")); c.appendChild(top);
       var dl = el("dl");
       var rows = [["Version", n.version || "–"], ["Announces", n.announce && host(n.announce) !== host(n.url) ? host(n.announce) : "–"], ["Height", n.height == null ? "–" : n.height], ["Round", n.round && n.round.no != null ? n.round.no + " · " + n.round.phase + (n.round.job_id ? " · " + n.round.job_id : "") : "idle"], ["Address", n.address ? shortAddr(n.address) : "–"], ["Where", placeName(n.place) || "–"], ["Peers", (n.peers || []).length ? n.peers.map(function (p) { return host(p.url) + (p.alive ? "" : " (down)"); }).join(", ") : "none"], ["Mempool", n.mempool], ["Devices", n.devices], ["Review", n.review == null ? "–" : (n.review ? "on" : "off")]];
       if (n.error) rows.unshift(["Error", n.error]); if (n.halted) rows.unshift(["Halted", n.halted]);

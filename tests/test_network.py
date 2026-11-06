@@ -692,6 +692,64 @@ class DistantDefenderTest(unittest.TestCase):
                           if s[0] == workers[0].address], "the honest defender wasn't slashed")
 
 
+class RegisterWhileCheckingTest(unittest.TestCase):
+    def test_a_worker_registers_while_its_last_rounds_checks_finish(self):
+        """An Evo check takes up to a minute and the register phase 3 s: a worker that waited for its checks before
+        registering missed every other round (vibehash-evo-1, round after round). It registers at once, and waits for
+        them before this round's work, or before registering loads a job it hasn't got yet."""
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        c = WorkerClient("http://127.0.0.1:9", KeyPair.generate(b"busy checker"), device="cpu", cache_dir=tmp.name)
+        status = {"genesis_hash": "g", "height": 4, "round": 5, "attempt": "a", "phase": "register", "phase_ends": 0,
+                  "job_id": "evo"}
+        c._follow_leader = lambda: dict(status)
+        c.jobs["evo"], c.speed["evo"] = TrainingJob("evo", "req", 0, 10), 1e12
+        sent = []
+        c._signed = lambda what, body: sent.append((what, body["round"]))
+        release = threading.Event()
+        self.addCleanup(release.set)
+        c.checking = threading.Thread(target=release.wait, daemon=True)
+        c.checking.start()
+        c.step()
+        self.assertEqual(sent, [("register", 5)], "registered with round 4's checks still running")
+        self.assertTrue(c.checking.is_alive())
+
+        status |= {"round": 6, "attempt": "b", "job_id": "new-job"}  # registering would load a job: it waits first
+        stepped = threading.Thread(target=c.step, daemon=True)
+        c.job = lambda job_id: (_ for _ in ()).throw(AssertionError("loaded a job with the checks still running")) \
+            if c.checking.is_alive() else c.jobs.setdefault(job_id, TrainingJob(job_id, "req", 0, 10))
+        c.speed["new-job"] = 1e12
+        stepped.start()
+        stepped.join(0.5)
+        self.assertTrue(stepped.is_alive(), "it didn't wait for the checks")
+        release.set()
+        stepped.join(5)
+        self.assertFalse(stepped.is_alive())
+        self.assertEqual(sent[-1], ("register", 6))
+
+
+class EvoSpeedTest(unittest.TestCase):
+    def test_an_evo_worker_claims_the_speed_it_measured(self):
+        """Every GPU said 2e12 FLOP/s for Evo: a 4070 does about 7.5e12, so it was handed a quarter of what it could
+        do. It claims what it measured (less a fifth), and never less than the default, nor with --flops set."""
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        c = WorkerClient("http://127.0.0.1:9", KeyPair.generate(b"speedy"), device="cpu", cache_dir=tmp.name)
+        job = TrainingJob("evo", "req", 0, 10)
+        c.speed["evo"] = c._es_default()
+        c._measured(job, int(7.5e12 * 40), 40.0)  # two units' worth in 40 s
+        self.assertAlmostEqual(c.speed["evo"], 0.8 * 7.5e12)
+        c._measured(job, int(1e9), 600.0)  # a round spent rebuilding the model first: not below the default
+        self.assertEqual(c.speed["evo"], c._es_default())
+        c._measured(job, 0, 10.0)  # nothing finished: kept
+        self.assertEqual(c.speed["evo"], c._es_default())
+        fixed = WorkerClient("http://127.0.0.1:9", KeyPair.generate(b"fixed"), device="cpu", cache_dir=tmp.name,
+                             flops_override=1e12)
+        fixed.speed["evo"] = 1e12
+        fixed._measured(job, int(7.5e12 * 40), 40.0)
+        self.assertEqual(fixed.speed["evo"], 1e12)
+
+
 class RerunRoundTest(unittest.TestCase):
     def test_a_round_run_again_gets_its_checkpoints_again(self):
         """What a worker remembers the node has is for one attempt at a round: another leader, or the node after a

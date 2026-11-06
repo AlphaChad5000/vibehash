@@ -62,18 +62,10 @@ def control_path() -> Path:
 
 
 def read_state() -> dict | None:
-    for attempt in range(3):  # on Windows, a file being swapped in can't be opened for a moment: try again
-        try:
-            return json.loads(state_path().read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError):
-            if attempt < 2:
-                time.sleep(0.02)
-    return None
-
-
-_STATE_LOCK = threading.Lock()  # the heartbeat thread and setup's reports both write the state file
+    try:
+        return json.loads(state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def running(state: dict | None = None, now: float | None = None) -> bool:
@@ -175,6 +167,7 @@ class Supervisor:
         self.wallet: dict | None = None
         self._started = False
         self._beating: threading.Event | None = None
+        self._state_lock = threading.Lock()  # write_state, from the heartbeat thread and the main one
         self.child: subprocess.Popen | None = None
         self.paused = False
         self.restarts = 0
@@ -345,20 +338,22 @@ class Supervisor:
         print(f"app: {text}", flush=True)
 
     def write_state(self, now: float, alive: bool = True) -> None:
-        state = {"beat": now if alive else 0, "started": self.started, "pid": os.getpid(), "paused": self.paused,
-                 "watch": f"http://127.0.0.1:{self.port}/", "worker": {"running": self.worker_alive(),
-                 "since": self.worker_since, "pid": self.child.pid if self.child else None, "restarts": self.restarts},
-                 "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events}
-        text = json.dumps(state, indent=1)
-        with _STATE_LOCK:  # one writer at a time: two sharing one .tmp file left it torn, or lost a report
-            tmp = state_path().with_suffix(f".{os.getpid()}.tmp")
-            for attempt in range(5):  # on Windows, a window reading the file blocks the swap for a moment
-                try:
-                    tmp.write_text(text, encoding="utf-8")
-                    os.replace(tmp, state_path())
-                    return
-                except OSError:
-                    time.sleep(0.02)
+        # One writer at a time: the heartbeat thread (beat_while_preparing) and report() both write while setup runs,
+        # and through the one state.tmp a second writer could truncate it under the first one's os.replace, leaving
+        # state.json empty or half (read_state() -> None: the app looked not running, the window saw no setup). The
+        # state is read inside the lock too, so each file is one consistent picture.
+        with self._state_lock:
+            child = self.child
+            state = {"beat": now if alive else 0, "started": self.started, "pid": os.getpid(), "paused": self.paused,
+                     "watch": f"http://127.0.0.1:{self.port}/", "worker": {"running": self.worker_alive(),
+                     "since": self.worker_since, "pid": child.pid if child else None, "restarts": self.restarts},
+                     "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events}
+            try:
+                tmp = state_path().with_suffix(".tmp")
+                tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+                os.replace(tmp, state_path())
+            except OSError:
+                pass
 
 
 # --- the status line -----------------------------------------------------------------------------------------------

@@ -79,12 +79,14 @@ class TaskUnavailable(RuntimeError):
 
 
 def last_answer(text: str):
-    found = _ANS.findall(text)
+    found = es.tagged(text)  # (_ANS.findall's answers, in linear time: es.tagged)
     return found[-1].strip() if found else None
 
 
 _LETTER_ALONE = re.compile(r"^\(?([A-H])\)?(?:[.):]|$)")  # "B", "B.", "B)", "(B)", "B: ..." (not "A dog ...")
-_LETTER_SAID = re.compile(r"\banswer(?:\s+is)?\s*[:\-]?\s*\(?([A-H])\b", re.I)  # "the answer is B", "Answer: (C)"
+# "the answer is B", "Answer: (C)". (Written \s*(?:[:\-]\s*)? and not \s*[:\-]?\s*, which matches the same text but
+# tries every split of a run of spaces between its two \s*: "answer", 40,000 spaces and a letter took 22 s.)
+_LETTER_SAID = re.compile(r"\banswer(?:\s+is)?\s*(?:[:\-]\s*)?\(?([A-H])\b", re.I)
 _NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 _YES_NO = re.compile(r"^(yes|no)\b", re.I)
 

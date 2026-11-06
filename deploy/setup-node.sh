@@ -118,7 +118,12 @@ fi
 # which come from Hugging Face datasets. Without the `datasets` library every reveal fails ("TaskUnavailable") and no
 # Evo work is ever accepted. They go in the node's own folder (the service may write only there), fetched now for the
 # public Evo job's tasks so the first rounds don't time out waiting for downloads; other tasks come on first use.
+# Its rounds also get a 180 s verify phase: a checker teacher-forces two members' 512-token answers to 16 problems a
+# task, which took longer than an Evo job's own ~67 s on vibehash-evo-1, so checks were left undone and the checkers
+# missed the next round's registration (every other round empty). The node takes the longer of its own and the job's.
+NODE_ARGS=""
 if python3 -c "import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get('es') is True else 1)" "$GENESIS"; then
+  NODE_ARGS="--verify-s 180"
   say "Getting the Evo tasks' questions (the node re-scores answers with them)"
   "$VENV/bin/pip" install -q --upgrade 'datasets>=2.18'
   grep -q '^HF_HOME=' "$ETC/env" || echo "HF_HOME=$DATA/hf" >> "$ETC/env"
@@ -176,7 +181,7 @@ User=vibehash
 Group=vibehash
 EnvironmentFile=$ETC/env
 WorkingDirectory=$DATA
-ExecStart=$VH node --genesis $GENESIS --wallet $WALLET --data-dir $DATA/data --host 0.0.0.0 --port $PORT --announce $URL --tls-cert $ETC/tls/cert.pem --tls-key $ETC/tls/key.pem
+ExecStart=$VH node --genesis $GENESIS --wallet $WALLET --data-dir $DATA/data --host 0.0.0.0 --port $PORT --announce $URL --tls-cert $ETC/tls/cert.pem --tls-key $ETC/tls/key.pem $NODE_ARGS
 Restart=always
 RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE

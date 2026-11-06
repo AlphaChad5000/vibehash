@@ -252,11 +252,36 @@ from, so make it from the one that has Vibe Hash and `pywebview`; any
 `--node`, `--token` and `--wallet` given with it are saved for it to open
 with. It isn't part of the public download.
 
+What locks the admin routes is what the node is started with, not secret
+code: anyone can read this code, and a node answers 404 to the routes when it
+has no token and 401 to the wrong one. Make the token with `admin
+--new-token`; a node refuses one shorter than 24 characters. For a second
+factor, `admin --new-mfa` makes a key for an authenticator app (Google or
+Microsoft Authenticator, 1Password and the like): add it to the app on your
+phone, start the node with it as `--admin-mfa` (or `$VIBEHASH_ADMIN_MFA`),
+and the admin app asks for the app's 6-digit code, for a sign-in that lasts
+12 hours. A stolen token is then not enough. An address that sends 10 wrong
+tokens or codes within 15 minutes is turned away until those 15 minutes are
+up, and the app sends a token only over HTTPS, or to this computer or a
+private network. Behind a reverse proxy, the proxy must set
+`X-Forwarded-For`, or every client looks like the proxy and anyone's wrong
+guesses lock everyone out.
+
 ```bash
-VIBEHASH_ADMIN_TOKEN=choose-one python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
-python -m vibehash admin --node https://node.vibehash.org --token choose-one
-python -m vibehash admin --install-shortcut --node https://node.vibehash.org --token choose-one
+python -m vibehash admin --new-token
+python -m vibehash admin --new-mfa
+VIBEHASH_ADMIN_TOKEN=THE-TOKEN VIBEHASH_ADMIN_MFA=THE-KEY python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
+python -m vibehash admin --node https://node.vibehash.org --token THE-TOKEN
+python -m vibehash admin --install-shortcut --node https://node.vibehash.org --token THE-TOKEN
 ```
+
+What a node learns about a miner: the address its worker connects from, and
+what the worker reports of its machine (speed, memory and hardware class).
+The node keeps these in memory only and never serves them on a public route.
+It shows them to its operators in the admin app, which looks up each
+address's rough place (city and country) at ip-api.com to draw the globe.
+Your wallet address and what it earns are public on the chain, as on any
+blockchain.
 
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
@@ -566,6 +591,11 @@ Vibe Hash and restarts the node, keeping its wallet and chain. Read the log
 with `journalctl -u vibehash-node -f`. The node's files are in
 `/var/lib/vibehash`, and its wallet password is in `/etc/vibehash/env`:
 include both in backups.
+
+To open the admin routes on it, add `VIBEHASH_ADMIN_TOKEN=...` and
+`VIBEHASH_ADMIN_MFA=...` lines to `/etc/vibehash/env` (made with `vibehash
+admin --new-token` and `--new-mfa`), then run `systemctl restart
+vibehash-node`. Running the script again keeps them.
 
 ### Lock down the server
 

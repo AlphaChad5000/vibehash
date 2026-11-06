@@ -186,7 +186,7 @@ class PhaseTimes:
     @property
     def round_s(self) -> float:
         """The longest a round can take: validators wait for a proposal accordingly (_propose_wait). A node's own
-        (Node.times) is also the shortest any of its rounds takes (Node._run_round)."""
+        (Node.times), up to economics.MAINNET_BLOCK_S, is also the shortest any of its rounds takes (Node.shortest_round)."""
         return self.register_s + self.compute_s + self.reveal_s + self.verify_s + self.dispute_s
 
 
@@ -196,7 +196,7 @@ class Node:
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
                  max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT,
-                 admin_token: str | None = None):
+                 admin_token: str | None = None, admin_mfa: str | None = None):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
         `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
@@ -204,7 +204,8 @@ class Node:
         links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
         reads one from the environment).
         `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade.
-        `admin_token`: what the admin app sends to reach /admin/* (nodeadmin.py); None: those routes don't exist."""
+        `admin_token`: what the admin app sends to reach /admin/* (nodeadmin.py); None: those routes don't exist.
+        `admin_mfa`: an authenticator app's key, so the token also needs that app's code (a sign-in, nodeadmin.py)."""
         if not parse_version(min_client):
             raise ValueError(f"min_client is a release such as {MIN_CLIENT}, not {min_client!r}")
         self.min_client = min_client
@@ -225,7 +226,7 @@ class Node:
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
         # The operators' holds on jobs and their review setting (nodeadmin.py): the coordinator asks before it picks
         # a round's job, and a release drops the "waits" line the hold left.
-        self.admin = nodeadmin.Admin(self.store, admin_token)
+        self.admin = nodeadmin.Admin(self.store, admin_token, mfa=admin_mfa)
         self.coord.policy = self.admin.reason
         self.admin.changed = lambda job_id: self.coord.waiting.pop(job_id, None)
         self.bucket = bucket
@@ -474,20 +475,29 @@ class Node:
         longest = max((self.times_for(s.job(j)).round_s for j, v in s.escrow.items() if v > 0), default=0.0)
         return self.engine.timeouts.propose + 1.5 * max(0.0, longest - self.times.round_s)
 
+    def shortest_round(self) -> float:
+        """The least a round lasts: this node's own round, but never more than the mainnet schedule's block time. A
+        node given longer phases for slow work (the Evo node's 180 s verify) has them as the most a phase may take,
+        not as a wait for rounds whose work is all in."""
+        return min(self.times.round_s, float(econ.MAINNET_BLOCK_S))
+
     def _run_round(self, still=None) -> bool:
         """Drive an open round through its phases. False if it was given up: we're stopping, or `still()` says the
         round's no longer wanted (another block was decided at its height).
 
         How long the phases last. Registration: this node's own length (self.times). Compute, reveal and verify: at
-        least this node's own length for each, and at most the round's (times_for: longer where the job needs it, as
-        for a big model's transfers or a DeepSeek prep unit's deadline, ten minutes at least), ending in between as soon
-        as everything the phase waits for is in (Coordinator.all_in: every unit handed out committed, every commitment
-        revealed, every task answered). So a round in which nothing was handed out (nobody registered who fits, or a
-        fine-tune short of its quorum) lasts exactly this node's own round, 38 s by default, however long the job's
-        are: the DeepSeek pilot's took 1,521 s with nobody mining it. Never less, though there's nothing to wait for:
-        any job with budget keeps rounds coming (_has_work), so a chain nobody mines would otherwise seal a block every
-        few seconds, and the mainnet schedule's halvings are timed by blocks of the default round
-        (economics.MAINNET_BLOCK_S). Nothing in a round's record or block but its timestamp depends on when a phase
+        most the round's (times_for: this node's own, or longer where the job needs it, as for a big model's transfers
+        or a DeepSeek prep unit's deadline, ten minutes at least), ending sooner as soon as everything the phase waits
+        for is in (Coordinator.all_in: every unit handed out committed, every commitment revealed, every task
+        answered). The whole round lasts at least shortest_round(), the rest of it spent in verify. So a round in which
+        nothing was handed out (nobody registered who fits, or a fine-tune short of its quorum) lasts 38 s by default,
+        however long the job's are: the DeepSeek pilot's took 1,521 s with nobody mining it. Never less, though
+        there's nothing to wait for: any job with budget keeps rounds coming (_has_work), so a chain nobody mines would
+        otherwise seal a block every few seconds, and the mainnet schedule's halvings are timed by blocks of the default
+        round (economics.MAINNET_BLOCK_S). (Each phase used to last at least the node's own length for it, so the Evo
+        node's 180 s verify, there to give checkers the time, was also how long every round waited with every check
+        in, or none handed out: 208 s rounds, 82% of vibehash-evo-1's first day with nobody mining, and two thirds of
+        each round that was mined.) Nothing in a round's record or block but its timestamp depends on when a phase
         ended: the compute seconds capacity reads (record["rules"]["compute_s"], Coordinator.timing) are still the
         job's, and nothing more can come in once a phase is all in."""
         c, own = self.coord, self.times
@@ -497,6 +507,7 @@ class Node:
         t = self.times_for(job)
         longer = f" (up to {t.round_s:.0f} s rounds for its size)" if t.round_s > own.round_s + 0.5 else ""
         log.info("round %d open for job %s%s", c.r.round_no, c.r.job_id, longer)
+        began = time.time()
         if not self._wait(t.register_s, still):
             return False
         c.start_compute()
@@ -504,9 +515,10 @@ class Node:
         short = f"; nothing to wait for: a {own.round_s:.0f} s round" if longer and not held and not job.sharded else ""
         log.info("  %d workers registered; %d units assigned, %d unassigned%s", len(c.r.regs), held, c.r.unassigned,
                  short)
-        for step, least, most in ((c.start_reveal, own.compute_s, t.compute_s),
-                                  (c.start_verify, own.reveal_s, t.reveal_s), (None, own.verify_s, t.verify_s)):
-            if not self._wait(most, still, c.all_in, min(least, most)):
+        floor = self.shortest_round()
+        for step, most in ((c.start_reveal, t.compute_s), (c.start_verify, t.reveal_s), (None, t.verify_s)):
+            least = max(0.0, began + floor - time.time()) if step is None else 0.0  # the round's floor, in its verify
+            if not self._wait(max(most, least), still, c.all_in, least):
                 return False
             if step:
                 step()
@@ -1442,6 +1454,14 @@ def _handler(node: Node):
             finally:
                 big.release()
 
+        def _ip(self) -> str:
+            """Where the request came from (behind a proxy on this computer, the client it forwarded for)."""
+            return nodeadmin.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"))
+
+        def _admin(self) -> None:
+            """The admin routes' gate (nodeadmin.Admin.check): the token, a sign-in if the node wants a code."""
+            node.admin.check(self.headers.get("Authorization"), self.headers.get(nodeadmin.LOGIN_HEADER), self._ip())
+
         def _guard(self, fn, raw: bool = False, content_type: str | None = None):
             try:
                 result = fn()
@@ -1450,6 +1470,8 @@ def _handler(node: Node):
                 self._send(404, {"error": f"not found: {e}"})
             except nodeadmin.Forbidden as e:
                 self._send(401, {"error": str(e)}, headers={"WWW-Authenticate": "Bearer"})
+            except nodeadmin.TooMany as e:
+                self._send(403, {"error": str(e)}, headers={"Retry-After": str(e.retry_after)})
             except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
                 self._send(400, {"error": str(e)})
             except Busy as e:
@@ -1522,7 +1544,7 @@ def _handler(node: Node):
                         raise KeyError(f"no record for block {parts[1]}")
                     return record
                 if parts == ["admin", "overview"]:  # the operators' view (nodeadmin.py): 404 without a token
-                    node.admin.check(self.headers.get("Authorization"))
+                    self._admin()
                     return node.admin.overview(node)
                 raise KeyError(url.path)
 
@@ -1571,9 +1593,11 @@ def _handler(node: Node):
                     node.submit_tx(tx)
                     return {"ok": True, "txid": tx.txid.hex()}
                 if worker:
-                    return node.handle(parts[0], body, ip=nodeadmin.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For")))
+                    return node.handle(parts[0], body, ip=self._ip())
+                if parts == ["admin", "login"]:  # the authenticator app's code for a sign-in (nodeadmin.py)
+                    return node.admin.login(self.headers.get("Authorization"), body.get("code"), self._ip())
                 if parts[:1] == ["admin"]:  # the operators' orders (nodeadmin.py): 404 without a token, 401 with the wrong one
-                    node.admin.check(self.headers.get("Authorization"))
+                    self._admin()
                     if parts == ["admin", "review"]:
                         return node.admin.set_review(bool(body.get("on")), list(node.chain.state.jobs))
                     if len(parts) == 4 and parts[1] == "jobs" and parts[3] in ("hold", "release"):
