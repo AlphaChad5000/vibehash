@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 
+WATCH_PORT = 7545  # the worker's feed (watch.py): a thousand below a node's 8545, so a testnet's validators never land on it
+
 PUBLIC_NODE = "https://node.vibehash.org"  # the public network: where commands go until you choose another node
 PUBLIC_EVO_NODE = "https://evo.vibehash.org:8443"  # the public Evo Hash network (vibehash-evo-1): the menu's Evo Hash
 

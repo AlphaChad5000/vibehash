@@ -118,7 +118,7 @@ class WatchTests(unittest.TestCase):
             page, headers = resp.read().decode("utf-8"), resp.headers
         self.assertTrue(headers["Content-Type"].startswith("text/html"))
         self.assertIn("connect-src 'self' http://127.0.0.1:8545", headers["Content-Security-Policy"])  # the node, and nothing else
-        for needed in ('fetch("/"', '"/events?after="', '"/network"', 'id="feed"', 'id="census"', 'id="balance"'):
+        for needed in ('fetch(FEED + "/"', '"/events?after="', '"/network"', 'id="feed"', 'id="census"', 'id="balance"'):
             self.assertIn(needed, page)
         self.assertNotIn("https://", page.replace("https://vibehash.org", ""))  # nothing fetched from the wider web
         self.assertEqual(headers["Cache-Control"], "no-store")

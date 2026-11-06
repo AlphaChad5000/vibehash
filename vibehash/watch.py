@@ -28,9 +28,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from .client import NodeClient, NodeError
 from .records import clean
+from .settings import WATCH_PORT as DEFAULT_PORT
 from .tasks import SYN_PER_VIBE
-
-DEFAULT_PORT = 7545  # a thousand below a node's 8545, so a testnet's validators (8545 and up) never land on it
 DASHBOARD = Path(__file__).resolve().parent / "data" / "dashboard.html"  # the app's window's page (window.py), at /dashboard
 EVENTS = 200  # kept in memory
 ACCOUNT_S = 20.0

@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from vibehash import app, settings
+from vibehash import app, settings  # noqa: F401
 
 # A stand-in worker: says hello, then waits to be stopped (Ctrl-Break on Windows, SIGTERM elsewhere), or exits as told.
 CHILD = ("import signal, sys, time\n"
@@ -34,6 +34,49 @@ def wait_for(cond, timeout=10.0):
     return False
 
 
+class FakeWinreg:
+    """Enough of winreg for the start-at-login and uninstall entries, in memory: {key path: {name: value}}."""
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, REG_DWORD = "HKCU", 2, 1, 4
+
+    class Key:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def __init__(self):
+        self.keys = {app.RUN_KEY: {}}  # the Run key is always there on Windows
+
+    def CreateKey(self, root, path):  # noqa: N802
+        self.keys.setdefault(path, {})
+        return self.Key(path)
+
+    def OpenKey(self, root, path, reserved=0, access=0):  # noqa: N802
+        if path not in self.keys:
+            raise OSError("no such key")
+        return self.Key(path)
+
+    def SetValueEx(self, key, name, reserved, kind, value):  # noqa: N802
+        self.keys[key.path][name] = value
+
+    def QueryValueEx(self, key, name):  # noqa: N802
+        if name not in self.keys[key.path]:
+            raise OSError("no such value")
+        return self.keys[key.path][name], self.REG_SZ
+
+    def DeleteValue(self, key, name):  # noqa: N802
+        if self.keys[key.path].pop(name, None) is None:
+            raise OSError("no such value")
+
+    def DeleteKey(self, root, path):  # noqa: N802
+        if self.keys.pop(path, None) is None:
+            raise OSError("no such key")
+
+
 class AppHome(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -41,6 +84,11 @@ class AppHome(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": self.tmp.name})
         self.env.start()
         self.addCleanup(self.env.stop)
+        os.environ.pop("VIBEHASH_LAUNCHER", None)
+        self.winreg = FakeWinreg()  # never the machine's own registry
+        self.reg = mock.patch.object(app, "_winreg", return_value=None)
+        self.reg.start()
+        self.addCleanup(self.reg.stop)
 
 
 class SupervisorTests(AppHome):
@@ -90,6 +138,46 @@ class SupervisorTests(AppHome):
         t.join(timeout=10)
         self.assertFalse(t.is_alive())
         self.assertTrue(wait_for(lambda: all(f.poll() is not None for f in s.friends)))  # told to leave when the app left
+
+    def test_the_avatar_is_turned_on_and_off_by_orders_and_the_setting(self):
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, avatar=child_command())
+        t = threading.Thread(target=s.run, daemon=True)
+        t.start()
+        self.assertTrue(wait_for(lambda: s.worker_alive() and s.avatar_alive()))
+        self.assertTrue(wait_for(lambda: (app.read_state() or {}).get("avatar") is True))
+        app.order("avatar-off")
+        self.assertTrue(wait_for(lambda: not s.avatar_alive()))
+        self.assertTrue(wait_for(lambda: (app.read_state() or {}).get("avatar") is False))
+        app.order("avatar-on")
+        self.assertTrue(wait_for(lambda: s.avatar_alive()))
+        app.order("stop")
+        t.join(timeout=10)
+        self.assertTrue(wait_for(lambda: s.avatar.poll() is not None))  # leaves with the app
+        settings.save(avatar=False)  # the setting: not started at all
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, avatar=child_command())
+        t = threading.Thread(target=s.run, daemon=True)
+        t.start()
+        self.assertTrue(wait_for(lambda: s.worker_alive()))
+        self.assertFalse(s.avatar_alive())
+        app.order("stop")
+        t.join(timeout=10)
+
+    def test_setup_is_reported_in_the_state_with_a_heartbeat_before_the_worker(self):
+        s = app.Supervisor([], 7545, beat_s=0.05, grace_s=5)
+        s.beat_while_preparing()
+        self.assertTrue(wait_for(lambda: app.running()))  # alive through setup, so a second app is refused
+        s.report("gpu", 0.3, wallet={"address": "0xabc", "path": "w.json", "words_file": None})
+        st = app.read_state()
+        self.assertEqual(st["setup"], {"step": "gpu", "fraction": 0.3})
+        self.assertEqual(st["wallet"]["address"], "0xabc")
+        self.assertIn("setup: gpu", " ".join(s.events))
+        s.command = child_command()
+        t = threading.Thread(target=s.run, daemon=True)
+        t.start()
+        self.assertTrue(wait_for(lambda: s.worker_alive() and (app.read_state() or {}).get("setup", {}).get("step") == "mining"))
+        self.assertTrue(s._beating.is_set())  # run() took the heartbeat over
+        app.order("stop")
+        t.join(timeout=10)
 
     def test_a_companion_that_cannot_start_is_said_and_the_app_goes_on(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[["no-such-program-xyz"]])
@@ -224,9 +312,19 @@ class StartupTests(AppHome):
             self.assertNotIn("--avatar", win.read_text())
             self.assertIn("-m vibehash app --no-window --avatar", app.startup_on("Windows", run, avatar=True).read_text())
             with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER": r"C:\x\VibeHash.exe"}):  # the download: the launcher itself
-                text = app.startup_on("Windows", run, avatar=True).read_text()
+                text = app.startup_on("Windows", run, avatar=True).read_text()  # (no winreg, as on another system)
                 self.assertIn('"C:\\x\\VibeHash.exe" -- --no-window', text)  # what follows -- goes to the app
                 self.assertNotIn("-m vibehash", text)
+                with mock.patch.object(app, "_winreg", return_value=self.winreg):  # on Windows itself: a Run value, no .cmd
+                    where = app.startup_on("Windows", run, avatar=True)
+                    self.assertEqual(where.name, "VibeHash")
+                    self.assertEqual(self.winreg.keys[app.RUN_KEY]["VibeHash"], '"C:\\x\\VibeHash.exe" -- --no-window')
+                    self.assertFalse(win.exists())  # the .cmd an earlier version wrote: gone
+                    self.assertTrue(app.startup_is_on("Windows"))
+                    app.startup_off("Windows", run)
+                    self.assertNotIn("VibeHash", self.winreg.keys[app.RUN_KEY])
+                    self.assertFalse(app.startup_is_on("Windows"))
+                win = app.startup_on("Windows", run)  # back to a file, for the rest of the test
             lin = app.startup_on("Linux", run, avatar=True)
             self.assertIn("-m vibehash app --no-window --avatar", lin.read_text())
             mac = app.startup_on("Darwin", run)
@@ -262,12 +360,17 @@ class CommandTests(AppHome):
             app.main(SimpleNamespace(acmd="stop"))
         self.assertIn("stopped", out.getvalue())
 
-    def test_a_second_app_is_refused(self):
+    def test_a_second_app_opens_the_running_ones_window_or_is_refused(self):
         app.app_dir().mkdir(parents=True)
         app.state_path().write_text(json.dumps({"beat": time.time(), "started": time.time()}))
         with self.assertRaises(SystemExit) as ctx:
-            app.main(SimpleNamespace(acmd=None))
+            app.main(SimpleNamespace(acmd=None, no_window=True))
         self.assertIn("already running", str(ctx.exception))
+        with mock.patch.object(app.subprocess, "call", return_value=0) as call, mock.patch("sys.stdout", new_callable=io.StringIO), \
+                self.assertRaises(SystemExit) as ctx:  # the Start menu, a second double-click: the way back in is the window
+            app.main(SimpleNamespace(acmd=None, watch=7000))
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(call.call_args.args[0][-2:], ["--watch", "7000"])
 
 
 if __name__ == "__main__":
