@@ -132,6 +132,25 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.20 (2026-11-06): anyone can join the public Evo network from the menu.** `vibehash-evo-1` went live
+2026-11-06 at `https://evo.vibehash.org:8443` (`settings.PUBLIC_EVO_NODE`), with job `vibe-08b-1` (es_tasks.VIBE on
+Qwen3.5-0.8B, 512-token answers, fee 0) posted from the owner's wallet. An Evo job needs **two staked workers** (a unit
+is never checked by its holder): the owner's wallet and `~/.vibehash/evo-checker.json` (no password) both mine on the
+4070. DNS for vibehash.org is on **Cloudflare** now, `node` and `evo` proxied, so setup-node.sh's "points at this
+server" check fails: upgrade with `sudo /opt/vibehash/bin/pip install -U vibehash` and `sudo systemctl restart
+vibehash-node vibehash-node-evo`; SSH to `cole@165.227.37.0`. The repo moved to `VibeHash/vibehash`, and PyPI's
+trusted publisher was re-added for it (PyPI user `Ctrain232`).
+- **The menu's Evo Hash** (`menu._evo`) asks: 1 (Enter) joins the public Evo network, `worker --node
+  PUBLIC_EVO_NODE`, after `_evo_ready` (PyTorch present, else Install GPU support; offers `pip install vibehash[evo]`)
+  and `wallet create` if there's no wallet; 2 is the local `testnet --evo2` as before.
+- **A worker downloads a public Evo job's base** (`es_local.find_base(spec, download=True)` from `Es2Work.why_not`):
+  once, at the commit the spec pins, only if its bf16 weights are at most `MAX_DOWNLOAD_BYTES` (10 GiB), since a job
+  names its base. Before this, a new computer never got Evo work unless it had the model cached.
+- `python -m vibehash` from the repo folder runs the checkout's code, not the installed release; Cloudflare answers
+  403 to releases before 0.5.17 (urllib's own User-Agent). Use the `vibehash` command.
+- Tests: `test_menu` (the Evo Hash choices, `_evo_ready`), `test_es.EvoModeTests.test_a_folder_and_the_cache` (the
+  download and its cap).
+
 **Release 0.5.19 (2026-11-05): the public Evo testnet's pieces, aimed at beating Qwen3.5-0.8B.** The owner chose
 (2026-11-05) a second public network, `vibehash-evo-1`, on the same droplet as node.vibehash.org, its Evo job on
 Qwen/Qwen3.5-0.8B posted with the owner's test coins (so it can be cancelled and reposted with better settings without a
