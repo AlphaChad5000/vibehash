@@ -955,7 +955,7 @@ vibehash job history fruit-demo --csv fruit-demo.csv
 Write a starter job file, for full control with post-job.
 
 ```
-vibehash job template [-h] [--out OUT] [--id ID] [--gpu] [--evo MODEL] [--tasks TASKS] [--rounds ROUNDS]
+vibehash job template [-h] [--out OUT] [--id ID] [--gpu] [--evo MODEL] [--tasks TASKS] [--rounds ROUNDS] [--max-tokens N]
 ```
 
 Flags:
@@ -964,8 +964,9 @@ Flags:
 - `--id ID`: the job's name (default my-first-job).
 - `--gpu`: a larger float32 model sized for GPUs.
 - `--evo MODEL`: an Evo job on MODEL that never ends, taking its tasks in turn: a genesis starter job (genesis create --es --starter-job).
-- `--tasks TASKS`: with --evo: the tasks, comma-separated, curated (the default: the ones a small model learns from) or all.
+- `--tasks TASKS`: with --evo: the tasks, comma-separated, curated (the default: the ones a small model learns from), vibe (the Qwen3.5-0.8B job's, for max_tokens 384-512) or all.
 - `--rounds ROUNDS`: with --evo: rounds on each task before the next (default 12).
+- `--max-tokens N`: with --evo: the longest answer, in tokens (default 64; 512 with --tasks vibe, whose math and instructions need room to reason).
 
 Examples:
 
