@@ -92,11 +92,28 @@ class AppHome(unittest.TestCase):
 
 
 class SupervisorTests(AppHome):
+    def start(self, s):
+        """s.run() on a thread that always ends with the test: a failed assertion before the test's own stop order
+        used to leave it running, and since app_dir() follows $VIBEHASH_HOME it moved into the next test's folder,
+        taking that test's orders and writing its state.json."""
+        done = threading.Event()
+        t = threading.Thread(target=s.run, kwargs={"stop": done}, daemon=True)
+        t.start()
+
+        def end():
+            done.set()
+            if s._beating is not None:
+                s._beating.set()
+            t.join(timeout=10)
+        self.addCleanup(end)
+        return t
+
     def test_starts_the_worker_pauses_resumes_and_stops_it(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5)
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive()))
+        # the state is written at the end of the turn that started the worker: wait for that turn's
+        self.assertTrue(wait_for(lambda: ((app.read_state() or {}).get("worker") or {}).get("running")))
         self.assertTrue(app.running())
         state = app.read_state()
         self.assertEqual((state["paused"], state["worker"]["running"], state["watch"]), (False, True, "http://127.0.0.1:7545/"))
@@ -131,8 +148,7 @@ class SupervisorTests(AppHome):
 
     def test_the_window_and_the_avatar_ride_along_and_leave_with_the_app(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[child_command(), child_command()])
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive() and len(s.friends) == 2 and all(f.poll() is None for f in s.friends)))
         app.order("stop")
         t.join(timeout=10)
@@ -141,8 +157,7 @@ class SupervisorTests(AppHome):
 
     def test_the_avatar_is_turned_on_and_off_by_orders_and_the_setting(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, avatar=child_command())
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive() and s.avatar_alive()))
         self.assertTrue(wait_for(lambda: (app.read_state() or {}).get("avatar") is True))
         app.order("avatar-off")
@@ -155,8 +170,7 @@ class SupervisorTests(AppHome):
         self.assertTrue(wait_for(lambda: s.avatar.poll() is not None))  # leaves with the app
         settings.save(avatar=False)  # the setting: not started at all
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, avatar=child_command())
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive()))
         self.assertFalse(s.avatar_alive())
         app.order("stop")
@@ -165,6 +179,7 @@ class SupervisorTests(AppHome):
     def test_setup_is_reported_in_the_state_with_a_heartbeat_before_the_worker(self):
         s = app.Supervisor([], 7545, beat_s=0.05, grace_s=5)
         s.beat_while_preparing()
+        self.addCleanup(s._beating.set)  # the heartbeat thread ends with the test, even one that fails before run()
         self.assertTrue(wait_for(lambda: app.running()))  # alive through setup, so a second app is refused
         s.report("gpu", 0.3, wallet={"address": "0xabc", "path": "w.json", "words_file": None})
         st = app.read_state()
@@ -172,8 +187,7 @@ class SupervisorTests(AppHome):
         self.assertEqual(st["wallet"]["address"], "0xabc")
         self.assertIn("setup: gpu", " ".join(s.events))
         s.command = child_command()
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive() and (app.read_state() or {}).get("setup", {}).get("step") == "mining"))
         self.assertTrue(s._beating.is_set())  # run() took the heartbeat over
         app.order("stop")
@@ -181,8 +195,7 @@ class SupervisorTests(AppHome):
 
     def test_a_companion_that_cannot_start_is_said_and_the_app_goes_on(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[["no-such-program-xyz"]])
-        t = threading.Thread(target=s.run, daemon=True)
-        t.start()
+        t = self.start(s)
         self.assertTrue(wait_for(lambda: s.worker_alive()))
         self.assertTrue(any("couldn't start no-such-program-xyz" in e for e in s.events))
         app.order("stop")
