@@ -122,8 +122,9 @@ def normalise_url(text: str, https: bool = False) -> str:
     text = text.strip().rstrip("/")
     if "://" in text:
         return text
-    if text == urlsplit(settings.PUBLIC_NODE).hostname:  # the public node serves HTTPS on the usual port
-        return settings.PUBLIC_NODE
+    for public in (settings.PUBLIC_NODE, settings.PUBLIC_EVO_NODE):  # the public nodes serve HTTPS, Evo's on 8443
+        if text in (urlsplit(public).hostname, urlsplit(public).netloc):
+            return public
     scheme = "https" if https else "http"
     return f"{scheme}://{text}" if urlsplit(f"http://{text}").port else f"{scheme}://{text}:8545"
 
