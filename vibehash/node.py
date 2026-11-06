@@ -196,7 +196,7 @@ class Node:
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
                  max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT,
-                 admin_token: str | None = None):
+                 admin_token: str | None = None, admin_mfa: str | None = None):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
         `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
@@ -204,7 +204,8 @@ class Node:
         links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
         reads one from the environment).
         `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade.
-        `admin_token`: what the admin app sends to reach /admin/* (nodeadmin.py); None: those routes don't exist."""
+        `admin_token`: what the admin app sends to reach /admin/* (nodeadmin.py); None: those routes don't exist.
+        `admin_mfa`: an authenticator app's key, so the token also needs that app's code (a sign-in, nodeadmin.py)."""
         if not parse_version(min_client):
             raise ValueError(f"min_client is a release such as {MIN_CLIENT}, not {min_client!r}")
         self.min_client = min_client
@@ -225,7 +226,7 @@ class Node:
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
         # The operators' holds on jobs and their review setting (nodeadmin.py): the coordinator asks before it picks
         # a round's job, and a release drops the "waits" line the hold left.
-        self.admin = nodeadmin.Admin(self.store, admin_token)
+        self.admin = nodeadmin.Admin(self.store, admin_token, mfa=admin_mfa)
         self.coord.policy = self.admin.reason
         self.admin.changed = lambda job_id: self.coord.waiting.pop(job_id, None)
         self.bucket = bucket
@@ -1442,6 +1443,14 @@ def _handler(node: Node):
             finally:
                 big.release()
 
+        def _ip(self) -> str:
+            """Where the request came from (behind a proxy on this computer, the client it forwarded for)."""
+            return nodeadmin.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"))
+
+        def _admin(self) -> None:
+            """The admin routes' gate (nodeadmin.Admin.check): the token, a sign-in if the node wants a code."""
+            node.admin.check(self.headers.get("Authorization"), self.headers.get(nodeadmin.LOGIN_HEADER), self._ip())
+
         def _guard(self, fn, raw: bool = False, content_type: str | None = None):
             try:
                 result = fn()
@@ -1450,6 +1459,8 @@ def _handler(node: Node):
                 self._send(404, {"error": f"not found: {e}"})
             except nodeadmin.Forbidden as e:
                 self._send(401, {"error": str(e)}, headers={"WWW-Authenticate": "Bearer"})
+            except nodeadmin.TooMany as e:
+                self._send(403, {"error": str(e)}, headers={"Retry-After": str(e.retry_after)})
             except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
                 self._send(400, {"error": str(e)})
             except Busy as e:
@@ -1522,7 +1533,7 @@ def _handler(node: Node):
                         raise KeyError(f"no record for block {parts[1]}")
                     return record
                 if parts == ["admin", "overview"]:  # the operators' view (nodeadmin.py): 404 without a token
-                    node.admin.check(self.headers.get("Authorization"))
+                    self._admin()
                     return node.admin.overview(node)
                 raise KeyError(url.path)
 
@@ -1571,9 +1582,11 @@ def _handler(node: Node):
                     node.submit_tx(tx)
                     return {"ok": True, "txid": tx.txid.hex()}
                 if worker:
-                    return node.handle(parts[0], body, ip=nodeadmin.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For")))
+                    return node.handle(parts[0], body, ip=self._ip())
+                if parts == ["admin", "login"]:  # the authenticator app's code for a sign-in (nodeadmin.py)
+                    return node.admin.login(self.headers.get("Authorization"), body.get("code"), self._ip())
                 if parts[:1] == ["admin"]:  # the operators' orders (nodeadmin.py): 404 without a token, 401 with the wrong one
-                    node.admin.check(self.headers.get("Authorization"))
+                    self._admin()
                     if parts == ["admin", "review"]:
                         return node.admin.set_review(bool(body.get("on")), list(node.chain.state.jobs))
                     if len(parts) == 4 and parts[1] == "jobs" and parts[3] in ("hold", "release"):

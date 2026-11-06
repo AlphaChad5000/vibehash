@@ -18,6 +18,11 @@ Confirm and deny are holds on every node the app knows (a hold is a node's own p
 are transactions signed with the admin's wallet (settings.wallet_path, `--wallet`), unlocked in the page with its
 password and kept only in this process's memory.
 
+Signing in: a node started with an authenticator key (`node --admin-mfa`, nodeadmin.py) wants its app's 6-digit
+code as well as the token. The page asks for it when a node does, and the app tries the one code on every node that
+asked; each sign-in lasts 12 hours, kept in this process's memory only. A token is only ever sent over HTTPS, or
+plainly to this computer or a private network's address: never in the clear across the internet.
+
 Places on the globe come from the devices' connection addresses, which only an admin's node gives out. They are looked
 up in batches at GEO_URL (ip-api.com's free service unless $VIBEHASH_GEO_URL names another; nothing but the addresses
 is sent), cached for a month in ~/.vibehash/admin/geo.json, and never for private or loopback addresses; "geo": false
@@ -52,7 +57,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import settings
+from . import nodeadmin, settings
 from . import wallet as wallets
 from .client import NodeClient, NodeError
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
@@ -74,6 +79,7 @@ GEO_BATCH = 100
 NODE_TIMEOUT = 15.0
 MAX_BODY = 256 * 1024
 BLOCKS_PAGE = 100
+INSECURE = "the admin token is only sent over https:// (or to this computer or a private network): change the URL"
 
 
 # --- where an address is ---------------------------------------------------------------------------
@@ -201,13 +207,37 @@ class NodeLink:
     def __init__(self, url: str, token: str | None = None, client: NodeClient | None = None):
         self.url, self.token = url.rstrip("/"), token or None
         self.client = client or NodeClient(self.url, timeout=NODE_TIMEOUT)
+        self.login: str | None = None  # the node's sign-in, after an authenticator code (nodeadmin.Admin.login)
+        self.login_until: float | None = None
+        self.needs_code = False  # the node said it wants a code
 
     @property
     def host(self) -> str:
         return urlsplit(self.url).hostname or ""
 
+    @property
+    def secure(self) -> bool:
+        """Whether the token may go to this URL: HTTPS, or this computer or a private network (no internet between)."""
+        parts = urlsplit(self.url)
+        if parts.scheme == "https":
+            return True
+        host = (parts.hostname or "").lower()
+        if host == "localhost":
+            return True
+        try:
+            return not ipaddress.ip_address(host).is_global
+        except ValueError:
+            return False
+
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"} if self.token else {}
+        if not self.token:
+            return {}
+        if not self.secure:
+            raise AdminError(INSECURE)
+        out = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        if self.login:
+            out[nodeadmin.LOGIN_HEADER] = self.login
+        return out
 
     def admin_get(self, path: str):
         return json.loads(self.client._req("GET", path, headers=self._headers()))  # noqa: SLF001
@@ -215,22 +245,34 @@ class NodeLink:
     def admin_post(self, path: str, body: dict):
         return json.loads(self.client._req("POST", path, json.dumps(body).encode(), headers=self._headers()))  # noqa: SLF001
 
+    def sign_in(self, code: str) -> dict:
+        """The authenticator app's code for a sign-in on this node (POST /admin/login)."""
+        out = self.admin_post("/admin/login", {"code": str(code or "").strip()})
+        self.login, self.login_until, self.needs_code = out.get("session"), out.get("expires"), False
+        return out
+
     def overview(self) -> dict:
-        """/admin/overview with the token; a node that doesn't serve it (no token, none here, or an older release)
-        gives what its public routes say instead, marked "admin": False."""
-        if self.token:
+        """/admin/overview with the token; a node that doesn't serve it (no token, none here, or an older release),
+        or that wants an authenticator code first ("mfa": True), gives what its public routes say instead, marked
+        "admin": False."""
+        error = None
+        if self.token and not self.secure:
+            error = INSECURE
+        elif self.token:
             try:
                 out = self.admin_get("/admin/overview")
-                out["admin"], out["url"] = True, self.url
+                self.needs_code = False
+                out.update(admin=True, url=self.url, mfa=False, login_until=self.login_until)
                 return out
             except NodeError as e:
-                if e.status not in (401, 404):
-                    return {"url": self.url, "admin": False, "error": str(e)}
-                error = str(e)
+                if e.status == 401 and nodeadmin.NEED_CODE in str(e):  # the token is right; the sign-in is missing or over
+                    self.login = self.login_until = None
+                    self.needs_code = True
+                elif e.status not in (401, 404):
+                    return {"url": self.url, "admin": False, "mfa": self.needs_code, "error": str(e)}
+                error = None if self.needs_code else str(e)
             except BROKEN as e:  # a reply that isn't the node's (a proxy's error page, a cut connection)
                 return {"url": self.url, "admin": False, "error": f"a reply that wasn't JSON: {e}"}
-        else:
-            error = None
         try:
             status, net = self.client.get("/status"), self.client.get("/network")
             vals = self.client.get("/validators")
@@ -240,7 +282,7 @@ class NodeLink:
             return {"url": self.url, "admin": False, "error": str(e)}
         except BROKEN as e:
             return {"url": self.url, "admin": False, "error": f"a reply that wasn't JSON: {e}"}
-        return {"url": self.url, "admin": False, "error": error, "now": time.time(), "review": None,
+        return {"url": self.url, "admin": False, "mfa": self.needs_code, "error": error, "now": time.time(), "review": None,
                 "node": {"url": self.url, "address": None, "version": status.get("version"), "chain_id": status.get("chain_id"),
                          "height": status.get("height"), "tip": status.get("tip"), "tip_time": net.get("time"),
                          "round": {"no": status.get("round"), "phase": status.get("phase"), "job_id": status.get("job_id")},
@@ -309,6 +351,7 @@ class AdminApp:
             # Its place: the address it announces to other nodes (the public one, behind a proxy), else the one we reach it at
             place = self.geo.place(urlsplit(n.get("url") or "").hostname) or self.geo.place(urlsplit(v["url"]).hostname)
             n.update(url=v["url"], announce=n.get("url"), admin=v.get("admin", False), error=v.get("error"), review=v.get("review"),
+                     mfa=bool(v.get("mfa")), login_until=v.get("login_until"),
                      place=place, peers=v.get("peers") or [], mempool=len(v.get("mempool") or []), devices=len(v.get("devices") or []))
             nodes.append(n)
         validators = {}
@@ -371,6 +414,15 @@ class AdminApp:
 
     def review(self, on: bool) -> dict:
         return {"ok": True, "nodes": self._each_admin(lambda l: l.admin_post("/admin/review", {"on": bool(on)}))}
+
+    def sign_in(self, code: str, url: str | None = None) -> dict:
+        """One authenticator code for every node that asked for one (or the one `url` names): admins of several nodes
+        add the same key to their app, and each node takes a code once."""
+        links = [l for l in self.links if l.token and (l.url == url.rstrip("/") if url else l.needs_code)]
+        if not links:
+            raise AdminError("no node is asking for a code")
+        results = [{"url": l.url, **_try(lambda l=l: l.sign_in(code))} for l in links]
+        return {"ok": any(r["ok"] for r in results), "nodes": results}
 
     def unlock(self, password: str | None) -> dict:
         if not self.wallet or not self.wallet.exists():
@@ -549,6 +601,8 @@ class AdminApp:
                         out = app.post_job(spec, body.get("budget"))
                     elif parts == ["unlock"]:
                         out = app.unlock(str(body.get("password") or ""))
+                    elif parts == ["login"]:
+                        out = app.sign_in(str(body.get("code") or ""), body.get("url") or None)
                     elif parts == ["settings"]:
                         out = app.set_settings(body.get("nodes"), body.get("wallet"), body.get("geo"))
                     else:
@@ -587,7 +641,7 @@ class AdminError(Exception):
 def _try(fn) -> dict:
     try:
         return {"ok": True, "result": fn()}
-    except (NodeError, *BROKEN) as e:
+    except (NodeError, AdminError, *BROKEN) as e:
         return {"ok": False, "error": str(e)}
 
 
@@ -793,7 +847,26 @@ def _log_without_console() -> None:
         pass
 
 
+def mfa_setup(key: str) -> str:
+    """What `--new-mfa` prints: the key, how to add it to an authenticator app, how to start the node with it."""
+    grouped = " ".join(key[i:i + 4] for i in range(0, len(key), 4))
+    return (f"A new authenticator key for a node's admin routes. Keep it as secret as the token.\n\n    {grouped}\n\n"
+            "1. In your authenticator app (Google or Microsoft Authenticator, 1Password, Authy, ...), add an account,\n"
+            "   choose to enter a setup key, and type the key above (time based). Everyone who runs the node adds this\n"
+            "   same key to their own app.\n"
+            "2. Start the node with it as well as the token:\n"
+            f"       VIBEHASH_ADMIN_MFA={key} vibehash node ...     (or --admin-mfa KEY)\n"
+            "3. The admin app then asks for the app's 6-digit code. A sign-in lasts 12 hours.\n\n"
+            f"On a phone that has the app, this link adds the key too:\n    {nodeadmin.otpauth_uri(key)}")
+
+
 def main(a) -> None:
+    if getattr(a, "new_token", False):
+        print(nodeadmin.new_token())
+        return
+    if getattr(a, "new_mfa", False):
+        print(mfa_setup(nodeadmin.new_mfa_key()))
+        return
     _log_without_console()
     if getattr(a, "remove_shortcut", False):
         where = remove_shortcut()
