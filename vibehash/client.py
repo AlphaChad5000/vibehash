@@ -50,10 +50,13 @@ OPEN_EVERY = 30.0  # seconds between a worker mining one job asking whether that
 # it ignore it, as they ignored urllib's own.
 USER_AGENT = f"vibehash/{__version__}"
 # The oldest release whose workers a node takes by default (`vibehash node --min-client`, /status `min_client`): a
-# register whose User-Agent names an older one is refused, naming the upgrade (node.Node.check_client). 0.5.14 because
-# its Evo v2 checkers round as its workers do (HANDOFF, "Release 0.5.14"); 0.5.10 brought fine-tunes' rule 2. Releases
-# from before this setting send no version, and requests that name none are taken as before: a nudge, not security.
-MIN_CLIENT = "0.5.14"
+# register whose User-Agent names an older one is refused, naming the upgrade (node.Node.check_client). 0.5.17: the
+# first release that follows block version 4 (ledger.ACCOUNTABILITY_VERSION), which a node of this release makes, and
+# the first that names itself. Releases before it send urllib's own User-Agent (`Python-urllib/3.x`) and can't follow
+# such a chain, so a register from one is told to upgrade too; requests with no User-Agent are taken as before: a
+# nudge, not security.
+MIN_CLIENT = "0.5.17"
+OLD_CLIENT = re.compile(r"^Python-urllib/")  # what a worker from before 0.5.17 says it is
 _SHOWN = re.compile(r"[0-9A-Za-z.+-]{1,32}")  # a version a node names, fit for a terminal: anything else isn't shown
 _NUDGED: set[tuple[str, str]] = set()  # (node, advice) said once a process already
 

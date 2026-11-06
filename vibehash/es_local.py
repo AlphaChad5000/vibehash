@@ -202,11 +202,15 @@ def chain_bytes(entry) -> int:
 
 # The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
 # sigma 1e-3, a cosine from 1e-3 to a quarter of it over the job, replay of 16 earlier correct answers, the anchor.
-V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=1e-3, lr_floor=0.25,
-                   rounds=12, replay=16, margin=0.1, lp_tol=0.05, decay=1 / 64, lenient=True)
+V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=5e-4, lr_floor=0.25,
+                   rounds=12, replay=16, margin=0.1, lp_tol=0.05, decay=1 / 256, lenient=True)
+# Jobs with `tasks` mix them in every round (Spec2.mix): spec2_for turns it on whenever a job names tasks.
+V2_MIX = True
 # lr 1e-3 and decay 1/64, the anchored step (es2's docstring, HANDOFF "The Evo collapse: cause and fix"): lr 4e-3 with
 # no anchor drifted the model 1.6% from its base a round at the cosine's top, broke it within about 100 rounds, and
-# made the testnet's ~400-round line worse on every task. Anchored, random drift levels off near 1-2%. lenient: a right
+# made the testnet's ~400-round line worse on every task. Anchored at 1/64, random drift levelled off at 2%, but a task
+# trained 200 rounds before had given back most of its gain; at 1/256 with half the step the drift settles about as
+# low and a push the rounds agree on adds up over four times as many rounds. lenient: a right
 # answer pays with or without its <answer> tags (es_tasks.lenient), so rounds reward being right, not the format.
 # margin 0.1: a checker teacher-forces answers through the engine that wrote them, in its passes of es_fast.ROWS rows,
 # so it rounds exactly as the worker did. Measured on Qwen2.5-0.5B-Instruct (RTX 4070 SUPER, a worker's 64 members x 16
@@ -241,6 +245,8 @@ def spec2_for(found: Base, task: str, start=(), **settings):
         raise RuntimeError("Evo mode needs PyTorch and transformers: `vibehash install-gpu`, then pip install "
                            "transformers") from None
     s = {**V2_SETTINGS, **settings}
+    if s.get("tasks") and "mix" not in settings:
+        s["mix"] = V2_MIX
     full = AutoConfig.from_pretrained(found.folder)
     c = full.get_text_config()
     tensors = tensors2_for(full)

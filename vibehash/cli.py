@@ -1957,10 +1957,24 @@ def _testnet(a, held: list) -> None:
         path = d / "evo2.json"
         cyc = json.loads(path.read_text()) if path.exists() else {"cycle": 1, "jobs": [], "parents": []}
         lost = [j for j in cyc["jobs"] if j not in node.chain.state.jobs]
+        mixed = es_local.V2_MIX
+
+        def mixed_spec(parents):  # one job a cycle: every task in every round, --evo2-rounds rounds' worth of each
+            return es_local.spec2_for(found, evo2_tasks[0], start=parents, rounds=a.evo2_rounds * len(evo2_tasks),
+                                      tasks=tuple(evo2_tasks))
         if lost:  # posted, but the network stopped before its transaction reached a block: the same job again
-            spec = es_local.spec2_for(found, lost[0].split("-", 2)[2], start=cyc["parents"], rounds=a.evo2_rounds)
+            spec = (mixed_spec(cyc["parents"]) if lost[0].endswith("-mix") else
+                    es_local.spec2_for(found, lost[0].split("-", 2)[2], start=cyc["parents"], rounds=a.evo2_rounds))
             return es_local.job2(spec, lost[0], keys["requester"].address)
         last = cyc["jobs"][-1] if cyc["jobs"] else None  # None only before the first job
+        if mixed:
+            if cyc["jobs"]:
+                cyc = {"cycle": cyc["cycle"] + 1, "jobs": []}
+            cyc["parents"] = [[last, 1.0, es2.hash_of(node.coord.start_params(last))]] if last else []
+            job = es_local.job2(mixed_spec(cyc["parents"]), f"evo2-c{cyc['cycle']}-mix", keys["requester"].address)
+            cyc["jobs"].append(job.job_id)
+            path.write_text(json.dumps(cyc, indent=2))
+            return job
         if len(cyc["jobs"]) >= len(evo2_tasks):
             cyc = {"cycle": cyc["cycle"] + 1, "jobs": []}
         # start_params also rebuilds the last job's final state from the chain when another validator led its last round
@@ -2243,7 +2257,8 @@ def parser() -> argparse.ArgumentParser:
     _rate_limit_flags(p)
     p.add_argument("--min-client", default=MIN_CLIENT, metavar="VERSION",
                    help=f"the oldest Vibe Hash release whose workers may register (default {MIN_CLIENT}); older ones are "
-                        "told to upgrade. Releases from before this option send no version and are taken as before")
+                        "told to upgrade, as are releases before 0.5.17, which name no version and can't follow "
+                        "version 4 blocks")
     p.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this PEM certificate (see `tls cert`)")
     p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
 

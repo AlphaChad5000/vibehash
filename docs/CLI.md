@@ -293,7 +293,7 @@ Flags:
 - `--rate-limit SPEC`: per-client request limits: default, off, or overrides like tx=1/10,read=100 (requests a second/burst; buckets: read, worker, tx, upload, other). Clients on this computer are never limited.
 - `--rate-limit-local`: limit clients on this computer (127.0.0.1) too, e.g. behind a reverse proxy, where everyone looks local.
 - `--max-connections MAX_CONNECTIONS`: connections served at once (default 256).
-- `--min-client VERSION`: the oldest Vibe Hash release whose workers may register (default 0.5.14); older ones are told to upgrade. Releases from before this option send no version and are taken as before.
+- `--min-client VERSION`: the oldest Vibe Hash release whose workers may register (default 0.5.17); older ones are told to upgrade, as are releases before 0.5.17, which name no version and can't follow version 4 blocks.
 - `--tls-cert FILE`: serve HTTPS with this PEM certificate (see `tls cert`).
 - `--tls-key FILE`: the certificate's private key.
 

@@ -130,6 +130,29 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.18 (2026-11-05): Evo Hash mixes its tasks in every round, with a longer memory.** The owner's 0.5.17
+testnet run (426 rounds, two cycles of 17 one-task jobs, 12 rounds each) beat the original on all 19 held-out sets at
+the end of cycle 1 (MMLU 25% → 37.5%) but not at the end of cycle 2: most sets gave back 2–8 points, MMLU to 32.5%.
+The anchor at 1/64 holds about the last 64 rounds, a cycle is ~200, so a task trained at the start of a cycle had
+given back ~95% of its gain by the next turn: whichever tasks trained last looked best. Fix: `Spec2.mix` (every
+round's 16 problems drawn across the job's tasks, problem i of step s from task (s·16 + i) mod 17, `es2_rounds.items`
+and `mix_seed`; a constant lr), on whenever a job names tasks (`es_local.V2_MIX`); `testnet --evo2` posts one mixed
+job a cycle (`evo2-cN-mix`, --evo2-rounds rounds' worth of each task); and lr 5e-4, decay 1/256. Measured with the
+network's round arithmetic on one GPU, 200 held-out items a set: at 68 rounds, mixed against one task at a time,
+sst2 85.5% vs 57.5%, sciq 74.5% vs 67%, arc_easy 63.5% vs 58%, openbookqa 44% vs 38%, commonsense_qa 54% vs 49%,
+hellaswag 30.5% vs 26%, MMLU (never trained) 39% vs 32.5%; at 102 rounds the likelihood scores were up too
+(arc_challenge 44.5% → 53%, hellaswag 29% → 37.5%, sciq 73.5% → 77%). Still below the original: boolq 63% (−5),
+asdiv 21% (−4), aqua_rat 21.5% (−3); math needs room to reason (answers are 64 tokens). Drift 2.0% at 68 rounds,
+2.3% at 102 (most-moved weight 4.1%): still rising slowly toward its level; watch it over a long run.
+Rollout: a 0.5.17 node refuses a spec with `mix`, so an Evo chain's nodes and workers all need 0.5.18; a testnet
+folder from 0.5.17 carries on with its next job mixed (it starts a new cycle from the last job's line).
+Tests: `test_es2.MixTests`.
+Also, for upgrading the public testnet node (vibehash-public-1, on 0.5.10 until now): `client.MIN_CLIENT` is 0.5.17,
+the first release that follows block version 4 (which this release's nodes make) and names itself, and a worker's
+register with urllib's own User-Agent (`Python-urllib/…`, what releases before 0.5.17 send) is told to upgrade too
+(`client.OLD_CLIENT`, `Node.check_client`): those releases can't follow a version 4 chain, and the message beats the
+chain error they'd hit. Requests with no User-Agent are taken as before. `test_versions_supply` covers both.
+
 **Release 0.5.17 (2026-11-05): `mainnet-checklist` (PR #27) and the Evo anchor (`evo-anchor`), on main.** Everything
 in the "Unreleased" sections below that names `mainnet-checklist`, `evo-qwen35`, `versions-supply-explorer`,
 `validator-accountability`, `save-before-adopt`, `address-checksum`, `halvings-count-work` or `evo-anchor` is in it:

@@ -20,8 +20,19 @@ def items(spec, round_seed: int, step: int = 0) -> list:
     """The round's problems (es_tasks.Item), drawn from its seed, of the task its step has (es2.task_at); with the
     spec's `lenient`, each checked by es_tasks.lenient (a right answer counts without its tags)."""
     from . import es_tasks
-    got = es_tasks.get(es2.task_at(spec, step)).items(round_seed, spec.problems)
+    if getattr(spec, "mix", False):  # problem i of step s: task (s * problems + i) mod the count, its own draw
+        n = len(spec.tasks)
+        got = [es_tasks.get(spec.tasks[(step * spec.problems + i) % n]).items(mix_seed(round_seed, i), 1)[0]
+               for i in range(spec.problems)]
+    else:
+        got = es_tasks.get(es2.task_at(spec, step)).items(round_seed, spec.problems)
     return [es_tasks.lenient(p) for p in got] if getattr(spec, "lenient", False) else got
+
+
+def mix_seed(round_seed: int, i: int) -> int:
+    """A mixed round's problem i is drawn from its task with this seed: the round's, told apart by the problem."""
+    import hashlib
+    return int.from_bytes(hashlib.sha256(b"evo2 mix %d %d" % (round_seed, i)).digest()[:8], "big")
 
 
 def claim_root(answers_sha: str, rewards: list, lps: list | None) -> bytes:

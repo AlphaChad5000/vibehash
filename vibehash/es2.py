@@ -74,6 +74,12 @@ class Spec2(es.EsSpec):
     # Answers scored by es_tasks.lenient: a right answer counts with or without its <answer> tags, so the reward is for
     # being right, not for the format. False: left out of the spec, as before it.
     lenient: bool = False
+    # Every round's problems drawn across `tasks` (es2_rounds.items: problem i of step s is task (s * problems + i) mod
+    # the count), at a constant lr, instead of `rounds` rounds of one task at a time. Taken in turn, the tasks trained
+    # long ago fade: with the anchor (decay) the change mostly holds its last 1 / decay rounds, a 17-task cycle is
+    # about 200, and at the end of the owner's second cycle (2026-11-05) the tasks trained first had given back most of
+    # what the first cycle taught them. Mixed, every task is always recent. False: left out of the spec, as before it.
+    mix: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -115,6 +121,8 @@ class Spec2(es.EsSpec):
             out.append("decay is 0 to 0.5")
         if not isinstance(self.lenient, bool):
             out.append("lenient is true or false")
+        if not isinstance(self.mix, bool) or (self.mix and not self.tasks):
+            out.append("mix is true or false, and true only with tasks")
         if self.rank != 1 or self.rule != RULE2 or self.precision != "float32":
             out.append("rank is 1, rule 2, precision float32")
         return out
@@ -138,14 +146,14 @@ class Spec2(es.EsSpec):
                        "start": [[j, w, h] for j, w, h in self.start], "check": self.check, "margin": self.margin,
                        "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {}),
                        **({"decay": self.decay} if self.decay else {}),
-                       **({"lenient": True} if self.lenient else {})}}
+                       **({"lenient": True} if self.lenient else {}), **({"mix": True} if self.mix else {})}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Spec2":
         e = d["es"]
         known = {"rule", "tensors", "n", "tensors_sha", "task", "pairs", "pairs_per_unit", "problems", "max_tokens",
                  "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks",
-                 "decay", "lenient"}
+                 "decay", "lenient", "mix"}
         if set(e) - known:
             raise ValueError(f"a rule-2 ES spec has no field {sorted(set(e) - known)[0]!r}")
         if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list) for k in ("start", "tasks")):
@@ -158,7 +166,7 @@ class Spec2(es.EsSpec):
                    replay=int(e["replay"]), start=tuple(tuple(s) for s in e.get("start", [])),
                    check=int(e["check"]), margin=float(e["margin"]), lp_tol=float(e["lp_tol"]),
                    rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])),
-                   decay=float(e.get("decay", 0.0)), lenient=e.get("lenient", False))
+                   decay=float(e.get("decay", 0.0)), lenient=e.get("lenient", False), mix=e.get("mix", False))
 
 
 def is_v2(d) -> bool:
@@ -244,12 +252,16 @@ def task_at(spec: Spec2, round_index: int) -> str:
     rounds, then round again."""
     if not spec.tasks:
         return spec.task
+    if getattr(spec, "mix", False):
+        return "mixed"  # every task, problem by problem (es2_rounds.items)
     return spec.tasks[(round_index // max(1, spec.rounds)) % len(spec.tasks)]
 
 
 def lr_at(spec: Spec2, round_index: int) -> float:
     """The cosine from lr down to lr * lr_floor over the job's planned rounds (round_index from 0), then flat. With
-    `tasks`, over each task's `rounds`, starting again with the next task."""
+    `tasks`, over each task's `rounds`, starting again with the next task. Mixed (`mix`): lr, constant."""
+    if getattr(spec, "mix", False):
+        return spec.lr
     if spec.tasks:
         round_index %= max(1, spec.rounds)
     x = min(1.0, round_index / max(1, spec.rounds))

@@ -58,7 +58,7 @@ from . import deepseek_graph as dsg
 from . import economics as econ
 from . import __version__, advice, filelock, hardware, netstats, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
-from .client import MIN_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
+from .client import MIN_CLIENT, OLD_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
 from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
@@ -922,10 +922,11 @@ class Node:
         return out
 
     def check_client(self, user_agent: str | None) -> None:
-        """A worker's register: refused (400) if its User-Agent names a release older than min_client. No version, or
-        another client's, is taken as before."""
+        """A worker's register: refused (400) if its User-Agent names a release older than min_client, or is urllib's
+        own (client.OLD_CLIENT: a worker from before releases named themselves, which can't follow block version 4).
+        No User-Agent, or another client's, is taken as before."""
         have = agent_version(user_agent)
-        if have and have < parse_version(self.min_client):
+        if (have and have < parse_version(self.min_client)) or (not have and OLD_CLIENT.match(user_agent or "")):
             raise ProtocolError(advice.too_old_client(self.min_client))
 
     def supply(self) -> dict:

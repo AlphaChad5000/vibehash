@@ -225,6 +225,43 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(arc.gold, "C")
 
 
+class MixTests(unittest.TestCase):
+    """Spec2.mix: every round's problems drawn across the job's tasks, at a constant lr, so no task waits a whole cycle
+    for its turn while the anchor gives back what it learned."""
+
+    def spec(self, **kw):
+        return AnchorTests().spec(task="countdown", tasks=("countdown", "arithmetic"), **kw)
+
+    def test_the_field(self):
+        spec = self.spec(mix=True)
+        self.assertEqual(spec.problems_list(), [])
+        self.assertIs(spec.to_json()["es"]["mix"], True)
+        self.assertEqual(es2.Spec2.from_json(spec.to_json()), spec)
+        self.assertNotIn("mix", self.spec().to_json()["es"], "unmixed: the spec byte for byte as before")
+        self.assertTrue(AnchorTests().spec(mix=True).problems_list(), "mix needs tasks")
+        self.assertTrue(self.spec(mix=1).problems_list())
+
+    def test_rounds_draw_from_every_task_at_one_lr(self):
+        spec, plain = self.spec(mix=True), self.spec()
+        self.assertEqual([es2.task_at(spec, i) for i in (0, 3, 7)], ["mixed"] * 3)
+        self.assertEqual({es2.lr_at(spec, i) for i in range(0, 40, 7)}, {spec.lr})
+        a, b = es2_rounds.items(spec, 99, 0), es2_rounds.items(spec, 100, 1)
+        self.assertEqual(len(a), spec.problems)
+        # problems 0 and 2 are countdown's, 1 and 3 arithmetic's (problem i of step s: task (s * problems + i) mod 2)
+        cd = es2_rounds.items(plain, 1, 0)[0].messages[0]["content"]
+        ar = es2_rounds.items(plain, 1, 3)[0].messages[0]["content"]
+        self.assertNotEqual(cd.split()[0], ar.split()[0], "the two tasks' prompts start differently")
+        self.assertEqual([it.messages[0]["content"].split()[0] for it in a],
+                         [cd.split()[0], ar.split()[0]] * (spec.problems // 2))
+        self.assertNotEqual([it.messages for it in a], [it.messages for it in b], "a new round's seed, new problems")
+        self.assertEqual([it.messages for it in a], [it.messages for it in es2_rounds.items(spec, 99, 0)])
+
+    def test_the_settings(self):
+        from vibehash import es_local
+        self.assertEqual((es_local.V2_SETTINGS["lr"], es_local.V2_SETTINGS["decay"], es_local.V2_MIX),
+                         (5e-4, 1 / 256, True))
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class StarterTemplateTests(unittest.TestCase):
     def test_an_evo_starter_job_from_the_template_goes_into_a_genesis(self):
@@ -243,8 +280,8 @@ class StarterTemplateTests(unittest.TestCase):
         s = Chain.from_genesis(g).state
         job = s.job("evo-starter")
         self.assertEqual((job.es, s.job_owner["evo-starter"], s.escrow["evo-starter"]), (True, SYSTEM, 1))
-        self.assertEqual([es2.task_at(job.spec, i) for i in (0, 4, 5, 10)],
-                         [es_tasks.CURATED[0], es_tasks.CURATED[0], es_tasks.CURATED[1], es_tasks.CURATED[2]])
+        self.assertTrue(job.spec.mix, "the curated tasks, mixed in every round (es_local.V2_MIX)")
+        self.assertEqual([es2.task_at(job.spec, i) for i in (0, 4, 5, 10)], ["mixed"] * 4)
         with self.assertRaisesRegex(InvalidBlock, "es"):  # an Evo starter job needs a genesis that takes Evo jobs
             Chain.from_genesis({**g, "es": False})
         # Rebuilds that look the spec up on chain (es2_rounds.rebuild_chain without one) find it in the genesis block.
@@ -343,7 +380,8 @@ class NetworkTests2(unittest.TestCase):
         self.assertEqual(line.params_hash, es.state_hash(state))
         from vibehash.es_fast import stream_layout
         layout = stream_layout(rt.linears)
-        self.assertEqual(spec.decay, 1 / 64, "the anchor is on by default")
+        from vibehash import es_local
+        self.assertEqual(spec.decay, es_local.V2_SETTINGS["decay"], "the anchor is on by default")
         exact = es2.canonical_weights(layout, {n: rt.base[n].numpy() for n, _, _ in layout}, history,
                                       decay=spec.decay)
         worst = max(float(np.abs((rt.base[n] + line.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)

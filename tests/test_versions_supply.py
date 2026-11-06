@@ -174,8 +174,12 @@ class VersionTests(unittest.TestCase):
         self.assertIn("0.6.0 or newer", error)
         self.assertIn("pip install -U vibehash", error)
         self.assertEqual(advice.explain(NodeError(f"POST /register: {error}", 400)), error)
-        # The release it asks for, a newer one, or a client that names none, get as far as the message's own checks.
-        for agent in ("vibehash/0.6.0", "vibehash/1.0", "Python-urllib/3.12", None):
+        # A worker from before releases named themselves (urllib's own User-Agent) is told to upgrade too.
+        status, body = raw(node.url, "POST", "/register", b"{}", {"User-Agent": "Python-urllib/3.12"})
+        self.assertEqual(status, 400)
+        self.assertIn("0.6.0 or newer", json.loads(body)["error"])
+        # The release it asks for, a newer one, another client, or none, get as far as the message's own checks.
+        for agent in ("vibehash/0.6.0", "vibehash/1.0", "curl/8.4", None):
             status, body = raw(node.url, "POST", "/register", b"{}", {"User-Agent": agent} if agent else {})
             self.assertEqual(status, 400)
             self.assertIn("malformed envelope", json.loads(body)["error"], agent)

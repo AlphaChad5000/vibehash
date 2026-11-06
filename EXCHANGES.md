@@ -472,7 +472,7 @@ add `staked` from `/supply`.
   "version": "0.5.17",
   "block_version": 3,
   "tip_version": 3,
-  "min_client": "0.5.14",
+  "min_client": "0.5.17",
   "paid_rounds": 1
 }
 ```
@@ -484,9 +484,9 @@ add `staked` from `/supply`.
   §10, "Block versions"). When `tip_version` is newer than your node's
   `block_version`, your node has stopped following: upgrade it.
 - `min_client`: the oldest release whose workers the node takes (`vibehash
-  node --min-client`, default 0.5.14). Clients send `User-Agent:
-  vibehash/VERSION`, and a worker registering from an older release is told
-  to upgrade. Clients that send no version are taken as before.
+  node --min-client`, default 0.5.17). Clients send `User-Agent:
+  vibehash/VERSION`, and a worker registering from an older release, or from
+  one before 0.5.17 (which sent urllib's own), is told to upgrade.
 - `paid_rounds`: rounds that paid for work so far, on networks whose schedule
   counts them.
 - Nodes released before these fields (0.5.16 and earlier) have none of

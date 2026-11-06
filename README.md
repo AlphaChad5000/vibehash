@@ -354,9 +354,9 @@ vibehash testnet --evo2
 ```
 
 This is Evo Hash ([white paper](docs/evo-hash.pdf); also in the menu: run `vibehash` and pick it under Mine). It runs a node
-and two miners on this computer, training Qwen2.5-0.5B-Instruct on one task after another,
-17 of them, then round again: science, commonsense, word-problem math, sentiment, news and
-emotion questions from public datasets (ARC, SciQ, CommonsenseQA, OpenBookQA, PIQA, Social IQa,
+and two miners on this computer, training Qwen2.5-0.5B-Instruct on 17 tasks at once, every
+round's questions drawn from all of them: science, commonsense, word-problem math, sentiment,
+news and emotion questions from public datasets (ARC, SciQ, CommonsenseQA, OpenBookQA, PIQA, Social IQa,
 WinoGrande, HellaSwag, BoolQ and more; downloaded once, about 1 GB, each pinned to one version
 so every computer reads the same questions). A right answer counts whether or not the model
 wrote it in the asked-for format, so the model is paid for being right. Each step is anchored
@@ -650,8 +650,9 @@ node's newest block is a version this copy doesn't know, or its
 `min_client` is newer than this copy, commands say so in one line and carry
 on, and `worker` refuses to start: upgrade with `python -m pip install -U
 vibehash`. A node turns away a worker's registration from a release older
-than its `--min-client` (default 0.5.14) with the same advice. Clients that
-send no version are taken as before.
+than its `--min-client` (default 0.5.17, the first release that follows block
+version 4), and one from a release before 0.5.17 (which named no version),
+with the same advice.
 
 Exchanges, wallets and listing sites: [EXCHANGES.md](EXCHANGES.md) says how
 to follow the chain, spot deposits, send withdrawals and read the supply.
