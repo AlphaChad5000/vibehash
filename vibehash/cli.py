@@ -423,9 +423,30 @@ def cmd_tls_fingerprint(a):
     print(tls.cert_fingerprint(a.cert))
 
 
+def pin_gpu(a) -> None:
+    """`--device cuda:N`: this process sees GPU N alone (CUDA_VISIBLE_DEVICES), as its "cuda". Evo's engines (es_fast,
+    es_hybrid) put their buffers, streams and CUDA graphs on "cuda", the current GPU, which is per thread and GPU 0 by
+    default: on any other GPU they captured empty graphs on the wrong device (garbage answers, rejected and slashed).
+    Only before PyTorch has started CUDA, which the variable can't change afterwards; a GPU list already set
+    (CUDA_VISIBLE_DEVICES=2,3) is indexed into."""
+    m = re.fullmatch(r"cuda:(\d+)", getattr(a, "device", None) or "")
+    if not m:
+        return
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        return
+    shown = [g.strip() for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if g.strip()]
+    n = int(m.group(1))
+    if shown and n >= len(shown):
+        sys.exit(f"error: --device {a.device}, but CUDA_VISIBLE_DEVICES shows only {len(shown)} GPU(s)")
+    os.environ["CUDA_VISIBLE_DEVICES"] = shown[n] if shown else str(n)
+    a.device = "cuda"
+
+
 def cmd_worker(a, keys: KeyPair | None = None):
     from .client import default_cache_dir
 
+    pin_gpu(a)
     keys = keys or load_wallet(wallet_of(a))
     # One worker per wallet: a second would prune the first's checkpoints and take the same units (unattended.py).
     lock = unattended.WorkerLock(Path(a.cache_dir) if a.cache_dir else default_cache_dir() / keys.address)

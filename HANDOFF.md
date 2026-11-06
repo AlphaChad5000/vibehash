@@ -132,6 +132,15 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.21 (2026-11-06): Evo on any GPU of a multi-GPU machine.** Found on the owner's 3-GPU RunPod pod: a
+worker started with `--device cuda:1` or `cuda:2` loaded the model there, but es_fast/es_hybrid put their buffers,
+streams and CUDA graphs on `"cuda"` (the current GPU, per thread, GPU 0 by default): PyTorch warned "The CUDA Graph is
+empty ... captured on wrong device", and the answers would be garbage (rejected, the stake at risk). `cli.pin_gpu`:
+`worker --device cuda:N` sets `CUDA_VISIBLE_DEVICES` to GPU N before PyTorch starts CUDA and works on `"cuda"` (a list
+already set is indexed into). Workaround before 0.5.21: `CUDA_VISIBLE_DEVICES=N vibehash worker --device cuda`. Also
+for pods: don't install `causal_conv1d` or `flash-linear-attention` (transformers' warnings suggest them): faster
+kernels change the arithmetic, so a worker's answers wouldn't match others' checks. Test: `tests/test_pin_gpu.py`.
+
 **Release 0.5.20 (2026-11-06): anyone can join the public Evo network from the menu.** `vibehash-evo-1` went live
 2026-11-06 at `https://evo.vibehash.org:8443` (`settings.PUBLIC_EVO_NODE`), with job `vibe-08b-1` (es_tasks.VIBE on
 Qwen3.5-0.8B, 512-token answers, fee 0) posted from the owner's wallet. An Evo job needs **two staked workers** (a unit
