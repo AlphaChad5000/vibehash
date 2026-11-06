@@ -1,4 +1,5 @@
 """`vibehash worker --watch`: what the dashboard shows, as JSON on this computer only (watch.py)."""
+import http.client
 import json
 import logging
 import threading
@@ -111,6 +112,37 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(headers["Access-Control-Allow-Origin"], "tauri://localhost")
         _, headers = self.get("/", origin="https://evil.example")
         self.assertNotIn("Access-Control-Allow-Origin", headers)
+        # names that only start like this computer's: any website can be called these (a prefix test let them read it)
+        for lookalike in ("http://localhost.evil.example", "http://127.0.0.1.nip.io:7545", "http://tauri.evil.example",
+                          "https://tauri.localhost.evil.example", "tauri://evil.example", "null", "http://[::2]"):
+            _, headers = self.get("/", origin=lookalike)
+            self.assertNotIn("Access-Control-Allow-Origin", headers, lookalike)
+        for ok in ("http://localhost:5173", "https://tauri.localhost", "http://[::1]:8000"):
+            _, headers = self.get("/", origin=ok)
+            self.assertEqual(headers["Access-Control-Allow-Origin"], ok)
+
+    def test_a_request_addressed_to_another_name_is_refused(self):
+        """DNS rebinding: attacker.example re-resolved to 127.0.0.1 makes the feed the attacker page's own origin, so
+        CORS never applies; the Host header still names attacker.example, and that is refused."""
+        for host in ("attacker.example:7545", "127.0.0.1.nip.io", "localhost.attacker.example", ""):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.putrequest("GET", "/", skip_host=True)
+            if host:
+                conn.putheader("Host", host)
+            conn.endheaders()
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 403, host)
+        for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}", "localhost"):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.putrequest("GET", "/", skip_host=True)
+            conn.putheader("Host", host)
+            conn.endheaders()
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 200, host)
 
     def test_the_window_is_a_page_that_reads_the_feed_and_the_node(self):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/dashboard")

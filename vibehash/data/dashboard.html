@@ -3,290 +3,630 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http: https:; base-uri 'none'; form-action 'none'">
 <title>Vibe Hash</title>
 <!-- The app's window: what `vibehash worker --watch` serves at /dashboard, reading its own feed (/ and /events) and the
-     node's public /network. One file, nothing fetched from anywhere but this computer and the node, so it works
-     offline and in the app's own window alike. Tabs: Mining (what the worker is doing, step by step), Wallet, and
-     Network (what is online, the hardware census, the most and least reputable, the jobs), and Settings. In the app's
-     own window (window.py) the page is loaded from the package with window.FEED set to the feed's address, and
-     pywebview.api (window.Api) gives it the app: Pause and Stop, the first run's setup progress, the new wallet's
-     words, the welcome tour, and the settings (the floating avatar, start at login). In a browser those parts stay
-     hidden. -->
+     node's public /network. One file: nothing is fetched from anywhere but this computer and the node, so it works
+     offline, in the app's own window and in a browser. It wears vibehash.org's look (dark glass, the gold-to-violet
+     line), with the site's fonts where this computer has them installed and its own fallbacks where not.
+
+     In the app's own window (window.py) the page is loaded from the package with window.FEED set to the feed's
+     address, and pywebview.api (window.Api) gives it the app: Pause and Stop, the first run's setup and new wallet,
+     settings (the automatic pauses, the avatar, start at login, reduced motion, the model store), the node's status,
+     the round history, the system check and updates. Links out go through Api.open_link by name, after a "Leaving
+     Vibe Hash" check, and open in the system's browser. In a browser those parts stay hidden.
+
+     Everything written into the page from the feed, the node or the app goes in as text (textContent), never as
+     markup. The recovery words are fetched only while the word check is open and cleared from the page when it
+     closes. -->
 <style>
-  :root { color-scheme: dark; --bg: #0f1115; --panel: #171a21; --rule: #262a34; --ink: #e6e8ee; --ink-2: #9aa3b2; --gold: #f1b23c; --green: #5fe182; --red: #f05f55; --violet: #b47aff; }
+  :root {
+    color-scheme: dark;
+    --ink: #0b0a09; --ink2: #151311; --raise: #1c1a17; --rule: #2b2824; --fg: #eeebe6; --mute: #a39c93; --dim: #7d8794;
+    --signal: #f1b23c; --on-signal: #1d1406; --good: #3fb950; --bad: #f28b7d; --violet: #b46eff; --term: #070606;
+    --signal-wash: rgb(241 178 60 / .12); --good-wash: rgb(63 185 80 / .13); --bad-wash: rgb(242 139 125 / .13);
+    --grad: linear-gradient(90deg, #ffcd3c, #ff9646 35%, #ff5f96 68%, #b46eff);
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "Source Sans 3", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); position: sticky; top: 0; }
-  header .mark { width: 18px; height: 24px; }
-  header h1 { font-size: 17px; margin: 0; font-weight: 700; }
-  header .state { margin-left: auto; color: var(--ink-2); font-size: 14px; display: flex; align-items: center; gap: 8px; }
-  header .controls { display: flex; gap: 8px; }
-  header .controls[hidden] { display: none; }
-  .btn { font: 600 13px system-ui, sans-serif; color: var(--ink); background: #222733; border: 1px solid var(--rule); border-radius: 8px; padding: 7px 14px; cursor: pointer; }
-  .btn:hover { border-color: var(--ink-2); }
-  .btn.gold { background: var(--gold); color: #1a1407; border-color: var(--gold); }
-  .btn.danger:hover { border-color: var(--red); color: var(--red); }
-  .btn[disabled] { opacity: .45; cursor: default; }
-  .toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--rule); }
-  .toggle:last-child { border-bottom: 0; }
-  .toggle .what b { display: block; font-size: 15px; }
-  .toggle .what span { color: var(--ink-2); font-size: 13px; }
-  .toggle input { width: 20px; height: 20px; accent-color: var(--gold); flex: none; }
-  .progress { height: 10px; background: var(--rule); border-radius: 5px; overflow: hidden; margin: 10px 0 6px; }
-  .progress i { display: block; height: 100%; width: 0; background: var(--gold); transition: width .6s; }
-  .progress.busy i { background: repeating-linear-gradient(90deg, var(--gold) 0 14px, #c58f2c 14px 28px); animation: slide 1s linear infinite; }
-  @keyframes slide { to { background-position: 28px 0; } }
-  #welcome { position: fixed; inset: 0; background: rgb(15 17 21 / .96); z-index: 10; overflow-y: auto; padding: 40px 24px; }
-  #welcome[hidden] { display: none; }
-  #welcome .sheet { max-width: 640px; margin: 0 auto; }
-  #welcome h2 { font-size: 24px; margin: 0 0 4px; }
-  #welcome .lead { color: var(--ink-2); margin: 0 0 20px; }
-  #welcome .dots { display: flex; gap: 6px; margin-bottom: 18px; }
-  #welcome .dots i { width: 28px; height: 4px; border-radius: 2px; background: var(--rule); }
-  #welcome .dots i.on { background: var(--gold); }
-  #welcome .words { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 12px 0; }
-  #welcome .words span { background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 6px 8px; font: 14px ui-monospace, Consolas, monospace; }
-  #welcome .words span b { color: var(--ink-2); font-weight: 400; margin-right: 6px; }
-  #welcome .actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; }
-  #welcome .actions .skip { margin-left: auto; color: var(--ink-2); background: none; border: 0; cursor: pointer; font-size: 13px; }
-  #welcome .tour { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  #welcome .tour .card b { display: block; margin-bottom: 4px; }
-  #welcome .tour .card { font-size: 14px; color: var(--ink-2); }
-  #welcome label { display: flex; align-items: center; gap: 10px; margin-top: 12px; cursor: pointer; }
-  #welcome label input { width: 18px; height: 18px; accent-color: var(--gold); }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-2); }
-  .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgb(95 225 130 / .5); animation: pulse 2s infinite; }
-  .dot.busy { background: var(--gold); }
-  @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgb(95 225 130 / 0); } 100% { box-shadow: 0 0 0 0 rgb(95 225 130 / 0); } }
-  nav { display: flex; gap: 2px; padding: 10px 20px 0; }
-  nav button { font: 600 14px system-ui, sans-serif; color: var(--ink-2); background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; }
-  nav button[aria-selected="true"] { color: var(--ink); border-color: var(--gold); }
-  main { padding: 16px 20px 40px; max-width: 1100px; }
-  section[hidden] { display: none; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
-  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; }
-  .card h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .06em; }
-  .card .big { font-size: 26px; font-weight: 700; }
-  .card .sub { color: var(--ink-2); font-size: 13px; }
-  .steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
-  .steps li { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 10px 8px; text-align: center; color: var(--ink-2); font-size: 13px; }
-  .steps li.done { border-color: var(--gold); color: var(--ink); }
-  .steps li.now { border-color: var(--gold); background: #2a2210; color: var(--gold); }
-  .steps li b { display: block; font-size: 18px; }
-  .feed { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 10px 14px; height: 320px; overflow-y: auto; font: 13px/1.5 ui-monospace, Consolas, monospace; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { margin: 0; color: var(--fg); font: 15px/1.5 var(--body); -webkit-font-smoothing: antialiased; display: grid; grid-template-rows: auto auto 1fr auto; overflow: hidden;
+    background: var(--ink) radial-gradient(50% 60% at 78% 30%, rgb(180 110 255 / .12), transparent 70%) no-repeat; }
+  body::before { content: ""; position: fixed; left: 0; right: 0; top: 0; height: 1px; background: var(--grad); opacity: .8; z-index: 20; }
+  h2, h3 { font-family: var(--display); margin: 0; text-wrap: balance; }
+  p { margin: 0; }
+  .grad-text { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .mute { color: var(--mute); }
+  .mono { font-family: var(--mono); font-size: .9em; }
+  .num { font-variant-numeric: tabular-nums; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; border-radius: 4px; }
+
+  /* the band: brand, what's happening, Pause, the tabs */
+  .band { border-bottom: 1px solid var(--rule); background: rgb(11 10 9 / .6); }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 14px 22px 0; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand svg { width: 13px; height: 18px; }
+  .brand b { font: 720 1.06rem var(--display); font-stretch: 115%; }
+  .tag { font: 500 .66rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--mute); border: 1px solid var(--rule); border-radius: 4px; padding: 2px 7px; }
+  .now { display: inline-flex; align-items: center; gap: 9px; padding: 5px 13px; border: 1px solid var(--rule); border-radius: 99px; background: var(--term); font-size: .9rem; min-width: 0; max-width: 100%; }
+  .now .why { color: var(--mute); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.on { background: var(--good); animation: pulse 2s infinite; }
+  .dot.held { background: var(--signal); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgb(63 185 80 / .5); } 70% { box-shadow: 0 0 0 7px rgb(63 185 80 / 0); } 100% { box-shadow: 0 0 0 0 rgb(63 185 80 / 0); } }
+  .bar .end { margin-left: auto; display: flex; gap: 8px; }
+  .tabs { display: flex; gap: 4px; padding: 8px 14px 0; overflow-x: auto; }
+  .tabs button { font: 600 .95rem var(--body); color: var(--mute); background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 10px 10px; cursor: pointer; white-space: nowrap; }
+  .tabs button:hover { color: var(--fg); }
+  .tabs button[aria-selected="true"] { color: var(--fg); border-image: var(--grad) 1; }
+
+  .btn { font: 600 .9rem var(--body); color: var(--fg); background: var(--ink2); border: 1px solid var(--rule); border-radius: 7px; padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--mute); }
+  .btn.gold { background: var(--signal); color: var(--on-signal); border-color: var(--signal); }
+  .btn.gold:hover { filter: brightness(1.07); }
+  .btn.bad { color: var(--bad); }
+  .btn.small { padding: 4px 10px; font-size: .84rem; }
+  .btn[disabled] { opacity: .45; cursor: default; filter: none; }
+  .link { all: unset; cursor: pointer; color: var(--signal); text-decoration: underline; text-underline-offset: 3px; }
+
+  .update { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 9px 22px; background: var(--signal-wash); border-left: 2px solid var(--signal); font-size: .95rem; }
+  .update .end { margin-left: auto; display: flex; gap: 8px; }
+
+  main { overflow-y: auto; padding: 24px 26px 34px; min-width: 0; }
+  .head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 8px 24px; margin-bottom: 18px; }
+  .head h2 { font-size: 1.55rem; font-weight: 720; font-stretch: 108%; letter-spacing: -.015em; }
+  .head p { color: var(--mute); max-width: 36rem; }
+  .eyebrow { font: 600 .74rem var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--signal); margin-bottom: 4px; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; margin: 0 0 18px; }
+  .stat { background: var(--ink); padding: 15px 18px; display: grid; gap: 2px; align-content: start; min-width: 0; }
+  .stat dt { font-size: .88rem; color: var(--mute); }
+  .stat dd { margin: 0; font: 720 1.75rem/1.15 var(--display); font-stretch: 105%; letter-spacing: -.02em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .stat dd small { font-size: .95rem; font-weight: 600; margin-left: 5px; color: var(--mute); letter-spacing: 0; }
+  .stat .sub { font-size: .86rem; color: var(--mute); }
+  .repbar { height: 5px; background: var(--ink2); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .repbar i { display: block; height: 100%; width: 0; background: var(--good); transition: width .6s; }
+
+  .panel { background: var(--ink2); border: 1px solid var(--rule); border-radius: 16px; padding: 16px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .panel h4 { margin: 0; font: 600 .9rem var(--body); color: var(--mute); }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+  .stages { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .stages li { font-size: .86rem; padding: 3px 12px; border-radius: 99px; background: var(--ink); color: var(--mute); border: 1px solid var(--rule); }
+  .stages li.past { color: var(--good); background: var(--good-wash); border-color: transparent; }
+  .stages li.now { background: var(--signal-wash); color: var(--signal); font-weight: 700; border-color: transparent; }
+
+  /* the mine: a pickaxe at the rock, sparks on each strike, a cart that fills with this round's units, gold when a
+     block pays. Its state follows the worker (scene()); still when paused, held off or between rounds. */
+  .mine { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 300px); gap: 16px; align-items: center; }
+  .mine svg { width: 100%; height: auto; max-height: 190px; display: block; }
+  .mine .mine-words { display: grid; gap: 8px; align-content: center; }
+  .mine .doing { font: 700 1.05rem var(--display); }
+  #pick { transform-origin: 104px 132px; transform: rotate(-38deg); transition: transform .4s; }
+  .scene.training #pick { animation: swing 1s cubic-bezier(.5, 0, .9, .5) infinite; }
+  .scene.checking #pick { animation: swing 2.2s cubic-bezier(.5, 0, .9, .5) infinite; }
+  .scene.uploading #pick, .scene.idle #pick { animation: breathe 3s ease-in-out infinite; }
+  .scene.rest #pick { transform: rotate(-70deg) translate(-6px, 10px); }
+  @keyframes swing { 0% { transform: rotate(-58deg); } 62% { transform: rotate(-58deg); } 82% { transform: rotate(6deg); } 88% { transform: rotate(2deg); } 100% { transform: rotate(-58deg); } }
+  @keyframes breathe { 0%, 100% { transform: rotate(-40deg); } 50% { transform: rotate(-34deg); } }
+  .spark { opacity: 0; }
+  .scene.training .spark { animation: spark 1s linear infinite; }
+  .scene.checking .spark { animation: spark 2.2s linear infinite; }
+  .spark:nth-of-type(2) { --dx: 22px; --dy: -26px; } .spark:nth-of-type(3) { --dx: 30px; --dy: -8px; } .spark:nth-of-type(4) { --dx: 14px; --dy: -34px; } .spark:nth-of-type(5) { --dx: 34px; --dy: -20px; }
+  @keyframes spark { 0%, 80% { opacity: 0; transform: translate(0, 0); } 83% { opacity: 1; } 100% { opacity: 0; transform: translate(var(--dx, 20px), var(--dy, -20px)); } }
+  #ore { transition: fill .6s; }
+  .scene.rest #ore, .scene.rest .vein { fill: #4a443d; }
+  #cartfill { transition: height .6s, y .6s; }
+  #up { opacity: 0; }
+  .scene.uploading #up { animation: rise 1.6s ease-out infinite; }
+  @keyframes rise { 0% { opacity: 0; transform: translateY(8px); } 30% { opacity: 1; } 100% { opacity: 0; transform: translateY(-22px); } }
+  .coins { position: absolute; left: 50%; top: 18%; font: 760 1.6rem var(--display); color: var(--signal); text-shadow: 0 0 18px rgb(241 178 60 / .5); opacity: 0; pointer-events: none; }
+  .coins.go { animation: coins 2.6s ease-out; }
+  @keyframes coins { 0% { opacity: 0; transform: translate(-50%, 10px) scale(.8); } 15% { opacity: 1; transform: translate(-50%, 0) scale(1.05); } 70% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -30px); } }
+
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .chip { font: 600 .82rem var(--body); padding: 3px 11px; border-radius: 99px; border: 1px solid var(--rule); background: var(--ink); color: var(--mute); cursor: pointer; }
+  .chip[aria-pressed="true"] { background: var(--fg); color: var(--ink); border-color: var(--fg); }
+  input[type="search"], input[type="text"], input[type="number"], select { font: .92rem var(--body); color: var(--fg); background: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 6px 10px; }
+  input[type="search"] { flex: 1; min-width: 150px; }
+  .feed { background: var(--term); border: 1px solid var(--rule); border-radius: 10px; padding: 10px 14px; font: .8rem/1.7 var(--mono); height: 260px; overflow-y: auto; }
   .feed div { white-space: pre-wrap; word-break: break-word; }
-  .feed .t { color: var(--ink-2); margin-right: 8px; }
-  .feed .warning { color: #f0c850; } .feed .error { color: var(--red); }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); }
-  th { color: var(--ink-2); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .feed .t { color: var(--dim); margin-right: 8px; }
+  .feed .paid { color: var(--signal); } .feed .warning { color: #e3c25a; } .feed .error { color: var(--bad); }
+
+  .wrap-x { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  th { color: var(--mute); font-weight: 600; font-size: .82rem; }
   td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
-  .addr { font: 13px ui-monospace, Consolas, monospace; }
-  .muted { color: var(--ink-2); }
-  .bar { height: 8px; background: var(--rule); border-radius: 4px; overflow: hidden; }
-  .bar i { display: block; height: 100%; background: var(--gold); }
-  footer { color: var(--ink-2); font-size: 12px; padding: 0 20px 20px; }
+  .plus { color: var(--good); } .minus { color: var(--bad); }
+  .pill { font: 600 .8rem var(--body); border-radius: 99px; padding: 2px 10px; background: var(--ink); color: var(--mute); white-space: nowrap; }
+  .pill.good { background: var(--good-wash); color: var(--good); }
+  .pill.wait { background: var(--signal-wash); color: var(--signal); }
+  .pill.bad { background: var(--bad-wash); color: var(--bad); }
+  .addr { font: .88rem var(--mono); overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  .group { margin-bottom: 22px; }
+  .group h3 { font-size: 1.02rem; margin-bottom: 8px; }
+  .list { border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; }
+  .item { display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid var(--rule); background: var(--ink); }
+  .item:last-child { border-bottom: 0; }
+  .item .what { flex: 1; min-width: 0; }
+  .item .what b { display: block; }
+  .item .what span { color: var(--mute); font-size: .92rem; }
+  .item.off .what b { color: var(--mute); }
+  .switch { position: relative; width: 40px; height: 23px; flex: none; }
+  .switch input { opacity: 0; position: absolute; inset: 0; margin: 0; cursor: pointer; }
+  .switch input[disabled] { cursor: default; }
+  .switch i { position: absolute; inset: 0; background: var(--rule); border-radius: 99px; pointer-events: none; transition: background .15s; }
+  .switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 50%; background: var(--mute); transition: transform .15s; }
+  .switch input:checked + i { background: var(--signal); }
+  .switch input:checked + i::after { transform: translateX(17px); background: var(--on-signal); }
+  .switch input:focus-visible + i { outline: 2px solid var(--signal); outline-offset: 2px; }
+  .switch input[disabled] + i { opacity: .4; }
+  .meter { height: 6px; background: var(--ink2); border-radius: 3px; overflow: hidden; margin-top: 6px; max-width: 280px; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--violet); }
+  dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; font-size: .92rem; }
+  .kv dt { color: var(--mute); } .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+  .checks { display: grid; gap: 8px; }
+  .check { display: flex; gap: 12px; align-items: flex-start; border: 1px solid var(--rule); border-radius: 10px; padding: 11px 14px; background: var(--ink); }
+  .check .tx { flex: 1; min-width: 0; } .check .tx b { display: block; }
+  .check .tx span { color: var(--mute); font-size: .92rem; overflow-wrap: anywhere; }
+
+  footer { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 7px 22px; border-top: 1px solid var(--rule); background: var(--ink2); font-size: .84rem; color: var(--mute); }
+  footer .addr { font-size: .8rem; color: var(--fg); }
+  footer .end { margin-left: auto; display: flex; gap: 14px; }
+
+  .scrim { position: fixed; inset: 0; background: rgb(0 0 0 / .66); display: grid; place-items: center; padding: 16px; z-index: 30; }
+  #welcome.scrim { z-index: 25; }  /* under the word check and the questions it opens, which come later in the page */
+  .dialog { position: relative; width: min(460px, 100%); max-height: 100%; overflow-y: auto; background: linear-gradient(180deg, #161412f2, #0a0908f7); border: 1px solid rgb(255 255 255 / .09); border-radius: 14px; padding: 22px; box-shadow: 0 50px 100px -40px #000, 0 0 140px -50px #b46eff73; }
+  .dialog::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: var(--grad); opacity: .8; }
+  .dialog.wide { width: min(660px, 100%); }
+  .dialog h3 { font-size: 1.22rem; margin-bottom: 6px; }
+  .dialog p { color: var(--mute); margin-bottom: 12px; }
+  .dest { font: .86rem var(--mono); background: var(--term); border: 1px solid var(--rule); border-radius: 8px; padding: 9px 12px; margin-bottom: 12px; overflow-wrap: anywhere; }
+  .dialog .btns { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  label.tick { display: flex; gap: 9px; align-items: center; font-size: .95rem; cursor: pointer; }
+  label.tick input { width: 17px; height: 17px; accent-color: var(--signal); }
+  .words { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 10px 0 14px; padding: 12px; background: var(--term); border: 1px solid var(--rule); border-radius: 10px; }
+  .words span { font: .84rem var(--mono); padding: 3px 4px; }
+  .words span b { color: var(--dim); font-weight: 400; margin-right: 5px; }
+  .quiz { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 6px 0; }
+  .quiz label { display: grid; gap: 4px; font-size: .88rem; color: var(--mute); }
+  .quiz input { width: 100%; font-family: var(--mono); }
+  .quiz input.right { border-color: var(--good); background: var(--good-wash); }
+  .quiz input.wrong { border-color: var(--bad); }
+  .steps { display: flex; gap: 6px; margin-bottom: 14px; }
+  .steps i { flex: 1; height: 4px; border-radius: 2px; background: var(--rule); }
+  .steps i.on { background: var(--grad); }
+  .progress { height: 8px; background: var(--rule); border-radius: 4px; overflow: hidden; margin: 10px 0 6px; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--grad); transition: width .6s; }
+  .progress.busy i { background: repeating-linear-gradient(90deg, var(--signal) 0 14px, #c58f2c 14px 28px); animation: slide 1s linear infinite; }
+  @keyframes slide { to { background-position: 28px 0; } }
+  .tour { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .tour .panel b { display: block; color: var(--fg); }
+  .tour .panel { font-size: .92rem; color: var(--mute); }
+
+  body.calm *, body.calm *::before, body.calm *::after { animation: none !important; transition: none !important; }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid2, .mine, .tour { grid-template-columns: minmax(0, 1fr); }
+    main { padding: 20px 16px 28px; }
+    .bar { padding: 12px 16px 0; }
+    .words { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .quiz { grid-template-columns: minmax(0, 1fr); }
+    .now .why { display: none; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <svg class="mark" viewBox="0 0 3 4" aria-hidden="true"><path fill="#f1b23c" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
-  <h1>Vibe Hash</h1>
-  <div class="state"><span class="dot" id="dot"></span><span id="state">connecting to the worker…</span></div>
-  <div class="controls" id="controls" hidden>
-    <button class="btn" id="pause" type="button">Pause</button>
-    <button class="btn danger" id="stop" type="button">Stop</button>
+<header class="band">
+  <div class="bar">
+    <div class="brand"><svg viewBox="0 0 3 4" aria-hidden="true"><path fill="#f1b23c" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg><b>Vibe Hash</b><span class="tag">Testnet</span></div>
+    <div class="now"><span class="dot" id="dot"></span><b id="state">Connecting</b><span class="why" id="why">to the worker…</span></div>
+    <div class="end" id="controls" hidden>
+      <button class="btn gold" id="pause" type="button">Pause mining</button>
+      <button class="btn bad" id="stop" type="button">Stop</button>
+    </div>
   </div>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" aria-selected="true" data-tab="mining">Mining</button>
+    <button role="tab" aria-selected="false" data-tab="wallet">Wallet</button>
+    <button role="tab" aria-selected="false" data-tab="network">Network</button>
+    <button role="tab" aria-selected="false" data-tab="check" id="tab-btn-check" hidden>System check</button>
+    <button role="tab" aria-selected="false" data-tab="settings">Settings</button>
+  </nav>
 </header>
-<nav role="tablist">
-  <button role="tab" aria-selected="true" data-tab="mining">Mining</button>
-  <button role="tab" aria-selected="false" data-tab="wallet">Wallet</button>
-  <button role="tab" aria-selected="false" data-tab="network">Network</button>
-  <button role="tab" aria-selected="false" data-tab="settings">Settings</button>
-</nav>
+
+<div class="update" id="update" hidden><span><b id="update-text">A new Vibe Hash is out.</b> It installs the next time the app starts.</span><span class="end"><button class="link" type="button" data-link="releases">What's new</button><button class="btn small" type="button" id="update-later">Later</button></span></div>
+
 <main>
   <section id="tab-mining">
-    <div class="grid">
-      <div class="card"><h3>Round</h3><div class="big" id="round">–</div><div class="sub" id="phase"></div></div>
-      <div class="card"><h3>Doing now</h3><div id="activity" style="font-weight:600">–</div><div class="sub" id="job"></div></div>
-      <div class="card"><h3>This session</h3><div class="big" id="session-units">0</div><div class="sub" id="session-sub">units accepted</div></div>
-      <div class="card"><h3>This machine</h3><div id="device" style="font-weight:600">–</div><div class="sub" id="hardware"></div></div>
+    <div class="head"><div><div class="eyebrow" id="eyebrow">Mining</div><h2>Your computer is training <span class="grad-text">real AI models</span></h2></div><p>Other miners check each piece you train, and the block pays you for what checks out.</p></div>
+    <dl class="stats">
+      <div class="stat"><dt>Round</dt><dd id="round">–</dd><span class="sub" id="phase">&nbsp;</span></div>
+      <div class="stat"><dt>Speed</dt><dd id="speed">–</dd><span class="sub" id="device">&nbsp;</span></div>
+      <div class="stat"><dt>This session</dt><dd id="earned">–</dd><span class="sub" id="session-sub">&nbsp;</span></div>
+      <div class="stat"><dt>Reputation</dt><dd id="reputation">–</dd><div class="repbar"><i id="repbar"></i></div></div>
+    </dl>
+    <div class="panel mine">
+      <div class="scene idle" id="scene">
+        <svg viewBox="0 0 360 170" role="img" aria-label="The mine: the pickaxe works while the worker trains">
+          <defs><linearGradient id="g-grad" x1="0" x2="1"><stop offset="0" stop-color="#ffcd3c"/><stop offset=".35" stop-color="#ff9646"/><stop offset=".68" stop-color="#ff5f96"/><stop offset="1" stop-color="#b46eff"/></linearGradient></defs>
+          <path d="M0 150h360" stroke="#2b2824" stroke-width="2"/>
+          <path d="M8 150 L24 108 L52 96 L70 112 L76 150 Z" fill="#1c1a17" stroke="#2b2824"/>
+          <g id="cart"><rect x="16" y="122" width="54" height="22" rx="3" fill="#151311" stroke="#a39c93" stroke-width="1.5"/><rect id="cartfill" x="19" y="141" width="48" height="0" fill="#f1b23c"/><circle cx="28" cy="148" r="4" fill="#a39c93"/><circle cx="58" cy="148" r="4" fill="#a39c93"/></g>
+          <g id="up"><path d="M43 112v-14M37 104l6-6 6 6" stroke="#b46eff" stroke-width="2" fill="none" stroke-linecap="round"/></g>
+          <path id="ore" d="M196 150 L206 74 L246 46 L300 58 L336 96 L348 150 Z" fill="#2b2824"/>
+          <path class="vein" d="M226 88 l14 10 l-6 14 M282 80 l-10 18 l12 10 M300 120 l-16 8" stroke="url(#g-grad)" stroke-width="3" fill="none" stroke-linecap="round"/>
+          <g id="pick"><rect x="100" y="56" width="7" height="80" rx="3" fill="#a3753a"/><path d="M76 66 Q104 40 138 54 L136 60 Q106 50 80 72 Z" fill="#c9c3ba" stroke="#7d8794"/></g>
+          <g transform="translate(196 96)"><circle class="spark" r="2.4" fill="#ffcd3c"/><circle class="spark" r="2" fill="#ff9646"/><circle class="spark" r="1.8" fill="#ffcd3c"/><circle class="spark" r="2" fill="#ff5f96"/><circle class="spark" r="1.6" fill="#f1b23c"/></g>
+        </svg>
+        <div class="coins" id="coins"></div>
+      </div>
+      <div class="mine-words">
+        <div class="doing" id="activity">Waiting for the worker</div>
+        <div class="mute" id="job">&nbsp;</div>
+        <ol class="stages" id="stages" aria-label="This round, step by step">
+          <li data-step="register">Registered</li><li data-step="compute">Training</li><li data-step="commit">Committed</li><li data-step="verify">Checking others</li><li data-step="paid">Paid</li>
+        </ol>
+      </div>
     </div>
-    <ol class="steps" id="steps" aria-label="The round, step by step">
-      <li data-step="register"><b>1</b>registered</li>
-      <li data-step="compute"><b>2</b>training</li>
-      <li data-step="commit"><b>3</b>committed</li>
-      <li data-step="verify"><b>4</b>checking</li>
-      <li data-step="paid"><b>5</b>paid</li>
-    </ol>
-    <h3 class="muted" style="margin:18px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em">What is happening</h3>
-    <div class="feed" id="feed"></div>
+    <div class="panel" style="margin-top:16px">
+      <div class="filters">
+        <h4 style="margin-right:auto">What's happening</h4>
+        <button class="chip" type="button" aria-pressed="true" data-level="all">Everything</button>
+        <button class="chip" type="button" aria-pressed="false" data-level="pay">Pay</button>
+        <button class="chip" type="button" aria-pressed="false" data-level="problems">Problems</button>
+        <input type="search" id="feed-q" placeholder="Search" aria-label="Search the activity">
+      </div>
+      <div class="feed" id="feed" aria-live="off"></div>
+    </div>
   </section>
+
   <section id="tab-wallet" hidden>
-    <div class="grid">
-      <div class="card"><h3>Balance</h3><div class="big" id="balance">–</div><div class="sub">VIBE you can spend</div></div>
-      <div class="card"><h3>Stake</h3><div class="big" id="stake">–</div><div class="sub" id="stake-sub">locked while you mine</div></div>
-      <div class="card"><h3>Reputation</h3><div class="big" id="reputation">–</div><div class="sub">1.0 is spotless</div></div>
-      <div class="card"><h3>Earned this session</h3><div class="big" id="earned">–</div><div class="sub" id="earned-sub">as the blocks paid it</div></div>
+    <div class="head"><div><div class="eyebrow">Your wallet</div><h2 id="balance-head">Your balance</h2></div><p>Your wallet is a file on this computer. Nobody else holds it, and nobody can reset it for you.</p></div>
+    <dl class="stats">
+      <div class="stat"><dt>Spendable</dt><dd id="balance">–</dd><span class="sub">VIBE</span></div>
+      <div class="stat"><dt>Staked</dt><dd id="stake">–</dd><span class="sub" id="stake-sub">locked while you mine</span></div>
+      <div class="stat"><dt>Unbonding</dt><dd id="unbonding">–</dd><span class="sub" id="unbonding-sub">unstaked, free after 20 rounds</span></div>
+      <div class="stat"><dt>Earned this session</dt><dd id="earned-2">–</dd><span class="sub">as the blocks paid it</span></div>
+    </dl>
+    <div class="grid2">
+      <div class="panel">
+        <h4>Recent rounds</h4>
+        <div class="wrap-x"><table id="history"><thead><tr><th>Round</th><th>Job</th><th class="n">Units</th><th class="n">Checks</th><th class="n">Paid</th></tr></thead><tbody></tbody></table></div>
+        <div class="mute" id="history-note" style="font-size:.9rem">Rounds appear here once their block is sealed.</div>
+      </div>
+      <div class="panel">
+        <h4>Your address</h4>
+        <div class="addr" id="address">–</div>
+        <div class="actions"><button class="btn small" type="button" id="copy-address">Copy address</button></div>
+        <h4 style="margin-top:8px">Recovery words</h4>
+        <p class="mute" id="words-note" style="font-size:.92rem">The 24 words that restore this wallet are in a file in your Vibe Hash folder.</p>
+        <div class="actions" id="words-actions" hidden><button class="btn small" type="button" id="words-check">Show and confirm words</button><button class="btn small bad" type="button" id="words-delete">Delete the words file</button></div>
+      </div>
     </div>
-    <div class="card"><h3>Address</h3><div class="addr" id="address">–</div><div class="sub" id="wallet-note"></div></div>
   </section>
+
   <section id="tab-network" hidden>
-    <div class="grid">
-      <div class="card"><h3>Online now</h3><div class="big" id="online">–</div><div class="sub" id="online-sub">miners in the last 10 minutes</div></div>
-      <div class="card"><h3>Today</h3><div class="big" id="day">–</div><div class="sub" id="day-sub">miners, units</div></div>
-      <div class="card"><h3>Validators</h3><div class="big" id="validators">–</div><div class="sub" id="height"></div></div>
-      <div class="card"><h3>Block time</h3><div class="big" id="block-time">–</div><div class="sub">seconds, lately</div></div>
+    <div class="head"><div><div class="eyebrow" id="net-eyebrow">Live</div><h2>The network right now</h2></div><p>Counted from what miners report. No addresses are shown, only the top miners' shortened ones.</p></div>
+    <dl class="stats">
+      <div class="stat"><dt>Miners online</dt><dd id="online">–</dd><span class="sub" id="online-sub">working in the last 10 minutes</span></div>
+      <div class="stat"><dt>Miners today</dt><dd id="day">–</dd><span class="sub" id="day-sub">in the last 24 hours</span></div>
+      <div class="stat"><dt>Validators</dt><dd id="validators">–</dd><span class="sub" id="height">&nbsp;</span></div>
+      <div class="stat"><dt>Block time</dt><dd id="block-time">–</dd><span class="sub">seconds, lately</span></div>
+    </dl>
+    <div class="grid2">
+      <div class="panel"><h4>What is online</h4><div class="wrap-x"><table id="census"><thead><tr><th>Machine</th><th class="n">Online</th><th class="n">Today</th></tr></thead><tbody></tbody></table></div><div class="mute" id="census-note" style="font-size:.9rem"></div></div>
+      <div class="panel"><h4>Most work today</h4><div class="wrap-x"><table id="top"><thead><tr><th>Address</th><th class="n">Work</th><th class="n">Rounds</th></tr></thead><tbody></tbody></table></div></div>
     </div>
-    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr))">
-      <div class="card">
-        <h3>What is online</h3>
-        <table id="census"><thead><tr><th>Machine</th><th class="n">Online</th><th class="n">Today</th></tr></thead><tbody></tbody></table>
-        <div class="sub" id="census-note"></div>
-      </div>
-      <div class="card">
-        <h3>Most work today</h3>
-        <table id="top"><thead><tr><th>Address</th><th class="n">Work</th><th class="n">Rounds</th></tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-    <div class="card" style="margin-top:12px">
-      <h3>Jobs</h3>
-      <table id="jobs"><thead><tr><th>Job</th><th>Model</th><th>Status</th><th class="n">Rounds</th><th class="n">Budget left</th><th>Score</th></tr></thead><tbody></tbody></table>
-    </div>
+    <div class="panel" style="margin-top:16px"><h4>Jobs</h4><div class="wrap-x"><table id="jobs"><thead><tr><th>Job</th><th>Model</th><th>Status</th><th class="n">Rounds</th><th class="n">Budget left</th><th>Score</th></tr></thead><tbody></tbody></table></div></div>
   </section>
+
+  <section id="tab-check" hidden>
+    <div class="head"><div><div class="eyebrow">vibehash selftest</div><h2>System check</h2></div><p>The same checks as the command line, including one real training unit replayed on the CPU. It takes a few minutes, and mining carries on meanwhile.</p></div>
+    <div class="actions" style="margin-bottom:16px"><button class="btn gold" type="button" id="check-run">Run system check</button><button class="btn" type="button" id="check-copy" disabled>Copy report for support</button><span class="mute" id="check-note" style="font-size:.9rem"></span></div>
+    <div class="checks" id="checks"></div>
+    <textarea id="check-text" class="mono" readonly hidden style="width:100%;height:160px;margin-top:12px;background:var(--term);color:var(--fg);border:1px solid var(--rule);border-radius:8px;padding:10px" aria-label="The report, to copy"></textarea>
+    <p class="mute" style="margin-top:14px;font-size:.9rem">The report leaves out your recovery words and anything like a key or password, shortens your address, and writes your user folder as ~.</p>
+  </section>
+
   <section id="tab-settings" hidden>
-    <div class="card" id="settings-card">
-      <div class="toggle"><div class="what"><b>The floating pickaxe</b><span>A small always-on-top avatar on the desktop that rests, swings while training and sparks when a round pays. Click it for this window.</span></div><input type="checkbox" id="set-avatar"></div>
-      <div class="toggle"><div class="what"><b>Start when I log in</b><span>Mining starts in the background at login, without this window. Open it from the avatar or the Start menu.</span></div><input type="checkbox" id="set-startup"></div>
-      <div class="toggle"><div class="what"><b>Your files</b><span id="set-home">The wallet, its recovery words and the logs live in the Vibe Hash folder.</span></div><button class="btn" id="set-open" type="button">Open folder</button></div>
-      <div class="toggle"><div class="what"><b>The welcome tour</b><span>What the app does and how a round works, once more.</span></div><button class="btn" id="set-welcome" type="button">Show again</button></div>
-    </div>
-    <p class="muted" id="settings-note" style="font-size:13px">Settings are changed from the app's own window; a browser can only look.</p>
+    <div class="head"><div><div class="eyebrow">Settings</div><h2>How Vibe Hash runs</h2></div><p id="settings-note">Settings are changed from the app's own window; a browser can only look.</p></div>
+    <div class="group"><h3>When to mine</h3><div class="list">
+      <div class="item" id="row-fullscreen"><div class="what"><b>Pause while I'm gaming</b><span id="why-fullscreen">Holds mining off while a game or any app is full screen, and carries on a minute after it closes.</span></div><label class="switch"><input type="checkbox" id="set-fullscreen" aria-label="Pause while I'm gaming"><i></i></label></div>
+      <div class="item" id="row-battery"><div class="what"><b>Pause on battery</b><span id="why-battery">Mines only while the laptop is plugged in.</span></div><label class="switch"><input type="checkbox" id="set-battery" aria-label="Pause on battery"><i></i></label></div>
+      <div class="item" id="row-idle"><div class="what"><b>Only when I'm away</b><span id="why-idle">Mines after <select id="set-minutes" aria-label="Minutes away"></select> min with no keyboard or mouse, and stops when you're back.</span></div><label class="switch"><input type="checkbox" id="set-idle" aria-label="Only when I'm away"><i></i></label></div>
+    </div></div>
+    <div class="group"><h3>App</h3><div class="list">
+      <div class="item"><div class="what"><b>Start when I log in</b><span>Mining starts in the background at login, without this window. Open it from the pickaxe or the Start menu.</span></div><label class="switch"><input type="checkbox" id="set-startup" aria-label="Start when I log in"><i></i></label></div>
+      <div class="item"><div class="what"><b>The floating pickaxe</b><span>A small always-on-top avatar that rests, swings while training and sparks when a round pays. Closing this window leaves it, and mining, running.</span></div><label class="switch"><input type="checkbox" id="set-avatar" aria-label="The floating pickaxe"><i></i></label></div>
+      <div class="item"><div class="what"><b>Reduce motion</b><span>Stops the mine's animation and the pulsing in this window.</span></div><label class="switch"><input type="checkbox" id="set-calm" aria-label="Reduce motion"><i></i></label></div>
+    </div></div>
+    <div class="group"><h3>Storage</h3><div class="list">
+      <div class="item"><div class="what"><b>Model files</b><span id="cache-text">Big downloads for the jobs you mine.</span><div class="meter"><i id="cache-meter"></i></div></div><label class="mute" for="set-cap">Cap</label><input type="number" id="set-cap" min="5" max="2000" step="5" style="width:84px"><span class="mute">GB</span></div>
+      <div class="item"><div class="what"><b>Clear model files</b><span id="clear-note">Frees the space now. Pause mining first; the next job downloads what it needs again.</span></div><button class="btn bad" type="button" id="cache-clear">Clear</button></div>
+    </div></div>
+    <div class="group"><h3>Network</h3><div class="list">
+      <div class="item"><div class="what"><b id="node-url">–</b><span id="node-kind">&nbsp;</span></div><span class="pill" id="node-ms">…</span></div>
+      <div class="item"><dl class="kv"><dt>Connection</dt><dd id="node-trust">–</dd><dt>Network</dt><dd class="mono" id="node-chain">–</dd><dt>Node version</dt><dd id="node-version">–</dd></dl></div>
+    </div></div>
+    <div class="group"><h3>Your files</h3><div class="list">
+      <div class="item"><div class="what"><b>Vibe Hash folder</b><span class="mono" id="set-home">~/.vibehash</span></div><button class="btn" type="button" id="set-open">Open folder</button></div>
+      <div class="item"><div class="what"><b>Welcome tour</b><span>What the app does and how a round works, once more.</span></div><button class="btn" type="button" id="set-welcome">Show again</button></div>
+      <div class="item"><div class="what"><b>Read more</b><span>The website, the whitepaper and the source code open in your browser.</span></div><div class="actions"><button class="link" type="button" data-link="site">vibehash.org</button><button class="link" type="button" data-link="whitepaper">Whitepaper</button><button class="link" type="button" data-link="source">Source</button></div></div>
+    </div></div>
   </section>
 </main>
-<footer id="foot"></footer>
-<div id="welcome" hidden>
-  <div class="sheet">
-    <div class="dots"><i id="dot-1" class="on"></i><i id="dot-2"></i><i id="dot-3"></i></div>
-    <div id="w-1">
-      <h2>Welcome to Vibe Hash</h2>
-      <p class="lead">Your computer is about to earn VIBE by training real AI models. Setting things up takes a few minutes the first time; after that, seconds.</p>
-      <div class="card">
-        <h3>Setting up</h3>
-        <div id="setup-text">starting…</div>
-        <div class="progress" id="setup-bar"><i></i></div>
-        <div class="sub" id="setup-sub">You can leave this window open or close it; setup carries on either way.</div>
-      </div>
-      <div class="actions"><button class="btn gold" id="w-next-1" type="button" disabled>Next: your account</button><button class="skip" type="button" data-skip>Skip the tour</button></div>
+
+<footer>
+  <span class="dot" id="foot-dot"></span><span id="foot-state">Not connected</span>
+  <span class="addr" id="foot-addr"></span><button class="btn small" type="button" id="foot-copy" hidden>Copy</button>
+  <span class="end"><span id="foot-node"></span><span class="mono" id="foot-version"></span></span>
+</footer>
+
+<div class="scrim" id="leave" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="leave-h">
+    <h3 id="leave-h">Leaving Vibe Hash</h3>
+    <p>This opens in your web browser, not in the app.</p>
+    <div class="dest" id="leave-url"></div>
+    <label class="tick"><input type="checkbox" id="leave-trust"> Don't ask again for <b id="leave-host"></b></label>
+    <div class="btns"><button class="btn" type="button" id="leave-no">Go back</button><button class="btn gold" type="button" id="leave-yes">Open in browser</button></div>
+  </div>
+</div>
+
+<div class="scrim" id="ask" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="ask-h">
+    <h3 id="ask-h"></h3>
+    <p id="ask-text"></p>
+    <div class="btns"><button class="btn" type="button" id="ask-no">Cancel</button><button class="btn gold" type="button" id="ask-yes"></button></div>
+  </div>
+</div>
+
+<div class="scrim" id="ceremony" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="cer-h">
+    <div class="steps"><i class="on"></i><i id="cer-dot-2"></i></div>
+    <div id="cer-1">
+      <div class="eyebrow">Step 1 of 2</div>
+      <h3 id="cer-h">Write down your recovery words</h3>
+      <p>These 24 words restore your wallet if this computer is lost. Anyone who has them can take your coins. Write them on paper, in order, and never type them into a website.</p>
+      <div class="words" id="cer-words"></div>
+      <label class="tick"><input type="checkbox" id="cer-written"> I've written all 24 words down, in order</label>
+      <div class="btns"><button class="btn" type="button" id="cer-cancel">Cancel</button><button class="btn gold" type="button" id="cer-next" disabled>Next: check them</button></div>
     </div>
-    <div id="w-2" hidden>
-      <h2>Your account</h2>
-      <p class="lead">Your wallet is your account: it is a file on this computer, and nobody holds it for you. VIBE you earn goes to this address.</p>
-      <div class="card"><h3>Address</h3><div class="addr" id="w-address">–</div></div>
-      <div class="card" style="margin-top:12px" id="w-words-card">
-        <h3>Recovery words</h3>
-        <div class="sub">These 24 words restore your wallet if this computer is lost, and anyone who has them can take its coins. Write them down somewhere safe, offline. They are shown here once; the file they are in stays in your Vibe Hash folder until you delete it.</div>
-        <div class="words" id="w-words"></div>
-        <label><input type="checkbox" id="w-saved"> I have written them down somewhere safe</label>
-      </div>
-      <div class="actions"><button class="btn gold" id="w-next-2" type="button" disabled>Next: how it works</button><button class="skip" type="button" data-skip>Skip the tour</button></div>
+    <div id="cer-2" hidden>
+      <div class="eyebrow">Step 2 of 2</div>
+      <h3>Check your copy</h3>
+      <p>Type these three words from your paper. They're no longer on screen.</p>
+      <div class="quiz" id="cer-quiz"></div>
+      <div class="btns"><button class="btn" type="button" id="cer-back">Show the words again</button><button class="btn gold" type="button" id="cer-done" disabled>Done</button></div>
     </div>
-    <div id="w-3" hidden>
-      <h2>How it works</h2>
-      <p class="lead">Mining is training. Every few minutes the network hands your machine a piece of a model to train; other miners check it, and the block pays you for what checks out.</p>
-      <div class="tour">
-        <div class="card"><b>Mining</b>The round, step by step: registered, training, committed, checking, paid. The feed underneath says what is happening right now.</div>
-        <div class="card"><b>Wallet</b>Your balance, the stake locked while you mine, your reputation, and what this session earned.</div>
-        <div class="card"><b>Network</b>Who is online, what kinds of machines, who did the most work today, and the jobs being trained.</div>
-        <div class="card"><b>The floating pickaxe</b>A small avatar on the desktop that shows what the worker is doing at a glance. Click it for this window; Settings turns it off.</div>
-      </div>
-      <p class="muted" style="font-size:14px;margin-top:14px">Closing this window keeps mining. Pause and Stop are in the top right, and in the pickaxe's right-click menu.</p>
-      <div class="actions"><button class="btn gold" id="w-done" type="button">Start mining</button></div>
+    <div id="cer-3" hidden>
+      <div class="eyebrow">Done</div>
+      <h3>Your copy matches</h3>
+      <p>The words are cleared from this window. Vibe Hash recommends deleting the words file from this computer now: the paper is your backup.</p>
+      <div class="btns"><button class="btn" type="button" id="cer-keep">Keep the file for now</button><button class="btn bad" type="button" id="cer-delete">Delete the words file</button></div>
     </div>
   </div>
 </div>
+
+<div class="scrim" id="welcome" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="w-h">
+    <div class="steps"><i id="dot-1" class="on"></i><i id="dot-2"></i><i id="dot-3"></i></div>
+    <div id="w-1">
+      <div class="eyebrow">Welcome</div>
+      <h3 id="w-h">Your computer is about to earn VIBE</h3>
+      <p>It trains real AI models in small pieces other miners check. Setting up takes a few minutes the first time; after that, seconds.</p>
+      <div class="panel"><h4>Setting up</h4><div id="setup-text">starting…</div><div class="progress" id="setup-bar"><i></i></div><div class="mute" id="setup-sub" style="font-size:.9rem">You can close this window; setup carries on either way.</div></div>
+      <div class="btns"><button class="btn" type="button" id="w-skip-1">Skip the tour</button><button class="btn gold" id="w-next-1" type="button" disabled>Next: your wallet</button></div>
+    </div>
+    <div id="w-2" hidden>
+      <div class="eyebrow">Your wallet</div>
+      <h3>VIBE you earn goes to this address</h3>
+      <p>Your wallet is a file on this computer, and nobody holds it for you.</p>
+      <div class="dest" id="w-address">–</div>
+      <div id="w-words-part" hidden>
+        <p>A new wallet comes with 24 recovery words. Write them down now: they are the only way back in if this computer is lost.</p>
+        <div class="actions"><button class="btn gold" type="button" id="w-words">Write down my recovery words</button><span class="mute" id="w-words-done" hidden>Checked. Your copy matches.</span></div>
+      </div>
+      <div class="btns"><button class="btn" type="button" id="w-skip-2">Skip the tour</button><button class="btn gold" id="w-next-2" type="button">Next: how it works</button></div>
+    </div>
+    <div id="w-3" hidden>
+      <div class="eyebrow">How it works</div>
+      <h3>Mining is training</h3>
+      <p>Every few minutes the network hands your computer a piece of a model to train. Other miners check it, and the block pays you for what checks out.</p>
+      <div class="tour">
+        <div class="panel"><b>Mining</b>The mine, the round step by step, and what's happening right now.</div>
+        <div class="panel"><b>Wallet</b>Your balance, your stake, what each round paid, and your recovery words.</div>
+        <div class="panel"><b>Settings</b>Pause while gaming, on battery, or mine only when you're away.</div>
+        <div class="panel"><b>The pickaxe</b>A small avatar on the desktop. Click it for this window; closing this window keeps mining.</div>
+      </div>
+      <div class="btns"><button class="btn gold" id="w-done" type="button">Start mining</button></div>
+    </div>
+  </div>
+</div>
+
 <script>
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
-  var SYN = 1e8, lastEvent = 0, node = null, earnedBefore = null, networkAt = 0;
+  var SYN = 1e8, lastEvent = 0, node = null, networkAt = 0, events = [], level = "all";
   var FEED = window.FEED || "";  // the feed's address when the app's window loads this page itself; relative when the feed serves it
-  var api = null, appPaused = false, appSetup = null;  // pywebview.api, in the app's own window only
+  var api = null, appPaused = false, appHeld = null, appSetup = null, appRunning = false, address = null;
+  var lastEarned = null, version = "", worker = null;
+
+  function text(id, s) { $(id).textContent = s == null || s === "" ? "–" : String(s); }
+  function vibe(syn, digits) { if (syn == null) return "–"; var v = syn / SYN; return v.toLocaleString(undefined, { minimumFractionDigits: digits == null ? 2 : 0, maximumFractionDigits: digits == null ? 2 : digits }); }
+  function short(a) { return a ? a.slice(0, 9) + "…" + a.slice(-6) : ""; }
+  function flops(n) { var u = ["FLOP", "kFLOP", "MFLOP", "GFLOP", "TFLOP", "PFLOP", "EFLOP"], i = 0; n = n || 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return [n.toFixed(n >= 100 ? 0 : 1), u[i]]; }
+  function clock(t) { return new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+  function big(id, value, unit) { var dd = $(id); dd.textContent = value; if (unit) { var s = document.createElement("small"); s.textContent = unit; dd.appendChild(s); } }
 
   // ---- tabs ----
-  document.querySelectorAll("nav button").forEach(function (b) {
+  var TABS = ["mining", "wallet", "network", "check", "settings"];
+  document.querySelectorAll(".tabs button").forEach(function (b) {
     b.addEventListener("click", function () {
-      document.querySelectorAll("nav button").forEach(function (x) { x.setAttribute("aria-selected", String(x === b)); });
-      ["mining", "wallet", "network", "settings"].forEach(function (t) { $("tab-" + t).hidden = t !== b.dataset.tab; });
+      document.querySelectorAll(".tabs button").forEach(function (x) { x.setAttribute("aria-selected", String(x === b)); });
+      TABS.forEach(function (t) { $("tab-" + t).hidden = t !== b.dataset.tab; });
       if (b.dataset.tab === "network") network(true);
+      if (b.dataset.tab === "wallet") history();
+      if (b.dataset.tab === "settings") { loadSettings(); loadCache(); loadNode(); }
     });
   });
 
-  // ---- formatting ----
-  function vibe(syn) { if (syn == null) return "–"; var v = syn / SYN; return (v >= 100 ? Math.round(v).toLocaleString() : v.toLocaleString(undefined, { maximumFractionDigits: 4 })) + " VIBE"; }
-  function short(a) { return a ? a.slice(0, 10) + "…" + a.slice(-6) : "–"; }
-  function flops(n) { var u = ["FLOP", "kFLOP", "MFLOP", "GFLOP", "TFLOP", "PFLOP"], i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return n.toFixed(n >= 100 ? 0 : 1) + " " + u[i]; }
-  function time(t) { var d = new Date(t * 1000); return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+  // ---- the mine ----
+  function scene(w) {
+    var s = "idle", act = (w && w.activity || "").toLowerCase();
+    if (!w || appPaused || appHeld) s = "rest";
+    else if (/upload/.test(act)) s = "uploading";
+    else if (w.busy && (w.phase === "verify" || w.phase === "dispute" || /check/.test(act))) s = "checking";
+    else if (w.busy) s = "training";
+    $("scene").className = "scene " + s;
+    var r = (w && w.this_round) || {}, full = r.assigned ? Math.min(1, (r.committed || r.trained || 0) / r.assigned) : 0;
+    $("cartfill").setAttribute("height", String(Math.round(19 * full)));
+    $("cartfill").setAttribute("y", String(141 - Math.round(19 * full)));
+  }
+  function paid(delta) {
+    var c = $("coins");
+    c.textContent = "+" + delta.toLocaleString(undefined, { maximumFractionDigits: 4 }) + " VIBE";
+    c.classList.remove("go"); void c.offsetWidth; c.classList.add("go");
+  }
+  function stages(phase, w) {
+    var order = ["register", "compute", "commit", "verify", "paid"];
+    var now = phase === "register" ? "register" : phase === "compute" ? (w.this_round.committed ? "commit" : "compute")
+            : phase === "reveal" ? "commit" : (phase === "verify" || phase === "dispute") ? "verify" : phase === "next" ? "paid" : null;
+    document.querySelectorAll("#stages li").forEach(function (li) {
+      var i = order.indexOf(li.dataset.step), j = order.indexOf(now);
+      li.className = now == null ? "" : i < j ? "past" : i === j ? "now" : "";
+    });
+  }
+
+  // ---- what the app and worker are doing, in the band and the footer ----
+  function status() {
+    var w = worker, st, why, dot;
+    if (appSetup && appSetup.step !== "mining" && appRunning) { st = "Setting up"; why = SETUP[appSetup.step] || appSetup.step; dot = "dot held"; }
+    else if (appPaused) { st = "Paused"; why = "resume whenever you're ready"; dot = "dot"; }
+    else if (appHeld) { st = "Held off"; why = appHeld; dot = "dot held"; }
+    else if (w) { st = w.busy ? "Mining" : "Waiting"; why = w.activity; dot = w.busy ? "dot on" : "dot held"; }
+    else { st = api ? (appRunning ? "Starting" : "Not running") : "Not connected"; why = api ? appWords() : "the worker isn't answering (is it running?)"; dot = "dot"; }
+    $("state").textContent = st; $("why").textContent = why || ""; $("dot").className = dot;
+    $("foot-dot").className = w ? "dot on" : "dot"; $("foot-state").textContent = w ? "Connected" : "Not connected";
+    scene(w);
+  }
 
   // ---- the worker's feed ----
-  function step(phase, w) {
-    var order = ["register", "compute", "commit", "verify", "paid"];
-    // the worker's phases: register, compute, reveal, verify, dispute (still being decided), next (the block), idle
-    var now = phase === "register" ? "register" : phase === "compute" ? (w.this_round.committed ? "commit" : "compute")
-            : phase === "reveal" ? "commit" : (phase === "verify" || phase === "dispute") ? "verify"
-            : phase === "next" ? "paid" : null;
-    document.querySelectorAll("#steps li").forEach(function (li) {
-      var i = order.indexOf(li.dataset.step), j = order.indexOf(now);
-      li.className = now == null ? "" : i < j ? "done" : i === j ? "now" : "";
-    });
-  }
-  function worker(s) {
+  function onFeed(s) {
     var w = s.workers[0];
-    if (!w) { $("state").textContent = "no worker in the feed"; return; }
+    worker = w || null;
+    if (!w) { status(); return; }
     node = s.node;
-    if (s.syn_per_vibe) SYN = s.syn_per_vibe;  // the feed says how many syn make a VIBE
-    $("dot").className = "dot " + (w.busy ? "busy" : "on");
-    $("state").textContent = w.activity;
-    $("round").textContent = w.round == null ? "–" : w.round;
-    $("phase").textContent = w.phase === "idle" ? "between rounds" : "phase: " + w.phase + (w.progress && w.progress[1] ? " (" + w.progress[0] + " of " + w.progress[1] + ")" : "");
-    $("activity").textContent = w.activity;
-    $("job").textContent = w.job ? "job " + w.job.id + " (" + w.job.kind + ")" : "no job right now";
-    $("session-units").textContent = (w.session.accepted_units != null ? w.session.accepted_units : w.session.units).toLocaleString();
-    $("session-sub").textContent = "units accepted · " + w.session.rounds + " rounds · " + w.session.checks + " checks · " + flops(w.session.training_flops || 0) + " trained";
-    $("device").textContent = w.device;
-    $("hardware").textContent = w.hardware ? w.hardware.label + ", " + w.hardware.memory_gb + " GB (" + w.hardware.vendor + " " + w.hardware.arch + ")" : "";
-    step(w.phase, w);
-    var a = w.account || {};
-    $("balance").textContent = vibe(a.balance);
-    $("stake").textContent = vibe(a.stake);
-    $("stake-sub").textContent = a.bootstrap ? "of which " + vibe(a.bootstrap) + " is bootstrap stake" : "locked while you mine; a cheat loses it";
-    $("reputation").textContent = a.reputation == null ? "–" : a.reputation.toFixed(2);
+    if (s.syn_per_vibe) SYN = s.syn_per_vibe;
+    address = w.address;
+    text("round", w.round == null ? null : Number(w.round).toLocaleString());
+    $("phase").textContent = w.phase === "idle" ? "between rounds" : (w.phase || "") + (w.progress && w.progress[1] ? " · " + w.progress[0] + " of " + w.progress[1] : "");
+    var f = flops(w.flops_per_sec); big("speed", f[0], f[1] + "/s");
+    $("device").textContent = w.hardware ? w.hardware.label + ", " + w.hardware.memory_gb + " GB" : (w.device || "");
     var earned = w.session.earned_vibe;
-    $("earned").textContent = earned == null ? "–" : (earned >= 0 ? "+" : "") + earned.toLocaleString(undefined, { maximumFractionDigits: 4 }) + " VIBE";
-    $("earned-sub").textContent = w.session.log ? "as the blocks paid it · log: " + w.session.log : "as the blocks paid it";
+    big("earned", earned == null ? "–" : (earned >= 0 ? "+" : "") + earned.toLocaleString(undefined, { maximumFractionDigits: 4 }), earned == null ? "" : "VIBE");
+    text("earned-2", earned == null ? null : (earned >= 0 ? "+" : "") + earned.toLocaleString(undefined, { maximumFractionDigits: 4 }));
+    if (earned != null && lastEarned != null && earned > lastEarned + 1e-9) paid(earned - lastEarned);
+    if (earned != null) lastEarned = earned;
+    var units = w.session.accepted_units != null ? w.session.accepted_units : w.session.units;
+    $("session-sub").textContent = units + " units · " + w.session.rounds + " rounds · " + w.session.checks + " checks";
+    $("activity").textContent = w.activity || "–";
+    $("job").textContent = w.job ? "Job " + w.job.id + " (" + w.job.kind + ")" : "No job right now";
+    $("eyebrow").textContent = w.round == null ? "Mining" : "Round " + Number(w.round).toLocaleString() + (w.job ? " · job " + w.job.id : "");
+    stages(w.phase, w);
+    var a = w.account || {};
+    text("balance", vibe(a.balance));
+    $("balance-head").textContent = a.balance == null ? "Your balance" : vibe(a.balance) + " VIBE to spend";
+    text("stake", vibe(a.stake));
+    $("stake-sub").textContent = a.bootstrap ? "of which " + vibe(a.bootstrap) + " is bootstrap stake" : "locked while you mine";
+    var ub = (a.unbonding || []).reduce(function (n, u) { return n + (Array.isArray(u) ? Number(u[0]) || 0 : Number(u && u.amount) || 0); }, 0);
+    text("unbonding", vibe(ub));
+    if (a.reputation != null) { text("reputation", a.reputation.toFixed(2)); $("repbar").style.width = Math.round(100 * a.reputation) + "%"; }
     $("address").textContent = w.address;
-    $("wallet-note").textContent = "Pay goes to this address. The wallet file and its recovery words are in ~/.vibehash on this computer; nothing of them is in this page.";
-    $("foot").textContent = "Node " + s.node + (s.chain_id ? " · network " + s.chain_id : "") + " · feed " + location.origin + "/ (JSON) · updated " + time(s.now);
+    $("foot-addr").textContent = short(w.address); $("foot-copy").hidden = false;
+    $("foot-node").textContent = s.node.replace(/^https?:\/\//, "") + (s.chain_id ? " · " + s.chain_id : "");
+    status();
   }
-  function events(list) {
-    var feed = $("feed"), stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 8;
-    list.forEach(function (e) {
-      var d = document.createElement("div");
-      d.className = e.level;
-      var t = document.createElement("span"); t.className = "t"; t.textContent = time(e.time);
-      d.appendChild(t); d.appendChild(document.createTextNode(e.text));
-      feed.appendChild(d);
-      lastEvent = e.id;
+  function addEvents(list) {
+    list.forEach(function (e) { events.push(e); lastEvent = e.id; });
+    if (events.length > 400) events = events.slice(-400);
+    if (list.length) drawFeed();
+  }
+  function kind(e) { return /sealed|paid|reward|earned/.test(e.text) && e.level === "info" ? "paid" : e.level; }
+  function drawFeed() {
+    var feed = $("feed"), q = $("feed-q").value.toLowerCase(), stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 8;
+    feed.textContent = "";
+    events.forEach(function (e) {
+      var k = kind(e);
+      if (level === "pay" && k !== "paid") return;
+      if (level === "problems" && k !== "warning" && k !== "error") return;
+      if (q && e.text.toLowerCase().indexOf(q) < 0) return;
+      var d = document.createElement("div"), t = document.createElement("span");
+      d.className = k; t.className = "t"; t.textContent = clock(e.time);
+      d.appendChild(t); d.appendChild(document.createTextNode(e.text)); feed.appendChild(d);
     });
-    while (feed.childNodes.length > 400) feed.removeChild(feed.firstChild);
-    if (stick && list.length) feed.scrollTop = feed.scrollHeight;
+    if (stick) feed.scrollTop = feed.scrollHeight;
   }
+  document.querySelectorAll(".chip").forEach(function (b) {
+    b.addEventListener("click", function () {
+      level = b.dataset.level;
+      document.querySelectorAll(".chip").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+      drawFeed();
+    });
+  });
+  $("feed-q").addEventListener("input", drawFeed);
   function poll() {
     fetch(FEED + "/", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (s) {
-      worker(s);
-      if (!lastEvent) events(s.events);
-      else return fetch(FEED + "/events?after=" + lastEvent, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (e) { events(e.events); });
-    }).catch(function () { $("dot").className = "dot"; $("state").textContent = api ? appWords() : "the worker isn't answering (is it running?)"; });
+      onFeed(s);
+      if (!lastEvent) addEvents(s.events);
+      else return fetch(FEED + "/events?after=" + lastEvent, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (e) { addEvents(e.events); });
+    }).catch(function () { worker = null; status(); });
   }
+
+  // ---- copying ----
+  function copy(textToCopy, button) {
+    var old = button.textContent;
+    var done = function (ok) { button.textContent = ok ? "Copied" : "Couldn't copy"; setTimeout(function () { button.textContent = old; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(textToCopy).then(function () { done(true); }, function () { done(false); });
+    else done(false);
+  }
+  $("copy-address").addEventListener("click", function () { if (address) copy(address, $("copy-address")); });
+  $("foot-copy").addEventListener("click", function () { if (address) copy(address, $("foot-copy")); });
+
+  // ---- asking first, in the page ----
+  var askYes = null;
+  function ask(title, body, yes, then) { $("ask-h").textContent = title; $("ask-text").textContent = body; $("ask-yes").textContent = yes; askYes = then; $("ask").hidden = false; $("ask-yes").focus(); }
+  $("ask-no").addEventListener("click", function () { $("ask").hidden = true; askYes = null; });
+  $("ask-yes").addEventListener("click", function () { $("ask").hidden = true; var f = askYes; askYes = null; if (f) f(); });
+
+  // ---- links out: by name, through the app, after "Leaving Vibe Hash" ----
+  var LINKS = {}, trusted = {}, leaving = null;
+  try { trusted = JSON.parse(localStorage.getItem("vh-trusted") || "{}") || {}; } catch (e) { trusted = {}; }
+  function host(url) { try { return new URL(url).host; } catch (e) { return url; } }
+  document.querySelectorAll("[data-link]").forEach(function (b) {
+    b.hidden = true;  // only in the app's window, which opens them in the browser
+    b.addEventListener("click", function () {
+      var name = b.dataset.link, url = LINKS[name];
+      if (!api || !url) return;
+      if (trusted[host(url)]) { api.open_link(name); return; }
+      leaving = name; $("leave-url").textContent = url; $("leave-host").textContent = host(url); $("leave-trust").checked = false;
+      $("leave").hidden = false; $("leave-yes").focus();
+    });
+  });
+  $("leave-no").addEventListener("click", function () { $("leave").hidden = true; leaving = null; });
+  $("leave-yes").addEventListener("click", function () {
+    var url = LINKS[leaving];
+    if ($("leave-trust").checked && url) { trusted[host(url)] = true; try { localStorage.setItem("vh-trusted", JSON.stringify(trusted)); } catch (e) {} }
+    $("leave").hidden = true; if (api && leaving) api.open_link(leaving); leaving = null;
+  });
 
   // ---- the app itself, through the window (pywebview.api; nothing here runs in a browser) ----
   var SETUP = { starting: "starting the app…", node: "finding the network…", wallet: "making your wallet…",
@@ -300,69 +640,237 @@
   function appState() {
     if (!api) return;
     api.state().then(function (s) {
+      appRunning = !!s.running;
       appSetup = s.running ? (s.setup || { step: "mining", fraction: 1 }) : null;
       appPaused = !!(s.running && s.paused);
+      appHeld = s.running ? (s.held || null) : null;
+      if (!s.running && s.setup && s.setup.step === "failed") appSetup = s.setup;
       $("controls").hidden = !s.running;
-      $("pause").textContent = appPaused ? "Resume" : "Pause";
-      $("pause").disabled = $("stop").disabled = !appSetup || appSetup.step !== "mining";  // nothing reads orders until setup is done
-      if (!s.running && s.setup && s.setup.step === "failed") appSetup = s.setup;  // the app left: say why
-      if (appPaused) { $("dot").className = "dot busy"; $("state").textContent = "paused"; }
+      $("pause").textContent = appPaused ? "Resume mining" : "Pause mining";
+      $("pause").disabled = $("stop").disabled = !appSetup || appSetup.step !== "mining";
       var w = s.wallet || {};
-      if (w.address && $("address").textContent === "–") { $("address").textContent = w.address; $("wallet-note").textContent = w.path || ""; }
-      setupProgress();
+      if (w.address && !address) { address = w.address; $("address").textContent = w.address; $("foot-addr").textContent = short(w.address); $("foot-copy").hidden = false; }
+      setupProgress(); status();
     }).catch(function () {});
   }
   function setupProgress() {
-    var bar = $("setup-bar"), f = appSetup ? appSetup.fraction : 0;
+    var f = appSetup ? appSetup.fraction : 0;
     $("setup-text").textContent = appSetup ? (SETUP[appSetup.step] || appSetup.step) : "waiting for the app to start…";
-    bar.firstElementChild.style.width = Math.round(100 * f) + "%";
-    bar.className = "progress" + (appSetup && appSetup.step === "gpu" ? " busy" : "");
+    $("setup-bar").firstElementChild.style.width = Math.round(100 * f) + "%";
+    $("setup-bar").className = "progress" + (appSetup && appSetup.step === "gpu" ? " busy" : "");
     if (appSetup && appSetup.step === "mining") $("setup-sub").textContent = "Ready. Mining has started.";
     if (appSetup && appSetup.step === "failed") { $("setup-text").textContent = "setup stopped: " + (appSetup.why || "see app.log"); $("setup-sub").textContent = "Start Vibe Hash again to retry; the log in the Vibe Hash folder has the details."; }
+    $("w-next-1").disabled = !(appSetup && (appSetup.step === "gpu" || appSetup.step === "ready" || appSetup.step === "mining"));
   }
   function order(word) { if (api) api.order(word).then(appState).catch(function () {}); }
   $("pause").addEventListener("click", function () { order(appPaused ? "resume" : "pause"); });
-  $("stop").addEventListener("click", function () { if (confirm("Stop mining? The worker leaves its round and the app closes.")) order("stop"); });
+  $("stop").addEventListener("click", function () { ask("Stop mining?", "The worker leaves its round and the app closes. Start Vibe Hash again to carry on.", "Stop", function () { order("stop"); }); });
+
+  // ---- settings ----
+  var settingsIds = ["set-fullscreen", "set-battery", "set-idle", "set-minutes", "set-startup", "set-avatar", "set-calm", "set-cap", "set-open", "cache-clear"];
+  settingsIds.forEach(function (id) { $(id).disabled = true; });
+  var welcomeOffered = false;
   function loadSettings() {
     if (!api) return;
     api.settings().then(function (c) {
-      $("set-avatar").checked = !!c.avatar;
-      $("set-startup").checked = !!c.startup;
-      $("set-home").textContent = "The wallet, its recovery words and the logs are in " + c.home + ".";
-      $("settings-note").textContent = "Vibe Hash " + c.version;
-      if (!c.welcomed) welcome(1);
+      var sup = c.supported || {};
+      [["set-fullscreen", "pause_when_fullscreen", "row-fullscreen"], ["set-battery", "pause_on_battery", "row-battery"], ["set-idle", "idle_only", "row-idle"]].forEach(function (x) {
+        $(x[0]).checked = !!c[x[1]]; $(x[0]).disabled = !sup[x[1]];
+        $(x[2]).className = "item" + (sup[x[1]] ? "" : " off"); $(x[2]).title = sup[x[1]] ? "" : "This system doesn't say, so this can't be used here.";
+      });
+      var sel = $("set-minutes");
+      if (!sel.options.length) (c.idle_choices || []).forEach(function (m) { var o = document.createElement("option"); o.value = String(m); o.textContent = String(m); sel.appendChild(o); });
+      sel.value = String(c.idle_minutes); sel.disabled = !sup.idle_only;
+      $("set-avatar").checked = !!c.avatar; $("set-startup").checked = !!c.startup; $("set-calm").checked = !!c.reduced_motion;
+      document.body.classList.toggle("calm", !!c.reduced_motion);
+      $("set-home").textContent = c.home;
+      version = c.version; $("foot-version").textContent = "v" + c.version;
+      $("settings-note").textContent = "Changes apply right away. Mining picks them up within a few seconds.";
+      $("words-actions").hidden = !c.words_file;
+      $("words-note").textContent = c.words_file ? "The 24 words that restore this wallet are in a file in your Vibe Hash folder. Once they're on paper, delete the file: anyone who can read it can take your coins." : "The recovery-words file isn't on this computer. Your paper copy is the backup.";
+      if (!c.welcomed && !welcomeOffered) { welcomeOffered = true; welcome(1); }  // once a window: a later reload mustn't restart the tour
     }).catch(function () {});
   }
+  function option(name, value) { if (api) api.set_option(name, value).then(loadSettings).catch(function () {}); }
+  $("set-fullscreen").addEventListener("change", function () { option("pause_when_fullscreen", $("set-fullscreen").checked); });
+  $("set-battery").addEventListener("change", function () { option("pause_on_battery", $("set-battery").checked); });
+  $("set-idle").addEventListener("change", function () { option("idle_only", $("set-idle").checked); });
+  $("set-minutes").addEventListener("change", function () { option("idle_minutes", Number($("set-minutes").value)); });
+  $("set-calm").addEventListener("change", function () { document.body.classList.toggle("calm", $("set-calm").checked); option("reduced_motion", $("set-calm").checked); });
   $("set-avatar").addEventListener("change", function () { if (api) api.set_avatar($("set-avatar").checked).catch(function () {}); });
   $("set-startup").addEventListener("change", function () { if (api) api.set_startup($("set-startup").checked).then(loadSettings).catch(function () {}); });
   $("set-open").addEventListener("click", function () { if (api) api.open_home().catch(function () {}); });
   $("set-welcome").addEventListener("click", function () { welcome(1); });
-  document.querySelectorAll("#tab-settings input, #set-open").forEach(function (el) { el.disabled = true; });
-  // the welcome: setup's progress, the new wallet and its words, the tour; once, then Settings shows it again
+  function gb(n) { return (n / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 }) + " GB"; }
+  function loadCache() {
+    if (!api) return;
+    api.cache().then(function (c) {
+      if (!c.ok) { $("cache-text").textContent = c.why; return; }
+      $("cache-text").textContent = gb(c.used) + " of " + gb(c.cap) + " in " + c.folder + " · " + c.files + " files";
+      $("cache-meter").style.width = Math.min(100, Math.round(100 * c.used / c.cap)) + "%";
+      if (document.activeElement !== $("set-cap")) $("set-cap").value = String(Math.round(c.cap / 1e9));
+      $("cache-clear").textContent = c.used ? "Clear " + gb(c.used) : "Nothing to clear"; $("cache-clear").disabled = !c.used;
+    }).catch(function () {});
+  }
+  $("set-cap").addEventListener("change", function () { if (api) api.set_cache_cap(Number($("set-cap").value)).then(loadCache).catch(function () {}); });
+  $("cache-clear").addEventListener("click", function () {
+    ask("Clear the model files?", "This deletes the downloaded model files. Jobs that need them download them again.", "Clear", function () {
+      api.clear_cache().then(function (r) { $("clear-note").textContent = r.ok ? "Freed " + gb(r.freed) + "." : r.why; loadCache(); }).catch(function () {});
+    });
+  });
+  function loadNode() {
+    if (!api) return;
+    api.node().then(function (n) {
+      $("node-url").textContent = n.url.replace(/^https?:\/\//, "");
+      $("node-kind").textContent = n.official ? "The official public network" : "A node you chose";
+      $("node-ms").textContent = n.ok ? n.ms + " ms" : "not answering"; $("node-ms").className = "pill " + (n.ok ? (n.ms < 300 ? "good" : "wait") : "bad");
+      $("node-trust").textContent = (n.encrypted ? "Encrypted (HTTPS), " : "") + n.trust;
+      text("node-chain", n.chain_id); text("node-version", n.version);
+      if (n.ok) $("foot-node").textContent = n.url.replace(/^https?:\/\//, "") + " · " + n.ms + " ms";
+    }).catch(function () {});
+  }
+
+  // ---- the wallet's rounds ----
+  function history() {
+    if (!api) return;
+    api.history(12).then(function (h) {
+      var tb = $("history").querySelector("tbody"); tb.textContent = "";
+      (h.rows || []).forEach(function (r) {
+        var tr = document.createElement("tr"), cells = [r.round == null ? "–" : Number(r.round).toLocaleString(), r.job || "–", r.accepted == null ? "–" : r.accepted, r.checks == null ? "–" : r.checks];
+        cells.forEach(function (c, i) { var td = document.createElement("td"); td.textContent = String(c); if (i >= 2) td.className = "n"; if (i === 1) td.className = "mono"; tr.appendChild(td); });
+        var td = document.createElement("td"), e = r.earned_vibe, lost = r.lost_vibe;
+        td.className = "n " + (lost ? "minus" : e ? "plus" : "");
+        td.textContent = lost ? "−" + lost.toLocaleString(undefined, { maximumFractionDigits: 4 }) : e ? "+" + e.toLocaleString(undefined, { maximumFractionDigits: 4 }) : (r.outcome || "–");
+        tr.appendChild(td); tb.appendChild(tr);
+      });
+      $("history-note").hidden = !!(h.rows || []).length;
+    }).catch(function () {});
+  }
+
+  // ---- the recovery words: shown, three checked, cleared ----
+  var words = null, asked = [], ceremonyDone = null;
+  function wipe() { words = null; asked = []; $("cer-words").textContent = ""; $("cer-quiz").textContent = ""; }
+  function cerStep(n) { [1, 2, 3].forEach(function (i) { $("cer-" + i).hidden = i !== n; }); $("cer-dot-2").className = n >= 2 ? "on" : ""; }
+  function closeCeremony() { wipe(); $("ceremony").hidden = true; }
+  function ceremony(onDone) {
+    if (!api) return;
+    ceremonyDone = onDone || null;
+    api.wallet().then(function (w) {
+      if (!(w.words || []).length) { ask("No recovery-words file", "The file setup saved the words in isn't on this computer any more. Your paper copy is the backup.", "OK", null); return; }
+      wipe(); words = w.words; cerStep(1); $("cer-written").checked = false; $("cer-next").disabled = true;
+      words.forEach(function (word, i) { var s = document.createElement("span"), b = document.createElement("b"); b.textContent = i + 1; s.appendChild(b); s.appendChild(document.createTextNode(word)); $("cer-words").appendChild(s); });
+      $("ceremony").hidden = false;
+    }).catch(function () {});
+  }
+  $("cer-written").addEventListener("change", function () { $("cer-next").disabled = !$("cer-written").checked; });
+  $("cer-next").addEventListener("click", function () {
+    $("cer-words").textContent = "";
+    var pool = words.map(function (_, i) { return i; }), buf = new Uint32Array(3);
+    (window.crypto || { getRandomValues: function (a) { for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 4294967296); return a; } }).getRandomValues(buf);
+    asked = [];
+    for (var j = 0; j < 3; j++) asked.push(pool.splice(buf[j] % pool.length, 1)[0]);
+    asked.sort(function (a, b) { return a - b; });
+    $("cer-quiz").textContent = "";
+    asked.forEach(function (k, n) {
+      var l = document.createElement("label"), inp = document.createElement("input");
+      l.appendChild(document.createTextNode("Word " + (k + 1)));
+      inp.type = "text"; inp.id = "cer-q" + n; inp.autocomplete = "off"; inp.spellcheck = false;
+      inp.addEventListener("input", quizCheck); l.appendChild(inp); $("cer-quiz").appendChild(l);
+    });
+    $("cer-done").disabled = true; cerStep(2); $("cer-q0").focus();
+  });
+  function quizCheck() {
+    var all = true;
+    asked.forEach(function (k, n) {
+      var inp = $("cer-q" + n), v = inp.value.trim().toLowerCase(), ok = v === words[k];
+      inp.className = !v ? "" : ok ? "right" : (words[k].indexOf(v) === 0 ? "" : "wrong");
+      all = all && ok;
+    });
+    $("cer-done").disabled = !all;
+  }
+  $("cer-back").addEventListener("click", function () { var f = ceremonyDone; closeCeremony(); ceremony(f); });
+  $("cer-done").addEventListener("click", function () { wipe(); cerStep(3); if (ceremonyDone) ceremonyDone(); });
+  $("cer-keep").addEventListener("click", closeCeremony);
+  $("cer-cancel").addEventListener("click", closeCeremony);
+  $("cer-delete").addEventListener("click", function () { closeCeremony(); deleteWords(); });
+  function deleteWords() { if (api) api.delete_words().then(loadSettings).catch(function () {}); }
+  $("words-check").addEventListener("click", function () { ceremony(null); });
+  $("words-delete").addEventListener("click", function () {
+    ask("Delete the recovery-words file?", "Only do this once the 24 words are written down somewhere safe: they are the only way back into this wallet if this computer is lost.", "Delete the file", deleteWords);
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    if (!$("ceremony").hidden) closeCeremony();
+    $("leave").hidden = true; $("ask").hidden = true;
+  });
+
+  // ---- the welcome: setup's progress, the new wallet and its words, the tour ----
   function welcome(step) {
     $("welcome").hidden = false;
     [1, 2, 3].forEach(function (i) { $("w-" + i).hidden = i !== step; $("dot-" + i).className = i <= step ? "on" : ""; });
-    if (step === 2 && api) api.wallet().then(function (w) {
-      $("w-address").textContent = w.address || "–";
-      var box = $("w-words"); box.innerHTML = "";
-      (w.words || []).forEach(function (word, i) { var s = document.createElement("span"); var b = document.createElement("b"); b.textContent = i + 1; s.appendChild(b); s.appendChild(document.createTextNode(word)); box.appendChild(s); });
-      $("w-words-card").hidden = !(w.words || []).length;
-      $("w-next-2").disabled = !!(w.words || []).length && !$("w-saved").checked;
-    }).catch(function () {});
     if (step === 1) setupProgress();
+    if (step === 2 && api) api.settings().then(function (c) { $("w-words-part").hidden = !c.words_file; }).catch(function () {});
+    if (step === 2) $("w-address").textContent = address || "–";
   }
-  function welcomeDone() { $("welcome").hidden = true; if (api) api.welcomed().catch(function () {}); }
+  function welcomeDone() { closeCeremony(); $("welcome").hidden = true; if (api) api.welcomed().catch(function () {}); }
   $("w-next-1").addEventListener("click", function () { welcome(2); });
   $("w-next-2").addEventListener("click", function () { welcome(3); });
-  $("w-saved").addEventListener("change", function () { $("w-next-2").disabled = !$("w-saved").checked; });
+  $("w-words").addEventListener("click", function () { ceremony(function () { $("w-words-done").hidden = false; $("w-words").hidden = true; }); });
+  $("w-skip-1").addEventListener("click", welcomeDone);
+  $("w-skip-2").addEventListener("click", welcomeDone);
   $("w-done").addEventListener("click", welcomeDone);
-  document.querySelectorAll("#welcome [data-skip]").forEach(function (b) { b.addEventListener("click", welcomeDone); });
-  setInterval(function () { if (!$("welcome").hidden && !$("w-1").hidden) $("w-next-1").disabled = !(appSetup && (appSetup.step === "gpu" || appSetup.step === "ready" || appSetup.step === "mining")); }, 500);
+
+  // ---- the system check ----
+  var report = null;
+  $("check-run").addEventListener("click", function () {
+    if (!api) return;
+    $("check-run").disabled = true; $("check-run").textContent = "Checking… a few minutes"; $("check-note").textContent = ""; $("checks").textContent = "";
+    api.diagnostics().then(function (r) {
+      $("check-run").disabled = false; $("check-run").textContent = "Run system check";
+      if (r.checks == null) { $("check-note").textContent = r.why || "The check couldn't run."; return; }
+      report = r; $("check-copy").disabled = false;
+      $("check-note").textContent = r.ok ? "This computer can mine." : "Something needs fixing before this computer can mine.";
+      r.checks.forEach(function (c) {
+        var d = document.createElement("div"), p = document.createElement("span"), tx = document.createElement("div"), b = document.createElement("b"), s = document.createElement("span");
+        d.className = "check"; p.className = "pill " + (c.status === "ok" ? "good" : c.status === "fail" ? "bad" : c.status === "warn" ? "wait" : "");
+        p.textContent = c.status === "ok" ? "ok" : c.status === "fail" ? "fix" : c.status === "warn" ? "check" : "skipped";
+        tx.className = "tx"; b.textContent = c.name; s.textContent = c.text;
+        tx.appendChild(b); tx.appendChild(s); d.appendChild(p); d.appendChild(tx); $("checks").appendChild(d);
+      });
+    }).catch(function () { $("check-run").disabled = false; $("check-run").textContent = "Run system check"; $("check-note").textContent = "The check couldn't run."; });
+  });
+  function reportText(r) {
+    var lines = ["Vibe Hash " + (r.version || version) + " system check", "node: " + (r.node || "?"), "can mine: " + (r.ok ? "yes" : "no"), ""];
+    (r.checks || []).forEach(function (c) { lines.push("[" + c.status + "] " + (c.section ? c.section + " / " : "") + c.name + ": " + c.text); });
+    return lines.join("\n");
+  }
+  $("check-copy").addEventListener("click", function () {
+    if (!report) return;
+    var t = reportText(report);
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(function () { $("check-note").textContent = "Report copied: no words, no keys."; }, function () { $("check-text").hidden = false; $("check-text").value = t; $("check-text").select(); });
+    else { $("check-text").hidden = false; $("check-text").value = t; $("check-text").select(); }
+  });
+
+  // ---- updates ----
+  function checkUpdate() {
+    if (!api) return;
+    api.update().then(function (u) {
+      if (!u.newer) return;
+      try { if (localStorage.getItem("vh-later") === u.latest) return; } catch (e) {}
+      $("update-text").textContent = "Vibe Hash " + u.latest + " is out."; $("update").hidden = false; $("update").dataset.latest = u.latest;
+    }).catch(function () {});
+  }
+  $("update-later").addEventListener("click", function () { $("update").hidden = true; try { localStorage.setItem("vh-later", $("update").dataset.latest || ""); } catch (e) {} });
+
   window.addEventListener("pywebviewready", function () {
     api = window.pywebview.api;
-    document.querySelectorAll("#tab-settings input, #set-open").forEach(function (el) { el.disabled = false; });
-    appState(); loadSettings();
+    settingsIds.forEach(function (id) { $(id).disabled = false; });
+    $("tab-btn-check").hidden = false;
+    api.links().then(function (l) { LINKS = l || {}; document.querySelectorAll("[data-link]").forEach(function (b) { b.hidden = !LINKS[b.dataset.link]; }); }).catch(function () {});
+    appState(); loadSettings(); checkUpdate(); loadNode();
     setInterval(appState, 2000);
+    setInterval(loadNode, 60000);
+    setInterval(checkUpdate, 3600000);
   });
 
   // ---- the network, from the node ----
@@ -371,43 +879,49 @@
     networkAt = Date.now();
     fetch(node + "/network", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (n) {
       var m = n.miners || {}, h = n.hardware || {};
-      $("online").textContent = m.online == null ? "–" : m.online;
-      $("online-sub").textContent = "miners in the last 10 minutes" + (h.reported != null ? " · " + h.reported + " said what they run on" : "");
-      $("day").textContent = m.day == null ? "–" : m.day;
-      $("day-sub").textContent = (m.units_day || 0).toLocaleString() + " units · " + flops(m.flops_day || 0) + " of work today";
-      $("validators").textContent = n.validators == null ? "–" : n.validators;
-      $("height").textContent = "block " + n.height + (n.chain_id ? " · " + n.chain_id : "");
-      $("block-time").textContent = m.block_time == null ? "–" : Math.round(m.block_time);
-      var tb = $("census").querySelector("tbody"); tb.innerHTML = "";
+      text("online", m.online); text("day", m.day);
+      $("online-sub").textContent = "working in the last 10 minutes" + (h.reported != null ? " · " + h.reported + " said what they run on" : "");
+      var fw = flops(m.flops_day || 0);
+      $("day-sub").textContent = (m.units_day || 0).toLocaleString() + " units · " + fw[0] + " " + fw[1] + " today";
+      text("validators", n.validators);
+      $("height").textContent = n.height == null ? "" : "block " + Number(n.height).toLocaleString();
+      $("net-eyebrow").textContent = "Live" + (n.chain_id ? " · " + n.chain_id : "");
+      text("block-time", m.block_time == null ? null : Math.round(m.block_time));
+      var tb = $("census").querySelector("tbody"); tb.textContent = "";
       (h.classes || []).forEach(function (c) {
         var tr = document.createElement("tr");
-        tr.innerHTML = "<td></td><td class='n'></td><td class='n'></td>";
-        tr.children[0].textContent = c.label + " · " + c.memory_gb + " GB"; tr.children[1].textContent = c.online; tr.children[2].textContent = c.day;
+        [c.label + " · " + c.memory_gb + " GB", c.online, c.day].forEach(function (v, i) { var td = document.createElement("td"); td.textContent = String(v); if (i) td.className = "n"; tr.appendChild(td); });
         tb.appendChild(tr);
       });
-      $("census-note").textContent = (h.classes || []).length ? "Counted from what workers say they run on; no addresses." : "No worker has said what it runs on yet.";
-      var tt = $("top").querySelector("tbody"); tt.innerHTML = "";
+      $("census-note").textContent = (h.classes || []).length ? "Counted from what miners say they run on; no addresses." : "No miner has said what it runs on yet.";
+      var tt = $("top").querySelector("tbody"); tt.textContent = "";
       (m.top_miners || []).forEach(function (t) {
-        var tr = document.createElement("tr");
-        tr.innerHTML = "<td class='addr'></td><td class='n'></td><td class='n'></td>";
-        tr.children[0].textContent = short(t.address); tr.children[0].title = t.address; tr.children[1].textContent = flops(t.flops); tr.children[2].textContent = t.rounds;
+        var tr = document.createElement("tr"), f = flops(t.flops);
+        [short(t.address), f[0] + " " + f[1], t.rounds].forEach(function (v, i) { var td = document.createElement("td"); td.textContent = String(v); td.className = i ? "n" : "mono"; tr.appendChild(td); });
         tt.appendChild(tr);
       });
-      var tj = $("jobs").querySelector("tbody"); tj.innerHTML = "";
+      var tj = $("jobs").querySelector("tbody"); tj.textContent = "";
       (n.jobs || []).forEach(function (j) {
         var tr = document.createElement("tr");
-        tr.innerHTML = "<td></td><td></td><td></td><td class='n'></td><td class='n'></td><td></td>";
-        tr.children[0].textContent = j.id; tr.children[1].textContent = j.model; tr.children[2].textContent = j.status;
-        tr.children[3].textContent = j.rounds_trained; tr.children[4].textContent = vibe(j.escrow);
-        tr.children[5].textContent = j.now == null ? "–" : (j.metric === "loss" ? "loss " + j.now.toFixed(3) : (100 * j.now).toFixed(1) + "% accuracy") + (j.start != null ? " (from " + (j.metric === "loss" ? j.start.toFixed(3) : (100 * j.start).toFixed(1) + "%") + ")" : "");
+        var score = j.now == null ? "–" : (j.metric === "loss" ? "loss " + j.now.toFixed(3) : (100 * j.now).toFixed(1) + "% accuracy") + (j.start != null ? " (from " + (j.metric === "loss" ? j.start.toFixed(3) : (100 * j.start).toFixed(1) + "%") + ")" : "");
+        var cells = [j.id, j.model, null, j.rounds_trained, vibe(j.escrow, 0) + " VIBE", score];
+        cells.forEach(function (v, i) {
+          var td = document.createElement("td");
+          if (i === 2) { var p = document.createElement("span"); p.className = "pill " + (/train/.test(j.status) ? "good" : "wait"); p.textContent = j.status; td.appendChild(p); }
+          else td.textContent = v == null ? "–" : String(v);
+          if (i === 0) td.className = "mono"; if (i === 3 || i === 4) td.className = "n";
+          tr.appendChild(td);
+        });
         tj.appendChild(tr);
       });
     }).catch(function () { $("census-note").textContent = "The node's network page isn't answering."; });
   }
 
+  status();
   poll();
   setInterval(poll, 1000);
   setInterval(function () { network(false); }, 5000);
+  setInterval(function () { if (!$("tab-wallet").hidden) history(); }, 15000);
 </script>
 </body>
 </html>

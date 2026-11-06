@@ -34,8 +34,33 @@ DASHBOARD = Path(__file__).resolve().parent / "data" / "dashboard.html"  # the a
 EVENTS = 200  # kept in memory
 ACCOUNT_S = 20.0
 LOGGERS = ("vibehash.worker", "vibehash.node", "vibehash.client")
-LOCAL_ORIGINS = ("http://127.0.0.1", "http://localhost", "tauri://", "http://tauri.", "https://tauri.")
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")  # the names this computer answers to: hostnames compared whole
+APP_HOSTS = ("tauri.localhost",)  # an app shell's own origin (http(s)://tauri.localhost, tauri://localhost)
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")  # the dashboard's colours, which a JSON feed has no use for
+
+
+def local_origin(origin: str) -> bool:
+    """Whether a page's Origin is this computer's (or the app's own window), compared by hostname, whole. A prefix
+    test let http://localhost.example.com and http://127.0.0.1.example.com through: any website can be named so."""
+    try:
+        u = urlsplit(origin)
+        host = u.hostname
+    except ValueError:
+        return False
+    if u.scheme == "tauri":
+        return host == "localhost"
+    return u.scheme in ("http", "https") and (host in LOCAL_HOSTS or host in APP_HOSTS)
+
+
+def local_host(host_header: str) -> bool:
+    """Whether a request was addressed to this computer by name (its Host header). A website can't send the feed a
+    request whose Host is 127.0.0.1 from a browser, except from this computer's own pages: so this stops DNS
+    rebinding, where attacker.example re-resolves to 127.0.0.1 and its page then reads the feed as its own origin."""
+    try:
+        host = urlsplit("//" + (host_header or "")).hostname
+    except ValueError:
+        return False
+    return host in LOCAL_HOSTS
 
 
 class Events(logging.Handler):
@@ -150,6 +175,9 @@ class Watch:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
+                if not local_host(self.headers.get("Host", "")):  # DNS rebinding (local_host)
+                    self.send_error(403, "this feed answers to 127.0.0.1 and localhost only")
+                    return
                 url = urlsplit(self.path)
                 if url.path in ("/dashboard", "/dashboard/"):  # the app's window: a page that reads the two below
                     page = DASHBOARD.read_bytes()
@@ -178,7 +206,7 @@ class Watch:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 origin = self.headers.get("Origin", "")
-                if origin.startswith(LOCAL_ORIGINS):  # a page from this computer, or the app's own window
+                if local_origin(origin):  # a page from this computer, or the app's own window
                     self.send_header("Access-Control-Allow-Origin", origin)
                 self.end_headers()
                 self.wfile.write(data)
