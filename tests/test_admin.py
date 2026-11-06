@@ -557,7 +557,7 @@ class ShortcutTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="C:\\Users\\x\\Start Menu\\Programs\\Vibe Hash Admin.lnk\n", stderr="")
 
         where = admin.install_shortcut("win32", run=run, home=self.home, python="C:\\it's\\pythonw.exe")
-        self.assertEqual(where.name, "Vibe Hash Admin.lnk")
+        self.assertTrue(str(where).endswith("Vibe Hash Admin.lnk"))  # (a Windows path: on Linux it has no "name" to split)
         script = calls[0][-1]
         self.assertEqual(calls[0][:2], ["powershell", "-NoProfile"])
         self.assertIn("GetFolderPath('Programs')", script)
@@ -568,7 +568,7 @@ class ShortcutTests(unittest.TestCase):
             admin.install_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="denied"),
                                    home=self.home)
         gone = admin.remove_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="C:\\x\\Vibe Hash Admin.lnk\n", stderr=""))
-        self.assertEqual(gone.name, "Vibe Hash Admin.lnk")
+        self.assertTrue(str(gone).endswith("Vibe Hash Admin.lnk"))
         self.assertIsNone(admin.remove_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")))
 
     def test_linux_writes_a_desktop_entry_and_takes_it_away(self):
