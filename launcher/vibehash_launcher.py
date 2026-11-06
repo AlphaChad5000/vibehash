@@ -285,8 +285,10 @@ def make_shortcuts(exe: Path, run=subprocess.run) -> list[Path]:
     its own COM object (PowerShell, no window). -> the shortcuts made (none when it didn't go)."""
     q = lambda p: "'" + str(p).replace("'", "''") + "'"  # noqa: E731
     script = ("$s = New-Object -ComObject WScript.Shell; "
-              "foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) { "
-              "if (-not $dir) { continue }; $p = Join-Path $dir 'Vibe Hash.lnk'; $l = $s.CreateShortcut($p); "
+              "$prog = [Environment]::GetFolderPath('Programs'); if (-not $prog) { $prog = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs' }; "
+              "$desk = [Environment]::GetFolderPath('Desktop'); if (-not $desk) { $desk = Join-Path $env:USERPROFILE 'Desktop' }; "
+              "foreach ($dir in @($prog, $desk)) { "
+              "if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }; $p = Join-Path $dir 'Vibe Hash.lnk'; $l = $s.CreateShortcut($p); "
               f"$l.TargetPath = {q(exe)}; $l.WorkingDirectory = {q(exe.parent)}; $l.IconLocation = {q(exe)} + ',0'; "
               "$l.Description = 'Vibe Hash: mining that trains real AI models'; $l.Save(); Write-Output $p }")
     try:
