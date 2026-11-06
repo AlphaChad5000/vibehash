@@ -36,6 +36,7 @@ while IFS= read -r f; do
     launcher/*|app.ps1) add tests.test_launcher ;;
     scripts/ci_scope.sh|.github/workflows/tests.yml) add tests.test_launcher ;;
     tests/test_*.py) light_test "tests.$(basename "$f" .py)" ;;
+    scripts/evo_margin_xgpu.py) ;;  # a measurement run by hand on GPUs; nothing imports it
     vibehash/*.py)
       m=$(basename "$f" .py)
       if [[ " $EDGE " == *" $m "* ]]; then
