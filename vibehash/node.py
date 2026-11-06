@@ -58,7 +58,7 @@ from . import deepseek_graph as dsg
 from . import economics as econ
 from . import __version__, advice, filelock, hardware, netstats, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
-from .client import MIN_CLIENT, OLD_CLIENT, NodeError, agent_version, parse_version  # (MIN_CLIENT: the oldest release whose workers it takes)
+from .client import MIN_CLIENT, OLD_CLIENT, NodeError, agent_version, parse_version  # the oldest releases it takes
 from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
                           CoordinatorConfig, Phase, ProtocolError)
