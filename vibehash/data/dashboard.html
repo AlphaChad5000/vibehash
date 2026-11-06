@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vibe Hash</title>
+<!-- The app's window: what `vibehash worker --watch` serves at /dashboard, reading its own feed (/ and /events) and the
+     node's public /network. One file, nothing fetched from anywhere but this computer and the node, so it works
+     offline and in the app's own window alike. Tabs: Mining (what the worker is doing, step by step), Wallet, and
+     Network (what is online, the hardware census, the most and least reputable, the jobs). -->
+<style>
+  :root { color-scheme: dark; --bg: #0f1115; --panel: #171a21; --rule: #262a34; --ink: #e6e8ee; --ink-2: #9aa3b2; --gold: #f1b23c; --green: #5fe182; --red: #f05f55; --violet: #b47aff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); position: sticky; top: 0; }
+  header .mark { width: 18px; height: 24px; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 700; }
+  header .state { margin-left: auto; color: var(--ink-2); font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-2); }
+  .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgb(95 225 130 / .5); animation: pulse 2s infinite; }
+  .dot.busy { background: var(--gold); }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgb(95 225 130 / 0); } 100% { box-shadow: 0 0 0 0 rgb(95 225 130 / 0); } }
+  nav { display: flex; gap: 2px; padding: 10px 20px 0; }
+  nav button { font: 600 14px system-ui, sans-serif; color: var(--ink-2); background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; }
+  nav button[aria-selected="true"] { color: var(--ink); border-color: var(--gold); }
+  main { padding: 16px 20px 40px; max-width: 1100px; }
+  section[hidden] { display: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .06em; }
+  .card .big { font-size: 26px; font-weight: 700; }
+  .card .sub { color: var(--ink-2); font-size: 13px; }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  .steps li { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 10px 8px; text-align: center; color: var(--ink-2); font-size: 13px; }
+  .steps li.done { border-color: var(--gold); color: var(--ink); }
+  .steps li.now { border-color: var(--gold); background: #2a2210; color: var(--gold); }
+  .steps li b { display: block; font-size: 18px; }
+  .feed { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 10px 14px; height: 320px; overflow-y: auto; font: 13px/1.5 ui-monospace, Consolas, monospace; }
+  .feed div { white-space: pre-wrap; word-break: break-word; }
+  .feed .t { color: var(--ink-2); margin-right: 8px; }
+  .feed .warning { color: #f0c850; } .feed .error { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); }
+  th { color: var(--ink-2); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .addr { font: 13px ui-monospace, Consolas, monospace; }
+  .muted { color: var(--ink-2); }
+  .bar { height: 8px; background: var(--rule); border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--gold); }
+  footer { color: var(--ink-2); font-size: 12px; padding: 0 20px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <svg class="mark" viewBox="0 0 3 4" aria-hidden="true"><path fill="#f1b23c" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
+  <h1>Vibe Hash</h1>
+  <div class="state"><span class="dot" id="dot"></span><span id="state">connecting to the worker…</span></div>
+</header>
+<nav role="tablist">
+  <button role="tab" aria-selected="true" data-tab="mining">Mining</button>
+  <button role="tab" aria-selected="false" data-tab="wallet">Wallet</button>
+  <button role="tab" aria-selected="false" data-tab="network">Network</button>
+</nav>
+<main>
+  <section id="tab-mining">
+    <div class="grid">
+      <div class="card"><h3>Round</h3><div class="big" id="round">–</div><div class="sub" id="phase"></div></div>
+      <div class="card"><h3>Doing now</h3><div id="activity" style="font-weight:600">–</div><div class="sub" id="job"></div></div>
+      <div class="card"><h3>This session</h3><div class="big" id="session-units">0</div><div class="sub" id="session-sub">units accepted</div></div>
+      <div class="card"><h3>This machine</h3><div id="device" style="font-weight:600">–</div><div class="sub" id="hardware"></div></div>
+    </div>
+    <ol class="steps" id="steps" aria-label="The round, step by step">
+      <li data-step="register"><b>1</b>registered</li>
+      <li data-step="compute"><b>2</b>training</li>
+      <li data-step="commit"><b>3</b>committed</li>
+      <li data-step="verify"><b>4</b>checking</li>
+      <li data-step="paid"><b>5</b>paid</li>
+    </ol>
+    <h3 class="muted" style="margin:18px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em">What is happening</h3>
+    <div class="feed" id="feed"></div>
+  </section>
+  <section id="tab-wallet" hidden>
+    <div class="grid">
+      <div class="card"><h3>Balance</h3><div class="big" id="balance">–</div><div class="sub">VIBE you can spend</div></div>
+      <div class="card"><h3>Stake</h3><div class="big" id="stake">–</div><div class="sub" id="stake-sub">locked while you mine</div></div>
+      <div class="card"><h3>Reputation</h3><div class="big" id="reputation">–</div><div class="sub">1.0 is spotless</div></div>
+      <div class="card"><h3>Earned this session</h3><div class="big" id="earned">–</div><div class="sub" id="earned-sub">as the blocks paid it</div></div>
+    </div>
+    <div class="card"><h3>Address</h3><div class="addr" id="address">–</div><div class="sub" id="wallet-note"></div></div>
+  </section>
+  <section id="tab-network" hidden>
+    <div class="grid">
+      <div class="card"><h3>Online now</h3><div class="big" id="online">–</div><div class="sub" id="online-sub">miners in the last 10 minutes</div></div>
+      <div class="card"><h3>Today</h3><div class="big" id="day">–</div><div class="sub" id="day-sub">miners, units</div></div>
+      <div class="card"><h3>Validators</h3><div class="big" id="validators">–</div><div class="sub" id="height"></div></div>
+      <div class="card"><h3>Block time</h3><div class="big" id="block-time">–</div><div class="sub">seconds, lately</div></div>
+    </div>
+    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(320px, 1fr))">
+      <div class="card">
+        <h3>What is online</h3>
+        <table id="census"><thead><tr><th>Machine</th><th class="n">Online</th><th class="n">Today</th></tr></thead><tbody></tbody></table>
+        <div class="sub" id="census-note"></div>
+      </div>
+      <div class="card">
+        <h3>Most work today</h3>
+        <table id="top"><thead><tr><th>Address</th><th class="n">Work</th><th class="n">Rounds</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h3>Jobs</h3>
+      <table id="jobs"><thead><tr><th>Job</th><th>Model</th><th>Status</th><th class="n">Rounds</th><th class="n">Budget left</th><th>Score</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+</main>
+<footer id="foot"></footer>
+<script>
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var SYN = 1e8, lastEvent = 0, node = null, earnedBefore = null, networkAt = 0;
+
+  // ---- tabs ----
+  document.querySelectorAll("nav button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll("nav button").forEach(function (x) { x.setAttribute("aria-selected", String(x === b)); });
+      ["mining", "wallet", "network"].forEach(function (t) { $("tab-" + t).hidden = t !== b.dataset.tab; });
+      if (b.dataset.tab === "network") network(true);
+    });
+  });
+
+  // ---- formatting ----
+  function vibe(syn) { if (syn == null) return "–"; var v = syn / SYN; return (v >= 100 ? Math.round(v).toLocaleString() : v.toLocaleString(undefined, { maximumFractionDigits: 4 })) + " VIBE"; }
+  function short(a) { return a ? a.slice(0, 10) + "…" + a.slice(-6) : "–"; }
+  function flops(n) { var u = ["FLOP", "kFLOP", "MFLOP", "GFLOP", "TFLOP", "PFLOP"], i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return n.toFixed(n >= 100 ? 0 : 1) + " " + u[i]; }
+  function time(t) { var d = new Date(t * 1000); return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+
+  // ---- the worker's feed ----
+  function step(phase, w) {
+    var order = ["register", "compute", "commit", "verify", "paid"];
+    var now = phase === "register" ? "register" : phase === "compute" ? (w.this_round.committed ? "commit" : "compute")
+            : phase === "reveal" ? "commit" : phase === "verify" ? "verify" : phase === "idle" ? null : "paid";
+    document.querySelectorAll("#steps li").forEach(function (li) {
+      var i = order.indexOf(li.dataset.step), j = order.indexOf(now);
+      li.className = now == null ? "" : i < j ? "done" : i === j ? "now" : "";
+    });
+  }
+  function worker(s) {
+    var w = s.workers[0];
+    if (!w) { $("state").textContent = "no worker in the feed"; return; }
+    node = s.node;
+    $("dot").className = "dot " + (w.busy ? "busy" : "on");
+    $("state").textContent = w.activity;
+    $("round").textContent = w.round == null ? "–" : w.round;
+    $("phase").textContent = w.phase === "idle" ? "between rounds" : "phase: " + w.phase + (w.progress && w.progress[1] ? " (" + w.progress[0] + " of " + w.progress[1] + ")" : "");
+    $("activity").textContent = w.activity;
+    $("job").textContent = w.job ? "job " + w.job.id + " (" + w.job.kind + ")" : "no job right now";
+    $("session-units").textContent = (w.session.accepted_units != null ? w.session.accepted_units : w.session.units).toLocaleString();
+    $("session-sub").textContent = "units accepted · " + w.session.rounds + " rounds · " + w.session.checks + " checks · " + flops(w.session.training_flops || 0) + " trained";
+    $("device").textContent = w.device;
+    $("hardware").textContent = w.hardware ? w.hardware.label + ", " + w.hardware.memory_gb + " GB (" + w.hardware.vendor + " " + w.hardware.arch + ")" : "";
+    step(w.phase, w);
+    var a = w.account || {};
+    $("balance").textContent = vibe(a.balance);
+    $("stake").textContent = vibe(a.stake);
+    $("stake-sub").textContent = a.bootstrap ? "of which " + vibe(a.bootstrap) + " is bootstrap stake" : "locked while you mine; a cheat loses it";
+    $("reputation").textContent = a.reputation == null ? "–" : a.reputation.toFixed(2);
+    var earned = w.session.earned_vibe;
+    $("earned").textContent = earned == null ? "–" : (earned >= 0 ? "+" : "") + earned.toLocaleString(undefined, { maximumFractionDigits: 4 }) + " VIBE";
+    $("earned-sub").textContent = w.session.log ? "as the blocks paid it · log: " + w.session.log : "as the blocks paid it";
+    $("address").textContent = w.address;
+    $("wallet-note").textContent = "Pay goes to this address. The wallet file and its recovery words are in ~/.vibehash on this computer; nothing of them is in this page.";
+    $("foot").textContent = "Node " + s.node + (s.chain_id ? " · network " + s.chain_id : "") + " · feed " + location.origin + "/ (JSON) · updated " + time(s.now);
+  }
+  function events(list) {
+    var feed = $("feed"), stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 8;
+    list.forEach(function (e) {
+      var d = document.createElement("div");
+      d.className = e.level;
+      var t = document.createElement("span"); t.className = "t"; t.textContent = time(e.time);
+      d.appendChild(t); d.appendChild(document.createTextNode(e.text));
+      feed.appendChild(d);
+      lastEvent = e.id;
+    });
+    while (feed.childNodes.length > 400) feed.removeChild(feed.firstChild);
+    if (stick && list.length) feed.scrollTop = feed.scrollHeight;
+  }
+  function poll() {
+    fetch("/", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (s) {
+      worker(s);
+      if (!lastEvent) events(s.events);
+      else return fetch("/events?after=" + lastEvent, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (e) { events(e.events); });
+    }).catch(function () { $("dot").className = "dot"; $("state").textContent = "the worker isn't answering (is it running?)"; });
+  }
+
+  // ---- the network, from the node ----
+  function network(force) {
+    if (!node || (!force && Date.now() - networkAt < 60000)) return;
+    networkAt = Date.now();
+    fetch(node + "/network", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (n) {
+      var m = n.miners || {}, h = n.hardware || {};
+      $("online").textContent = m.online == null ? "–" : m.online;
+      $("online-sub").textContent = "miners in the last 10 minutes" + (h.reported != null ? " · " + h.reported + " said what they run on" : "");
+      $("day").textContent = m.day == null ? "–" : m.day;
+      $("day-sub").textContent = (m.units_day || 0).toLocaleString() + " units · " + flops(m.flops_day || 0) + " of work today";
+      $("validators").textContent = n.validators == null ? "–" : n.validators;
+      $("height").textContent = "block " + n.height + (n.chain_id ? " · " + n.chain_id : "");
+      $("block-time").textContent = m.block_time == null ? "–" : Math.round(m.block_time);
+      var tb = $("census").querySelector("tbody"); tb.innerHTML = "";
+      (h.classes || []).forEach(function (c) {
+        var tr = document.createElement("tr");
+        tr.innerHTML = "<td></td><td class='n'></td><td class='n'></td>";
+        tr.children[0].textContent = c.label + " · " + c.memory_gb + " GB"; tr.children[1].textContent = c.online; tr.children[2].textContent = c.day;
+        tb.appendChild(tr);
+      });
+      $("census-note").textContent = (h.classes || []).length ? "Counted from what workers say they run on; no addresses." : "No worker has said what it runs on yet.";
+      var tt = $("top").querySelector("tbody"); tt.innerHTML = "";
+      (m.top_miners || []).forEach(function (t) {
+        var tr = document.createElement("tr");
+        tr.innerHTML = "<td class='addr'></td><td class='n'></td><td class='n'></td>";
+        tr.children[0].textContent = short(t.address); tr.children[0].title = t.address; tr.children[1].textContent = flops(t.flops); tr.children[2].textContent = t.rounds;
+        tt.appendChild(tr);
+      });
+      var tj = $("jobs").querySelector("tbody"); tj.innerHTML = "";
+      (n.jobs || []).forEach(function (j) {
+        var tr = document.createElement("tr");
+        tr.innerHTML = "<td></td><td></td><td></td><td class='n'></td><td class='n'></td><td></td>";
+        tr.children[0].textContent = j.id; tr.children[1].textContent = j.model; tr.children[2].textContent = j.status;
+        tr.children[3].textContent = j.rounds_trained; tr.children[4].textContent = vibe(j.escrow);
+        tr.children[5].textContent = j.now == null ? "–" : (j.metric === "loss" ? "loss " + j.now.toFixed(3) : (100 * j.now).toFixed(1) + "% accuracy") + (j.start != null ? " (from " + (j.metric === "loss" ? j.start.toFixed(3) : (100 * j.start).toFixed(1) + "%") + ")" : "");
+        tj.appendChild(tr);
+      });
+    }).catch(function () { $("census-note").textContent = "The node's network page isn't answering."; });
+  }
+
+  poll();
+  setInterval(poll, 1000);
+  setInterval(function () { network(false); }, 5000);
+</script>
+</body>
+</html>

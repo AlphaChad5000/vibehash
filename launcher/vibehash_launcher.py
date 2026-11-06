@@ -220,7 +220,7 @@ def run_app(python: Path, args: list[str], child_env: dict | None = None) -> int
     so the app gets to stop its worker properly (round log written, dashboard summed up) before both end. Run from
     the environment's own folder: `python -m vibehash` would otherwise import a `vibehash` folder that happened to be
     in whatever folder the launcher was started from (a checkout, say), not the installed package."""
-    cmd = [str(python), "-m", "vibehash", "app", "--no-password", *args]
+    cmd = [str(python), "-m", "vibehash", "app", "--no-password", "--avatar", *args]  # (no screen: the avatar leaves quietly)
     sys.stdout.flush()
     child = subprocess.Popen(cmd, cwd=str(python.parent.parent), env=child_env)
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)

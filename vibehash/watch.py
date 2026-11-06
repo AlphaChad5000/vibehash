@@ -23,6 +23,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .client import NodeClient, NodeError
@@ -30,6 +31,7 @@ from .records import clean
 from .tasks import SYN_PER_VIBE
 
 DEFAULT_PORT = 7545  # a thousand below a node's 8545, so a testnet's validators (8545 and up) never land on it
+DASHBOARD = Path(__file__).resolve().parent / "data" / "dashboard.html"  # the app's window, served at /dashboard
 EVENTS = 200  # kept in memory
 ACCOUNT_S = 20.0
 LOGGERS = ("vibehash.worker", "vibehash.node", "vibehash.client")
@@ -150,6 +152,16 @@ class Watch:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 url = urlsplit(self.path)
+                if url.path in ("/dashboard", "/dashboard/"):  # the app's window: a page that reads the two below
+                    page = DASHBOARD.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self' " + watch.node_url)
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
                 if url.path == "/":
                     body = watch.snapshot()
                 elif url.path == "/events":

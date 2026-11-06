@@ -207,6 +207,16 @@ it ever stops. `app pause`, `app resume`, `app stop` and `app status` drive
 it from another terminal, and `app startup on` starts it when you log in.
 It is what the desktop app runs underneath.
 
+While it mines, `http://127.0.0.1:7545/dashboard` is the window: the round
+step by step (registered, training, committed, checking, paid), what the
+worker is doing, your balance and stake, and the network (who is online, what
+kinds of machines, who did the most work, the jobs). `app --avatar` (what the
+download does) also puts a small pickaxe on the desktop, always on top, that
+rests, swings while training, glows while checking and throws sparks when a
+round pays; click it for the window, right-click for pause, resume and more,
+drag it anywhere. `python -m vibehash avatar` shows it beside any worker
+started with `--watch`.
+
 ```bash
 python -m vibehash app
 ```
