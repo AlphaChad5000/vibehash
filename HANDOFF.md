@@ -151,6 +151,21 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
+**Release 0.5.23 (2026-11-06): Evo's holes closed, its rounds stop wasting time, the menu fits any window (PRs #56,
+#57, #58).** A bug hunt over vibehash-evo-1's records and the code found:
+- Three ways one worker could stop the network: an answers blob of JSON nested too deep (RecursionError in rescore
+  after the reveal was recorded: a 500, unslashed, an unreplayable block); quadratic answer regexes (an 8 MB blob held
+  the coordinator's lock for hours); and token ids outside the vocabulary, which made a checker drop the rest of its
+  round's checks.
+- Time: workers missed every other round (they waited for their checks before the 3 s registration); the Evo node's
+  180 s verify was a floor, not a ceiling (208 s rounds); every GPU claimed 2e12 FLOP/s for Evo, so a quarter of
+  each round's pairs went to nobody.
+- Still open, needing the owner's rules: one free "no" vetoes a claim; reputation drains from misses the scheduler
+  causes (checkers get more tasks than verify has time for); two colluding wallets can approve each other's fakes (no
+  Evo canaries); one missed reveal forfeits a worker's whole round; a check is 4 quarter-full GPU passes where one
+  would do.
+The menu: 33 rows didn't fit PowerShell's default 30, so each redraw scrolled and left the last page mixed in.
+
 **Release 0.5.22 (2026-11-06, merged and tagged, its PyPI publish cancelled at the owner's request): the miner opens on the Evo scene on an Evo network.** The owner found the menu's Evo
 Hash "brings you to the Vibe Hash terminal": the miner's screen showed the usual drill until the Evo job loaded
 (datasets and model, a minute or two on a new machine). `cli.evo_network` reads the node's `/genesis` (`"es": true`)
