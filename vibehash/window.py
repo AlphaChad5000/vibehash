@@ -310,7 +310,7 @@ class Api:
     def diagnostics(self) -> dict:
         """`vibehash selftest --json` (Python, packages, the GPU, a real unit, the node, the clock, disk), with
         anything secret taken out (redact). A few minutes: it trains and replays a real unit."""
-        cmd = [sys.executable, "-m", "vibehash", "selftest", "--json"]
+        cmd = [str(python()), "-m", "vibehash", "selftest", "--json"]
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -336,6 +336,22 @@ class Api:
         return {"ok": True, "home": str(home)}
 
 
+def python(executable: str | None = None, package: Path | None = None, frozen: bool | None = None) -> Path:
+    """The Python that runs `-m vibehash` for this window. Usually this process's own; but under the downloadable
+    launcher (`VibeHash.exe --window`) the window is hosted by the frozen .exe, whose sys.executable doesn't know
+    `-m`, so it is the environment's python the package was imported from (env/Scripts/python.exe, env/bin/python)."""
+    executable = executable or sys.executable
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if not frozen:
+        return Path(executable)
+    package = package or Path(__file__).resolve().parent
+    for env in package.parents:
+        for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
+            if candidate.is_file():
+                return candidate
+    return Path(executable)
+
+
 def _words_file_present() -> bool:
     """Whether setup's recovery-words file is still on disk (Settings offers to delete it), without reading it."""
     path = ((app_module.read_state() or {}).get("wallet") or {}).get("words_file")
@@ -355,8 +371,9 @@ def _parts(v: str) -> tuple:
 
 
 def newer(latest: str | None, mine: str) -> bool:
-    """Whether release `latest` is newer than `mine` (dotted numbers compared as numbers)."""
-    return bool(latest) and _parts(latest) > _parts(mine)
+    """Whether release `latest` is newer than `mine` (dotted numbers compared as numbers). A version this install
+    can't read is never older: no banner on every start for it."""
+    return bool(latest) and bool(_parts(mine)) and _parts(latest) > _parts(mine)
 
 
 _ADDRESS = re.compile(r"\b(vibe1[0-9a-zA-Z]{4})[0-9a-zA-Z]{8,}([0-9a-zA-Z]{4})\b")

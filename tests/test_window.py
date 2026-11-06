@@ -239,6 +239,7 @@ class ApiTests(Home):
         self.assertFalse(window.newer("0.5.22", "0.5.22"))
         self.assertFalse(window.newer("0.5.21", "0.5.22"))
         self.assertFalse(window.newer(None, "0.5.22"))
+        self.assertFalse(window.newer("0.5.23", "unknown"))  # a version it can't read: no banner on every start
         asked = []
         with mock.patch.object(window, "PYPI_LATEST", side_effect=lambda: asked.append(1) or "99.0.0"), \
                 mock.patch.object(window, "_version", return_value="0.5.22"), mock.patch.object(window.Api, "_update", None):
@@ -279,6 +280,19 @@ class ApiTests(Home):
         self.alive(paused=True)
         self.assertEqual(self.api.clear_cache(), {"ok": True, "freed": 0})
 
+    def test_the_check_runs_with_the_environments_python_under_the_launcher(self):
+        """VibeHash.exe --window hosts this module in the frozen launcher, whose sys.executable doesn't know -m."""
+        self.assertEqual(window.python("C:/py/python.exe", frozen=False), Path("C:/py/python.exe"))
+        env = Path(self.tmp.name) / "VibeHash" / "env"
+        package = env / "Lib" / "site-packages" / "vibehash"
+        package.mkdir(parents=True)
+        (env / "Scripts").mkdir()
+        (env / "Scripts" / "python.exe").write_text("")
+        self.assertEqual(window.python("C:/VibeHash/VibeHash.exe", package=package, frozen=True), env / "Scripts" / "python.exe")
+        nowhere = Path(self.tmp.name) / "loose" / "vibehash"
+        nowhere.mkdir(parents=True)
+        self.assertEqual(window.python("C:/X/VibeHash.exe", package=nowhere, frozen=True), Path("C:/X/VibeHash.exe"))
+
     def test_a_support_report_carries_no_secret(self):
         home = str(Path(self.tmp.name))
         report = {"ok": True, "checks": [{"name": "wallet", "text": f"read {home}/wallet.json for vibe1qqqqabcdefghijklmnop1234",
@@ -315,6 +329,12 @@ class PageTests(unittest.TestCase):
         # the words are cleared from the page whenever the check closes, however it closes
         self.assertIn('function closeCeremony() { wipe();', self.script)
         self.assertIn('$("cer-done").addEventListener("click", function () { wipe();', self.script)
+        # the word check opens from the welcome's second step, so it must sit above the welcome, not under it
+        order = [self.page.index(f'<div class="scrim" id="{i}"') for i in ("ceremony", "ask", "welcome")]
+        self.assertIn("#welcome.scrim { z-index: 25; }", self.page)
+        self.assertIn("z-index: 30", self.page)
+        self.assertTrue(all(o > 0 for o in order))
+        self.assertIn("!welcomeOffered", self.script)  # a settings reload mid-tour doesn't restart it
 
     def test_nothing_from_the_wider_web_and_no_markup_from_data(self):
         self.assertNotIn("https://", self.page.replace("https://vibehash.org", ""))

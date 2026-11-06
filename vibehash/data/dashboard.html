@@ -182,6 +182,7 @@
   footer .end { margin-left: auto; display: flex; gap: 14px; }
 
   .scrim { position: fixed; inset: 0; background: rgb(0 0 0 / .66); display: grid; place-items: center; padding: 16px; z-index: 30; }
+  #welcome.scrim { z-index: 25; }  /* under the word check and the questions it opens, which come later in the page */
   .dialog { position: relative; width: min(460px, 100%); max-height: 100%; overflow-y: auto; background: linear-gradient(180deg, #161412f2, #0a0908f7); border: 1px solid rgb(255 255 255 / .09); border-radius: 14px; padding: 22px; box-shadow: 0 50px 100px -40px #000, 0 0 140px -50px #b46eff73; }
   .dialog::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: var(--grad); opacity: .8; }
   .dialog.wide { width: min(660px, 100%); }
@@ -668,6 +669,7 @@
   // ---- settings ----
   var settingsIds = ["set-fullscreen", "set-battery", "set-idle", "set-minutes", "set-startup", "set-avatar", "set-calm", "set-cap", "set-open", "cache-clear"];
   settingsIds.forEach(function (id) { $(id).disabled = true; });
+  var welcomeOffered = false;
   function loadSettings() {
     if (!api) return;
     api.settings().then(function (c) {
@@ -686,7 +688,7 @@
       $("settings-note").textContent = "Changes apply right away. Mining picks them up within a few seconds.";
       $("words-actions").hidden = !c.words_file;
       $("words-note").textContent = c.words_file ? "The 24 words that restore this wallet are in a file in your Vibe Hash folder. Once they're on paper, delete the file: anyone who can read it can take your coins." : "The recovery-words file isn't on this computer. Your paper copy is the backup.";
-      if (!c.welcomed) welcome(1);
+      if (!c.welcomed && !welcomeOffered) { welcomeOffered = true; welcome(1); }  // once a window: a later reload mustn't restart the tour
     }).catch(function () {});
   }
   function option(name, value) { if (api) api.set_option(name, value).then(loadSettings).catch(function () {}); }

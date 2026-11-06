@@ -25,9 +25,9 @@ def on_battery() -> bool | None:
             import ctypes
             from ctypes import wintypes
 
-            class Status(ctypes.Structure):
-                _fields_ = [("ACLineStatus", wintypes.BYTE), ("BatteryFlag", wintypes.BYTE),
-                            ("BatteryLifePercent", wintypes.BYTE), ("SystemStatusFlag", wintypes.BYTE),
+            class Status(ctypes.Structure):  # unsigned bytes: wintypes.BYTE is signed, and 128 ("no battery") read -128
+                _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                            ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
                             ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD)]
 
             s = Status()
