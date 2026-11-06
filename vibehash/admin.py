@@ -620,12 +620,8 @@ def show(url: str, browser: bool = False, fallback=webbrowser.open, say=lambda t
     if not browser:
         try:
             own_taskbar_button()
-            window = webview.create_window(TITLE, url=url, width=SIZE[0], height=SIZE[1], min_size=MIN_SIZE, text_select=True)
-            try:
-                window.events.shown += lambda: set_window_icon(window)
-            except (AttributeError, TypeError):  # (a stand-in without events)
-                pass
-            webview.start(icon=str(ICON_PNG))  # GTK and Qt take the icon here; Windows from set_window_icon
+            webview.create_window(TITLE, url=url, width=SIZE[0], height=SIZE[1], min_size=MIN_SIZE, text_select=True)
+            webview.start(icon=str(window_icon()))
             return "window"
         except KeyboardInterrupt:
             return "window"
@@ -648,18 +644,10 @@ def own_taskbar_button(system: str | None = None) -> bool:
         return False
 
 
-def set_window_icon(window, icon: Path = ICON) -> bool:
-    """The violet icon on the window and its taskbar button on Windows (pywebview's WinForms form, `window.native`),
-    set on the form's own thread. Anything missing leaves Python's icon."""
-    try:
-        from System import Action  # (pythonnet, which pywebview brings on Windows)
-        from System.Drawing import Icon
-
-        form = window.native
-        form.Invoke(Action(lambda: setattr(form, "Icon", Icon(str(icon)))))
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+def window_icon(system: str | None = None) -> Path:
+    """The icon pywebview puts on the window: the .ico on Windows, where it is handed to WinForms' Icon, which takes
+    nothing else (a PNG there ends the process from inside .NET, with nothing to catch); the PNG for GTK and Qt."""
+    return ICON if (system or sys.platform) == "win32" else ICON_PNG
 
 
 # --- the shortcut ----------------------------------------------------------------------------------------

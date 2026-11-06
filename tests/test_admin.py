@@ -628,9 +628,12 @@ class ShortcutTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"webview": wv}), mock.patch.object(admin, "own_taskbar_button") as own:
             self.assertEqual(admin.show("http://127.0.0.1:1/"), "window")
         own.assert_called_once()
-        self.assertEqual(wv.start.call_args.kwargs["icon"], str(admin.ICON_PNG))
+        self.assertEqual(wv.start.call_args.kwargs["icon"], str(admin.window_icon()))
         self.assertFalse(admin.own_taskbar_button("linux"))
-        self.assertFalse(admin.set_window_icon(SimpleNamespace()))  # no form: Python's icon stays, nothing raised
+        # WinForms' Icon takes only an .ico: a PNG there killed the process from inside .NET
+        self.assertEqual(admin.window_icon("win32"), admin.ICON)
+        self.assertEqual(admin.window_icon("linux"), admin.ICON_PNG)
+        self.assertEqual(admin.ICON.read_bytes()[:4], b"\x00\x00\x01\x00")  # an .ico header
 
     def test_the_icons_ship_with_the_package_and_are_the_scripts(self):
         sys.path.insert(0, str(ROOT / "scripts"))
