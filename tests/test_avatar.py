@@ -163,9 +163,11 @@ class WindowTests(unittest.TestCase):
         self.av._menu(mock.Mock(x_root=5, y_root=5))  # builds the tk menu without complaint
 
     def test_hide_closes_the_window(self):
+        self.av.window = mock.Mock(**{"poll.return_value": None})  # a dashboard window this avatar opened
         self.av.hide()
         self.assertTrue(self.root.destroyed)
         self.assertTrue(self.av.hidden)
+        self.av.window.terminate.assert_called_once_with()  # it goes with the avatar
 
 
 if __name__ == "__main__":

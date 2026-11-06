@@ -216,6 +216,8 @@ class Avatar:
 
     def hide(self) -> None:
         self.hidden = True
+        if self.window is not None and self.window.poll() is None:  # the window this avatar opened goes with it
+            self.window.terminate()
         self.root.destroy()
 
     # -- the feed --

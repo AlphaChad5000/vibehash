@@ -159,13 +159,17 @@ class Supervisor:
 
     # -- the child --
 
-    def start_worker(self) -> None:
-        # In a group (Windows) or session (elsewhere) of its own, so a Ctrl+C at the app's terminal doesn't also reach
-        # the worker directly: the app stops it, once, the way stop_worker does.
+    @staticmethod
+    def spawn(command: list[str]) -> subprocess.Popen:
+        """A child in a group (Windows) or session (elsewhere) of its own, so a Ctrl+C at the app's terminal doesn't
+        also reach it directly: the app stops the worker, once, the way stop_worker does, and the companions when
+        it leaves."""
         if os.name == "nt":
-            self.child = subprocess.Popen(self.command, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-        else:
-            self.child = subprocess.Popen(self.command, start_new_session=True)
+            return subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        return subprocess.Popen(command, start_new_session=True)
+
+    def start_worker(self) -> None:
+        self.child = self.spawn(self.command)
         self.worker_since = time.time()
         self.say(f"worker started (pid {self.child.pid}): {shlex.join(self.command)}")
 
@@ -234,7 +238,7 @@ class Supervisor:
         take_order()  # a stale order from an earlier app
         for companion in self.companions:
             try:  # the window, the avatar: processes of their own; no screen, and each says so and leaves, which is fine
-                self.friends.append(subprocess.Popen(companion))
+                self.friends.append(self.spawn(companion))
             except OSError as e:
                 self.say(f"couldn't start {shlex.join(companion)}: {e}")
         try:
@@ -425,7 +429,8 @@ def main(a) -> None:
             companions.append(window.command(port))
         if getattr(a, "avatar", False):
             companions.append([sys.executable, "-m", "vibehash", "avatar", "--watch", str(port)])
-        print(f"mining; the window shows it (also at http://127.0.0.1:{port}/dashboard) and `vibehash app status` sums it up. "
-              "Ctrl+C stops it.")
+        page = f"http://127.0.0.1:{port}/dashboard"
+        where = f"the window shows it (also at {page})" if not getattr(a, "no_window", False) else f"the dashboard is at {page}"
+        print(f"mining; {where} and `vibehash app status` sums it up. Ctrl+C stops it.")
         Supervisor(cmd, port, companions=companions).run()
         print("app stopped")

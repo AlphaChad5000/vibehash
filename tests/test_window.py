@@ -1,5 +1,8 @@
 """The app's window (window.py): the dashboard in a web view of its own, with the browser as the fallback."""
+import http.client
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -36,6 +39,7 @@ def fake_webview(start_raises=None):
         return w
 
     def start(fn=None, args=None):
+        m.started = args
         if start_raises:
             raise start_raises
         if fn:
@@ -46,6 +50,13 @@ def fake_webview(start_raises=None):
 
 
 class WindowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": self.tmp.name, "DISPLAY": ":0"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def test_the_command_is_this_python_running_the_window_for_a_port(self):
         self.assertEqual(window.command(7000), [sys.executable, "-m", "vibehash", "window", "--watch", "7000"])
         self.assertEqual(window.dashboard_url(7000), "http://127.0.0.1:7000/dashboard")
@@ -56,8 +67,9 @@ class WindowTests(unittest.TestCase):
         said = []
         with mock.patch.dict(sys.modules, {"webview": wv}), \
                 mock.patch.object(window, "feed_ready", side_effect=lambda url, timeout=1.0: next(answers)), \
-                mock.patch.object(window.time, "sleep"):
-            how = window.open(7000, fallback=lambda url: said.append(url), say=said.append)
+                mock.patch.object(window.time, "sleep") as sleep:
+            how = window.show(7000, fallback=lambda url: said.append(url), say=said.append)
+        self.assertEqual(sleep.call_count, 2)  # the two misses, without waiting for real
         self.assertEqual(how, "window")
         self.assertEqual(said, [])
         title, html, kw, w = wv.windows[0]
@@ -65,7 +77,12 @@ class WindowTests(unittest.TestCase):
         self.assertIn("starting", html)
         self.assertEqual((kw["width"], kw["height"], kw["min_size"]), (window.SIZE[0], window.SIZE[1], window.MIN_SIZE))
         self.assertEqual(w.loaded, ["http://127.0.0.1:7000/dashboard"])  # after the two misses
-        self.assertEqual(len(w.events.closed), 1)  # closing it ends the wait
+        self.assertEqual(len(w.events.closed), 1)  # closing it ends the wait: the hook sets the event the wait polls
+        closed = wv.started[2]
+        self.assertFalse(closed.is_set())
+        w.events.closed[0]()
+        self.assertTrue(closed.is_set())
+        self.assertTrue(window.Lock(7000).acquire())  # the lock was let go when the window closed
 
     def test_closing_the_window_while_waiting_stops_the_wait(self):
         w = FakeWindow()
@@ -85,7 +102,7 @@ class WindowTests(unittest.TestCase):
     def test_without_pywebview_the_browser_gets_the_dashboard(self):
         opened, said = [], []
         with mock.patch.dict(sys.modules, {"webview": None}):  # import webview -> ImportError
-            how = window.open(7545, fallback=opened.append, say=said.append)
+            how = window.show(7545, fallback=opened.append, say=said.append)
         self.assertEqual(how, "browser")
         self.assertEqual(opened, ["http://127.0.0.1:7545/dashboard"])
         self.assertIn("pywebview", said[0])
@@ -94,18 +111,41 @@ class WindowTests(unittest.TestCase):
         opened, said = [], []
         wv = fake_webview(start_raises=RuntimeError("You must have either QT or GTK with Python extensions installed"))
         with mock.patch.dict(sys.modules, {"webview": wv}):
-            how = window.open(7545, fallback=opened.append, say=said.append)
+            how = window.show(7545, fallback=opened.append, say=said.append)
         self.assertEqual(how, "browser")
         self.assertEqual(opened, ["http://127.0.0.1:7545/dashboard"])
         self.assertIn("QT or GTK", said[0])
 
     def test_feed_ready_asks_the_feeds_events_which_need_no_node(self):
-        with mock.patch.object(window.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(window._LOCAL, "open") as urlopen:
             urlopen.return_value.__enter__.return_value.status = 200
             self.assertTrue(window.feed_ready("http://127.0.0.1:7545/dashboard"))
             self.assertEqual(urlopen.call_args.args[0], "http://127.0.0.1:7545/events?after=0")
             urlopen.side_effect = OSError("refused")
             self.assertFalse(window.feed_ready("http://127.0.0.1:7545/dashboard"))
+            urlopen.side_effect = http.client.IncompleteRead(b"")  # a server just starting: not yet, not a crash
+            self.assertFalse(window.feed_ready("http://127.0.0.1:7545/dashboard"))
+
+    def test_one_window_per_feed(self):
+        first = window.Lock(7545)
+        self.assertTrue(first.acquire())
+        self.assertFalse(window.Lock(7545).acquire())  # the same feed: no
+        self.assertTrue(window.Lock(7546).acquire())  # another feed: fine
+        opened, said = [], []
+        with mock.patch.dict(sys.modules, {"webview": fake_webview()}):
+            self.assertEqual(window.show(7545, fallback=opened.append, say=said.append), "open")
+        self.assertEqual((opened, said), ([], ["the window is already open"]))
+        first.release()
+        self.assertTrue(window.Lock(7545).acquire())  # let go: the next one gets it
+
+    def test_no_screen_on_linux_means_no_window_and_no_console_browser(self):
+        opened, said = [], []
+        with mock.patch.object(window.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}), \
+                mock.patch.dict(sys.modules, {"webview": None}):
+            self.assertEqual(window.show(7545, fallback=opened.append, say=said.append), "none")
+        self.assertEqual(opened, [])
+        self.assertIn("needs a screen", said[0])
 
     def test_the_cli_has_it(self):
         from vibehash import cli
