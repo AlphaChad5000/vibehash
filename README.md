@@ -508,6 +508,43 @@ with `journalctl -u vibehash-node -f`. The node's files are in
 `/var/lib/vibehash`, and its wallet password is in `/etc/vibehash/env`:
 include both in backups.
 
+### Lock down the server
+
+Anyone who gets a shell on the server has the validator's wallet, so close
+SSH to everyone but you right after the first run. Keep the session you're in
+open throughout; your host's web console gets you back in if a step goes wrong.
+
+1. A user of your own with sudo, and your SSH key:
+   ```bash
+   adduser YOU && usermod -aG sudo YOU && rsync --archive --chown=YOU:YOU ~/.ssh /home/YOU
+   ```
+   Check `ssh YOU@SERVER` and `sudo -v` work from a second terminal before going on.
+2. No root login and no passwords. The file is named `00-` because sshd keeps
+   the first value it reads, and Ubuntu's cloud images may ship
+   `50-cloud-init.conf` with `PasswordAuthentication yes`:
+   ```bash
+   printf 'PermitRootLogin no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/00-hardening.conf
+   sudo sshd -t && sudo systemctl reload ssh
+   ```
+3. SSH only over [Tailscale](https://tailscale.com), so port 22 isn't open to
+   the internet (or `ufw allow from YOUR-IP to any port 22` in place of the
+   Tailscale rule, if your address doesn't change):
+   ```bash
+   curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+   sudo ufw allow in on tailscale0 to any port 22 && sudo ufw delete allow OpenSSH
+   ```
+
+From then on `SERVER` is the server's Tailscale name, from a computer on the
+same tailnet. The script leaves SSH rules alone once the firewall is on, so
+upgrading doesn't reopen port 22. Upgrade as your own user:
+
+```bash
+scp deploy/setup-node.sh YOU@SERVER:
+```
+```bash
+ssh -t YOU@SERVER sudo bash setup-node.sh --domain node.vibehash.org
+```
+
 ## Run a network for other people
 
 `vibehash testnet --host 0.0.0.0` is the quick way: other computers on your
