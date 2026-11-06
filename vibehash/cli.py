@@ -2427,6 +2427,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet", help="the admin wallet, for cancelling and posting jobs (default: as other commands)")
     p.add_argument("--port", type=int, default=ADMIN_PORT, help=f"the local server's port (default {ADMIN_PORT})")
     p.add_argument("--browser", action="store_true", help="open the page in the browser instead of a window")
+    p.add_argument("--install-shortcut", action="store_true", help="put \"Vibe Hash Admin\" in the Start menu (the apps "
+                   "menu on Linux, ~/Applications on a Mac), running this Python; --node, --token and --wallet given with "
+                   "it are saved for it to open with")
+    p.add_argument("--remove-shortcut", action="store_true", help="take that shortcut away again")
     p.set_defaults(fn=cmd_admin)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")

@@ -42,7 +42,7 @@ EXAMPLES: dict[str, list[str]] = {
              "VIBEHASH_ADMIN_TOKEN=SECRET vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0"],
     "tls cert": ["vibehash tls cert --host 192.168.1.20"],
     "admin": ["vibehash admin", "vibehash admin --node https://node.vibehash.org --token SECRET --node http://10.0.0.5:8545",
-              "vibehash admin --browser"],
+              "vibehash admin --browser", "vibehash admin --install-shortcut --node https://node.vibehash.org --token SECRET"],
     "tls fingerprint": ["vibehash tls fingerprint node-cert.pem"],
     "worker": ["vibehash worker", "vibehash worker --device cuda:1 --wallet gpu1.json", "vibehash worker --job fruit-demo",
                "VIBEHASH_PASSWORD='choose-one' nohup vibehash worker --plain > worker.log 2>&1 &"],
