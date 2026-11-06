@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from vibehash import app, avatar
+from vibehash import app, avatar, settings
 
 GOLD = avatar.GOLD
 
@@ -168,6 +168,12 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(self.root.destroyed)
         self.assertTrue(self.av.hidden)
         self.av.window.terminate.assert_called_once_with()  # it goes with the avatar
+        self.assertNotIn("avatar", settings.load())  # a plain hide is for now
+
+    def test_the_menus_hide_is_a_setting(self):
+        self.av.hide_for_good()
+        self.assertTrue(self.av.hidden)
+        self.assertIs(settings.load()["avatar"], False)  # the window's Settings turn it back on
 
 
 if __name__ == "__main__":

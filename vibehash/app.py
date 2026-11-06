@@ -7,6 +7,7 @@ stops, and takes orders from the other `app` commands:
     vibehash app resume          # mine again
     vibehash app stop            # stop the app itself
     vibehash app status          # is it running, is it paused, what is the worker doing
+    (the window's buttons and Settings give the same orders, plus avatar-on and avatar-off)
     vibehash app startup on|off  # start it when you log in (Windows, macOS and Linux), without the window
 
 It is what the desktop app's launcher runs, and what a tray icon's menu drives, so everything here works with no
@@ -32,17 +33,20 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from . import settings, window
-from .watch import DEFAULT_PORT
+from .settings import WATCH_PORT as DEFAULT_PORT
 
 BEAT_S = 1.0  # how often the app writes its heartbeat
 STALE_S = 10.0  # a heartbeat older than this: the app isn't running
 STOP_GRACE_S = 25.0  # how long a worker gets to leave its round before it is killed
 BACKOFF_S = (5, 15, 60)  # between restarts of a worker that keeps stopping
 LABEL = "org.vibehash.app"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"  # start at login under the launcher: a Run value, no console flash
+ORDERS = ("pause", "resume", "stop", "avatar-on", "avatar-off")
 
 
 def app_dir() -> Path:
@@ -91,19 +95,26 @@ def take_order() -> str | None:
 
 # --- getting ready ------------------------------------------------------------------------------------------------
 
-def prepare(a) -> tuple[str, Path]:
+def prepare(a, report=None) -> tuple[str, Path]:
     """Node, wallet and GPU support, without a question that can't be answered: -> (node url, wallet path).
-    The same steps as `setup`, kept: a second run changes nothing."""
+    The same steps as `setup`, kept: a second run changes nothing. `report(step, fraction, **facts)`, if given,
+    hears each step as it starts (the window shows it): node, wallet (with the wallet's address, file and words
+    file), gpu, ready."""
     from . import cli, unattended
     from . import wallet as wallets
 
+    report = report or (lambda step, fraction, **facts: None)
+    report("node", 0.05)
     url = settings.chosen_node(getattr(a, "node", None)) or settings.PUBLIC_NODE
     url = cli.normalise_url(url)
     settings.save(node=url)
     print(f"node: {url}")
 
+    report("wallet", 0.15)
     path = settings.wallet_path(getattr(a, "wallet", None)) or settings.default_wallet()
     address, pw = cli.ensure_wallet(path, "wallet: ", no_password=bool(getattr(a, "no_password", False)))
+    words = unattended.words_file(address)
+    report("gpu", 0.3, wallet={"address": address, "path": str(path), "words_file": str(words) if words.exists() else None})
     if pw is None and wallets.is_encrypted(path):
         # The worker is a child process that unlocks the wallet itself: it reads $VIBEHASH_PASSWORD, so the password
         # asked for here (once, at a terminal) is handed to it that way, after a check that it opens the wallet.
@@ -127,6 +138,7 @@ def prepare(a) -> tuple[str, Path]:
         print("graphics card:")
         if cli._setup_gpu(assume_yes=True):  # settled: ready, or nothing to install; a failed install is tried again
             settings.save(app_gpu_ready=True)
+    report("ready", 0.95)
     return url, path
 
 
@@ -145,10 +157,16 @@ class Supervisor:
     stopped on its own, and writes the app's state with a heartbeat."""
 
     def __init__(self, command: list[str], port: int, beat_s: float = BEAT_S, backoff=BACKOFF_S, grace_s: float = STOP_GRACE_S,
-                 companions: list[list[str]] | None = None):
+                 companions: list[list[str]] | None = None, avatar: list[str] | None = None):
         self.command, self.port, self.beat_s, self.backoff, self.grace_s = list(command), port, beat_s, backoff, grace_s
-        self.companions = [list(c) for c in companions or []]  # the window and the avatar: started once, not kept alive
+        self.companions = [list(c) for c in companions or []]  # the window: started once, not kept alive
         self.friends: list[subprocess.Popen] = []
+        self.avatar_cmd = list(avatar) if avatar else None  # the avatar: the same, but orders turn it on and off
+        self.avatar: subprocess.Popen | None = None
+        self.setup = {"step": "starting", "fraction": 0.0}  # what prepare() is doing, for the window
+        self.wallet: dict | None = None
+        self._started = False
+        self._beating: threading.Event | None = None
         self.child: subprocess.Popen | None = None
         self.paused = False
         self.restarts = 0
@@ -200,6 +218,59 @@ class Supervisor:
     def worker_alive(self) -> bool:
         return self.child is not None and self.child.poll() is None
 
+    # -- the companions --
+
+    def start_companions(self) -> None:
+        """The window and the avatar (if wanted), once; before setup, so the window can show it."""
+        if self._started:
+            return
+        self._started = True
+        for companion in self.companions:
+            try:  # processes of their own; no screen, and each says so and leaves, which is fine
+                self.friends.append(self.spawn(companion))
+            except OSError as e:
+                self.say(f"couldn't start {shlex.join(companion)}: {e}")
+        if self.avatar_cmd and settings.load().get("avatar", True):
+            self.avatar_on()
+
+    def avatar_alive(self) -> bool:
+        return self.avatar is not None and self.avatar.poll() is None
+
+    def avatar_on(self) -> None:
+        if self.avatar_cmd and not self.avatar_alive():
+            try:
+                self.avatar = self.spawn(self.avatar_cmd)
+            except OSError as e:
+                self.say(f"couldn't start the avatar: {e}")
+
+    def avatar_off(self) -> None:
+        if self.avatar_alive():
+            self.avatar.terminate()
+        self.avatar = None
+
+    # -- setup, as the window sees it --
+
+    def report(self, step: str, fraction: float, **facts) -> None:
+        """prepare()'s progress: into the state file, for the window."""
+        self.setup = {"step": step, "fraction": fraction}
+        app_dir().mkdir(parents=True, exist_ok=True)
+        if facts.get("wallet"):
+            self.wallet = facts["wallet"]
+        self.say(f"setup: {step}")
+        self.write_state(time.time())
+
+    def beat_while_preparing(self) -> None:
+        """A heartbeat through setup (minutes, when PyTorch is installed), so `app status` and a second `app` know
+        this one is alive; run() takes over."""
+        self._beating = threading.Event()
+        app_dir().mkdir(parents=True, exist_ok=True)
+
+        def beat(stop=self._beating):
+            while not stop.wait(self.beat_s):
+                self.write_state(time.time())
+
+        threading.Thread(target=beat, daemon=True, name="app-beat").start()
+
     # -- the loop --
 
     def tick(self, now: float | None = None) -> bool:
@@ -210,6 +281,10 @@ class Supervisor:
             self.stop_worker("the app was told to stop")
             self.write_state(now, alive=False)
             return False
+        if word == "avatar-on":
+            self.avatar_on()
+        elif word == "avatar-off":
+            self.avatar_off()
         if word == "pause" and not self.paused:
             self.paused = True
             self.stop_worker("paused")
@@ -234,13 +309,13 @@ class Supervisor:
     def run(self, stop=None) -> None:
         from .cli import _stop_like_ctrl_c
         _stop_like_ctrl_c()  # `kill`, a service manager or a closed console window: the worker is stopped first
+        if self._beating is not None:
+            self._beating.set()
         app_dir().mkdir(parents=True, exist_ok=True)
-        take_order()  # a stale order from an earlier app
-        for companion in self.companions:
-            try:  # the window, the avatar: processes of their own; no screen, and each says so and leaves, which is fine
-                self.friends.append(self.spawn(companion))
-            except OSError as e:
-                self.say(f"couldn't start {shlex.join(companion)}: {e}")
+        if not self._started:
+            take_order()  # a stale order from an earlier app
+        self.start_companions()
+        self.setup = {"step": "mining", "fraction": 1.0}
         try:
             while (stop is None or not stop.is_set()) and self.tick():
                 time.sleep(self.beat_s)
@@ -251,7 +326,7 @@ class Supervisor:
             if self.worker_alive():
                 self.stop_worker("the app is leaving")
                 self.write_state(time.time(), alive=False)
-            for friend in self.friends:
+            for friend in self.friends + ([self.avatar] if self.avatar_alive() else []):
                 if friend.poll() is None:
                     friend.terminate()
 
@@ -265,7 +340,7 @@ class Supervisor:
         state = {"beat": now if alive else 0, "started": self.started, "pid": os.getpid(), "paused": self.paused,
                  "watch": f"http://127.0.0.1:{self.port}/", "worker": {"running": self.worker_alive(),
                  "since": self.worker_since, "pid": self.child.pid if self.child else None, "restarts": self.restarts},
-                 "events": self.events}
+                 "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events}
         try:
             tmp = state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
@@ -325,6 +400,30 @@ def stop_and_wait(timeout: float = STOP_GRACE_S + 10) -> bool:
 
 # --- starting when you log in --------------------------------------------------------------------------------------
 
+def _winreg():
+    try:
+        import winreg
+        return winreg
+    except ImportError:
+        return None
+
+
+def startup_is_on(system: str | None = None) -> bool:
+    """Whether a start-at-login entry exists (a file, or the Run value under the launcher)."""
+    system = system or platform.system()
+    if startup_file(system).exists():
+        return True
+    winreg = _winreg()
+    if system == "Windows" and winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+                winreg.QueryValueEx(k, "VibeHash")
+            return True
+        except OSError:
+            pass
+    return False
+
+
 def startup_file(system: str | None = None) -> Path:
     system = system or platform.system()
     if system == "Windows":
@@ -335,11 +434,12 @@ def startup_file(system: str | None = None) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / "vibehash.service"
 
 
-def startup_on(system: str | None = None, run=subprocess.run, avatar: bool = False) -> Path:
+def startup_on(system: str | None = None, run=None, avatar: bool = False) -> Path:
     """Start `vibehash app` at login: a Startup-folder script (Windows), a LaunchAgent (macOS) or a systemd user
     service (Linux), without the window (`--no-window`: logging in shouldn't open one; the avatar or `vibehash window`
     opens it). `avatar`: with the avatar, as the app was started. -> the file written."""
     system = system or platform.system()
+    run = run or subprocess.run
     path = startup_file(system)
     path.parent.mkdir(parents=True, exist_ok=True)
     home = settings.home()
@@ -348,6 +448,14 @@ def startup_on(system: str | None = None, run=subprocess.run, avatar: bool = Fal
     launcher = os.environ.get("VIBEHASH_LAUNCHER")
     exe, args = ((launcher, ["--", "--no-window"]) if launcher
                  else (sys.executable, ["-m", "vibehash", "app", "--no-window"] + (["--avatar"] if avatar else [])))
+    winreg = _winreg()
+    if system == "Windows" and launcher and winreg is not None:
+        # The launcher is a windowed program: a Run value starts it with no console flashing by, as a Startup-folder
+        # .cmd would (which an earlier version wrote: removed here).
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "VibeHash", 0, winreg.REG_SZ, f'"{exe}" {" ".join(args)}')
+        path.unlink(missing_ok=True)
+        return Path("HKCU") / RUN_KEY / "VibeHash"
     if system == "Windows":
         # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n
         text = f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n')
@@ -387,9 +495,17 @@ WantedBy=default.target
     return path
 
 
-def startup_off(system: str | None = None, run=subprocess.run) -> Path:
+def startup_off(system: str | None = None, run=None) -> Path:
     system = system or platform.system()
+    run = run or subprocess.run
     path = startup_file(system)
+    winreg = _winreg()
+    if system == "Windows" and winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, "VibeHash")
+        except OSError:
+            pass
     if system == "Darwin" and path.exists():
         run(["launchctl", "unload", "-w", str(path)], check=False)
     elif system == "Linux" and path.exists():
@@ -421,16 +537,25 @@ def main(a) -> None:
         if running():
             sys.exit(f"an app is already running (since {time.strftime('%H:%M', time.localtime(read_state()['started']))}); "
                      "`vibehash app status` says what it is doing, `vibehash app stop` stops it")
-        url, wallet = prepare(a)
         port = a.watch if getattr(a, "watch", None) else DEFAULT_PORT
-        cmd = worker_command(url, wallet, port, getattr(a, "device", "auto"), getattr(a, "job", None))
-        companions = []
-        if not getattr(a, "no_window", False):
-            companions.append(window.command(port))
-        if getattr(a, "avatar", False):
-            companions.append([sys.executable, "-m", "vibehash", "avatar", "--watch", str(port)])
+        companions = [] if getattr(a, "no_window", False) else [window.command(port)]
+        avatar = [sys.executable, "-m", "vibehash", "avatar", "--watch", str(port)] if getattr(a, "avatar", False) else None
+        sup = Supervisor([], port, companions=companions, avatar=avatar)
+        app_dir().mkdir(parents=True, exist_ok=True)
+        take_order()  # a stale order from an earlier app
+        sup.start_companions()  # the window first, so setup (minutes, the first time) is watched, not waited for blind
+        sup.beat_while_preparing()
+        try:
+            url, wallet = prepare(a, report=sup.report)
+        except BaseException:
+            sup.write_state(time.time(), alive=False)
+            for friend in sup.friends + ([sup.avatar] if sup.avatar_alive() else []):
+                if friend.poll() is None:
+                    friend.terminate()
+            raise
+        sup.command = worker_command(url, wallet, port, getattr(a, "device", "auto"), getattr(a, "job", None))
         page = f"http://127.0.0.1:{port}/dashboard"
         where = f"the window shows it (also at {page})" if not getattr(a, "no_window", False) else f"the dashboard is at {page}"
         print(f"mining; {where} and `vibehash app status` sums it up. Ctrl+C stops it.")
-        Supervisor(cmd, port, companions=companions).run()
+        sup.run()
         print("app stopped")

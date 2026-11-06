@@ -209,19 +209,22 @@ when you log in (without the window). It is what the desktop app runs
 underneath.
 
 The window is the round step by step (registered, training, committed,
-checking, paid), what the worker is doing, your balance and stake, and the
+checking, paid), what the worker is doing, your balance and stake, the
 network (who is online, what kinds of machines, who did the most work, the
-jobs). It is a window of its own, the system's web view (Edge on Windows,
-Safari's on a Mac) through the small `pywebview` package that
-`pip install vibehash[app]` adds and the download has; without it, the same
-page opens in your browser at `http://127.0.0.1:7545/dashboard`. Closing the
-window doesn't stop mining; `python -m vibehash window` opens it again.
+jobs), and Settings. It is a window of its own, the system's web view (Edge
+on Windows, Safari's on a Mac) through the small `pywebview` package that
+`pip install vibehash[app]` adds and the download has. The first time, it
+walks you through setup with a progress bar, shows your new wallet's address
+and recovery words once, and gives a short tour; Pause and Stop are in its
+top right. Without pywebview, the same page opens in your browser at
+`http://127.0.0.1:7545/dashboard` (to look, not to change settings). Closing
+the window doesn't stop mining; `python -m vibehash window` opens it again.
 `app --avatar` (what the download does) also puts a small pickaxe on the
 desktop, always on top, that rests, swings while training, glows while
 checking and throws sparks when a round pays; click it for the window,
-right-click for pause, resume and more, drag it anywhere.
-`python -m vibehash avatar` shows it beside any worker started with
-`--watch`.
+right-click for pause, resume and more, drag it anywhere; Settings in the
+window turns it off and on. `python -m vibehash avatar` shows it beside any
+worker started with `--watch`.
 
 ```bash
 python -m vibehash app

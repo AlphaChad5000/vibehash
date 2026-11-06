@@ -9,7 +9,7 @@ results, throwing gold sparks with the amount when a round pays, and going grey 
 it anywhere (the place is remembered, and kept on a screen that is still there); a click opens the window (window.py:
 the dashboard in a web view of its own, or the browser where there is none); a right-click gives the menu: open the
 window, pause or resume mining,
-start at login or not, hide, and stop mining.
+start at login or not, hide (a setting: the window's Settings tab turns it back on), and stop mining.
 
 Plain tkinter, which the Python the launcher installs has, so there is nothing to add: no browser engine, no Rust.
 The drawing is the brand mark (docs/site: a pickaxe of three blocks, in the dashboard's gold) on a transparent
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from . import app as app_module
 from . import settings
 from . import window as window_module
-from .watch import DEFAULT_PORT
+from .settings import WATCH_PORT as DEFAULT_PORT
 
 GOLD, GOLD_DIM, GREY, SPARK = "#f1b23c", "#8a6a2a", "#5a5f6a", "#ffe08a"
 SIZE = 96  # the window's square, in pixels
@@ -193,7 +193,7 @@ class Avatar:
                          else ("Pause mining", lambda: app_module.order("pause")))
         items += [None, ("Start when I log in", lambda: app_module.startup_on(avatar=True)),
                   ("Don't start when I log in", lambda: app_module.startup_off()), None,
-                  ("Hide the avatar", self.hide)]
+                  ("Hide the avatar (Settings in the window shows it again)", self.hide_for_good)]
         if running:
             items.append(("Stop mining", lambda: (app_module.order("stop"), self.hide())))
         return items
@@ -213,6 +213,11 @@ class Avatar:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+
+    def hide_for_good(self) -> None:
+        """The menu's hide: off until the window's Settings turn it on again."""
+        settings.save(avatar=False)
+        self.hide()
 
     def hide(self) -> None:
         self.hidden = True
