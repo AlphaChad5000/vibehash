@@ -115,6 +115,10 @@ footer .mark svg { width: 12px; height: 16px; color: var(--signal); }
 .runline code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font: 0.92rem var(--font-mono); color: var(--band-ink); scrollbar-width: none; }
 .runline code::before { content: "> "; color: var(--signal); }
 .copy { flex: none; font: 700 0.9rem var(--font-body); background: var(--signal); color: var(--on-signal); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+.download-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; font-size: 0.95rem; color: var(--band-ink-2); }
+.download-row[hidden] { display: none; }
+.download { flex: none; font: 700 1rem var(--font-body); background: var(--signal); color: var(--on-signal); border-radius: 8px; padding: 11px 18px; text-decoration: none; }
+.download:hover { filter: brightness(1.08); }
 .install p { font-size: 0.95rem; color: var(--band-ink-2); }
 .install p a { color: var(--band-ink); }
 
@@ -388,6 +392,10 @@ summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; bor
           <button type="button" data-os="win" aria-pressed="true">Windows</button>
           <button type="button" data-os="unix" aria-pressed="false">macOS and Linux</button>
         </div>
+        <div class="download-row" id="download-row">
+          <a class="download" id="download" href="https://github.com/AlphaChad5000/vibehash/releases/latest/download/VibeHash.exe">Download VibeHash.exe</a>
+          <span>Run it and it does the rest: no questions, mining in a minute. Windows may warn that it's from an unknown publisher (choose More info, then Run anyway); the same app with no warning is one line in PowerShell: <code>irm https://vibehash.org/app.ps1 | iex</code>. Or paste the guided install line:</span>
+        </div>
         <div class="runline"><code id="cmd">irm https://vibehash.org/install.ps1 | iex</code><button class="copy" type="button" id="copy">Copy</button></div>
         <p id="cmd-note">Paste it into PowerShell. It installs everything, asks four quick questions, then offers to start mining. <a href="#start">What it asks</a></p>
       </div>
@@ -540,6 +548,7 @@ summary:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; bor
     document.querySelectorAll(".os button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.os === os)); });
     $("cmd").textContent = CMDS[os][0];
     $("cmd-note").firstChild.textContent = CMDS[os][1] + " ";
+    $("download-row").hidden = os !== "win";  // the .exe is for Windows; macOS and Linux paste the line
     document.querySelectorAll("code.vh").forEach(function (c) { c.textContent = vhText(c.dataset.cmd); });
     document.querySelectorAll("code.words").forEach(cmdWords);  // the job reports' commands
   }

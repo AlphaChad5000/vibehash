@@ -1,0 +1,66 @@
+# Builds the downloadable launcher (launcher/vibehash_launcher.py) into one file per system and attaches it to the
+# GitHub release of a version tag, where vibehash.org's download button points:
+#   https://github.com/AlphaChad5000/vibehash/releases/latest/download/VibeHash.exe
+# Runs on the same tags as publish.yml (git tag v0.5.18 && git push origin v0.5.18), and by hand from the Actions tab
+# to try a build without a release. The launcher has no dependencies, so the build is PyInstaller alone; the .exe is
+# not code-signed yet, which Windows SmartScreen warns about on first run (the site says so).
+name: Build the launcher
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to attach the files to the release
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: VibeHash.exe
+          - os: macos-latest
+            name: VibeHash-macos
+          - os: ubuntu-latest
+            name: VibeHash-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test the launcher
+        run: python -m unittest tests.test_launcher
+      - name: Build one file
+        run: |
+          python -m pip install --quiet pyinstaller
+          python -m PyInstaller --onefile --console --name VibeHash --distpath dist launcher/vibehash_launcher.py
+      - name: Name it for the release
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" != "Windows" ]; then mv dist/VibeHash "dist/${{ matrix.name }}"; fi  # Windows: VibeHash.exe already
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to the tag's release (made here if publish.yml hasn't)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "Vibe Hash $tag" --notes "See HANDOFF.md for what changed."
+          gh release upload "$tag" dist/VibeHash.exe dist/VibeHash-macos dist/VibeHash-linux --repo "$GITHUB_REPOSITORY" --clobber

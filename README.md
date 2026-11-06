@@ -15,7 +15,18 @@ sets out the design in eleven pages.
 
 ## Install
 
-To start mining, one line installs Vibe Hash and starts the guided setup,
+**The download.** On Windows, [VibeHash.exe](https://github.com/AlphaChad5000/vibehash/releases/latest/download/VibeHash.exe)
+from [vibehash.org](https://vibehash.org) does everything with no questions:
+the first run installs a Python of its own, Vibe Hash and the GPU build of
+PyTorch into `%LOCALAPPDATA%\VibeHash`, makes a wallet (no password; the
+recovery words go to a file only you can read), and mines; every run after
+that just mines, and checks for a newer Vibe Hash once a day. Windows warns
+that it's from an unknown publisher, since it isn't code-signed yet: choose
+"More info", then "Run anyway". It is [launcher/vibehash_launcher.py](launcher/vibehash_launcher.py),
+plain Python, built by [launcher.yml](.github/workflows/launcher.yml);
+`VibeHash.exe --uninstall` removes what it installed and leaves your wallet.
+
+**The install line.** One line installs Vibe Hash and starts the guided setup,
 which asks the rest (network, wallet password, GPU support). On Windows, in
 PowerShell (it offers to install Python too, if you need it):
 
@@ -187,6 +198,18 @@ python -m vibehash
 
 Every command, with its flags and an example, is in [docs/CLI.md](docs/CLI.md);
 `python -m vibehash COMMAND --help` says the same at the terminal.
+
+Or let it look after itself. `python -m vibehash app` does setup without
+questions (the wallet's password from `$VIBEHASH_PASSWORD`, or asked once; a
+new wallet's recovery words go to a file only you can read), installs GPU
+support, mines with the worker's live feed on, and starts the worker again if
+it ever stops. `app pause`, `app resume`, `app stop` and `app status` drive
+it from another terminal, and `app startup on` starts it when you log in.
+It is what the desktop app runs underneath.
+
+```bash
+python -m vibehash app
+```
 
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:

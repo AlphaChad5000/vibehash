@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sys
 import threading
@@ -168,6 +169,39 @@ def show_words(words: str, indent: str = "") -> None:
     for r in range(rows):
         print(indent + "  " + "".join(f"{i + 1:>3}. {w[i]:<10}" for i in range(r, len(w), rows)).rstrip())
     print()
+
+
+def ensure_wallet(path: Path, indent: str = "", no_password: bool = False) -> tuple[str, str | None]:
+    """The wallet at `path`, made if there is none: its password asked for (or $VIBEHASH_PASSWORD; with neither, the
+    error says so), its recovery words shown once or saved to a file when nobody is watching. -> (address, the
+    password a new wallet was made with, else None). `no_password`: make it without one, as `wallet create
+    --no-password` does, for an app that must start with no question: the file is then as safe as the user's
+    account, and the recovery words still restore it."""
+    if path.exists():
+        address = json.loads(path.read_text())["address"]
+        print(f"{indent}using {path}\n{indent}address {checksummed(address)}")
+        return address, None
+    if no_password and "VIBEHASH_PASSWORD" not in os.environ:
+        words = mnemonic.generate()
+        keys = mnemonic.keypair(words)
+        wallets.save(keys, path, None, mnemonic.PATH)
+        print(f"{indent}created {path} (no password: as safe as this user account)\n{indent}address {checksummed(keys.address)}")
+        # Always to the file, whether or not this is a terminal: the app's log scrolls on into the worker's, and
+        # someone who started it once and forgot it must still find the words later.
+        print(unattended.words_note(unattended.save_words(words, keys.address, path), indent))
+        return keys.address, None
+    pw = password(f"{indent}Choose a wallet password: ", confirm=True)
+    if pw is None:
+        raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
+                              "too, to unlock the wallet unattended")
+    if not pw:
+        sys.exit("a wallet password is required (set VIBEHASH_PASSWORD for unattended setups)")
+    words = mnemonic.generate()
+    keys = mnemonic.keypair(words)
+    wallets.save(keys, path, pw, mnemonic.PATH)
+    print(f"{indent}created {path}\n{indent}address {checksummed(keys.address)}")
+    give_words(words, keys.address, path, indent)
+    return keys.address, pw
 
 
 def give_words(words: str, address: str, wallet: Path, indent: str = "") -> None:
@@ -403,10 +437,28 @@ def cmd_worker(a, keys: KeyPair | None = None):
         lock.release()
 
 
+def _interrupt(*_) -> None:
+    raise KeyboardInterrupt
+
+
+def _stop_like_ctrl_c() -> None:
+    """SIGTERM (a service manager, `app stop` on Linux and macOS) and Ctrl-Break (`app stop` on Windows) end the worker
+    the way Ctrl+C does: the round log is written out and the dashboard sums up. Only the main thread may do this, and
+    a test that runs the command in another thread doesn't need it."""
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _interrupt)
+            except (ValueError, OSError):
+                pass
+
+
 def _mine(a, keys: KeyPair):
     from . import minerui, selftest
     from .wire import MAX_CLOCK_SKEW_S
 
+    _stop_like_ctrl_c()
     url = node_of(a)
     # A worker that can't follow the node's chain (blocks of a version newer than it knows) or that the node won't take
     # (older than its min_client) stops here, before the GPU's self-test, naming the upgrade. A node from before
@@ -484,6 +536,12 @@ def _mine(a, keys: KeyPair):
     _record_end(session)
 
 
+def cmd_app(a):
+    from . import app
+
+    app.main(a)
+
+
 def _chosen_job(api: NodeClient, job: str, url: str) -> None:
     """`worker --job JOB`: the node must list JOB among its jobs with budget left, or the worker stops here naming
     the ones it does. A node from before /network is asked about JOB alone."""
@@ -542,8 +600,10 @@ def driver_advice(label: str) -> str:
     return f"Update the graphics driver from {site}"
 
 
-def _setup_gpu(assume_yes: bool) -> None:
-    """Find the GPU, install the PyTorch build for it (after asking), and self-test it."""
+def _setup_gpu(assume_yes: bool) -> bool:
+    """Find the GPU, install the PyTorch build for it (after asking), and self-test it. -> whether that's settled:
+    the GPU trains, or there is none PyTorch supports, or a driver has to change first. False when it is worth
+    trying again (the install failed, or wasn't wanted), which `app` does at its next start."""
     from . import gpusetup
 
     if torch := gpusetup.installed_torch():
@@ -553,34 +613,36 @@ def _setup_gpu(assume_yes: bool) -> None:
         for d in listed:
             print(f"   {d['label']}: {'ready' if d['ready'] else 'not usable: ' + str(d['problem'])[:120]}")
         print(f"   PyTorch {gpusetup.installed_torch()} already trains on it, so nothing is installed")
-        return
+        return True
     if listed:  # PyTorch sees the card but can't run on it: the driver, not the build, is the problem
         for d in listed:
             print(f"   {d['label']} isn't usable with PyTorch {gpusetup.installed_torch()} ({str(d['problem'])[:120]}).\n"
                   f"   {driver_advice(d['label'])}, then run `{prog()} install-gpu` again. Until then training uses "
                   "the CPU.")
-        return
+        return True
     gpus = gpusetup.detect()
     if not gpus:
         print("   no graphics card PyTorch supports; training will use the CPU, which works fine")
-        return
+        return True
     for g in gpus:
         print(f"   found {g.describe()}")
     print("   checking which PyTorch builds are published for it...")
     gpu, build, why = gpusetup.choose(gpus)
     if build is None:
         print(f"   can't train on {gpu.name} yet: {why}. Training will use the CPU.")
-        return
+        return True
     print(f"   it needs PyTorch built for {build.label}, a large download (up to 3 GB) into\n   {sys.executable}")
     if not ask("   Install it now?", assume_yes):
         print(f"   skipped. Install it later with: {prog()} install-gpu")
-        return
+        return False
     if code := gpusetup.install(build):
         print(f"   the install failed (pip exit code {code}). Training will use the CPU until it's fixed.")
-        return
+        return False
     print("   testing it (a minute or two the first time)...", flush=True)
-    for d in gpusetup.devices():
+    found = gpusetup.devices()
+    for d in found:
         print(f"   {d['id']:<8} {d['label']}  [{'ready' if d['ready'] else 'NOT USABLE: ' + str(d['problem'])[:120]}]")
+    return any(d["ready"] for d in found if d["id"] != "cpu")
 
 
 def cmd_install_gpu(a):
@@ -622,23 +684,8 @@ def cmd_setup(a):
 
     print("\n2. Wallet")
     path = settings.wallet_path(a.wallet) or settings.default_wallet()
-    keys = None
-    if path.exists():
-        address = json.loads(path.read_text())["address"]
-        print(f"   using {path}\n   address {checksummed(address)}")
-    else:
-        pw = password("   Choose a wallet password: ", confirm=True)
-        if pw is None:
-            raise unattended.need("a wallet password", "set VIBEHASH_PASSWORD to the one you want; the worker reads it "
-                                  "too, to unlock the wallet unattended")
-        if not pw:
-            sys.exit("a wallet password is required (set VIBEHASH_PASSWORD for unattended setups)")
-        words = mnemonic.generate()
-        keys = mnemonic.keypair(words)
-        wallets.save(keys, path, pw, mnemonic.PATH)
-        address = keys.address
-        print(f"   created {path}\n   address {checksummed(address)}")
-        give_words(words, address, path, "   ")
+    address, pw = ensure_wallet(path, "   ")
+    keys = None if pw is None else wallets.load(path, pw)  # (a wallet made just now: no second password for staking)
     settings.save(wallet=str(path))
     if a.deepseek:
         settings.save(deepseek=a.deepseek)  # what `worker` does with DeepSeek jobs, until `worker --deepseek` changes it
@@ -2235,6 +2282,34 @@ def parser() -> argparse.ArgumentParser:
                    "(default auto: every job this worker can do). The dashboard's job line changes it while it runs: "
                    "Tab or 0-9")
     p.set_defaults(fn=cmd_worker)
+
+    ap_ = sub.add_parser("app", help="mine without the questions: get ready, join, keep the worker running, start at "
+                         "login; `app status`, `pause`, `resume` and `stop` drive it", description="`vibehash app` is "
+                         "the worker as something you start once and forget: it saves the node, makes a wallet if there "
+                         "is none (its password from $VIBEHASH_PASSWORD, or asked once at a terminal; the recovery words "
+                         "go to a file only you can read), installs the GPU build of PyTorch without asking, then runs "
+                         "`worker --watch` and starts it again whenever it stops. The other `app` commands talk to the "
+                         "running one through ~/.vibehash/app. It is what the desktop app's launcher runs.")
+    for p in (ap_, None):  # the start options, on plain `app` and on `app start` alike
+        if p is None:
+            asub = ap_.add_subparsers(dest="acmd")
+            p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)")
+        p.add_argument("--node", help="node address (default: the one saved, else the public network's)")
+        p.add_argument("--wallet", help=WALLET)
+        p.add_argument("--device", default="auto", help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
+        p.add_argument("--watch", type=int, metavar="PORT", help=f"the worker's feed's port (default {WATCH_PORT})")
+        p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
+        p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
+        p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
+        p.add_argument("--no-password", action="store_true", help="make a first wallet without a password, so nothing is "
+                       "asked (what the downloadable app does); the file is then as safe as your user account")
+        p.set_defaults(fn=cmd_app)
+    for name, what in (("pause", "stop mining for now; the worker leaves its round"), ("resume", "mine again"),
+                       ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
+        asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
+    p = asub.add_parser("startup", help="start the app when you log in (on), or not (off)")
+    p.add_argument("mode", choices=["on", "off"]); p.set_defaults(fn=cmd_app)
+    ap_.set_defaults(fn=cmd_app, acmd=None)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
     p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",

@@ -61,10 +61,13 @@ def build(guide: Path, front: Path, out: Path) -> None:
             (out / f.name).write_bytes(f.read_bytes())
     (out / "CNAME").write_text(DOMAIN + "\n", encoding="utf-8", newline="\n")  # GitHub Pages' custom domain
     (out / ".nojekyll").write_text("", encoding="utf-8")  # serve the files as they are
-    for script in ("install.ps1", "install.sh"):  # irm https://vibehash.org/install.ps1 | iex, and curl … | sh
+    for script in ("install.ps1", "install.sh", "app.ps1"):  # irm https://vibehash.org/install.ps1 | iex, curl … | sh
         (out / script).write_bytes((guide.parent.parent / script).read_bytes())
+    # app.ps1 fetches the launcher from here: irm https://vibehash.org/app.ps1 | iex
+    (out / "vibehash_launcher.py").write_bytes((guide.parent.parent / "launcher" / "vibehash_launcher.py").read_bytes())
     (out / "whitepaper.pdf").write_bytes((guide.parent / "whitepaper.pdf").read_bytes())  # vibehash.org/whitepaper.pdf
-    print(f"wrote index.html, guide/index.html ({len(page.encode()):,} bytes), install.ps1, install.sh, whitepaper.pdf, "
+    print(f"wrote index.html, guide/index.html ({len(page.encode()):,} bytes), install.ps1, install.sh, app.ps1, vibehash_launcher.py, "
+          "whitepaper.pdf, "
           "CNAME and .nojekyll")
 
 
