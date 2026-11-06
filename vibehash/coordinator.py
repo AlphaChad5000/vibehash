@@ -446,6 +446,9 @@ class Coordinator:
         # job -> why it isn't training, in words for /status and the dashboards: a sharded job no team could be formed
         # for, or one this node can't run. Not in any record: nothing a round decides depends on it.
         self.waiting: dict[str, str] = {}
+        # The operators' policy (nodeadmin.Admin.reason): (job id, owner) -> why this node leads no round for the job,
+        # or None. This node's own choice, like `waiting`: nothing a round decides depends on it.
+        self.policy = None
 
     # --- jobs and transactions -------------------------------------------------
 
@@ -511,6 +514,10 @@ class Coordinator:
                 if job.sharded and not self.runs_teams:
                     self.waiting[job_id] = (f"job {job_id} waits: it's split into {job.shards} shards, trained by teams "
                                             "whose workers send each other activations, and this node can't run teams yet")
+                    continue
+                why = self.policy(job_id, self.chain.state.job_owner.get(job_id)) if self.policy is not None else None
+                if why:  # the operators' hold (nodeadmin.py): this node's own policy, no rule of the chain
+                    self.waiting[job_id] = f"job {job_id} waits: {why}"
                     continue
                 ready.append(job_id)
         if not ready:

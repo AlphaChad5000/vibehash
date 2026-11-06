@@ -235,6 +235,23 @@ worker started with `--watch`.
 python -m vibehash app
 ```
 
+For the people running the network there is `python -m vibehash admin`: a
+window of its own with a globe of where devices connect from (dots for the
+land, a point per place, arcs to the node each reports to), the jobs to
+confirm, deny, cancel or post, the ledger as blocks land, the devices online
+and the nodes. It talks to nodes started with `--admin-token` (or
+`$VIBEHASH_ADMIN_TOKEN`), which adds a few routes behind that token: a hold
+on a job (the node leads no round for it until released) and the devices'
+addresses, looked up in batches at ip-api.com and cached a month, never for
+private ones; Settings turns the lookups off. Cancel and post sign with your
+wallet, unlocked in the page. Nodes, tokens and the wallet are saved under
+`"admin"` in config.json.
+
+```bash
+VIBEHASH_ADMIN_TOKEN=choose-one python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
+python -m vibehash admin --node https://node.vibehash.org --token choose-one
+```
+
 To train a model, save your examples as a CSV file (a header row, numeric
 input columns, and the column to predict last), then:
 

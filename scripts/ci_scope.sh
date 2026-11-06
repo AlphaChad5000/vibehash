@@ -17,7 +17,7 @@ fi
 # Modules whose own tests are enough when only they change: nothing in them decides what the chain accepts, and
 # their tests pass without PyTorch (checked with torch, transformers and safetensors blocked). cli.py is not here:
 # over a dozen test modules import it, so a change to it runs everything. Nor is selftest: its tests need PyTorch.
-EDGE="app watch window avatar minerui trainui termui advice hardware netstats records settings unattended emblems"
+EDGE="app watch window avatar admin minerui trainui termui advice hardware netstats records settings unattended emblems"
 # Test modules that may run in the light set: the edge modules' own, plus these (also PyTorch-free).
 LIGHT_TESTS=" tests.test_launcher tests.test_cli_docs tests.test_setup tests.test_menu "
 
