@@ -245,11 +245,17 @@ on a job (the node leads no round for it until released) and the devices'
 addresses, looked up in batches at ip-api.com and cached a month, never for
 private ones; Settings turns the lookups off. Cancel and post sign with your
 wallet, unlocked in the page. Nodes, tokens and the wallet are saved under
-`"admin"` in config.json.
+`"admin"` in config.json. To keep it as an app, `--install-shortcut` puts
+"Vibe Hash Admin", with its own violet icon, in the Start menu (the apps menu
+on Linux, ~/Applications on a Mac). The shortcut runs the Python you made it
+from, so make it from the one that has Vibe Hash and `pywebview`; any
+`--node`, `--token` and `--wallet` given with it are saved for it to open
+with. It isn't part of the public download.
 
 ```bash
 VIBEHASH_ADMIN_TOKEN=choose-one python -m vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0
 python -m vibehash admin --node https://node.vibehash.org --token choose-one
+python -m vibehash admin --install-shortcut --node https://node.vibehash.org --token choose-one
 ```
 
 To train a model, save your examples as a CSV file (a header row, numeric

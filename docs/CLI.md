@@ -492,7 +492,7 @@ The operators' window: a globe of where devices connect from, the jobs to confir
 The admin app (admin.py): a small server on this computer only, with the nodes behind it, and its page in a window of its own (pywebview, the `app` extra) or the browser. It asks each node's /admin/overview with the token that node was started with (`node --admin-token`; a node without one shows only what its public routes say). Confirm and deny are holds on every node it knows; cancel and post are transactions signed with the admin wallet, unlocked in the page. The nodes, their tokens, the wallet and whether to look up places are kept in config.json under "admin", from the page's Settings or these flags.
 
 ```
-vibehash admin [-h] [--node URL] [--token TOKEN] [--wallet WALLET] [--port PORT] [--browser]
+vibehash admin [-h] [--node URL] [--token TOKEN] [--wallet WALLET] [--port PORT] [--browser] [--install-shortcut] [--remove-shortcut]
 ```
 
 Flags:
@@ -502,6 +502,8 @@ Flags:
 - `--wallet WALLET`: the admin wallet, for cancelling and posting jobs (default: as other commands).
 - `--port PORT`: the local server's port (default 7546).
 - `--browser`: open the page in the browser instead of a window.
+- `--install-shortcut`: put "Vibe Hash Admin" in the Start menu (the apps menu on Linux, ~/Applications on a Mac), running this Python; --node, --token and --wallet given with it are saved for it to open with.
+- `--remove-shortcut`: take that shortcut away again.
 
 Examples:
 
@@ -509,6 +511,7 @@ Examples:
 vibehash admin
 vibehash admin --node https://node.vibehash.org --token SECRET --node http://10.0.0.5:8545
 vibehash admin --browser
+vibehash admin --install-shortcut --node https://node.vibehash.org --token SECRET
 ```
 
 ## vibehash cache

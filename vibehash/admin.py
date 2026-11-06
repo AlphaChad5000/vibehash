@@ -5,6 +5,8 @@ ledger as blocks land; the devices online; the validators and peers.
     vibehash admin                                  # the nodes and tokens saved in config.json ("admin")
     vibehash admin --node https://node.vibehash.org --token SECRET --node http://10.0.0.5:8545
     vibehash admin --browser                        # in the browser instead of a window of its own
+    vibehash admin --install-shortcut               # "Vibe Hash Admin" in the Start menu (or the apps menu), for good
+    vibehash admin --remove-shortcut
 
 It is a small local server (127.0.0.1:7546, `--port`) serving data/admin.html, with the nodes behind it: the page asks
 this server (/api/*), and this server asks each node's /admin/overview with its token (nodeadmin.py), so no token
@@ -19,7 +21,14 @@ password and kept only in this process's memory.
 Places on the globe come from the devices' connection addresses, which only an admin's node gives out. They are looked
 up in batches at GEO_URL (ip-api.com's free service unless $VIBEHASH_GEO_URL names another; nothing but the addresses
 is sent), cached for a month in ~/.vibehash/admin/geo.json, and never for private or loopback addresses; "geo": false
-in the admin settings sends nothing out, and the globe shows only the nodes' own places from their URLs."""
+in the admin settings sends nothing out, and the globe shows only the nodes' own places from their URLs.
+
+The shortcut (`--install-shortcut`) is how an operator keeps it as an app: "Vibe Hash Admin" with its own violet icon
+(data/admin.ico) in the Start menu on Windows, the applications menu on Linux, ~/Applications on a Mac. It runs this
+same Python (pythonw on Windows: no console) with `-m vibehash admin`, so make it from the environment that has
+Vibe Hash and pywebview, and it keeps working as that environment is updated. Any --node, --token and --wallet given
+with it are saved first, so the shortcut opens with them. It is never part of the public download: the admin app is for
+the people who run the nodes. Started without a console, the app logs to ~/.vibehash/admin/admin.log."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -30,7 +39,10 @@ import json
 import logging
 import os
 import secrets
+import shlex
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,6 +61,10 @@ log = logging.getLogger("vibehash.admin")
 BROKEN = (ValueError, OSError, http.client.HTTPException)  # a node's reply that isn't one: never the whole view's error
 PAGE = Path(__file__).resolve().parent / "data" / "admin.html"
 GLOBE = Path(__file__).resolve().parent / "data" / "globe.json"
+ICON = Path(__file__).resolve().parent / "data" / "admin.ico"
+ICON_PNG = Path(__file__).resolve().parent / "data" / "admin.png"
+APP_ID = "VibeHash.Admin"  # Windows' AppUserModelID: the taskbar shows the window as an app of its own, with its icon
+SHORTCUT = "Vibe Hash Admin"
 DEFAULT_PORT = 7546  # beside the worker's feed (7545)
 TITLE = "Vibe Hash admin"
 SIZE, MIN_SIZE = (1280, 820), (900, 600)
@@ -603,8 +619,9 @@ def show(url: str, browser: bool = False, fallback=webbrowser.open, say=lambda t
             browser = True
     if not browser:
         try:
+            own_taskbar_button()
             webview.create_window(TITLE, url=url, width=SIZE[0], height=SIZE[1], min_size=MIN_SIZE, text_select=True)
-            webview.start()
+            webview.start(icon=str(window_icon()))
             return "window"
         except KeyboardInterrupt:
             return "window"
@@ -612,6 +629,143 @@ def show(url: str, browser: bool = False, fallback=webbrowser.open, say=lambda t
             say(f"the window can't open here ({e}); opening the admin page in the browser instead")
     fallback(url)
     return "browser"
+
+
+def own_taskbar_button(system: str | None = None) -> bool:
+    """On Windows, the process's own AppUserModelID, so its window is a taskbar button of its own (with its icon), not
+    one more python.exe window grouped with any other."""
+    if (system or sys.platform) != "win32":
+        return False
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def window_icon(system: str | None = None) -> Path:
+    """The icon pywebview puts on the window: the .ico on Windows, where it is handed to WinForms' Icon, which takes
+    nothing else (a PNG there ends the process from inside .NET, with nothing to catch); the PNG for GTK and Qt."""
+    return ICON if (system or sys.platform) == "win32" else ICON_PNG
+
+
+# --- the shortcut ----------------------------------------------------------------------------------------
+
+def shortcut_command(python: str | None = None) -> list[str]:
+    """What the shortcut runs: this Python (pythonw beside it on Windows, so no console opens) with -m vibehash admin."""
+    python = python or sys.executable
+    exe = Path(python)
+    if exe.name.lower() == "python.exe" and (exe.parent / "pythonw.exe").exists():
+        python = str(exe.parent / "pythonw.exe")
+    return [python, "-m", "vibehash", "admin"]
+
+
+def _ps(text) -> str:
+    """A PowerShell string literal."""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def _powershell(script: str, run) -> list[str]:
+    out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
+              timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if out.returncode != 0:
+        raise AdminError(f"PowerShell said: {(out.stderr or out.stdout or '').strip()[:300]}")
+    return (out.stdout or "").strip().splitlines()
+
+
+def _linux_entry(home: Path) -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share") / "applications" / "vibehash-admin.desktop"
+
+
+def install_shortcut(system: str | None = None, run=None, home: Path | None = None, python: str | None = None) -> Path:
+    """'Vibe Hash Admin' where this system keeps its apps; -> where. Replaces one already there."""
+    system = system or sys.platform
+    run = run or subprocess.run
+    home = Path(home) if home else Path.home()
+    cmd = shortcut_command(python)
+    if system == "win32":
+        script = ("$p = [Environment]::GetFolderPath('Programs'); "
+                  "if (-not $p) { $p = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs' }; "
+                  "New-Item -ItemType Directory -Force $p | Out-Null; "
+                  f"$l = Join-Path $p {_ps(SHORTCUT + '.lnk')}; "
+                  "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($l); "
+                  f"$s.TargetPath = {_ps(cmd[0])}; $s.Arguments = {_ps(' '.join(cmd[1:]))}; "
+                  f"$s.WorkingDirectory = {_ps(home)}; $s.IconLocation = {_ps(str(ICON) + ',0')}; "
+                  "$s.Description = 'The Vibe Hash network: devices, jobs, the ledger'; $s.Save(); Write-Output $l")
+        where = _powershell(script, run)
+        if not where:
+            raise AdminError("the shortcut couldn't be made: PowerShell named no file")
+        return Path(where[-1])
+    if system == "darwin":  # an app bundle whose program is a two-line script
+        app = home / "Applications" / f"{SHORTCUT}.app"
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True, exist_ok=True)
+        program = macos / "admin"
+        program.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(c) for c in cmd) + "\n", encoding="utf-8")
+        program.chmod(0o755)
+        (app / "Contents" / "Info.plist").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>'
+            f"<key>CFBundleName</key><string>{SHORTCUT}</string><key>CFBundleExecutable</key><string>admin</string>"
+            "<key>CFBundleIdentifier</key><string>org.vibehash.admin</string><key>CFBundlePackageType</key>"
+            "<string>APPL</string></dict></plist>\n", encoding="utf-8")
+        return app
+    entry = _linux_entry(home)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("[Desktop Entry]\nType=Application\nName=" + SHORTCUT + "\nComment=The Vibe Hash network: devices, "
+                     "jobs, the ledger\nExec=" + " ".join(shlex.quote(c) for c in cmd) + f"\nIcon={ICON_PNG}\n"
+                     "Terminal=false\nCategories=Network;\n", encoding="utf-8")
+    entry.chmod(0o755)
+    return entry
+
+
+def remove_shortcut(system: str | None = None, run=None, home: Path | None = None) -> Path | None:
+    """Takes the shortcut away again; -> where it was, or None when there was none."""
+    system = system or sys.platform
+    run = run or subprocess.run
+    home = Path(home) if home else Path.home()
+    if system == "win32":
+        where = _powershell("$p = [Environment]::GetFolderPath('Programs'); "
+                            f"$l = Join-Path $p {_ps(SHORTCUT + '.lnk')}; "
+                            "if (Test-Path $l) { Remove-Item -Force $l; Write-Output $l }", run)
+        return Path(where[-1]) if where else None
+    target = home / "Applications" / f"{SHORTCUT}.app" if system == "darwin" else _linux_entry(home)
+    if not target.exists():
+        return None
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return target
+
+
+def save_flags(a, save=settings.save, load=settings.load) -> bool:
+    """--node, --token and --wallet given with --install-shortcut, saved as the page's Settings would save them, so
+    the shortcut opens with them; the nodes named come first, in their order (the first is the primary). -> whether
+    anything was saved."""
+    urls = [u.rstrip("/") for u in (getattr(a, "node", None) or [])]
+    token, wallet = getattr(a, "token", None), getattr(a, "wallet", None)
+    if not (urls or wallet):
+        return False
+    cfg = dict(load().get("admin") or {})
+    saved = {n["url"].rstrip("/"): dict(n, url=n["url"].rstrip("/"))
+             for n in cfg.get("nodes", []) if isinstance(n, dict) and n.get("url")}
+    named = []
+    for u in urls:
+        n = saved.pop(u, {"url": u})
+        if token:
+            n["token"] = token
+        named.append(n)
+    cfg["nodes"] = named + list(saved.values())
+    if wallet:
+        cfg["wallet"] = str(Path(wallet).expanduser().resolve())
+    save(admin=cfg)
+    try:
+        os.chmod(settings.config_path(), 0o600)
+    except OSError:
+        pass
+    return True
 
 
 def build(a) -> AdminApp:
@@ -622,9 +776,45 @@ def build(a) -> AdminApp:
     return AdminApp(links, wallet, geo)
 
 
+def _log_without_console() -> None:
+    """Started from the shortcut (pythonw: no console), what it would print goes to ~/.vibehash/admin/admin.log."""
+    if sys.stderr is not None:
+        return
+    try:
+        path = settings.home() / "admin" / "admin.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 2**20:
+            path.unlink()
+        sys.stderr = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115  (for the life of the process)
+        sys.stdout = sys.stdout or sys.stderr
+        sys.stderr.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    except OSError:
+        pass
+
+
 def main(a) -> None:
+    _log_without_console()
+    if getattr(a, "remove_shortcut", False):
+        where = remove_shortcut()
+        print(f"removed {where}" if where else "there was no shortcut to remove")
+        return
+    if getattr(a, "install_shortcut", False):
+        if save_flags(a):
+            print("saved the nodes and wallet given, for the shortcut to open with")
+        try:
+            import webview  # noqa: F401
+        except ImportError:
+            print("note: pywebview isn't in this Python, so the shortcut will open the browser; for a window of its own: "
+                  f"{Path(sys.executable).name} -m pip install pywebview")
+        where = install_shortcut()
+        print(f"{SHORTCUT}: {where}\n  it runs {' '.join(shortcut_command())}")
+        return
     app = build(a)
-    port = app.serve(getattr(a, "port", DEFAULT_PORT) or DEFAULT_PORT)
+    try:
+        port = app.serve(getattr(a, "port", DEFAULT_PORT) or DEFAULT_PORT)
+    except OSError:  # the port is taken (another admin app, say): any free one does, the page carries its own session
+        port = app.serve(0)
     url = f"http://127.0.0.1:{port}/"
     print(f"admin app at {url}  nodes: {', '.join(l.url + ('' if l.token else ' (no token)') for l in app.links)}", file=sys.stderr)
     try:

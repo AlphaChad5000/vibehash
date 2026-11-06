@@ -529,6 +529,120 @@ class AdminAppTests(unittest.TestCase):
         self.assertEqual(opened[-1], "http://127.0.0.1:2/")
 
 
+class ShortcutTests(unittest.TestCase):
+    """`vibehash admin --install-shortcut`: the admin app kept as an app, never on this machine's real menus here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": str(self.home / ".vibehash")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("XDG_DATA_HOME", None)
+
+    def test_it_runs_this_python_without_a_console_on_windows(self):
+        (self.home / "python.exe").write_text("")
+        self.assertEqual(admin.shortcut_command(str(self.home / "python.exe"))[1:], ["-m", "vibehash", "admin"])
+        self.assertTrue(admin.shortcut_command(str(self.home / "python.exe"))[0].endswith("python.exe"))  # no pythonw beside it
+        (self.home / "pythonw.exe").write_text("")
+        self.assertEqual(admin.shortcut_command(str(self.home / "python.exe"))[0], str(self.home / "pythonw.exe"))
+        self.assertEqual(admin.shortcut_command("/usr/bin/python3")[0], "/usr/bin/python3")
+
+    def test_windows_makes_a_start_menu_link_with_the_admin_icon(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="C:\\Users\\x\\Start Menu\\Programs\\Vibe Hash Admin.lnk\n", stderr="")
+
+        where = admin.install_shortcut("win32", run=run, home=self.home, python="C:\\it's\\pythonw.exe")
+        self.assertTrue(str(where).endswith("Vibe Hash Admin.lnk"))  # (a Windows path: on Linux it has no "name" to split)
+        script = calls[0][-1]
+        self.assertEqual(calls[0][:2], ["powershell", "-NoProfile"])
+        self.assertIn("GetFolderPath('Programs')", script)
+        self.assertIn("$s.TargetPath = 'C:\\it''s\\pythonw.exe'", script)  # a quote in a path is escaped
+        self.assertIn("$s.Arguments = '-m vibehash admin'", script)
+        self.assertIn(str(admin.ICON) + ",0", script)
+        with self.assertRaises(admin.AdminError):
+            admin.install_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="denied"),
+                                   home=self.home)
+        gone = admin.remove_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="C:\\x\\Vibe Hash Admin.lnk\n", stderr=""))
+        self.assertTrue(str(gone).endswith("Vibe Hash Admin.lnk"))
+        self.assertIsNone(admin.remove_shortcut("win32", run=lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")))
+
+    def test_linux_writes_a_desktop_entry_and_takes_it_away(self):
+        where = admin.install_shortcut("linux", home=self.home, python="/opt/my env/bin/python3")
+        self.assertEqual(where, self.home / ".local" / "share" / "applications" / "vibehash-admin.desktop")
+        text = where.read_text(encoding="utf-8")
+        self.assertIn("Name=Vibe Hash Admin", text)
+        self.assertIn("Exec='/opt/my env/bin/python3' -m vibehash admin", text)
+        self.assertIn(f"Icon={admin.ICON_PNG}", text)
+        self.assertEqual(admin.remove_shortcut("linux", home=self.home), where)
+        self.assertFalse(where.exists())
+        self.assertIsNone(admin.remove_shortcut("linux", home=self.home))
+
+    def test_a_mac_gets_an_app_in_its_applications_folder(self):
+        app = admin.install_shortcut("darwin", home=self.home, python="/usr/local/bin/python3")
+        self.assertEqual(app, self.home / "Applications" / "Vibe Hash Admin.app")
+        program = app / "Contents" / "MacOS" / "admin"
+        self.assertEqual(program.read_text(encoding="utf-8"), "#!/bin/sh\nexec /usr/local/bin/python3 -m vibehash admin\n")
+        self.assertIn("<string>admin</string>", (app / "Contents" / "Info.plist").read_text(encoding="utf-8"))
+        self.assertEqual(admin.remove_shortcut("darwin", home=self.home), app)
+        self.assertFalse(app.exists())
+
+    def test_flags_given_with_it_are_saved_for_it_to_open_with(self):
+        store = {"admin": {"nodes": [{"url": "http://old:1", "token": "keep"}, {"url": "http://b:1"}], "geo": False}}
+        save = lambda **kw: store.update(kw)  # noqa: E731
+        load = lambda: store  # noqa: E731
+        self.assertFalse(admin.save_flags(SimpleNamespace(node=None, token="t", wallet=None), save, load))
+        a = SimpleNamespace(node=["http://b:1/", "http://new:1"], token="tok", wallet=str(self.home / "w.json"))
+        self.assertTrue(admin.save_flags(a, save, load))
+        self.assertEqual(store["admin"]["nodes"], [{"url": "http://b:1", "token": "tok"}, {"url": "http://new:1", "token": "tok"},
+                                                   {"url": "http://old:1", "token": "keep"}])
+        self.assertEqual(store["admin"]["wallet"], str((self.home / "w.json").resolve()))
+        self.assertFalse(store["admin"]["geo"])  # the rest kept
+
+    def test_the_command_installs_or_removes_and_opens_nothing(self):
+        with mock.patch.object(admin, "install_shortcut", return_value=Path("X.lnk")) as put, \
+                mock.patch.object(admin, "build") as build:
+            admin.main(SimpleNamespace(install_shortcut=True, remove_shortcut=False, node=None, token=None, wallet=None))
+        put.assert_called_once()
+        build.assert_not_called()
+        with mock.patch.object(admin, "remove_shortcut", return_value=None) as take, mock.patch.object(admin, "build") as build:
+            admin.main(SimpleNamespace(install_shortcut=False, remove_shortcut=True))
+        take.assert_called_once()
+        build.assert_not_called()
+
+    def test_a_taken_port_means_another_one(self):
+        app = mock.MagicMock()
+        app.serve.side_effect = [OSError("in use"), 51234]
+        app.links = []
+        with mock.patch.object(admin, "build", return_value=app), mock.patch.object(admin, "show", return_value="window") as show:
+            admin.main(SimpleNamespace(port=admin.DEFAULT_PORT, browser=False))
+        self.assertEqual(app.serve.call_args_list[1].args, (0,))
+        self.assertEqual(show.call_args.args[0], "http://127.0.0.1:51234/")
+
+    def test_the_window_gets_its_icon_and_its_own_taskbar_button(self):
+        wv = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"webview": wv}), mock.patch.object(admin, "own_taskbar_button") as own:
+            self.assertEqual(admin.show("http://127.0.0.1:1/"), "window")
+        own.assert_called_once()
+        self.assertEqual(wv.start.call_args.kwargs["icon"], str(admin.window_icon()))
+        self.assertFalse(admin.own_taskbar_button("linux"))
+        # WinForms' Icon takes only an .ico: a PNG there killed the process from inside .NET
+        self.assertEqual(admin.window_icon("win32"), admin.ICON)
+        self.assertEqual(admin.window_icon("linux"), admin.ICON_PNG)
+        self.assertEqual(admin.ICON.read_bytes()[:4], b"\x00\x00\x01\x00")  # an .ico header
+
+    def test_the_icons_ship_with_the_package_and_are_the_scripts(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import make_icon
+        self.assertEqual(admin.ICON.read_bytes(), make_icon.ico(ground=make_icon.VIOLET))
+        self.assertEqual(admin.ICON_PNG.read_bytes(), make_icon.png(256, make_icon.VIOLET))
+        self.assertIn('"data/*.ico"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
 class GlobeTests(unittest.TestCase):
     def test_dots_fall_only_on_land(self):
         square = [(-10.0, -10.0), (10.0, -10.0), (10.0, 10.0), (-10.0, 10.0)]  # (lon, lat)
