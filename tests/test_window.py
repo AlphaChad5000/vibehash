@@ -76,7 +76,11 @@ class WindowTests(Home):
         self.assertEqual(said, [])
         w = wv.windows[0]
         self.assertEqual(w.title, window.TITLE)
-        self.assertIn('window.FEED = "http://127.0.0.1:7000"', w.html)
+        self.assertIsNone(w.html)  # a file pywebview serves, not a string: WebView2 gives a string the origin "null"
+        served = Path(w.kw["url"])
+        self.assertEqual(served.parent, app.app_dir() / "window")
+        self.assertEqual(os.listdir(served.parent), [served.name])  # its folder holds only the page
+        self.assertIn('window.FEED = "http://127.0.0.1:7000"', served.read_text(encoding="utf-8"))
         self.assertIsInstance(w.kw["js_api"], window.Api)
         self.assertEqual(w.kw["js_api"].port, 7000)
         self.assertEqual((w.kw["width"], w.kw["height"], w.kw["min_size"]), (window.SIZE[0], window.SIZE[1], window.MIN_SIZE))
@@ -192,6 +196,132 @@ class ApiTests(Home):
             self.assertTrue(Path(on["where"]).exists())
             self.assertTrue(self.api.set_startup(False)["ok"])
             self.assertFalse(self.api.settings()["startup"])
+
+    def test_options_take_only_their_own_names_and_kinds(self):
+        with mock.patch.object(app, "_winreg", return_value=None):
+            for name in window.OPTIONS:
+                self.assertEqual(self.api.set_option(name, True), {"ok": True, name: True})
+                self.assertIs(self.api.settings()[name], True)
+            self.assertFalse(self.api.set_option("pause_on_battery", "yes")["ok"])  # a bool, not a truthy string
+            self.assertFalse(self.api.set_option("node", "https://evil.example")["ok"])  # not a setting the page may change
+            self.assertNotIn("node", settings.load())
+            self.assertEqual(self.api.set_option("idle_minutes", 10), {"ok": True, "idle_minutes": 10})
+            self.assertEqual(self.api.settings()["idle_minutes"], 10)
+            for bad in (7, True, "5", -1):
+                self.assertFalse(self.api.set_option("idle_minutes", bad)["ok"], bad)
+            self.assertEqual(self.api.settings()["idle_minutes"], 10)
+
+    def test_links_open_by_name_only_in_the_browser(self):
+        opened = []
+        with mock.patch.object(window, "OPEN", side_effect=opened.append):
+            self.assertEqual(self.api.open_link("source"), {"ok": True, "url": window.LINKS["source"]})
+            for bad in ("https://evil.example", "javascript:alert(1)", "file:///etc/passwd", None, ["site"]):
+                self.assertFalse(self.api.open_link(bad)["ok"], bad)
+        self.assertEqual(opened, [window.LINKS["source"]])
+        self.assertTrue(all(u.startswith("https://") for u in self.api.links().values()))
+
+    def test_the_words_file_is_deleted_on_request_and_the_wallet_stays(self):
+        self.assertFalse(self.api.delete_words()["ok"])  # no app state, no file named
+        words, wallet_file = Path(self.tmp.name) / "words.txt", Path(self.tmp.name) / "w.json"
+        words.write_text(" 1. apple\n"), wallet_file.write_text("{}")
+        self.alive(wallet={"address": "0xabc", "path": str(wallet_file), "words_file": str(words)})
+        with mock.patch.object(app, "_winreg", return_value=None):
+            self.assertTrue(self.api.settings()["words_file"])
+            self.assertEqual(self.api.delete_words(), {"ok": True, "deleted": True})
+            self.assertFalse(words.exists())
+            self.assertTrue(wallet_file.exists())
+            self.assertFalse(self.api.settings()["words_file"])
+        self.assertEqual(self.api.delete_words(), {"ok": True, "deleted": False})
+
+    def test_updates_compare_release_numbers_and_ask_pypi_seldom(self):
+        self.assertTrue(window.newer("0.5.23", "0.5.22"))
+        self.assertTrue(window.newer("0.10.0", "0.9.9"))  # numbers, not text
+        self.assertFalse(window.newer("0.5.22", "0.5.22"))
+        self.assertFalse(window.newer("0.5.21", "0.5.22"))
+        self.assertFalse(window.newer(None, "0.5.22"))
+        asked = []
+        with mock.patch.object(window, "PYPI_LATEST", side_effect=lambda: asked.append(1) or "99.0.0"), \
+                mock.patch.object(window, "_version", return_value="0.5.22"), mock.patch.object(window.Api, "_update", None):
+            self.assertEqual(self.api.update(), {"current": "0.5.22", "latest": "99.0.0", "newer": True})
+            self.api.update()
+            self.assertEqual(len(asked), 1)  # cached
+        with mock.patch.object(window, "PYPI_LATEST", side_effect=OSError("offline")), mock.patch.object(window.Api, "_update", None):
+            self.assertFalse(self.api.update()["newer"])  # offline: no banner, no error
+
+    def test_the_round_history_is_this_wallets_sealed_rounds_newest_first(self):
+        from vibehash import records
+        self.alive(wallet={"address": "vibe1me"})
+        log = records.logs_dir() / "rounds.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{"worker": "vibe1me", "round": 1, "sealed": True, "earned_vibe": 0.2, "job": "j"},
+                {"worker": "vibe1other", "round": 2, "sealed": True, "earned_vibe": 9},
+                {"worker": "vibe1me", "round": 3},  # not sealed yet
+                {"worker": "vibe1me", "round": 4, "sealed": True, "lost_vibe": 2.5, "secret_stuff": "x"}]
+        log.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        got = self.api.history(10)["rows"]
+        self.assertEqual([r["round"] for r in got], [4, 1])
+        self.assertNotIn("secret_stuff", got[0])
+        self.assertEqual(len(self.api.history(1)["rows"]), 1)
+
+    def test_the_model_store_clears_only_while_nothing_mines(self):
+        from vibehash import modelstore
+        folder = Path(self.tmp.name) / "models"
+        settings.save(models={"folder": str(folder), "cap_gb": 40})
+        c = self.api.cache()
+        self.assertTrue(c["ok"])
+        self.assertEqual((c["used"], c["cap"]), (0, 40 * modelstore.GB))
+        self.assertTrue(self.api.set_cache_cap(100)["ok"])
+        self.assertEqual(self.api.cache()["cap"], 100 * modelstore.GB)
+        for bad in (1, 5000, True, "50"):
+            self.assertFalse(self.api.set_cache_cap(bad)["ok"], bad)
+        self.alive()  # mining
+        self.assertFalse(self.api.clear_cache()["ok"])
+        self.alive(paused=True)
+        self.assertEqual(self.api.clear_cache(), {"ok": True, "freed": 0})
+
+    def test_a_support_report_carries_no_secret(self):
+        home = str(Path(self.tmp.name))
+        report = {"ok": True, "checks": [{"name": "wallet", "text": f"read {home}/wallet.json for vibe1qqqqabcdefghijklmnop1234",
+                                          "data": {"words_file": "x", "password": "hunter2", "mnemonic": "a b c",
+                                                   "admin_token": "t", "private_key": "k", "size": 3}}]}
+        out = window.redact(report, home=home)
+        data = out["checks"][0]["data"]
+        self.assertEqual(data, {"size": 3})
+        self.assertEqual(out["checks"][0]["text"], "read ~/wallet.json for vibe1qqqq...1234")
+        self.assertNotIn("hunter2", json.dumps(out))
+
+
+class PageTests(unittest.TestCase):
+    """The page as a whole, read as text: every control has a handler, nothing comes from the wider web, and what the
+    feed, node or app say goes in as text, never as markup."""
+
+    def setUp(self):
+        self.page = window.DASHBOARD.read_text(encoding="utf-8")
+        self.script = self.page.split("<script>", 1)[1]
+
+    def test_every_button_and_input_is_wired(self):
+        import re
+        ids = re.findall(r'<(?:button|input|select)[^>]*\bid="([^"]+)"', self.page)
+        self.assertGreater(len(ids), 25)
+        loose = [i for i in ids if f'$("{i}")' not in self.script and f'"{i}"' not in self.script]
+        self.assertEqual(loose, [], "controls nothing in the script refers to")
+        for data_attr in ("data-tab", "data-level", "data-link"):  # the rest are wired by attribute
+            self.assertIn(f'dataset.{data_attr[5:]}', self.script)
+
+    def test_the_tour_and_the_word_check_have_every_step(self):
+        for needed in ('id="w-next-1"', 'id="w-next-2"', 'id="w-done"', 'id="w-skip-1"', 'id="w-skip-2"',
+                       'id="cer-next"', 'id="cer-done"', 'id="cer-delete"', 'id="cer-cancel"', "function wipe()"):
+            self.assertIn(needed, self.page)
+        # the words are cleared from the page whenever the check closes, however it closes
+        self.assertIn('function closeCeremony() { wipe();', self.script)
+        self.assertIn('$("cer-done").addEventListener("click", function () { wipe();', self.script)
+
+    def test_nothing_from_the_wider_web_and_no_markup_from_data(self):
+        self.assertNotIn("https://", self.page.replace("https://vibehash.org", ""))
+        self.assertNotIn("innerHTML", self.script)
+        self.assertNotIn("window.open", self.script)  # links leave through Api.open_link only
+        self.assertIn('http-equiv="Content-Security-Policy"', self.page)
+        self.assertIn("default-src 'none'", self.page)
 
 
 if __name__ == "__main__":

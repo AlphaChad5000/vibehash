@@ -213,6 +213,80 @@ class SupervisorTests(AppHome):
         self.assertFalse(app.running())
 
 
+class HoldTests(AppHome):
+    """The automatic pauses (Settings: while gaming, on battery, only when away): presence.hold decides, the Supervisor
+    stops the worker while there's a reason and starts it again once the reason has been gone for the cooldown."""
+
+    def test_the_decision(self):
+        from vibehash import presence
+        none = {"battery": None, "fullscreen": None, "idle_s": None}
+        self.assertIsNone(presence.hold({}, {"battery": True, "fullscreen": True, "idle_s": 0}))  # nothing chosen
+        self.assertEqual(presence.hold({"pause_on_battery": True}, {"battery": True}), "on battery")
+        self.assertIsNone(presence.hold({"pause_on_battery": True}, {"battery": False}))
+        self.assertIn("full-screen", presence.hold({"pause_when_fullscreen": True}, {"fullscreen": True}))
+        self.assertIsNone(presence.hold({"pause_when_fullscreen": True}, {"fullscreen": False}))
+        away = {"idle_only": True, "idle_minutes": 10}
+        self.assertIn("after 10 min", presence.hold(away, {"idle_s": 599}))
+        self.assertIsNone(presence.hold(away, {"idle_s": 600}))
+        self.assertIn("after 5 min", presence.hold({"idle_only": True, "idle_minutes": "lots"}, {"idle_s": 1}))
+        # a system that can't tell never holds mining off, whatever is chosen
+        self.assertIsNone(presence.hold({"pause_on_battery": True, "pause_when_fullscreen": True, "idle_only": True}, none))
+
+    def test_the_worker_is_held_off_and_comes_back_after_the_cooldown(self):
+        facts = {"fullscreen": True}
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, probe=lambda: dict(facts),
+                           hold_check_s=0.0, cooldown_s=60.0)
+        app.app_dir().mkdir(parents=True)
+        self.addCleanup(s.stop_worker, "test over")
+        s.tick(1000.0)  # nothing chosen: it mines
+        self.assertTrue(wait_for(s.worker_alive))
+        settings.save(pause_when_fullscreen=True)
+        s.tick(1001.0)  # a game full screen: held off, the worker stopped
+        self.assertIn("full-screen", s.held)
+        self.assertFalse(s.worker_alive())
+        self.assertEqual(app.read_state()["held"], s.held)
+        self.assertEqual(s.restarts, 0)  # held off isn't "stopped on its own"
+        facts["fullscreen"] = False
+        s.tick(1002.0)  # the game closed: still held for the cooldown, so a flicker doesn't reload the model
+        self.assertIsNotNone(s.held)
+        self.assertIsNone(s.child)
+        s.tick(1061.0)
+        self.assertIsNotNone(s.held)
+        s.tick(1062.0)  # a minute without the reason: mining again
+        self.assertIsNone(s.held)
+        self.assertTrue(wait_for(s.worker_alive))
+        self.assertIsNone(app.read_state()["held"])
+
+    def test_a_probe_that_fails_never_holds_mining_off(self):
+        settings.save(pause_on_battery=True)
+
+        def broken():
+            raise OSError("no such call here")
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, probe=broken, hold_check_s=0.0)
+        app.app_dir().mkdir(parents=True)
+        self.addCleanup(s.stop_worker, "test over")
+        s.tick(1000.0)
+        self.assertIsNone(s.held)
+        self.assertTrue(wait_for(s.worker_alive))
+
+    def test_your_own_pause_wins_over_a_reason_ending(self):
+        facts = {"battery": True}
+        settings.save(pause_on_battery=True)
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, probe=lambda: dict(facts),
+                           hold_check_s=0.0, cooldown_s=0.0)
+        app.app_dir().mkdir(parents=True)
+        self.addCleanup(s.stop_worker, "test over")
+        s.tick(1000.0)
+        self.assertEqual(s.held, "on battery")
+        app.order("pause")
+        s.tick(1001.0)
+        facts["battery"] = False
+        s.tick(1002.0)  # plugged in, but paused by hand: stays off
+        self.assertIsNone(s.held)
+        self.assertTrue(s.paused)
+        self.assertIsNone(s.child)
+
+
 class StatusTests(AppHome):
     def test_status_lines(self):
         self.assertIn("isn't running", app.status_text())

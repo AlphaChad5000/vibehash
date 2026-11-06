@@ -37,13 +37,16 @@ import threading
 import time
 from pathlib import Path
 
-from . import settings, window
+from . import presence, settings, window
 from .settings import WATCH_PORT as DEFAULT_PORT
 
 BEAT_S = 1.0  # how often the app writes its heartbeat
 STALE_S = 10.0  # a heartbeat older than this: the app isn't running
 STOP_GRACE_S = 25.0  # how long a worker gets to leave its round before it is killed
 BACKOFF_S = (5, 15, 60)  # between restarts of a worker that keeps stopping
+HOLD_CHECK_S = 5.0  # how often the automatic pauses look (presence.py: battery, a full-screen app, idle time)
+HOLD_COOLDOWN_S = 60.0  # how long a reason to hold off must stay gone before the worker starts again: a game
+#                          flicking out of full screen, or a mouse nudged, mustn't reload the model each time
 LABEL = "org.vibehash.app"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"  # start at login under the launcher: a Run value, no console flash
 ORDERS = ("pause", "resume", "stop", "avatar-on", "avatar-off")
@@ -157,7 +160,8 @@ class Supervisor:
     stopped on its own, and writes the app's state with a heartbeat."""
 
     def __init__(self, command: list[str], port: int, beat_s: float = BEAT_S, backoff=BACKOFF_S, grace_s: float = STOP_GRACE_S,
-                 companions: list[list[str]] | None = None, avatar: list[str] | None = None):
+                 companions: list[list[str]] | None = None, avatar: list[str] | None = None, probe=None,
+                 hold_check_s: float = HOLD_CHECK_S, cooldown_s: float = HOLD_COOLDOWN_S):
         self.command, self.port, self.beat_s, self.backoff, self.grace_s = list(command), port, beat_s, backoff, grace_s
         self.companions = [list(c) for c in companions or []]  # the window: started once, not kept alive
         self.friends: list[subprocess.Popen] = []
@@ -175,6 +179,13 @@ class Supervisor:
         self.worker_since: float | None = None
         self.next_start = 0.0  # when the worker may be started again (after it stopped on its own)
         self.events: list[str] = []
+        # The automatic pauses (Settings: on battery, while a full-screen app runs, only when away): `held` is the
+        # reason mining is held off now, apart from `paused`, which is the person's own Pause.
+        self.probe = probe or presence.facts
+        self.hold_check_s, self.cooldown_s = hold_check_s, cooldown_s
+        self.held: str | None = None
+        self._hold_checked = float("-inf")
+        self._clear_since: float | None = None
 
     # -- the child --
 
@@ -293,7 +304,10 @@ class Supervisor:
             self.paused = False
             self.next_start = 0.0
             self.say("resumed")
-        if not self.paused and not self.worker_alive():
+        self.update_hold(now)
+        if self.held and self.worker_alive():
+            self.stop_worker(f"held off: {self.held}")
+        if not self.paused and not self.held and not self.worker_alive():
             if self.child is not None:  # it stopped on its own: say so, and wait a little longer each time
                 code = self.child.returncode
                 self.child = None
@@ -306,6 +320,26 @@ class Supervisor:
                 self.start_worker()
         self.write_state(now)
         return True
+
+    def update_hold(self, now: float) -> None:
+        """Look (every hold_check_s) whether a setting says to hold mining off now, and let go once the reason has
+        been gone for cooldown_s. A probe or settings file that fails never holds mining off."""
+        if now - self._hold_checked < self.hold_check_s:
+            return
+        self._hold_checked = now
+        try:
+            why = presence.hold(settings.load(), self.probe() or {})
+        except Exception:  # noqa: BLE001  (an OS call that fails: mine as if the setting were off)
+            why = None
+        if why:
+            if why != self.held:
+                self.say(f"holding mining off: {why}")
+            self.held, self._clear_since = why, None
+        elif self.held:
+            self._clear_since = now if self._clear_since is None else self._clear_since
+            if now - self._clear_since >= self.cooldown_s:
+                self.say(f"carrying on ({self.held}: no longer)")
+                self.held, self._clear_since = None, None
 
     def run(self, stop=None) -> None:
         from .cli import _stop_like_ctrl_c
@@ -347,7 +381,8 @@ class Supervisor:
             state = {"beat": now if alive else 0, "started": self.started, "pid": os.getpid(), "paused": self.paused,
                      "watch": f"http://127.0.0.1:{self.port}/", "worker": {"running": self.worker_alive(),
                      "since": self.worker_since, "pid": child.pid if child else None, "restarts": self.restarts},
-                     "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events}
+                     "setup": self.setup, "wallet": self.wallet, "avatar": self.avatar_alive(), "events": self.events,
+                     "held": self.held}
             try:
                 tmp = state_path().with_suffix(".tmp")
                 tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
