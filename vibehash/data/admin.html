@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vibe Hash admin</title>
+<!-- The admin app's page (admin.py serves it on 127.0.0.1 with the nodes behind it). It reads only its own server:
+     /api/overview every few seconds (every node's view, the devices with their places, the jobs, the mempool), /api/blocks
+     for the ledger, and sends orders to /api/jobs/<id>/hold|release|cancel, /api/jobs/post, /api/review, /api/unlock,
+     /api/settings, each with the session key the server put in window.ADMIN. Everything a node says is put on the page
+     as text, never as markup. The globe is a canvas: the land as dots (globe.json), the devices where they connect
+     from, arcs to the node each reports to, and the validators linked to each other. -->
+<style>
+  :root { color-scheme: dark; --bg: #0b0d12; --panel: #141720; --rule: #232735; --ink: #e6e8ee; --ink-2: #9aa3b2; --gold: #f1b23c; --green: #5fe182; --red: #f05f55; --violet: #b47aff; --blue: #6cb8ff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); }
+  header .mark { width: 15px; height: 20px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  header h1 span { color: var(--ink-2); font-weight: 500; margin-left: 6px; }
+  header .state { margin-left: auto; color: var(--ink-2); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-2); flex: none; }
+  .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgb(95 225 130 / .5); animation: pulse 2s infinite; }
+  .dot.bad { background: var(--red); }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgb(95 225 130 / 0); } 100% { box-shadow: 0 0 0 0 rgb(95 225 130 / 0); } }
+  nav { display: flex; gap: 2px; padding: 8px 20px 0; border-bottom: 1px solid var(--rule); background: var(--panel); }
+  nav button { font: 600 13px system-ui, sans-serif; color: var(--ink-2); background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; cursor: pointer; margin-bottom: -1px; }
+  nav button[aria-selected="true"] { color: var(--ink); border-color: var(--gold); }
+  nav button i { font-style: normal; background: var(--rule); color: var(--ink); border-radius: 9px; padding: 0 6px; font-size: 11px; margin-left: 6px; }
+  nav button i.gold { background: var(--gold); color: #1a1407; }
+  main { flex: 1; padding: 16px 20px 30px; overflow: auto; }
+  section[hidden] { display: none; }
+  .btn { font: 600 12px system-ui, sans-serif; color: var(--ink); background: #222733; border: 1px solid var(--rule); border-radius: 7px; padding: 6px 11px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--ink-2); }
+  .btn.gold { background: var(--gold); color: #1a1407; border-color: var(--gold); }
+  .btn.green { border-color: var(--green); color: var(--green); }
+  .btn.danger { border-color: #5a2a28; color: var(--red); }
+  .btn.danger:hover { border-color: var(--red); }
+  .btn[disabled] { opacity: .4; cursor: default; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .card h3 { margin: 0 0 6px; font-size: 11px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .06em; }
+  .card .big { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card .sub { color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+  .globe-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; }
+  @media (max-width: 1000px) { .globe-wrap { grid-template-columns: 1fr; } }
+  #stage { position: relative; background: radial-gradient(ellipse at 50% 40%, #121626 0%, #0b0d12 70%); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; min-height: 520px; }
+  #globe { display: block; width: 100%; height: 100%; cursor: grab; }
+  #globe.drag { cursor: grabbing; }
+  #tip { position: absolute; pointer-events: none; background: rgb(20 23 32 / .96); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-size: 12px; max-width: 260px; display: none; z-index: 2; }
+  #tip b { display: block; font-size: 13px; }
+  #legend { position: absolute; left: 12px; bottom: 10px; font-size: 12px; color: var(--ink-2); display: flex; gap: 14px; }
+  #legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  #globe-note { position: absolute; right: 12px; bottom: 10px; font-size: 12px; color: var(--ink-2); text-align: right; max-width: 55%; }
+  .side .card { margin-bottom: 10px; }
+  .side .card:last-child { margin-bottom: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { color: var(--ink-2); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .mono { font: 12px ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+  .muted { color: var(--ink-2); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; font-weight: 600; background: var(--rule); color: var(--ink); white-space: nowrap; }
+  .tag.training { background: #2a2210; color: var(--gold); }
+  .tag.open { background: #15301f; color: var(--green); }
+  .tag.held { background: #3a1a18; color: var(--red); }
+  .tag.finished { color: var(--ink-2); }
+  .tag.review { background: #2a1f3f; color: var(--violet); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .spacer { flex: 1; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+  .toggle input { width: 18px; height: 18px; accent-color: var(--gold); }
+  input, textarea, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 7px; padding: 7px 10px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--gold); }
+  textarea { width: 100%; min-height: 220px; font: 12px/1.45 ui-monospace, Consolas, monospace; resize: vertical; }
+  label.field { display: block; margin-bottom: 10px; }
+  label.field span { display: block; color: var(--ink-2); font-size: 12px; margin-bottom: 4px; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .blocks { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; }
+  @media (max-width: 1000px) { .blocks { grid-template-columns: 1fr; } }
+  .block { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }
+  .block.fresh { animation: land 1.6s ease-out; }
+  @keyframes land { from { border-color: var(--gold); background: #1f1a10; } }
+  .block .head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .block .head b { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .block .txs { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; }
+  .block .txs li { padding: 3px 0; border-top: 1px dashed var(--rule); overflow-wrap: anywhere; }
+  .msg { font-size: 13px; margin: 8px 0; min-height: 18px; }
+  .msg.bad { color: var(--red); } .msg.good { color: var(--green); }
+  .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .nodes dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 8px 0 0; font-size: 13px; }
+  .nodes dt { color: var(--ink-2); } .nodes dd { margin: 0; overflow-wrap: anywhere; }
+  .settings { max-width: 760px; }
+  .settings .node-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 8px; }
+  footer { color: var(--ink-2); font-size: 11px; padding: 0 20px 14px; }
+</style>
+</head>
+<body>
+<header>
+  <svg class="mark" viewBox="0 0 3 4" aria-hidden="true"><path fill="#f1b23c" d="M0 0h1v3H0zM2 0h1v3H2zM1 3h1v1H1z"/></svg>
+  <h1>Vibe Hash <span>admin</span></h1>
+  <div class="state"><span class="dot" id="dot"></span><span id="state">connecting…</span></div>
+</header>
+<nav role="tablist">
+  <button role="tab" aria-selected="true" data-tab="globe">Globe</button>
+  <button role="tab" aria-selected="false" data-tab="jobs">Jobs<i id="n-jobs" hidden></i></button>
+  <button role="tab" aria-selected="false" data-tab="ledger">Ledger</button>
+  <button role="tab" aria-selected="false" data-tab="devices">Devices<i id="n-devices" hidden></i></button>
+  <button role="tab" aria-selected="false" data-tab="nodes">Nodes</button>
+  <button role="tab" aria-selected="false" data-tab="settings">Settings</button>
+</nav>
+<main>
+  <section id="tab-globe">
+    <div class="globe-wrap">
+      <div id="stage">
+        <canvas id="globe"></canvas>
+        <div id="tip"></div>
+        <div id="legend"><span><i style="background:var(--gold)"></i>device</span><span><i style="background:var(--violet)"></i>node</span><span><i style="background:var(--blue)"></i>validator</span></div>
+        <div id="globe-note"></div>
+      </div>
+      <div class="side">
+        <div class="card"><h3>Devices online</h3><div class="big" id="k-online">–</div><div class="sub" id="k-online-sub">registered in the last 10 minutes</div></div>
+        <div class="card"><h3>Jobs</h3><div class="big" id="k-jobs">–</div><div class="sub" id="k-jobs-sub"></div></div>
+        <div class="card"><h3>Chain</h3><div class="big" id="k-height">–</div><div class="sub" id="k-height-sub"></div></div>
+        <div class="card"><h3>Round</h3><div class="big" id="k-round">–</div><div class="sub" id="k-round-sub"></div></div>
+        <div class="card"><h3>Validators</h3><div class="big" id="k-validators">–</div><div class="sub" id="k-validators-sub"></div></div>
+        <div class="card"><h3>Mempool</h3><div class="big" id="k-mempool">–</div><div class="sub" id="k-mempool-sub">transactions waiting</div></div>
+        <div class="card"><h3>In circulation</h3><div class="big" id="k-supply">–</div><div class="sub" id="k-supply-sub">VIBE</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-jobs" hidden>
+    <div class="toolbar">
+      <label class="toggle"><input type="checkbox" id="review"> Review new jobs <span class="muted">(a job posted from now on waits until an admin confirms it)</span></label>
+      <span class="spacer"></span>
+      <button class="btn gold" id="show-post" type="button">Post a job</button>
+    </div>
+    <div class="msg" id="jobs-msg"></div>
+    <div class="card" id="post" hidden>
+      <h3>Post a job</h3>
+      <p class="muted" style="margin:0 0 10px">The spec as `post-job --spec` takes it (the starter below is `job template`'s; a fine-tune's comes from `train --base`). Its budget leaves the admin wallet now and comes back with `cancel`.</p>
+      <textarea id="post-spec" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:10px">
+        <label class="field" style="margin:0"><span>Budget, VIBE</span><input id="post-budget" type="number" min="1" step="any" value="100" style="width:140px"></label>
+        <button class="btn gold" id="post-go" type="button" style="align-self:end">Post it</button>
+        <button class="btn" id="post-hide" type="button" style="align-self:end">Close</button>
+      </div>
+    </div>
+    <div class="card" id="unlock-card" hidden>
+      <h3>Admin wallet</h3>
+      <div class="row">
+        <span class="mono" id="unlock-wallet"></span>
+        <input id="unlock-password" type="password" placeholder="password" autocomplete="off">
+        <button class="btn" id="unlock-go" type="button">Unlock</button>
+        <span class="muted">cancelling and posting jobs sign with it</span>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Job</th><th>Model</th><th>Owner</th><th>State</th><th class="n">Budget left</th><th class="n">Rounds</th><th>Score</th><th>Actions</th></tr></thead>
+      <tbody id="jobs"></tbody>
+    </table>
+  </section>
+
+  <section id="tab-ledger" hidden>
+    <div class="blocks">
+      <div>
+        <div class="toolbar"><b>Blocks</b><span class="muted" id="ledger-note">as they land</span><span class="spacer"></span><label class="toggle"><input type="checkbox" id="only-rounds"> only rounds that trained</label></div>
+        <div id="blocks"></div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:10px"><h3>Mempool</h3><div id="mempool" class="muted">nothing waiting</div></div>
+        <div class="card"><h3>Lately</h3><dl class="nodes" style="display:grid;grid-template-columns:max-content 1fr;gap:3px 12px;margin:0;font-size:13px"><dt>Block time</dt><dd id="l-block-time">–</dd><dt>Miners today</dt><dd id="l-day">–</dd><dt>Units today</dt><dd id="l-units">–</dd><dt>Subsidy</dt><dd id="l-subsidy">–</dd></dl></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-devices" hidden>
+    <div class="toolbar"><span class="muted" id="devices-note"></span></div>
+    <table>
+      <thead><tr><th>Device</th><th>Hardware</th><th class="n">Speed</th><th class="n">Memory</th><th>Last seen</th><th>From</th><th>Node</th></tr></thead>
+      <tbody id="devices"></tbody>
+    </table>
+  </section>
+
+  <section id="tab-nodes" hidden>
+    <div class="nodes" id="nodes"></div>
+    <h3 class="muted" style="margin:18px 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.06em">Validators on chain</h3>
+    <table><thead><tr><th>Validator</th><th>Address</th><th class="n">Stake</th><th>Votes</th><th>Where</th></tr></thead><tbody id="validators"></tbody></table>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="settings">
+      <div class="card" style="margin-bottom:12px">
+        <h3>Nodes</h3>
+        <p class="muted" style="margin:0 0 10px">The first is the one the jobs and the ledger come from; holds go to every node with a token. A token is what the node was started with (`vibehash node --admin-token`); leave it empty to keep the one saved.</p>
+        <div id="node-rows"></div>
+        <button class="btn" id="add-node" type="button">Add a node</button>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <h3>Wallet</h3>
+        <label class="field"><span>The admin wallet file (signs cancels and posts)</span><input id="set-wallet" style="width:100%"></label>
+        <div class="muted" id="set-wallet-note"></div>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <h3>Places</h3>
+        <label class="toggle"><input type="checkbox" id="set-geo"> Look up where devices connect from <span class="muted">(their addresses go to the lookup service, nothing else; off, the globe shows only the nodes)</span></label>
+      </div>
+      <div class="row"><button class="btn gold" id="save-settings" type="button">Save</button><span class="msg" id="settings-msg"></span></div>
+    </div>
+  </section>
+</main>
+<footer id="foot"></footer>
+
+<script>
+(function () {
+  "use strict";
+  var ADMIN = window.ADMIN || { session: "", nodes: [], version: "" };
+  var $ = function (id) { return document.getElementById(id); };
+  var SYN = 1e8;
+  var state = { data: null, primary: null, tip: null, blocks: {}, order: [], seen: {}, lastErr: null };
+
+  // --- talking to the server ---
+  function api(path, body) {
+    var opts = { headers: { "X-Admin-Session": ADMIN.session }, cache: "no-store" };
+    if (body !== undefined) { opts.method = "POST"; opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    return fetch(path, opts).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.statusText); return j; }); });
+  }
+
+  // --- helpers ---
+  function text(el, s) { el.textContent = s == null ? "" : String(s); }
+  function el(tag, cls, s) { var e = document.createElement(tag); if (cls) e.className = cls; if (s != null) e.textContent = String(s); return e; }
+  function vibe(syn) { if (syn == null) return "–"; var v = syn / SYN; return v.toLocaleString(undefined, { maximumFractionDigits: v < 10 ? 4 : 2 }); }
+  function shortAddr(a) { return a ? (a.length > 18 ? a.slice(0, 10) + "…" + a.slice(-6) : a) : "–"; }
+  function ago(t, now) { if (!t) return "–"; var s = Math.max(0, (now || Date.now() / 1000) - t); if (s < 60) return Math.round(s) + " s ago"; if (s < 3600) return Math.round(s / 60) + " min ago"; if (s < 86400) return (s / 3600).toFixed(1) + " h ago"; return Math.round(s / 86400) + " d ago"; }
+  function flops(f) { if (!f) return "–"; var u = ["", "K", "M", "G", "T", "P"], i = 0; while (f >= 1000 && i < u.length - 1) { f /= 1000; i++; } return f.toFixed(f < 10 ? 1 : 0) + " " + u[i] + "FLOP/s"; }
+  function mb(m) { if (!m) return "–"; return m >= 1024 ? (m / 1024).toFixed(m >= 10240 ? 0 : 1) + " GB" : m + " MB"; }
+  function hw(h) { if (!h) return "unknown"; return h.label || (h.vendor + " " + h.arch + (h.memory_gb ? " " + h.memory_gb + " GB" : "")); }
+  function host(url) { try { return new URL(url).host; } catch (e) { return url || "–"; } }
+  function placeName(p) { return p ? [p.city, p.country].filter(Boolean).join(", ") : ""; }
+  function score(j) { if (j.start == null && j.now == null) return "–"; var f = function (x) { return x == null ? "–" : (j.metric === "loss" ? x.toFixed(3) : (x * 100).toFixed(1) + "%"); }; return (j.metric === "loss" ? "loss " : "acc ") + f(j.start) + " → " + f(j.now); }
+
+  // --- tabs ---
+  document.querySelectorAll("nav button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll("nav button").forEach(function (x) { x.setAttribute("aria-selected", x === b ? "true" : "false"); });
+      document.querySelectorAll("main > section").forEach(function (s) { s.hidden = s.id !== "tab-" + b.dataset.tab; });
+      if (b.dataset.tab === "globe") resize();
+    });
+  });
+
+  // --- the overview ---
+  function refresh() {
+    api("/api/overview").then(function (d) {
+      state.data = d; state.lastErr = null;
+      $("dot").className = "dot on";
+      var n = d.nodes[0] || {};
+      text($("state"), (n.error ? "can't reach " + host(n.url) : host(n.url) + (n.admin ? "" : " (no admin token)")) + " · height " + (n.height == null ? "–" : n.height));
+      if (n.error) $("dot").className = "dot bad";
+      render(d);
+      if (d.primary !== state.primary) { state.primary = d.primary; state.tip = null; state.blocks = {}; state.order = []; state.seen = {}; renderBlocks(); }  // another chain: start the ledger over
+      if (n.height != null && n.height !== state.tip) { state.tip = n.height; loadBlocks(); }
+    }).catch(function (e) {
+      state.lastErr = e; $("dot").className = "dot bad"; text($("state"), "the admin server isn't answering: " + e.message);
+    });
+  }
+
+  function render(d) {
+    var now = d.now, nodes = d.nodes || [], n = nodes[0] || {}, jobs = d.jobs || [], devices = d.devices || [];
+    var online = devices.filter(function (x) { return x.online; }).length;
+    var minersOnline = d.miners ? d.miners.online : null;
+    text($("k-online"), online || minersOnline || 0);
+    text($("k-online-sub"), (online ? online + " registered in the last 10 minutes" : (minersOnline != null ? minersOnline + " in blocks of the last 10 minutes" : "none yet")) + (devices.length ? " · " + devices.length + " seen lately" : ""));
+    var training = jobs.filter(function (j) { return j.status === "training"; }).length, open = jobs.filter(function (j) { return j.status === "open"; }).length, held = jobs.filter(function (j) { return j.policy; }).length;
+    text($("k-jobs"), training + open);
+    text($("k-jobs-sub"), training + " training, " + open + " waiting their turn" + (held ? ", " + held + " held" : "") + (jobs.length - training - open ? ", " + (jobs.length - training - open) + " finished" : ""));
+    text($("k-height"), n.height == null ? "–" : n.height.toLocaleString());
+    text($("k-height-sub"), (n.chain_id || "") + (n.tip_time ? " · last block " + ago(n.tip_time, now) : "") + (n.halted ? " · HALTED: " + n.halted : ""));
+    var r = n.round || {};
+    text($("k-round"), r.no == null ? "idle" : r.no);
+    text($("k-round-sub"), r.no == null ? "no round open" : (r.phase || "") + (r.job_id ? " · " + r.job_id : "") + (r.registered ? " · " + r.registered + " registered" : ""));
+    var vals = d.validators || {}, voting = Object.keys(vals).filter(function (a) { return vals[a].votes; }).length;
+    text($("k-validators"), voting);
+    text($("k-validators-sub"), Object.keys(vals).length + " announced · " + nodes.filter(function (x) { return !x.error; }).length + " of " + nodes.length + " nodes answering");
+    text($("k-mempool"), (d.mempool || []).length);
+    var sup = n.supply && n.supply.vibe ? n.supply.vibe : null;
+    text($("k-supply"), sup ? Number(sup.circulating).toLocaleString(undefined, { maximumFractionDigits: 0 }) : "–");
+    text($("k-supply-sub"), sup ? "VIBE · " + Number(sup.total).toLocaleString(undefined, { maximumFractionDigits: 0 }) + " in all" : "VIBE");
+    var badge = $("n-jobs"); badge.hidden = !held && d.review !== true ? true : false; badge.className = held ? "gold" : ""; text(badge, held ? held + " held" : "review on");
+    $("n-devices").hidden = !online; text($("n-devices"), online);
+    renderJobs(d); renderDevices(d); renderNodes(d); renderMempool(d); renderSettings(d);
+    text($("foot"), "Vibe Hash " + (ADMIN.version || "") + " · admin app on this computer only · " + (d.geo && d.geo.enabled ? (d.geo.waiting ? d.geo.waiting + " places being looked up" : "places from ip-api.com, cached a month") : "place lookups off"));
+    globeData(d);
+  }
+
+  // --- jobs ---
+  function renderJobs(d) {
+    var tb = $("jobs"); tb.textContent = "";
+    var me = d.me || {}, admin = (d.nodes[0] || {}).admin;
+    $("review").checked = d.review === true; $("review").disabled = !admin;
+    $("unlock-card").hidden = !me.wallet || me.unlocked; text($("unlock-wallet"), me.wallet || "");
+    (d.jobs || []).forEach(function (j) {
+      var tr = document.createElement("tr");
+      var c1 = el("td"); c1.appendChild(el("div", "mono", j.id)); if (j.starter) c1.appendChild(el("div", "muted", "starter job (pays only new coins)")); tr.appendChild(c1);
+      tr.appendChild(el("td", null, j.model || "–"));
+      var c3 = el("td", "mono", j.owner ? shortAddr(j.owner) : (j.starter ? "nobody" : "–")); if (j.mine) c3.appendChild(el("span", "tag", "yours")); tr.appendChild(c3);
+      var c4 = el("td");
+      c4.appendChild(el("span", "tag " + (j.policy ? "held" : (j.status || "")), j.policy ? "held" : (j.status || "–")));
+      if (j.policy) { c4.appendChild(el("div", "muted", j.policy + (j.held && j.held.why ? ": " + j.held.why : "") + (j.held_on && j.held_on.length ? " · on " + j.held_on.map(host).join(", ") : ""))); }
+      else if (j.waiting) { c4.appendChild(el("div", "muted", j.waiting)); }
+      tr.appendChild(c4);
+      tr.appendChild(el("td", "n", vibe(j.escrow)));
+      tr.appendChild(el("td", "n", j.rounds_trained == null ? "–" : j.rounds_trained));
+      tr.appendChild(el("td", null, score(j)));
+      var c8 = el("td"), acts = el("div", "actions");
+      if (admin) {
+        if (j.policy) { var ok = el("button", "btn green", "Confirm"); ok.onclick = function () { order("/api/jobs/" + encodeURIComponent(j.id) + "/release", {}, "released " + j.id); }; acts.appendChild(ok); }
+        else if (j.status !== "finished") { var no = el("button", "btn danger", "Deny"); no.onclick = function () { var why = prompt("Hold " + j.id + " on every node. Why? (optional; only admins see this)"); if (why === null) return; order("/api/jobs/" + encodeURIComponent(j.id) + "/hold", { why: why }, "held " + j.id); }; acts.appendChild(no); }
+      }
+      if (j.mine && j.status !== "finished" && j.escrow > 0) { var cx = el("button", "btn danger", "Cancel"); cx.onclick = function () { if (confirm("Cancel " + j.id + "? Its unspent budget comes back to your wallet.")) order("/api/jobs/" + encodeURIComponent(j.id) + "/cancel", {}, "cancelled " + j.id); }; acts.appendChild(cx); }
+      c8.appendChild(acts); tr.appendChild(c8);
+      tb.appendChild(tr);
+    });
+    if (!(d.jobs || []).length) { var tr0 = document.createElement("tr"), td0 = el("td", "muted", "no jobs on this chain yet"); td0.colSpan = 8; tr0.appendChild(td0); tb.appendChild(tr0); }
+  }
+  function order(path, body, done) {
+    say($("jobs-msg"), "…", "");
+    api(path, body).then(function (r) {
+      var failed = (r.nodes || []).filter(function (x) { return !x.ok; });
+      say($("jobs-msg"), done + (failed.length ? "; but " + failed.map(function (x) { return host(x.url) + ": " + x.error; }).join("; ") : "") + (r.txid ? " (tx " + r.txid.slice(0, 12) + "…)" : ""), failed.length ? "bad" : "good");
+      refresh();
+    }).catch(function (e) { say($("jobs-msg"), e.message, "bad"); });
+  }
+  function say(where, s, cls) { text(where, s); where.className = "msg " + (cls || ""); }
+  $("review").addEventListener("change", function () { order("/api/review", { on: $("review").checked }, $("review").checked ? "review on: new jobs wait for a confirm" : "review off"); });
+  $("show-post").onclick = function () { $("post").hidden = false; if (!$("post-spec").value) api("/api/template").then(function (t) { $("post-spec").value = JSON.stringify(t, null, 2); }).catch(function () {}); };
+  $("post-hide").onclick = function () { $("post").hidden = true; };
+  $("post-go").onclick = function () {
+    var spec; try { spec = JSON.parse($("post-spec").value); } catch (e) { say($("jobs-msg"), "the spec isn't valid JSON: " + e.message, "bad"); return; }
+    order("/api/jobs/post", { spec: spec, budget: $("post-budget").value }, "posted the job");
+  };
+  $("unlock-go").onclick = function () { api("/api/unlock", { password: $("unlock-password").value }).then(function (r) { $("unlock-password").value = ""; say($("jobs-msg"), "wallet unlocked: " + r.address, "good"); refresh(); }).catch(function (e) { say($("jobs-msg"), e.message, "bad"); }); };
+  $("unlock-password").addEventListener("keydown", function (e) { if (e.key === "Enter") $("unlock-go").click(); });
+
+  // --- devices ---
+  function renderDevices(d) {
+    var tb = $("devices"); tb.textContent = ""; var devs = d.devices || [];
+    var placed = devs.filter(function (x) { return x.place; }).length;
+    text($("devices-note"), devs.length ? devs.length + " devices registered lately" + (placed < devs.length ? " · " + (devs.length - placed) + " with no place on the map (local networks, or not looked up" + (d.geo && !d.geo.enabled ? ": lookups are off" : "") + ")" : "") : ((d.nodes[0] || {}).admin ? "no device has registered since the node started" : "devices need a node with an admin token"));
+    devs.forEach(function (x) {
+      var tr = document.createElement("tr");
+      var c1 = el("td"); var dot = el("span", "dot" + (x.online ? " on" : "")); dot.style.display = "inline-block"; dot.style.marginRight = "6px"; c1.appendChild(dot); c1.appendChild(el("span", "mono", shortAddr(x.address))); tr.appendChild(c1);
+      tr.appendChild(el("td", null, hw(x.hardware)));
+      tr.appendChild(el("td", "n", flops(x.flops_per_sec)));
+      tr.appendChild(el("td", "n", mb(x.memory_mb)));
+      tr.appendChild(el("td", null, ago(x.when, d.now) + (x.round ? " · round " + x.round : "")));
+      var c6 = el("td"); c6.appendChild(el("div", null, placeName(x.place) || (x.ip ? "no place" : "–"))); if (x.ip) c6.appendChild(el("div", "mono muted", x.ip)); tr.appendChild(c6);
+      tr.appendChild(el("td", "muted", host(x.node)));
+      tb.appendChild(tr);
+    });
+  }
+
+  // --- nodes ---
+  function renderNodes(d) {
+    var box = $("nodes"); box.textContent = "";
+    (d.nodes || []).forEach(function (n, i) {
+      var c = el("div", "card"); var h = el("h3", null, host(n.url) + (i === 0 ? " · primary" : "")); c.appendChild(h);
+      var top = el("div", "row"); top.appendChild(el("span", "dot" + (n.error ? " bad" : " on"))); top.appendChild(el("b", null, n.error ? "unreachable" : (n.halted ? "halted" : "up"))); top.appendChild(el("span", "tag" + (n.admin ? " open" : ""), n.admin ? "admin" : "public only")); if (n.validator) top.appendChild(el("span", "tag review", "validator")); c.appendChild(top);
+      var dl = el("dl");
+      var rows = [["Version", n.version || "–"], ["Announces", n.announce && host(n.announce) !== host(n.url) ? host(n.announce) : "–"], ["Height", n.height == null ? "–" : n.height], ["Round", n.round && n.round.no != null ? n.round.no + " · " + n.round.phase + (n.round.job_id ? " · " + n.round.job_id : "") : "idle"], ["Address", n.address ? shortAddr(n.address) : "–"], ["Where", placeName(n.place) || "–"], ["Peers", (n.peers || []).length ? n.peers.map(function (p) { return host(p.url) + (p.alive ? "" : " (down)"); }).join(", ") : "none"], ["Mempool", n.mempool], ["Devices", n.devices], ["Review", n.review == null ? "–" : (n.review ? "on" : "off")]];
+      if (n.error) rows.unshift(["Error", n.error]); if (n.halted) rows.unshift(["Halted", n.halted]);
+      rows.forEach(function (r) { dl.appendChild(el("dt", null, r[0])); dl.appendChild(el("dd", null, r[1])); });
+      c.appendChild(dl); box.appendChild(c);
+    });
+    var tb = $("validators"); tb.textContent = ""; var vals = d.validators || {};
+    Object.keys(vals).sort(function (a, b) { return vals[b].stake - vals[a].stake; }).forEach(function (a) {
+      var v = vals[a], tr = document.createElement("tr");
+      tr.appendChild(el("td", null, host(v.url))); tr.appendChild(el("td", "mono", shortAddr(a))); tr.appendChild(el("td", "n", vibe(v.stake))); tr.appendChild(el("td", null, v.votes ? "yes" : "not yet")); tr.appendChild(el("td", null, placeName(v.place) || "–"));
+      tb.appendChild(tr);
+    });
+  }
+
+  // --- the ledger ---
+  function renderMempool(d) {
+    var box = $("mempool"); box.textContent = ""; var pool = d.mempool || [];
+    if (!pool.length) { box.className = "muted"; box.textContent = "nothing waiting"; }
+    else { box.className = ""; pool.forEach(function (t) { box.appendChild(el("div", "mono", t.kind + " " + vibe(t.amount) + " " + shortAddr(t.sender) + " → " + shortAddr(t.recipient) + (t.memo ? " · " + t.memo.slice(0, 40) : ""))); }); }
+    var m = d.miners || {}, n = d.nodes[0] || {};
+    text($("l-block-time"), m.block_time && m.block_time < 86400 ? Math.round(m.block_time) + " s" : "–"); text($("l-day"), m.day == null ? "–" : m.day); text($("l-units"), m.units_day == null ? "–" : m.units_day); text($("l-subsidy"), n.subsidy == null ? "–" : vibe(n.subsidy) + " VIBE a round");
+  }
+  function loadBlocks() {
+    if (state.tip == null) return;
+    var have = state.order.length ? state.order[0] : -1;
+    var from = have < 0 ? Math.max(0, state.tip - 24) : have + 1;
+    if (from > state.tip) return;
+    api("/api/blocks?from=" + from + "&to=" + state.tip).then(function (list) {
+      (list || []).forEach(function (b) { if (!(b.height in state.blocks)) { state.blocks[b.height] = b; state.order.unshift(b.height); state.seen[b.height] = have >= 0; } });
+      state.order.sort(function (a, b) { return b - a; }); state.order = state.order.slice(0, 60);
+      Object.keys(state.blocks).forEach(function (h) { if (state.order.indexOf(Number(h)) < 0) { delete state.blocks[h]; delete state.seen[h]; } });
+      renderBlocks();
+    }).catch(function (e) { text($("ledger-note"), "blocks: " + e.message); });
+  }
+  function renderBlocks() {
+    var box = $("blocks"); box.textContent = ""; var only = $("only-rounds").checked;
+    state.order.forEach(function (h) {
+      var b = state.blocks[h]; if (!b) return; var s = b.summary;
+      if (only && !(s && s.accepted_units > 0)) return;
+      var div = el("div", "block" + (state.seen[h] ? " fresh" : "")); state.seen[h] = false;
+      var head = el("div", "head"); head.appendChild(el("b", null, "#" + b.height)); head.appendChild(el("span", "muted", new Date(b.timestamp * 1000).toLocaleTimeString()));
+      if (s) { head.appendChild(el("span", "tag training", s.job_id)); head.appendChild(el("span", null, s.accepted_units + " units accepted")); var miners = Object.keys(s.worker_flops || {}).length; if (miners) head.appendChild(el("span", "muted", miners + " miners")); }
+      else head.appendChild(el("span", "muted", "no round"));
+      head.appendChild(el("span", "muted", (b.txs || []).length + " tx")); head.appendChild(el("span", "mono muted", "by " + shortAddr(b.proposer)));
+      if (b.certificate) head.appendChild(el("span", "tag open", "certified"));
+      div.appendChild(head);
+      var user = (b.txs || []).filter(function (t) { return ["transfer", "stake", "unstake", "post_job", "cancel_job", "validator", "evidence"].indexOf(t.kind) >= 0; });
+      var paid = (b.txs || []).filter(function (t) { return t.kind === "reward"; }).reduce(function (a, t) { return a + t.amount; }, 0);
+      if (user.length || paid) {
+        var ul = el("ul", "txs");
+        if (paid) ul.appendChild(el("li", "muted", "paid out " + vibe(paid) + " VIBE to miners"));
+        user.forEach(function (t) { ul.appendChild(el("li", "mono", t.kind + " " + vibe(t.amount) + " VIBE  " + shortAddr(t.sender) + " → " + shortAddr(t.recipient) + (t.memo && t.kind !== "post_job" ? " · " + t.memo.slice(0, 60) : (t.kind === "post_job" ? " · a job spec" : "")))); });
+        div.appendChild(ul);
+      }
+      box.appendChild(div);
+    });
+  }
+  $("only-rounds").addEventListener("change", renderBlocks);
+
+  // --- settings ---
+  var settingsDirty = false;
+  function renderSettings(d) {
+    if (settingsDirty || document.activeElement && $("tab-settings").contains(document.activeElement)) return;
+    var s = d.settings || { nodes: [], wallet: "", geo: true };
+    var rows = $("node-rows"); rows.textContent = "";
+    s.nodes.forEach(function (n) { addNodeRow(n.url, n.token); });
+    $("set-wallet").value = s.wallet || "";
+    text($("set-wallet-note"), d.me && d.me.address ? "address " + d.me.address + (d.me.balance != null ? " · " + vibe(d.me.balance) + " VIBE" : "") + (d.me.unlocked ? " · unlocked" : (d.me.encrypted ? " · locked" : "")) : "no wallet file yet");
+    $("set-geo").checked = !!s.geo;
+  }
+  $("set-wallet").addEventListener("input", function () { settingsDirty = true; });
+  $("set-geo").addEventListener("change", function () { settingsDirty = true; });
+  function addNodeRow(url, hasToken) {
+    var row = el("div", "node-row"); var u = el("input"); u.placeholder = "https://node.example.org:8545"; u.value = url || "";
+    var t = el("input"); t.type = "password"; t.placeholder = hasToken ? "token saved (leave empty to keep)" : "admin token (optional)"; t.autocomplete = "off";
+    var x = el("button", "btn", "Remove"); x.type = "button"; x.onclick = function () { row.remove(); settingsDirty = true; };
+    [u, t].forEach(function (i) { i.addEventListener("input", function () { settingsDirty = true; }); });
+    row.appendChild(u); row.appendChild(t); row.appendChild(x); $("node-rows").appendChild(row);
+  }
+  $("add-node").onclick = function () { addNodeRow("", false); settingsDirty = true; };
+  $("save-settings").onclick = function () {
+    var nodes = Array.prototype.map.call($("node-rows").children, function (r) { return { url: r.children[0].value, token: r.children[1].value }; }).filter(function (n) { return n.url.trim(); });
+    api("/api/settings", { nodes: nodes, wallet: $("set-wallet").value, geo: $("set-geo").checked }).then(function () { settingsDirty = false; say($("settings-msg"), "saved", "good"); refresh(); }).catch(function (e) { say($("settings-msg"), e.message, "bad"); });
+  };
+
+  // --- the globe ---
+  var canvas = $("globe"), ctx = canvas.getContext("2d"), tip = $("tip");
+  var land = [], markers = [], arcs = [], yaw = -1.2, pitch = 0.35, zoom = 1, dragging = null, idleSince = 0, dpr = 1, W = 0, H = 0;
+  fetch("/globe.json", { cache: "force-cache" }).then(function (r) { return r.json(); }).then(function (g) {
+    land = []; g.rows.forEach(function (row) { var lat = row[0] / 10; row[1].forEach(function (lon) { land.push(unit(lat, lon / 10)); }); });
+  }).catch(function () {});
+  function unit(lat, lon) { var la = lat * Math.PI / 180, lo = lon * Math.PI / 180, c = Math.cos(la); return [c * Math.sin(lo), Math.sin(la), c * Math.cos(lo)]; }
+  function rotate(p) {
+    var cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var x = p[0] * cy + p[2] * sy, z = -p[0] * sy + p[2] * cy, y = p[1];
+    return [x, y * cp - z * sp, y * sp + z * cp];
+  }
+  function resize() {
+    var stage = $("stage"); dpr = window.devicePixelRatio || 1; W = stage.clientWidth; H = stage.clientHeight || 520;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  }
+  window.addEventListener("resize", resize); resize();
+
+  function globeData(d) {
+    var groups = {}, devs = d.devices || [], nodes = d.nodes || [], vals = d.validators || {};
+    markers = []; arcs = [];
+    var nodeAt = {};
+    nodes.forEach(function (n) { if (n.place) { var m = { kind: "node", lat: n.place.lat, lon: n.place.lon, label: host(n.url), sub: placeName(n.place), n: 1, p: unit(n.place.lat, n.place.lon) }; markers.push(m); nodeAt[n.url] = m; } });
+    Object.keys(vals).forEach(function (a) { var v = vals[a]; if (v.place && !nodes.some(function (n) { return host(n.url) === host(v.url); })) { var m = { kind: "validator", lat: v.place.lat, lon: v.place.lon, label: host(v.url), sub: placeName(v.place) + " · " + vibe(v.stake) + " VIBE staked", n: 1, p: unit(v.place.lat, v.place.lon) }; markers.push(m); } });
+    devs.forEach(function (x) {
+      if (!x.place) return; var key = x.place.lat.toFixed(1) + "," + x.place.lon.toFixed(1) + "," + x.node;
+      var g = groups[key]; if (!g) { g = groups[key] = { kind: "device", lat: x.place.lat, lon: x.place.lon, n: 0, online: 0, label: placeName(x.place) || "somewhere", hw: {}, node: x.node, p: unit(x.place.lat, x.place.lon) }; markers.push(g); }
+      g.n++; if (x.online) g.online++; var h = hw(x.hardware); g.hw[h] = (g.hw[h] || 0) + 1;
+    });
+    markers.forEach(function (g) { if (g.kind === "device") { g.sub = g.n + (g.n === 1 ? " device" : " devices") + (g.online ? ", " + g.online + " online" : "") + " · " + Object.keys(g.hw).map(function (k) { return g.hw[k] + "× " + k; }).join(", "); var hub = nodeAt[g.node]; if (hub) arcs.push({ a: g.p, b: hub.p, kind: "device", w: Math.min(3, 0.8 + Math.log(g.n + 1)), live: g.online > 0 }); } });
+    var hubs = markers.filter(function (m) { return m.kind !== "device"; });
+    for (var i = 0; i < hubs.length; i++) for (var j = i + 1; j < hubs.length; j++) arcs.push({ a: hubs[i].p, b: hubs[j].p, kind: "node", w: 1, live: true });
+    arcs.forEach(function (a, i) { a.phase = (i * 0.37) % 1; a.speed = 0.12 + (i % 5) * 0.025; });
+    var noPlace = devs.filter(function (x) { return !x.place; }).length;
+    text($("globe-note"), (devs.length ? (devs.length - noPlace) + " of " + devs.length + " devices placed" + (noPlace ? " (" + noPlace + " on local networks or not looked up yet)" : "") : "no devices registered lately") + " · drag to turn, wheel to zoom");
+  }
+
+  function project(p, lift) {
+    var q = rotate(p), R = Math.min(W, H) * 0.42 * zoom, s = 1 + (lift || 0);
+    return { x: W / 2 + q[0] * R * s, y: H / 2 - q[1] * R * s, z: q[2], R: R };
+  }
+  function slerp(a, b, t) {
+    var dot = Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2])), om = Math.acos(dot);
+    if (om < 1e-6) return a; var sa = Math.sin((1 - t) * om) / Math.sin(om), sb = Math.sin(t * om) / Math.sin(om);
+    return [a[0] * sa + b[0] * sb, a[1] * sa + b[1] * sb, a[2] * sa + b[2] * sb];
+  }
+  function angle(a, b) { return Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]))); }
+
+  var hover = null, mouse = null;
+  function draw(ts) {
+    requestAnimationFrame(draw);
+    if (!W || !H) return;
+    var t = ts / 1000;
+    if (!dragging && t - idleSince > 2.5) yaw += 0.0025;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    var R = Math.min(W, H) * 0.42 * zoom, cx = W / 2, cy = H / 2;
+    // the sphere
+    var g = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.35, R * 0.1, cx, cy, R);
+    g.addColorStop(0, "#1b2033"); g.addColorStop(1, "#0d1019");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(241,178,60,.25)"; ctx.lineWidth = 1; ctx.stroke();
+    // the land
+    var dot = Math.max(1, R / 170);
+    for (var i = 0; i < land.length; i++) {
+      var q = rotate(land[i]); if (q[2] <= 0) continue;
+      var a = 0.25 + 0.55 * q[2];
+      ctx.fillStyle = "rgba(154,163,178," + a.toFixed(2) + ")";
+      ctx.fillRect(cx + q[0] * R - dot / 2, cy - q[1] * R - dot / 2, dot, dot);
+    }
+    // the arcs
+    arcs.forEach(function (arc) {
+      var steps = 48, h = 0.06 + 0.3 * angle(arc.a, arc.b) / Math.PI, pts = [];
+      for (var k = 0; k <= steps; k++) { var u = k / steps, p = slerp(arc.a, arc.b, u); pts.push(project(p, h * Math.sin(Math.PI * u))); }
+      ctx.lineWidth = arc.w; ctx.lineCap = "round";
+      for (var k2 = 1; k2 < pts.length; k2++) {
+        var p0 = pts[k2 - 1], p1 = pts[k2]; if (p0.z < -0.05 && p1.z < -0.05) continue;
+        var vis = Math.max(0, Math.min(1, (p0.z + p1.z) / 2 + 0.5));
+        ctx.strokeStyle = (arc.kind === "node" ? "rgba(180,122,255," : "rgba(241,178,60,") + (0.12 + 0.4 * vis).toFixed(2) + ")";
+        ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+      }
+      if (arc.live) {  // the comet: a point of light travelling along the arc
+        var u2 = (t * arc.speed + arc.phase) % 1, tail = 6;
+        for (var m = 0; m < tail; m++) {
+          var uu = u2 - m * 0.012; if (uu < 0) continue; var pp = project(slerp(arc.a, arc.b, uu), h * Math.sin(Math.PI * uu)); if (pp.z < -0.05) continue;
+          ctx.fillStyle = (arc.kind === "node" ? "rgba(220,190,255," : "rgba(255,230,160,") + ((1 - m / tail) * 0.9).toFixed(2) + ")";
+          ctx.beginPath(); ctx.arc(pp.x, pp.y, (arc.w + 1.2) * (1 - m / tail) + 0.4, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+    });
+    // the markers
+    hover = null; var best = 14;
+    markers.forEach(function (m) {
+      var p = project(m.p, 0); if (p.z < 0) { m.sx = null; return; }
+      m.sx = p.x; m.sy = p.y;
+      var r = m.kind === "device" ? 3 + 2.2 * Math.sqrt(m.n) : 5;
+      var col = m.kind === "device" ? "241,178,60" : m.kind === "node" ? "180,122,255" : "108,184,255";
+      if (m.kind === "device" ? m.online : true) { var pulse = (t * 0.9 + (m.lat + m.lon) / 90) % 1; ctx.strokeStyle = "rgba(" + col + "," + (0.55 * (1 - pulse)).toFixed(2) + ")"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(p.x, p.y, r + 2 + pulse * 14, 0, Math.PI * 2); ctx.stroke(); }
+      var glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 2.4); glow.addColorStop(0, "rgba(" + col + ",.55)"); glow.addColorStop(1, "rgba(" + col + ",0)");
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(p.x, p.y, r * 2.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "rgb(" + col + ")";
+      if (m.kind === "device") { ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); }
+      else { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(Math.PI / 4); ctx.fillRect(-r, -r, 2 * r, 2 * r); ctx.restore(); }
+      if (m.kind === "device" && m.n > 1) { ctx.fillStyle = "#1a1407"; ctx.font = "bold " + Math.max(9, r) + "px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(m.n, p.x, p.y + 0.5); }
+      if (mouse) { var dd = Math.hypot(mouse.x - p.x, mouse.y - p.y); if (dd < best) { best = dd; hover = m; } }
+    });
+    if (hover && mouse) { tip.style.display = "block"; tip.textContent = ""; tip.appendChild(el("b", null, hover.label)); tip.appendChild(document.createTextNode(hover.sub || "")); tip.style.left = Math.min(W - 270, mouse.x + 14) + "px"; tip.style.top = Math.max(4, mouse.y - 10) + "px"; }
+    else tip.style.display = "none";
+  }
+  requestAnimationFrame(draw);
+  canvas.addEventListener("mousedown", function (e) { dragging = { x: e.clientX, y: e.clientY, yaw: yaw, pitch: pitch }; canvas.classList.add("drag"); });
+  window.addEventListener("mousemove", function (e) {
+    var rect = canvas.getBoundingClientRect(); mouse = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    if (dragging) { yaw = dragging.yaw + (e.clientX - dragging.x) / (120 * zoom); pitch = Math.max(-1.3, Math.min(1.3, dragging.pitch + (e.clientY - dragging.y) / (160 * zoom))); idleSince = performance.now() / 1000; }
+  });
+  window.addEventListener("mouseup", function () { dragging = null; canvas.classList.remove("drag"); idleSince = performance.now() / 1000; });
+  canvas.addEventListener("mouseleave", function () { mouse = null; });
+  canvas.addEventListener("wheel", function (e) { e.preventDefault(); zoom = Math.max(0.7, Math.min(2.2, zoom * (e.deltaY > 0 ? 0.92 : 1.08))); idleSince = performance.now() / 1000; }, { passive: false });
+  canvas.addEventListener("touchstart", function (e) { var t0 = e.touches[0]; dragging = { x: t0.clientX, y: t0.clientY, yaw: yaw, pitch: pitch }; }, { passive: true });
+  canvas.addEventListener("touchmove", function (e) { if (!dragging) return; var t0 = e.touches[0]; yaw = dragging.yaw + (t0.clientX - dragging.x) / (120 * zoom); pitch = Math.max(-1.3, Math.min(1.3, dragging.pitch + (t0.clientY - dragging.y) / (160 * zoom))); idleSince = performance.now() / 1000; }, { passive: true });
+  canvas.addEventListener("touchend", function () { dragging = null; });
+
+  refresh();
+  setInterval(refresh, 5000);
+  setInterval(loadBlocks, 3000);
+})();
+</script>
+</body>
+</html>

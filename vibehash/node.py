@@ -56,7 +56,7 @@ import numpy as np
 
 from . import deepseek_graph as dsg
 from . import economics as econ
-from . import __version__, advice, filelock, hardware, netstats, receipts, supply, tasks
+from . import __version__, advice, filelock, hardware, netstats, nodeadmin, receipts, supply, tasks
 from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check_id
 from .client import MIN_CLIENT, OLD_CLIENT, NodeError, agent_version, parse_version  # the oldest releases it takes
 from .consensus import Engine, Timeouts, check_certificate, evidence_memo
@@ -195,14 +195,16 @@ class Node:
                  times: PhaseTimes | None = None, config: CoordinatorConfig | None = None, keep_rounds: int = 10,
                  limits: Limits | None = None, tls: ssl.SSLContext | None = None,
                  peers: list[str] = (), announce: str | None = None, timeouts: Timeouts | None = None,
-                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT):
+                 max_job_bytes: int = MAX_JOB_BYTES, bucket: dsg.Signer | None = None, min_client: str = MIN_CLIENT,
+                 admin_token: str | None = None):
         """`peers`: other nodes to connect to (validators find each other from the chain without them).
         `announce`: the address other nodes reach this one at, if it isn't the one it listens on.
         `max_job_bytes`: the biggest model (one checkpoint) a job may have for this node to relay its post_job.
         `bucket`: the storage DeepSeek jobs hand off through (deepseek_graph.Signer, its keys this node's): workers get
         links it signs for their units' own objects. None: this node can't run a DeepSeek job's prep (bucket_from_env
         reads one from the environment).
-        `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade."""
+        `min_client`: the oldest release whose workers may register (MIN_CLIENT); older ones are told to upgrade.
+        `admin_token`: what the admin app sends to reach /admin/* (nodeadmin.py); None: those routes don't exist."""
         if not parse_version(min_client):
             raise ValueError(f"min_client is a release such as {MIN_CLIENT}, not {min_client!r}")
         self.min_client = min_client
@@ -221,6 +223,11 @@ class Node:
             raise
         self.genesis = genesis
         self.coord = Coordinator(self.chain, keys, cfg, store=self.store)
+        # The operators' holds on jobs and their review setting (nodeadmin.py): the coordinator asks before it picks
+        # a round's job, and a release drops the "waits" line the hold left.
+        self.admin = nodeadmin.Admin(self.store, admin_token)
+        self.coord.policy = self.admin.reason
+        self.admin.changed = lambda job_id: self.coord.waiting.pop(job_id, None)
         self.bucket = bucket
         if bucket is not None:
             self.coord.prep_store = self.prep_store
@@ -1082,7 +1089,8 @@ class Node:
             self._blob_of[id(arr)] = bid
         return bid
 
-    def handle(self, kind: str, env: dict) -> dict:
+    def handle(self, kind: str, env: dict, ip: str | None = None) -> dict:
+        """A worker's signed message; `ip` is where it came from, noted for the admin app's map on a registration."""
         c = self.coord
         if self.halted:  # no round is open, nor will be: no receipts for messages no block will hold
             raise ProtocolError(f"this node has stopped: {self.halted_public}")
@@ -1107,6 +1115,8 @@ class Node:
             job = c.job(r.job_id)
             if kind == "register":
                 entry = c.register(addr, float(body["flops_per_sec"]), int(body["memory_mb"]), envelope=env)
+                if self.admin.enabled:
+                    self.admin.saw(addr, ip, body, r.round_no)
                 return {"ok": True, "receipt": self._receipt(kind, entry)}
             if kind == "assignment":
                 units = c.assignment(addr)
@@ -1438,6 +1448,8 @@ def _handler(node: Node):
                 self._send(200, result, content_type or ("application/octet-stream" if raw else "application/json"))
             except KeyError as e:
                 self._send(404, {"error": f"not found: {e}"})
+            except nodeadmin.Forbidden as e:
+                self._send(401, {"error": str(e)}, headers={"WWW-Authenticate": "Bearer"})
             except (ProtocolError, WireError, InvalidJob, BlobError, ValueError, TypeError, OverflowError) as e:
                 self._send(400, {"error": str(e)})
             except Busy as e:
@@ -1509,6 +1521,9 @@ def _handler(node: Node):
                     if record is None:
                         raise KeyError(f"no record for block {parts[1]}")
                     return record
+                if parts == ["admin", "overview"]:  # the operators' view (nodeadmin.py): 404 without a token
+                    node.admin.check(self.headers.get("Authorization"))
+                    return node.admin.overview(node)
                 raise KeyError(url.path)
 
             self._guard(route)
@@ -1556,7 +1571,17 @@ def _handler(node: Node):
                     node.submit_tx(tx)
                     return {"ok": True, "txid": tx.txid.hex()}
                 if worker:
-                    return node.handle(parts[0], body)
+                    return node.handle(parts[0], body, ip=nodeadmin.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For")))
+                if parts[:1] == ["admin"]:  # the operators' orders (nodeadmin.py): 404 without a token, 401 with the wrong one
+                    node.admin.check(self.headers.get("Authorization"))
+                    if parts == ["admin", "review"]:
+                        return node.admin.set_review(bool(body.get("on")), list(node.chain.state.jobs))
+                    if len(parts) == 4 and parts[1] == "jobs" and parts[3] in ("hold", "release"):
+                        if parts[2] not in node.chain.state.jobs:
+                            raise KeyError(f"no job {parts[2]}")
+                        if parts[3] == "hold":
+                            return node.admin.hold(parts[2], str(body.get("why") or ""))
+                        return node.admin.release(parts[2])
                 raise KeyError(self.path)
 
             self._guard(route)

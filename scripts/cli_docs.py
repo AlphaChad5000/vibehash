@@ -38,8 +38,11 @@ EXAMPLES: dict[str, list[str]] = {
                        "--bootstrap NODE_ADDR=10 --validator NODE_ADDR=http://192.168.1.20:8545 --alloc REQUESTER_ADDR=500"],
     "node": ["vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0",
              "vibehash node --genesis genesis.json --wallet bob.json --data-dir bob-data --host 0.0.0.0 "
-             "--announce http://203.0.113.7:8545 --peer http://192.168.1.20:8545"],
+             "--announce http://203.0.113.7:8545 --peer http://192.168.1.20:8545",
+             "VIBEHASH_ADMIN_TOKEN=SECRET vibehash node --genesis genesis.json --wallet node.json --data-dir node-data --host 0.0.0.0"],
     "tls cert": ["vibehash tls cert --host 192.168.1.20"],
+    "admin": ["vibehash admin", "vibehash admin --node https://node.vibehash.org --token SECRET --node http://10.0.0.5:8545",
+              "vibehash admin --browser"],
     "tls fingerprint": ["vibehash tls fingerprint node-cert.pem"],
     "worker": ["vibehash worker", "vibehash worker --device cuda:1 --wallet gpu1.json", "vibehash worker --job fruit-demo",
                "VIBEHASH_PASSWORD='choose-one' nohup vibehash worker --plain > worker.log 2>&1 &"],

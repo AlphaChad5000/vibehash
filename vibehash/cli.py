@@ -48,6 +48,8 @@ from .model import ModelSpec
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
 from .watch import DEFAULT_PORT as WATCH_PORT
 
+ADMIN_PORT = 7546  # the admin app's local server (admin.DEFAULT_PORT; not imported: the admin module is for admins only)
+
 
 def to_syn(text: str) -> int:
     try:
@@ -385,7 +387,7 @@ def cmd_node(a):
                     keep_rounds=a.keep_rounds, limits=limits, tls=context, peers=[normalise_url(p) for p in a.peer or []],
                     announce=normalise_url(a.announce) if a.announce else None, max_job_bytes=int(a.max_job_mb * 2**20),
                     bucket=bucket_from_env(),  # DeepSeek jobs' hand-offs, if $VIBEHASH_BUCKET_* are set
-                    min_client=a.min_client).start()
+                    min_client=a.min_client, admin_token=a.admin_token).start()
     except FolderInUse as e:
         sys.exit(f"error: {e}")
     if context:
@@ -583,6 +585,12 @@ def cmd_window(a):
     from . import window
 
     window.main(a)
+
+
+def cmd_admin(a):
+    from . import admin
+
+    admin.main(a)
 
 
 def _chosen_job(api: NodeClient, job: str, url: str) -> None:
@@ -2306,6 +2314,10 @@ def parser() -> argparse.ArgumentParser:
                    help=f"the oldest Vibe Hash release whose workers may register (default {MIN_CLIENT}); older ones are "
                         "told to upgrade, as are releases before 0.5.17, which name no version and can't follow "
                         "version 4 blocks")
+    p.add_argument("--admin-token", metavar="TOKEN", default=os.environ.get("VIBEHASH_ADMIN_TOKEN") or None,
+                   help="serve the operators' routes (/admin/*: hold and release jobs, the devices' addresses) to the "
+                        "admin app (`vibehash admin`) that sends this token; default $VIBEHASH_ADMIN_TOKEN; without "
+                        "one those routes don't exist")
     p.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this PEM certificate (see `tls cert`)")
     p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
 
@@ -2398,6 +2410,24 @@ def parser() -> argparse.ArgumentParser:
                        "mining. Without pywebview, or a web view on this Linux, the dashboard opens in the browser instead.")
     p.add_argument("--watch", type=int, metavar="PORT", default=WATCH_PORT, help=f"the feed's port (default {WATCH_PORT})")
     p.set_defaults(fn=cmd_window)
+
+    p = sub.add_parser("admin", help="the operators' window: a globe of where devices connect from, the jobs to confirm, "
+                       "deny, cancel or post, the ledger live, the devices and the nodes",
+                       description="The admin app (admin.py): a small server on this computer only, with the nodes behind "
+                       "it, and its page in a window of its own (pywebview, the `app` extra) or the browser. It asks each "
+                       "node's /admin/overview with the token that node was started with (`node --admin-token`; a node "
+                       "without one shows only what its public routes say). Confirm and deny are holds on every node it "
+                       "knows; cancel and post are transactions signed with the admin wallet, unlocked in the page. The "
+                       "nodes, their tokens, the wallet and whether to look up places are kept in config.json under "
+                       "\"admin\", from the page's Settings or these flags.")
+    p.add_argument("--node", action="append", metavar="URL", help="a node to watch (repeat for more; the first gives the "
+                   "jobs and the ledger); default: the ones saved, else the node setup chose")
+    p.add_argument("--token", metavar="TOKEN", help="the admin token for the --node(s) given (default: the one saved for "
+                   "that node, else $VIBEHASH_ADMIN_TOKEN; a saved node without a token of its own gets none)")
+    p.add_argument("--wallet", help="the admin wallet, for cancelling and posting jobs (default: as other commands)")
+    p.add_argument("--port", type=int, default=ADMIN_PORT, help=f"the local server's port (default {ADMIN_PORT})")
+    p.add_argument("--browser", action="store_true", help="open the page in the browser instead of a window")
+    p.set_defaults(fn=cmd_admin)
 
     p = sub.add_parser("cache", help="big model files kept for jobs: where, how big and why; `cache clear` removes them")
     p.add_argument("action", nargs="?", choices=["show", "clear", "sweep"], default="show",
