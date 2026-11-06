@@ -76,9 +76,10 @@ class PhaseLengthTests(unittest.TestCase):
 
 
 class PhaseEndTests(unittest.TestCase):
-    """A phase of a job's round lasts at least the node's own length for it and at most the job's (longer for a big
-    model, ten minutes at least for a DeepSeek prep unit), ending in between once everything it waits for is in
-    (Coordinator.all_in). So a round nobody was handed work in lasts the node's own round, not the job's."""
+    """A phase of a job's round lasts at most the job's length for it (longer for a big model, ten minutes at least for
+    a DeepSeek prep unit), ending sooner once everything it waits for is in (Coordinator.all_in); the round lasts at
+    least the node's own round, up to the mainnet block time. So a round nobody was handed work in lasts the node's own
+    round, not the job's."""
 
     def run_round(self, all_in, own: PhaseTimes, job: PhaseTimes) -> tuple[float, list[str]]:
         """Node._run_round with a coordinator whose phases are all in when `all_in()` says so."""
@@ -91,6 +92,7 @@ class PhaseEndTests(unittest.TestCase):
         node = SimpleNamespace(coord=c, blobs=SimpleNamespace(put_array=lambda a, d: None), times=own,
                                times_for=lambda j: job, stopping=threading.Event(), phase_ends=0.0)
         node._wait = lambda *a: Node._wait(node, *a)
+        node.shortest_round = lambda: Node.shortest_round(node)
         began = time.monotonic()
         self.assertTrue(Node._run_round(node))
         return time.monotonic() - began, steps
@@ -102,6 +104,22 @@ class PhaseEndTests(unittest.TestCase):
         self.assertEqual(steps, ["compute", "reveal", "verify"])
         self.assertGreaterEqual(took, own.round_s - 0.05, "never shorter than the node's own round")
         self.assertLess(took, own.round_s + 3, "not the job's 1,800 s")
+
+    def test_a_long_phase_is_the_most_it_waits_not_the_least(self):
+        """The Evo node's own verify is 180 s, for checkers that need it. With every check in (or none handed out), a
+        round waited all 180 s anyway: 208 s rounds, most of a mined round and 82% of the network's first day. Now it
+        ends once the work is in, and lasts the mainnet block time at least."""
+        own = PhaseTimes(register_s=0.1, compute_s=0.2, reveal_s=0.1, verify_s=30)  # (a 30 s verify: the Evo node's)
+        with mock.patch("vibehash.economics.MAINNET_BLOCK_S", 0.8):
+            took, steps = self.run_round(lambda: True, own, own)
+        self.assertEqual(steps, ["compute", "reveal", "verify"])
+        self.assertGreaterEqual(took, 0.8 - 0.05, "never shorter than the block time")
+        self.assertLess(took, 3, "not the node's 30 s verify")
+        with mock.patch("vibehash.economics.MAINNET_BLOCK_S", 0.8):  # a check still out: it gets the whole verify
+            ends = time.monotonic() + 1.5
+            took, _ = self.run_round(lambda: time.monotonic() > ends, own, own)
+        self.assertGreaterEqual(took, 1.5)
+        self.assertLess(took, 4, "and ends once it's in")
 
     def test_a_phase_waiting_for_work_runs_the_jobs_time(self):
         own, job = PhaseTimes(register_s=0, compute_s=0.1, reveal_s=0.1, verify_s=0.1), \
