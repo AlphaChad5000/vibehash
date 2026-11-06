@@ -220,8 +220,13 @@ def chain_bytes(entry) -> int:
 
 # The fast recipe's settings (the speed and multi-task tests): 64 antithetic pairs, 16 problems a round, 64 tokens,
 # sigma 1e-3, a cosine from 1e-3 to a quarter of it over the job, replay of 16 earlier correct answers, the anchor.
+# margin 0.5, measured across GPU kinds on vibehash-evo-1 (2026-11-06, Qwen3.5-0.8B, 512-token answers, every token
+# teacher-forced on an RTX 4070 SUPER): 96 honest members answered on RTX 4090s were at most 0.375 below the greedy
+# logit (mostly 0.125, one bf16 step; 0 of 96 over 0.5, 2 over 0.25), while 128 members claiming their twin's answers
+# (the cheap cheat) were at least 3.5 below, 46 or more tokens each. Same GPU kind: every honest gap exactly 0. Their
+# replay log-probabilities differed by at most 0.015 (lp_tol 0.05).
 V2_SETTINGS = dict(pairs=64, pairs_per_unit=8, problems=16, max_tokens=64, sigma=1e-3, lr=5e-4, lr_floor=0.25,
-                   rounds=12, replay=16, margin=0.1, lp_tol=0.05, decay=1 / 256, lenient=True)
+                   rounds=12, replay=16, margin=0.5, lp_tol=0.05, decay=1 / 256, lenient=True)
 # Jobs with `tasks` mix them in every round (Spec2.mix): spec2_for turns it on whenever a job names tasks.
 V2_MIX = True
 # lr 1e-3 and decay 1/64, the anchored step (es2's docstring, HANDOFF "The Evo collapse: cause and fix"): lr 4e-3 with
@@ -236,8 +241,13 @@ V2_MIX = True
 # another): every honest member's worst gap was exactly 0 (with transformers' path, as before, up to 0.5625, and 1.125
 # on the testnet). Answers that pay and that the model didn't write (the answer key's, or the model's with its answer
 # swapped for the key's) sat 0.125 or more below at their worst token, but for 14 of 1,439 on commonsense_qa that tie
-# exactly in bf16 (no margin tells those apart). So 0.1, under the smallest of the rest: for workers on one kind of GPU;
-# another kind rounds differently and needs measuring first.
+# exactly in bf16 (no margin tells those apart). So 0.1, under the smallest of the rest: for workers on one kind of GPU.
+# Another kind rounds differently (measured: honest gaps up to 0.375, above), so 0.5 since 2026-11-06. What that lets
+# through, measured on the same network: of 535 wrong multiple-choice answers with only their letter swapped for the
+# key's, 26.9% sit within 0.5 (4.9% within 0.1); a near-tie flipped honestly on another GPU and one flipped on purpose
+# look the same, so no margin tells them apart. It doesn't pay: workers are paid by accepted FLOPs, not rewards, and
+# the update follows the replay log-probabilities; a swap can at most make a key's answer a problem's replay target.
+# The cheat that pays, skipping work (claiming a twin's answers), sat 3.5 or more below in all 128 members tried.
 # lp_tol 0.05: workers and checkers score the replay answers on the same path (es_fast.score_items).
 V2_COMPUTE_S = 300
 
