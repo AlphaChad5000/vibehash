@@ -345,10 +345,14 @@ def python(executable: str | None = None, package: Path | None = None, frozen: b
     if not frozen:
         return Path(executable)
     package = package or Path(__file__).resolve().parent
-    for env in package.parents:
-        for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
-            if candidate.is_file():
-                return candidate
+    # Only the environment the package sits in: env/Lib/site-packages (Windows) or env/lib/pythonX.Y/site-packages,
+    # never any python further up the tree (/bin/python is the system's, not the app's).
+    sp = next((p for p in [package, *package.parents] if p.name == "site-packages"), None)
+    if sp is not None:
+        for env in (sp.parent.parent, sp.parent.parent.parent):
+            for candidate in (env / "Scripts" / "python.exe", env / "bin" / "python"):
+                if candidate.is_file():
+                    return candidate
     return Path(executable)
 
 

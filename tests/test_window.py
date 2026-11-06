@@ -289,6 +289,13 @@ class ApiTests(Home):
         (env / "Scripts").mkdir()
         (env / "Scripts" / "python.exe").write_text("")
         self.assertEqual(window.python("C:/VibeHash/VibeHash.exe", package=package, frozen=True), env / "Scripts" / "python.exe")
+        posix = Path(self.tmp.name) / "share" / "env"
+        (posix / "lib" / "python3.12" / "site-packages" / "vibehash").mkdir(parents=True)
+        (posix / "bin").mkdir()
+        (posix / "bin" / "python").write_text("")
+        self.assertEqual(window.python("/opt/VibeHash", package=posix / "lib" / "python3.12" / "site-packages" / "vibehash",
+                                       frozen=True), posix / "bin" / "python")
+        # not in an environment: the launcher itself, never some python further up the tree (/bin/python on Linux)
         nowhere = Path(self.tmp.name) / "loose" / "vibehash"
         nowhere.mkdir(parents=True)
         self.assertEqual(window.python("C:/X/VibeHash.exe", package=nowhere, frozen=True), Path("C:/X/VibeHash.exe"))
