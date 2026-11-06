@@ -884,8 +884,8 @@ def _evo_template(a, out: Path):
     its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
     from . import es_local, es_tasks
 
-    tasks = (list(es_tasks.NAMES) if a.tasks == "all" else list(es_tasks.CURATED) if a.tasks == "curated"
-             else [t.strip() for t in a.tasks.split(",") if t.strip()])
+    named = {"all": es_tasks.NAMES, "curated": es_tasks.CURATED, "vibe": es_tasks.VIBE}
+    tasks = (list(named[a.tasks]) if a.tasks in named else [t.strip() for t in a.tasks.split(",") if t.strip()])
     unknown = [t for t in tasks if t not in es_tasks.NAMES]
     if unknown or not tasks:
         sys.exit(f"unknown task {unknown[0] if unknown else '(none given)'}: the tasks are {', '.join(es_tasks.NAMES)}")
@@ -2469,7 +2469,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--evo", metavar="MODEL", help="an Evo job on MODEL that never ends, taking its tasks in turn: a "
                                                   "genesis starter job (genesis create --es --starter-job)")
     p.add_argument("--tasks", default="curated", help="with --evo: the tasks, comma-separated, curated (the default: "
-                   "the ones a small model learns from) or all")
+                   "the ones a small model learns from), vibe (the Qwen3.5-0.8B job's, for max_tokens 384-512) "
+                   "or all")
     p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
     p.set_defaults(fn=cmd_job_template)
 
