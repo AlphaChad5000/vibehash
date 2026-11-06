@@ -93,19 +93,45 @@ class MenuTests(unittest.TestCase):
         with mock.patch("builtins.input", lambda *a: ""):
             self.assertIsNone(menu._finetune())  # no file, nothing posted
 
-    def test_evo_hash_starts_a_local_evo_network_when_asked(self):
+    def test_evo_hash_joins_the_public_evo_network_or_starts_a_local_one(self):
         labels = [i.label for i in menu.items()]
         item = menu.items()[labels.index("Evo Hash")]
         self.assertIn("Mine", [title for title, group in menu.SECTIONS if item in group])
-        self.assertEqual(item.usage, "testnet --evo2")
+        public = ["worker", "--node", menu.settings.PUBLIC_EVO_NODE]
+        self.assertEqual(item.usage, " ".join(public))
         with no_wallet():
             page = menu.frame(labels.index("Evo Hash"), menu.Status(), "vibehash", 120, termui.ASCII)
-        self.assertIn("same as:  vibehash testnet --evo2", re.sub(r"\x1b\[[0-9;]*[mKJH]", "", page))
-        with mock.patch("builtins.input", lambda *a: "y"), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(item.ask(), [["testnet", "--evo2"]])
-        self.assertIn("the chain is the model", out.getvalue())
-        with mock.patch("builtins.input", lambda *a: ""), contextlib.redirect_stdout(io.StringIO()):
-            self.assertIsNone(item.ask())  # nothing started without a yes
+        self.assertIn("same as:  vibehash " + " ".join(public), re.sub(r"\x1b\[[0-9;]*[mKJH]", "", page))
+
+        def ask(answers, wallet="w.json", ready=True):
+            it = iter(answers)
+            with mock.patch("builtins.input", lambda *a: next(it)),                     mock.patch.object(menu.settings, "wallet_path", return_value=wallet),                     mock.patch.object(menu, "_evo_ready", return_value=ready),                     contextlib.redirect_stdout(io.StringIO()) as out:
+                return item.ask(), out.getvalue()
+
+        got, said = ask([""])  # Enter: the public network
+        self.assertEqual(got, [public])
+        self.assertIn("the chain is the model", said)
+        self.assertIn("Qwen3.5-0.8B", said)
+        self.assertEqual(ask(["1"], wallet=None)[0], [["wallet", "create"], public])  # a worker needs a wallet
+        self.assertIsNone(ask(["1"], ready=False)[0])  # no PyTorch or transformers: nothing started
+        self.assertEqual(ask(["2", "y"])[0], [["testnet", "--evo2"]])
+        self.assertIsNone(ask(["2", ""])[0])  # the test network needs a yes
+        self.assertIsNone(ask(["q"])[0])
+
+    def test_evo_ready_asks_before_installing_transformers(self):
+        from importlib import util
+        have = {"torch": object(), "transformers": None, "huggingface_hub": object()}
+        with mock.patch.object(util, "find_spec", lambda name: have.get(name)),                 mock.patch.object(menu.subprocess, "call", return_value=0) as pip,                 contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch("builtins.input", lambda *a: ""):
+                self.assertFalse(menu._evo_ready())
+            pip.assert_not_called()
+            with mock.patch("builtins.input", lambda *a: "y"):
+                self.assertTrue(menu._evo_ready())
+            self.assertIn("vibehash[evo]", pip.call_args[0][0])
+        have["torch"] = None
+        with mock.patch.object(util, "find_spec", lambda name: have.get(name)),                 contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(menu._evo_ready())
+        self.assertIn("Install GPU support", out.getvalue())
 
     def test_nothing_is_sent_without_a_yes(self):
         answers = iter([checksummed(FRIEND), "2.5", ""])

@@ -99,13 +99,39 @@ def _deepseek() -> list[list[str]] | None:
 
 
 def _evo() -> list[list[str]] | None:
-    print("Evo Hash: mining by evolution, the chain is the model. It runs a test network on this computer, a node and\n"
-          "two miners, that trains Qwen2.5-0.5B-Instruct by evolution strategies on one task after another (Countdown\n"
-          "puzzles, arithmetic, science questions): each round tries 128 nudged copies of the whole model in twin pairs,\n"
-          "and its block keeps only their seeds and scores, about 2 KB from which anyone can work the model out again.\n"
-          "It needs a graphics card with PyTorch (Install GPU support) and `pip install vibehash[evo]`. The model comes\n"
-          "from your Hugging Face cache, or is downloaded once (about 1 GB). Ctrl+C stops it; running it again carries on.")
-    return [["testnet", "--evo2"]] if _yes("Start it?") else None
+    print("Evo Hash: mining by evolution, the chain is the model. Each round tries 128 nudged copies of the whole model\n"
+          "in twin pairs, scores them on problems, and its block keeps only their seeds and scores, from which anyone\n"
+          "can work the model out again.\n\n"
+          f"  1. Join the public Evo network ({settings.PUBLIC_EVO_NODE}): it tunes Qwen3.5-0.8B on 16 kinds of\n"
+          "     problem (math, instructions, science, common sense) to beat the official model. You need an NVIDIA\n"
+          "     graphics card with 8 GB or more; the model (about 1.7 GB) downloads once. A new wallet earns its first\n"
+          "     5 VIBE as stake, from work staked miners check.\n"
+          "  2. A test network on this computer: a node and two miners tuning Qwen2.5-0.5B-Instruct, nothing shared.")
+    choice = input("Which? [1/2, Enter for 1, q to cancel] ").strip().lower()
+    if choice in ("q", "n", "no"):
+        return None
+    if choice == "2":
+        return [["testnet", "--evo2"]] if _yes("Start the test network?") else None
+    if not _evo_ready():
+        return None
+    commands = [] if settings.wallet_path() is not None else [["wallet", "create"]]  # (worker needs one)
+    return commands + [["worker", "--node", settings.PUBLIC_EVO_NODE]]
+
+
+def _evo_ready() -> bool:
+    """Whether this Python has what an Evo miner runs on (PyTorch, transformers); offers to install transformers."""
+    from importlib.util import find_spec
+    if find_spec("torch") is None:
+        print("Evo Hash needs PyTorch for your graphics card first: More commands > Install GPU support, then come back.")
+        return False
+    if find_spec("transformers") is None or find_spec("huggingface_hub") is None:
+        if not _yes('Evo Hash needs transformers (pip install "vibehash[evo]"). Install it now?'):
+            return False
+        code = subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "vibehash[evo]"])
+        if code != 0:
+            print(f"pip stopped with exit code {code}.")
+            return False
+    return True
 
 
 def _cancel() -> list[list[str]] | None:
@@ -148,8 +174,8 @@ MORE = (
 SECTIONS = [
     ("Mine", [
         Item("Start mining", "earn VIBE with this computer", ("worker",)),
-        Item("Evo Hash", "mine by evolution: the chain is the model (on this computer)", ask=_evo,
-             usage="testnet --evo2"),
+        Item("Evo Hash", "mine by evolution on the public Qwen3.5 network", ask=_evo,
+             usage=f"worker --node {settings.PUBLIC_EVO_NODE}"),
         Item("My balance", "what you've earned and staked", ("balance",)),
         Item("What can this computer train on?", "its graphics cards and processor", ("devices",)),
         Item("Check this computer", "a real training test: is it ready, what can it take", ("selftest",)),
