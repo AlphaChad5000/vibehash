@@ -31,4 +31,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[finetune,evo,app]" pip-audit
       - name: Audit what was installed
-        run: python -m pip_audit --strict --progress-spinner off --desc on
+        # Not --strict: that also fails on a package it can't look up, and vibehash itself (built here from the
+        # checkout) is one. A known vulnerability in anything installed still fails the step.
+        run: python -m pip_audit --progress-spinner off --desc on
