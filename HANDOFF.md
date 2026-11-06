@@ -133,7 +133,20 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
-**Release 0.5.22 (2026-11-06): the miner opens on the Evo scene on an Evo network.** The owner found the menu's Evo
+**The public Evo node's missing datasets (2026-11-06, deploy/setup-node.sh; no PyPI release needed).** For its first
+26 blocks `vibehash-evo-1` accepted no Evo work: at reveal the node re-scores every answer with the task's own
+questions (`es2_rounds.rescore`, es_tasks), which come from Hugging Face datasets, and setup-node.sh installed plain
+`vibehash`, without `datasets`, so every reveal failed with `TaskUnavailable` (in the miners' logs as `POST /reveal:
+TaskUnavailable`). Fixed on the droplet by hand (pip install datasets, `HF_HOME=/var/lib/vibehash-evo/hf` in
+`/etc/vibehash-evo/env`, the VIBE tasks fetched, the node restarted); block 27 then accepted 4 units, the first. The
+script now does the same for any node whose genesis has `"es": true`, and its "points at this server" check accepts a
+name behind Cloudflare's proxy (its `/cdn-cgi/trace` answers), so re-running it upgrades the proxied nodes again.
+Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the proxy.
+**Measured the same day: Evo checks fail across GPU kinds.** The owner's RTX 4070 SUPER checking the RunPod pod's
+units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
+block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
+
+**Release 0.5.22 (2026-11-06, merged and tagged, its PyPI publish cancelled at the owner's request): the miner opens on the Evo scene on an Evo network.** The owner found the menu's Evo
 Hash "brings you to the Vibe Hash terminal": the miner's screen showed the usual drill until the Evo job loaded
 (datasets and model, a minute or two on a new machine). `cli.evo_network` reads the node's `/genesis` (`"es": true`)
 and `_mine` passes `evo=` to `minerui.MinerDashboard`, as `testnet --evo2` already did. Test: `tests/test_evo_view.py`.
