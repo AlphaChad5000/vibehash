@@ -562,6 +562,21 @@ class WorkerClient:
             return self.backend.memory_mb() or hardware.total_memory_mb()
         return hardware.total_memory_mb()
 
+    def _measured(self, job: TrainingJob, flops: int, seconds: float) -> None:
+        """An Evo job's speed, as this computer last did its units (with a fifth to spare, for uploads and a slower
+        round), in place of the 2e12 FLOP/s every GPU said: a 4070 answers at about 7.5e12, so it was handed a quarter
+        of what it could do, and with three workers a quarter of each round's pairs went to nobody. Never less than
+        that default: a slow round (the model rebuilt from the chain first) mustn't claim too little to be handed a
+        unit, and so never measure again. The node still ramps what it hands out by what each worker delivered
+        (Coordinator.capacity)."""
+        if self.flops_override or flops <= 0 or seconds <= 0:
+            return
+        self.speed[job.job_id] = max(self._es_default(), 0.8 * flops / seconds)
+        self.stats.flops_per_sec = self.speed[job.job_id]
+
+    def _es_default(self) -> float:
+        return 2e12 if self.backend.name != "cpu" else 2e10
+
     def job(self, job_id: str) -> TrainingJob:
         if job_id not in self.jobs:
             info = self.node.get(f"/job/{job_id}")
@@ -579,7 +594,7 @@ class WorkerClient:
                 job.attach_data(load_dataset(path), sha)
             if job.es:  # its base model, loaded on the GPU by why_not (es.runtime); no dataset
                 self.jobs[job_id] = job
-                self.speed[job_id] = self.flops_override or (2e12 if self.backend.name != "cpu" else 2e10)
+                self.speed[job_id] = self.flops_override or self._es_default()
                 log.info("job %s trains %s by evolution strategies on %s", job_id, job.spec.repo, self.es.device())
                 return job
             if job.deepseek:  # its model files come unit by unit, through the model store (deepseek_client.py)
@@ -689,7 +704,12 @@ class WorkerClient:
         st.progress = termui.parse_progress(s.get("progress"))
         self.seen = (rnd, phase)
         if rnd is None or phase in ("register", "compute"):
-            if self.checking is not None and self.checking.is_alive():  # an earlier round's, stopping at its next segment
+            # An earlier round's checks, stopping at their next segment, are waited for before this round's work: but
+            # not before registering for it (the phase is 3 s, and an Evo check can take a minute: workers missed
+            # every other round's registration), unless registering first loads a job (a model on the GPU they use).
+            # _tidy leaves the files alone while they run.
+            if (self.checking is not None and self.checking.is_alive()
+                    and (phase != "register" or s.get("job_id") not in self.jobs)):
                 self.checking.join()
             if phase != "compute":  # (before this round has files of its own: pruning empties the folder)
                 self._tidy(rnd)
@@ -778,17 +798,20 @@ class WorkerClient:
                 units = []
             elif units and job.es:  # an ES round: answers committed to, rewards and all (es_client.py)
                 st.busy = True
-                t0 = time.perf_counter()
+                t0, done_flops = time.perf_counter(), 0
                 try:
                     for u in self.es.compute(rnd, job, units, given):
                         st.committed += 1
                         st.units += 1
                         st.training_flops += u.flops
+                        done_flops += u.flops
                         self.record.add(rnd, committed=1)
                         self.record.append(rnd, "_unit_flops", u.flops)  # (so its line can count the units accepted)
                 finally:
                     st.busy = False
-                    self.record.add(rnd, train_s=time.perf_counter() - t0, trained=len(units))
+                    took = time.perf_counter() - t0
+                    self.record.add(rnd, train_s=took, trained=len(units))
+                    self._measured(job, done_flops, took)
                 st.activity = "Evo answers committed; waiting for the reveal"
                 units = []
             elif units and job.deepseek:  # a DeepSeek training round: its records, once
