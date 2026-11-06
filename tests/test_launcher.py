@@ -223,13 +223,20 @@ class MainTests(unittest.TestCase):
             wallet = Path(tmp) / ".vibehash" / "wallet.json"  # not the launcher's: must stay
             wallet.parent.mkdir()
             wallet.write_text("{}")
-            links = L.shortcut_paths()
+            links = L.shortcut_paths() + [Path(tmp) / "OneDrive" / "Desktop" / "Vibe Hash.lnk"]
             for link in links:
                 link.parent.mkdir(parents=True, exist_ok=True)
                 link.write_text("")
+            (folder / "shortcuts.txt").write_text(f"{links[-1]}\n")  # the one the shell put somewhere else
             L.register(folder / L.EXE, folder, winreg=self.winreg)
-            with mock.patch.object(L.platform, "system", return_value="Windows"):
+            python = L.env_python(folder / "env", "Windows")
+            python.parent.mkdir(parents=True)
+            python.write_text("")
+            ran = []
+            with mock.patch.object(L.platform, "system", return_value="Windows"), \
+                    mock.patch.object(L.subprocess, "call", side_effect=lambda cmd, **kw: ran.append(cmd) or 0):
                 self.assertEqual(L.main(["--uninstall"]), 0)
+            self.assertEqual([c[-2:] for c in ran], [["app", "stop"], ["startup", "off"]])  # a running app is stopped first
             self.assertFalse(folder.exists())
             self.assertTrue(wallet.exists())
             self.assertFalse(any(link.exists() for link in links))
@@ -250,23 +257,24 @@ class MainTests(unittest.TestCase):
         download.parent.mkdir()
         download.write_bytes(b"MZ launcher")
         ran = []
-        run = lambda cmd, **kw: ran.append(cmd) or mock.Mock(returncode=0)  # noqa: E731
+        made = [tmp / "Programs" / "Vibe Hash.lnk", tmp / "OneDrive" / "Desktop" / "Vibe Hash.lnk"]  # where the shell says
+        run = lambda cmd, **kw: ran.append(cmd) or mock.Mock(returncode=0, stdout="".join(f"{p}\n" for p in made))  # noqa: E731
         installed = L.install_self(folder, "Windows", exe=download, run=run, winreg=self.winreg)
         self.assertEqual(installed, folder / "VibeHash.exe")
         self.assertEqual(installed.read_bytes(), b"MZ launcher")
+        self.assertFalse((folder / "VibeHash.exe.new").exists())  # copied beside, then swapped in
         self.assertEqual(ran[0][:2], ["powershell", "-NoProfile"])  # the shortcuts, through the shell's COM object
-        self.assertIn("Vibe Hash.lnk", ran[0][-1])
+        self.assertIn("GetFolderPath('Desktop')", ran[0][-1])  # the real desktop (OneDrive's, say), not a guess
         self.assertIn(str(installed), ran[0][-1])
+        self.assertEqual((folder / "shortcuts.txt").read_text().splitlines(), [str(p) for p in made])  # remembered for uninstall
         entry = self.winreg.keys[L.UNINSTALL_KEY]
         self.assertEqual(entry["DisplayName"], "Vibe Hash")
         self.assertEqual(entry["UninstallString"], f'"{installed}" --uninstall')
         self.assertEqual(entry["DisplayVersion"], L.VERSION)
-        # the installed copy itself: nothing to copy, no hand-over; the shortcuts are checked, the entry refreshed
-        for link in L.shortcut_paths():
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.write_text("")
+        # the installed copy itself: nothing to copy, no hand-over, the shortcuts not made again (a deleted one stays
+        # deleted), the entry refreshed
         self.assertIsNone(L.install_self(folder, "Windows", exe=installed, run=run, winreg=self.winreg))
-        self.assertEqual(len(ran), 1)  # shortcuts there already: not made again
+        self.assertEqual(len(ran), 1)
         self.assertIsNone(L.install_self(folder, "Linux", exe=download, run=run, winreg=self.winreg))  # Windows only
         with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER_DIR": str(folder)}), mock.patch.object(L, "install_self", return_value=installed), \
                 mock.patch.object(L.subprocess, "Popen") as popen, mock.patch("sys.stdout", new_callable=io.StringIO):

@@ -36,7 +36,8 @@ class Home(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": self.tmp.name, "DISPLAY": ":0"})
+        self.env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": self.tmp.name, "DISPLAY": ":0",
+                                              "APPDATA": self.tmp.name + "/AppData"})  # never this machine's Startup folder
         self.env.start()
         self.addCleanup(self.env.stop)
         os.environ.pop("VIBEHASH_LAUNCHER", None)

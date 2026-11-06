@@ -293,6 +293,7 @@
                 gpu: "installing PyTorch for your graphics card (up to 3 GB: a few minutes)…", ready: "starting the worker…", mining: "mining" };
   function appWords() {
     if (!appSetup) return "the app isn't running";
+    if (appSetup.step === "failed") return "setup stopped: " + (appSetup.why || "see app.log");
     if (appSetup.step !== "mining") return SETUP[appSetup.step] || appSetup.step;
     return appPaused ? "paused" : "the worker is starting…";
   }
@@ -303,7 +304,8 @@
       appPaused = !!(s.running && s.paused);
       $("controls").hidden = !s.running;
       $("pause").textContent = appPaused ? "Resume" : "Pause";
-      $("pause").disabled = !appSetup || appSetup.step !== "mining";
+      $("pause").disabled = $("stop").disabled = !appSetup || appSetup.step !== "mining";  // nothing reads orders until setup is done
+      if (!s.running && s.setup && s.setup.step === "failed") appSetup = s.setup;  // the app left: say why
       if (appPaused) { $("dot").className = "dot busy"; $("state").textContent = "paused"; }
       var w = s.wallet || {};
       if (w.address && $("address").textContent === "–") { $("address").textContent = w.address; $("wallet-note").textContent = w.path || ""; }
@@ -316,6 +318,7 @@
     bar.firstElementChild.style.width = Math.round(100 * f) + "%";
     bar.className = "progress" + (appSetup && appSetup.step === "gpu" ? " busy" : "");
     if (appSetup && appSetup.step === "mining") $("setup-sub").textContent = "Ready. Mining has started.";
+    if (appSetup && appSetup.step === "failed") { $("setup-text").textContent = "setup stopped: " + (appSetup.why || "see app.log"); $("setup-sub").textContent = "Start Vibe Hash again to retry; the log in the Vibe Hash folder has the details."; }
   }
   function order(word) { if (api) api.order(word).then(appState).catch(function () {}); }
   $("pause").addEventListener("click", function () { order(appPaused ? "resume" : "pause"); });

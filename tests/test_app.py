@@ -360,12 +360,17 @@ class CommandTests(AppHome):
             app.main(SimpleNamespace(acmd="stop"))
         self.assertIn("stopped", out.getvalue())
 
-    def test_a_second_app_is_refused(self):
+    def test_a_second_app_opens_the_running_ones_window_or_is_refused(self):
         app.app_dir().mkdir(parents=True)
         app.state_path().write_text(json.dumps({"beat": time.time(), "started": time.time()}))
         with self.assertRaises(SystemExit) as ctx:
-            app.main(SimpleNamespace(acmd=None))
+            app.main(SimpleNamespace(acmd=None, no_window=True))
         self.assertIn("already running", str(ctx.exception))
+        with mock.patch.object(app.subprocess, "call", return_value=0) as call, mock.patch("sys.stdout", new_callable=io.StringIO), \
+                self.assertRaises(SystemExit) as ctx:  # the Start menu, a second double-click: the way back in is the window
+            app.main(SimpleNamespace(acmd=None, watch=7000))
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(call.call_args.args[0][-2:], ["--watch", "7000"])
 
 
 if __name__ == "__main__":

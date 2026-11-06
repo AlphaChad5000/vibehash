@@ -452,7 +452,7 @@ def startup_on(system: str | None = None, run=None, avatar: bool = False) -> Pat
     if system == "Windows" and launcher and winreg is not None:
         # The launcher is a windowed program: a Run value starts it with no console flashing by, as a Startup-folder
         # .cmd would (which an earlier version wrote: removed here).
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             winreg.SetValueEx(k, "VibeHash", 0, winreg.REG_SZ, f'"{exe}" {" ".join(args)}')
         path.unlink(missing_ok=True)
         return Path("HKCU") / RUN_KEY / "VibeHash"
@@ -535,8 +535,14 @@ def main(a) -> None:
             print(f"won't start when you log in (removed {startup_off()})")
     else:
         if running():
-            sys.exit(f"an app is already running (since {time.strftime('%H:%M', time.localtime(read_state()['started']))}); "
-                     "`vibehash app status` says what it is doing, `vibehash app stop` stops it")
+            since = time.strftime('%H:%M', time.localtime(read_state()['started']))
+            if getattr(a, "no_window", False):
+                sys.exit(f"an app is already running (since {since}); `vibehash app status` says what it is doing, "
+                         "`vibehash app stop` stops it")
+            # The Start menu, a second double-click: the way back into the running one is its window
+            port = a.watch if getattr(a, "watch", None) else DEFAULT_PORT
+            print(f"an app is already running (since {since}); opening its window")
+            sys.exit(subprocess.call(window.command(port)))
         port = a.watch if getattr(a, "watch", None) else DEFAULT_PORT
         companions = [] if getattr(a, "no_window", False) else [window.command(port)]
         avatar = [sys.executable, "-m", "vibehash", "avatar", "--watch", str(port)] if getattr(a, "avatar", False) else None
@@ -547,7 +553,10 @@ def main(a) -> None:
         sup.beat_while_preparing()
         try:
             url, wallet = prepare(a, report=sup.report)
-        except BaseException:
+        except BaseException as e:
+            sup._beating.set()
+            why = str(e) if isinstance(e, (SystemExit, Exception)) and str(e) else type(e).__name__
+            sup.setup = {"step": "failed", "fraction": 0.0, "why": why[:400]}
             sup.write_state(time.time(), alive=False)
             for friend in sup.friends + ([sup.avatar] if sup.avatar_alive() else []):
                 if friend.poll() is None:

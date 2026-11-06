@@ -272,25 +272,29 @@ def child_env(folder: Path) -> dict:
 # --- installing itself (Windows) ----------------------------------------------------------------------------------
 
 def shortcut_paths(env: dict | None = None) -> list[Path]:
-    """Where "Vibe Hash" goes: the Start menu and the desktop."""
+    """Where "Vibe Hash" usually goes: the Start menu and the desktop (the shell is asked for the real folders when
+    the shortcuts are made, a desktop under OneDrive say; these are the guesses uninstall also clears)."""
     env = os.environ if env is None else env
     appdata = Path(env.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     profile = Path(env.get("USERPROFILE") or Path.home())
     return [appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Vibe Hash.lnk", profile / "Desktop" / "Vibe Hash.lnk"]
 
 
-def make_shortcuts(exe: Path, links: list[Path], run=subprocess.run) -> bool:
-    """Windows shortcuts to the .exe, through the shell's own COM object (PowerShell, no window). -> whether it went."""
+def make_shortcuts(exe: Path, run=subprocess.run) -> list[Path]:
+    """Windows shortcuts to the .exe in the Start menu and on the desktop, where the shell says those are, through
+    its own COM object (PowerShell, no window). -> the shortcuts made (none when it didn't go)."""
     q = lambda p: "'" + str(p).replace("'", "''") + "'"  # noqa: E731
-    lines = ["$s = New-Object -ComObject WScript.Shell"]
-    for link in links:
-        lines.append(f"$l = $s.CreateShortcut({q(link)}); $l.TargetPath = {q(exe)}; $l.WorkingDirectory = {q(exe.parent)}; "
-                     f"$l.IconLocation = {q(exe)} + ',0'; $l.Description = 'Vibe Hash: mining that trains real AI models'; $l.Save()")
+    script = ("$s = New-Object -ComObject WScript.Shell; "
+              "foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) { "
+              "if (-not $dir) { continue }; $p = Join-Path $dir 'Vibe Hash.lnk'; $l = $s.CreateShortcut($p); "
+              f"$l.TargetPath = {q(exe)}; $l.WorkingDirectory = {q(exe.parent)}; $l.IconLocation = {q(exe)} + ',0'; "
+              "$l.Description = 'Vibe Hash: mining that trains real AI models'; $l.Save(); Write-Output $p }")
     try:
-        return run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "; ".join(lines)],
-                   creationflags=NO_WINDOW, capture_output=True, timeout=60).returncode == 0
+        done = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                   creationflags=NO_WINDOW, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return []
+    return [Path(line.strip()) for line in (done.stdout or "").splitlines() if line.strip().lower().endswith(".lnk")]
 
 
 def _winreg():
@@ -343,14 +347,21 @@ def install_self(folder: Path, system: str | None = None, exe: Path | None = Non
     installed = me.parent == folder.resolve()
     if not installed:
         folder.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(me, target)
-        except OSError as e:  # the installed copy is running, say: it is what we hand over to
+        fresh = folder / (EXE + ".new")
+        try:  # whole or not at all: copied beside, then swapped in
+            shutil.copy2(me, fresh)
+            os.replace(fresh, target)
+        except OSError as e:
+            fresh.unlink(missing_ok=True)
             if not target.exists():
                 raise SystemExit(f"couldn't put the launcher in {folder}: {e}") from None
-    links = shortcut_paths()
-    if not all(link.exists() for link in links):
-        make_shortcuts(target, links, run=run)
+            say(f"the installed Vibe Hash is in use, so this download can't replace it now; starting the installed one "
+                f"(stop Vibe Hash and run the download again to put the new launcher in)")
+    made = folder / "shortcuts.txt"  # the shortcuts, made once (a deleted one stays deleted) and listed for uninstall
+    if not made.exists():
+        links = make_shortcuts(target, run=run)
+        if links:
+            made.write_text("".join(f"{link}\n" for link in links), encoding="utf-8")
     register(target, folder, winreg=winreg)
     return None if installed else target
 
@@ -480,7 +491,8 @@ def run_app(python: Path, args: list[str], child_env: dict | None = None, log: P
         kw["creationflags"] = NO_WINDOW
         if log is not None:
             try:
-                kw["stdout"] = kw["stderr"] = open(log, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
+                mode = "w" if log.exists() and log.stat().st_size > 5 * 2**20 else "a"  # a second launch mustn't wipe a running app's log
+                kw["stdout"] = kw["stderr"] = open(log, mode, encoding="utf-8", errors="replace")  # noqa: SIM115
             except OSError:
                 kw["stdout"] = kw["stderr"] = subprocess.DEVNULL
         else:
@@ -523,16 +535,20 @@ def window(folder: Path, port: int, system: str | None = None, run=subprocess.ca
 # --- leaving -------------------------------------------------------------------------------------------------------
 
 def uninstall(folder: Path, system: str | None = None, run=run, winreg=None) -> bool:
-    """Remove what the launcher installed: the start-at-login entry if `app startup on` made one (it would point at a
-    python that is about to go), the shortcuts and the Settings > Apps entry, then the folder. The wallet, settings
-    and logs live in ~/.vibehash and stay. A running .exe inside the folder can't delete itself on Windows: the folder
-    goes a moment after it exits. -> whether everything went (or is about to)."""
+    """Remove what the launcher installed: a running app is stopped (`app stop`, waited for) and its start-at-login
+    entry taken out (it would point at a python that is about to go), then the shortcuts and the Settings > Apps
+    entry, then the folder. The wallet, settings and logs live in ~/.vibehash and stay. A running .exe inside the
+    folder can't delete itself on Windows: `remove_later` takes the folder once this program has left.
+    -> whether everything went (or is about to)."""
     system = system or platform.system()
     python = env_python(folder / "env", system)
     if python.exists():
-        run([str(python), "-m", "vibehash", "app", "startup", "off"], cwd=str(folder / "env"), env=child_env(folder))
+        for words in (("app", "stop"), ("app", "startup", "off")):
+            run([str(python), "-m", "vibehash", *words], cwd=str(folder / "env"), env=child_env(folder))
     if system == "Windows":
-        for link in shortcut_paths():
+        listed = folder / "shortcuts.txt"
+        links = [Path(p) for p in listed.read_text(encoding="utf-8").splitlines() if p.strip()] if listed.exists() else []
+        for link in links + shortcut_paths():
             link.unlink(missing_ok=True)
         unregister(winreg=winreg)
     inside = frozen() and folder.exists() and Path(sys.executable).resolve().parent == folder.resolve()
@@ -541,13 +557,18 @@ def uninstall(folder: Path, system: str | None = None, run=run, winreg=None) -> 
     if folder.exists() and not inside:
         say(f"couldn't remove all of {folder} (is Vibe Hash still running? stop it, then try again)")
         return False
-    screen.folder = None  # the log went with the folder; nothing more is written there
-    if inside:  # the folder holds this very program: let cmd take it after we have left
-        subprocess.Popen(["cmd", "/c", f'ping -n 3 127.0.0.1 >nul & rmdir /s /q "{folder}"'], creationflags=NO_WINDOW | 0x8,
-                         close_fds=True)  # 0x8: DETACHED_PROCESS
+    screen.folder = None  # the log goes with the folder; nothing more is written there
     say(f"removed {folder}. Your wallet and settings are still in ~/.vibehash; delete that folder yourself if you "
         "want them gone too (back up its recovery words first).")
     return True
+
+
+def remove_later(folder: Path) -> None:
+    """The folder that holds this very program, taken by cmd once we have left: tried every second for a minute,
+    since the .exe is locked until it has really exited."""
+    loop = (f'for /l %i in (1,1,60) do (rmdir /s /q "{folder}" 2>nul & if not exist "{folder}" exit /b 0 & '
+            'ping -n 2 127.0.0.1 >nul)')
+    subprocess.Popen(["cmd", "/c", loop], creationflags=NO_WINDOW | 0x8, close_fds=True)  # 0x8: DETACHED_PROCESS
 
 
 # --- the command ----------------------------------------------------------------------------------------------------
@@ -581,8 +602,11 @@ def main(argv: list[str] | None = None) -> int:
     if "--uninstall" in mine:
         if not screen.ask("Remove Vibe Hash from this computer? Your wallet and settings in ~/.vibehash stay."):
             return 0
+        inside = frozen() and Path(sys.executable).resolve().parent == folder.resolve()
         ok = uninstall(folder)
-        screen.tell(screen.lines[-1], error=not ok)
+        screen.tell(screen.lines[-1], error=not ok)  # (a box: the folder can only go once this is dismissed and we are gone)
+        if ok and inside and folder.exists():
+            remove_later(folder)
         return 0 if ok else 1
     try:
         installed = install_self(folder)
