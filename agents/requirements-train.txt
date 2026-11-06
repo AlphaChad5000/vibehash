@@ -2,6 +2,6 @@
 # (train_local.py, the dispatcher) and to answer (judge.py answer). The LLM calls need nothing.
 # Versions this was trained and served with (an RTX 4060, CUDA 13.2); install torch with the CUDA build for your
 # GPU from pytorch.org first. Newer releases will likely work, but these are the ones tested.
-torch>=2.6
+torch>=2.14.1
 transformers==5.22.1
 peft==0.21.2
