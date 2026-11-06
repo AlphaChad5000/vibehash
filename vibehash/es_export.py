@@ -6,7 +6,9 @@ is a function of them (es2.py). Exporting works it out the way a worker does, wi
 against the hash its block commits to and every state against the block's params_hash, the job's change from the base
 built round by round (or carried on from a line a worker on this computer saved to disk). Then base + change goes into
 the base model, and the model is saved in Hugging Face's layout (safetensors, its tokenizer and chat template), with an
-EVO.md and evo.json saying which chain, job and block it is.
+EVO.md and evo.json saying which chain, job and block it is. A base whose checkpoint holds more than its text model
+(Qwen3.5's vision tower and multi-token-prediction head) is exported whole, in its own layout (base_layout): only its
+text model is trained, the rest is the base's.
 
 The weights are saved in bfloat16 by default: what a worker's model holds on a GPU when it answers a round (the base's
 own dtype too). float32 keeps the change unrounded, as es2.canonical_weights would give it to about 1e-5.
@@ -121,13 +123,14 @@ def export(node, job_id: str, out: Path, device: str | None = None, dtype: str =
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["dtype" if "dtype" in cfg else "torch_dtype"] = dtype  # (newer transformers name it dtype)
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    layout = "base" if base_layout(base, tmp, dtype) else "text model"
 
     st = node.status()
     info = {
         "job": job_id, "task": spec.task, "base": spec.base, "chain_id": st.get("chain_id"),
         "genesis_hash": st.get("genesis_hash"), "node": getattr(node, "url", None),
         "block": ln.last_round, "params_hash": ln.params_hash, "rounds_learned": len(ln.history),
-        "lineage": _lineage(node, spec, {job_id}), "dtype": dtype, "device": device,
+        "lineage": _lineage(node, spec, {job_id}), "dtype": dtype, "device": device, "layout": layout,
         "seconds": round(time.monotonic() - t0, 1), "exported": time.strftime("%Y-%m-%d %H:%M:%S %z"),
     }
     (tmp / "evo.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
@@ -136,6 +139,68 @@ def export(node, job_id: str, out: Path, device: str | None = None, dtype: str =
         shutil.rmtree(out)
     tmp.replace(out)
     return info
+
+
+_NOT_CARRIED = {"config.json", "generation_config.json", "model.safetensors.index.json", "README.md", ".gitattributes"}
+
+
+def base_layout(base: Path, folder: Path, dtype: str) -> bool:
+    """Put an export of a base whose checkpoint holds more than its text model (Qwen3.5: a vision tower and a
+    multi-token-prediction head beside the language model, the text model's dims in its config's text_config) back in
+    the base's own layout, so it loads wherever the base does (as an image-text-to-text model too) and can stand in
+    for it: the text model `folder` holds stays as it is (transformers saves it under the base's own tensor names),
+    the base's other tensors go beside it in one more file with an index naming every tensor's file, and the base's
+    config (its dtype set to `dtype`), license and processor files come along. Returns False, leaving `folder` as it
+    is, for a base that is its text model alone, or one whose tensor names the export's don't match."""
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    cfg = json.loads((base / "config.json").read_text(encoding="utf-8"))
+    if "text_config" not in cfg:
+        return False
+    in_base: dict[str, Path] = {}
+    for f in sorted(base.glob("*.safetensors")):
+        with safe_open(f, "pt") as fh:
+            in_base.update((k, f) for k in fh.keys())
+    ours = sorted(folder.glob("*.safetensors"))
+    have: dict[str, Path] = {}
+    for f in ours:
+        with safe_open(f, "pt") as fh:
+            have.update((k, f) for k in fh.keys())
+    if not have or any(k not in in_base for k in have):
+        return False
+    want = {"bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
+    extra = {}
+    for f in sorted({f for k, f in in_base.items() if k not in have}):
+        with safe_open(f, "pt") as fh:
+            for k in fh.keys():
+                if k not in have:
+                    t = fh.get_tensor(k)
+                    extra[k] = t.to(want) if t.is_floating_point() else t
+    n = len(ours) + 1
+    files = {}
+    for i, f in enumerate(ours, 1):
+        name = f"model-{i:05d}-of-{n:05d}.safetensors"
+        f.rename(folder / name)
+        files[f] = name
+    last = f"model-{n:05d}-of-{n:05d}.safetensors"
+    save_file(extra, folder / last, metadata={"format": "pt"})
+    weight_map = {k: files[f] for k, f in have.items()}
+    weight_map.update((k, last) for k in extra)
+    total = sum((folder / name).stat().st_size for name in set(weight_map.values()))
+    (folder / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))}, indent=2) + "\n",
+        encoding="utf-8")
+    cfg["dtype" if "dtype" in cfg or "torch_dtype" not in cfg else "torch_dtype"] = dtype
+    if isinstance(cfg.get("text_config"), dict) and "dtype" in cfg["text_config"]:
+        cfg["text_config"]["dtype"] = dtype
+    (folder / "config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    for f in base.iterdir():
+        if (f.is_file() and f.suffix not in (".safetensors", ".bin", ".pt", ".gguf") and f.name not in _NOT_CARRIED
+                and not (folder / f.name).exists()):
+            shutil.copyfile(f, folder / f.name)
+    return True
 
 
 def _report(info: dict, spec) -> str:
@@ -165,7 +230,9 @@ def _report(info: dict, spec) -> str:
         "print(tok.decode(model.generate(ids, max_new_tokens=64)[0][ids.shape[1]:], skip_special_tokens=True))",
         "```",
         "",
-        "It's an ordinary Qwen2 folder, so llama.cpp's convert_hf_to_gguf.py turns it into a GGUF for Ollama or LM Studio.",
+        "It's laid out as its base is (" + ("the base's whole checkpoint: its other parts, such as a vision tower, "
+        "as they were" if info.get("layout") == "base" else "its text model") + "), so tools that read the base read it "
+        "too: llama.cpp's convert_hf_to_gguf.py turns it into a GGUF for Ollama or LM Studio where it supports the base.",
         "",
     ]
     return "\n".join(lines)

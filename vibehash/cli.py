@@ -890,20 +890,24 @@ def _evo_template(a, out: Path):
     its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
     from . import es_local, es_tasks
 
-    tasks = (list(es_tasks.NAMES) if a.tasks == "all" else list(es_tasks.CURATED) if a.tasks == "curated"
-             else [t.strip() for t in a.tasks.split(",") if t.strip()])
+    named = {"all": es_tasks.NAMES, "curated": es_tasks.CURATED, "vibe": es_tasks.VIBE}
+    tasks = (list(named[a.tasks]) if a.tasks in named else [t.strip() for t in a.tasks.split(",") if t.strip()])
     unknown = [t for t in tasks if t not in es_tasks.NAMES]
     if unknown or not tasks:
         sys.exit(f"unknown task {unknown[0] if unknown else '(none given)'}: the tasks are {', '.join(es_tasks.NAMES)}")
     try:
         found = es_local.find(a.evo, config_only=True)
-        spec = es_local.spec2_for(found, tasks[0], rounds=a.rounds, tasks=tuple(tasks))
+        # The vibe mix reasons before it answers (gsm8k, math, ifeval), so it gets room to: es_tasks.VIBE.
+        max_tokens = a.max_tokens or (es_tasks.VIBE_MAX_TOKENS if a.tasks == "vibe" else None)
+        spec = es_local.spec2_for(found, tasks[0], rounds=a.rounds, tasks=tuple(tasks),
+                                  **({"max_tokens": max_tokens} if max_tokens else {}))
         job = es_local.job2(spec, a.id, "system", budget=1, fee=0)
     except (ValueError, RuntimeError, OSError, InvalidJob) as e:
         sys.exit(f"can't make an Evo job for {a.evo}: {e}")
     out.write_text(json.dumps(job.to_spec(), indent=2) + "\n")
-    print(f"wrote {out}: an Evo job on {found.repo}, {len(tasks)} tasks in turn, {a.rounds} rounds each, paying only "
-          f"new coins; give it to `vibehash genesis create --es --starter-job {out}`")
+    print(f"wrote {out}: an Evo job on {found.repo}, {len(tasks)} tasks{' mixed in every round' if spec.mix else ' in turn'}, "
+          f"answers up to {spec.max_tokens} tokens, paying only new coins; give it to `vibehash genesis create --es "
+          f"--starter-job {out}`, or post it with `vibehash post-job --spec {out} --budget VIBE`")
 
 
 def cmd_cancel_job(a):
@@ -2488,8 +2492,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--evo", metavar="MODEL", help="an Evo job on MODEL that never ends, taking its tasks in turn: a "
                                                   "genesis starter job (genesis create --es --starter-job)")
     p.add_argument("--tasks", default="curated", help="with --evo: the tasks, comma-separated, curated (the default: "
-                   "the ones a small model learns from) or all")
+                   "the ones a small model learns from), vibe (the Qwen3.5-0.8B job's, for max_tokens 384-512) "
+                   "or all")
     p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
+    p.add_argument("--max-tokens", type=int, metavar="N", help="with --evo: the longest answer, in tokens (default 64; "
+                   "512 with --tasks vibe, whose math and instructions need room to reason)")
     p.set_defaults(fn=cmd_job_template)
 
     e = sub.add_parser("evo", help="Evo Hash's models").add_subparsers(dest="ecmd", required=True)

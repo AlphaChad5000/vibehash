@@ -461,7 +461,7 @@ class Es2Work:
             from . import es_tasks
             for task in job.spec.tasks or (job.spec.task,):  # their datasets' downloads, once (TaskUnavailable without)
                 es_tasks.get(task).items(0, 1)
-            find_base(job.spec)
+            find_base(job.spec, download=True)  # a public Evo network's base, fetched once (es_local.find_base)
             runtime2(job.spec, self.work.device())
         except Exception as e:  # noqa: BLE001 - whatever stops it, this worker can't take the job
             return f"job {job.job_id}: {e}"

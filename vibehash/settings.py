@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 PUBLIC_NODE = "https://node.vibehash.org"  # the public network: where commands go until you choose another node
+PUBLIC_EVO_NODE = "https://evo.vibehash.org:8443"  # the public Evo Hash network (vibehash-evo-1): the menu's Evo Hash
 
 
 def home() -> Path:

@@ -362,8 +362,25 @@ slightly twisted copies of the model, and a block keeps only the twists' seeds a
 they scored. Every node works the model out from those, so the trained model is a
 function of the chain: about 2 KB a round, no weight files.
 
-Evo mode runs on a local test network for now; the public network doesn't take Evo jobs
-yet. It needs a GPU with PyTorch (`vibehash install-gpu`) and `pip install vibehash[evo]`.
+It needs an NVIDIA GPU with PyTorch (`vibehash install-gpu`) and `pip install vibehash[evo]`.
+
+### The public Evo network
+
+`https://evo.vibehash.org:8443` (`vibehash-evo-1`) is a public network for Evo jobs, apart
+from the main one. Its job tunes Qwen3.5-0.8B on 16 kinds of problem (math, following
+instructions, science, common sense) to beat the official model. Join it with a GPU of 8 GB
+or more:
+
+```
+vibehash worker --node https://evo.vibehash.org:8443
+```
+
+or run `vibehash` and pick **Evo Hash** under Mine. The miner downloads the job's model once
+(about 1.7 GB) and the tasks' datasets. A new wallet starts with no stake and earns its
+first 5 VIBE as stake. Until then, its work counts only while a staked miner is online to
+check it: an Evo unit is never checked by the miner who answered it.
+
+### A test network on this computer
 
 ```
 vibehash testnet --evo2
@@ -550,6 +567,28 @@ scp deploy/setup-node.sh YOU@SERVER:
 ```bash
 ssh -t YOU@SERVER sudo bash setup-node.sh --domain node.vibehash.org
 ```
+
+### A second network on the same server
+
+One server can run another network's node beside the first: an Evo Hash
+testnet, say. Give it a name, its own domain (an A record to the same
+server), a port other than 443 and its own chain id:
+
+```bash
+ssh -t YOU@SERVER sudo bash setup-node.sh --name evo --domain evo.vibehash.org --port 8443 --chain-id vibehash-evo-1 --es --stake YOUR-GPU-WALLET=10 --fund YOUR-WALLET-ADDRESS=10000
+```
+
+- `--name evo` keeps it apart: `/var/lib/vibehash-evo`, `/etc/vibehash-evo`,
+  the service `vibehash-node-evo` and its own certificate. The first node is
+  left as it is.
+- `--es` makes a network that takes Evo Hash jobs.
+- `--stake` starts a wallet with stake. An Evo job's work is checked only by
+  staked workers, so someone must be staked before newcomers can earn theirs.
+- `--es`, `--stake` and `--fund` only count the first time, when the genesis
+  is made.
+
+Both nodes share the server's Vibe Hash install, so after upgrading one,
+restart the other too: `sudo systemctl restart 'vibehash-node*'`.
 
 ## Run a network for other people
 

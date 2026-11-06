@@ -118,18 +118,36 @@ def register(found: Base) -> str:
     return m
 
 
-def find_base(spec: es.EsSpec) -> bool:
+# The biggest base a worker downloads for an Evo job by itself (download=True): its weights in bf16. A job names its
+# base, so without a cap any job could make every worker fetch any model; the 0.8B is ~1.7 GB, a 4B ~8 GB.
+MAX_DOWNLOAD_BYTES = 10 * 2**30
+
+
+def find_base(spec: es.EsSpec, download: bool = False) -> bool:
     """A worker's side: whether this process knows where `spec`'s base is, after looking for it in the local
-    Hugging Face cache if the job is a local network's (its manifest is `manifest`'s stand-in for its base). Looks,
-    never downloads; any trouble is just "no"."""
+    Hugging Face cache if the job is a local network's (its manifest is `manifest`'s stand-in for its base). With
+    `download`, a base the cache doesn't have is downloaded into it once, at the commit the spec pins, if it's no
+    bigger than MAX_DOWNLOAD_BYTES (a public Evo network's miners: `vibehash worker --node ...` on a new computer).
+    Any trouble is just "no"."""
     if spec.manifest in es.LOCAL:
         return True
     if spec.manifest != manifest(spec.base) or spec.base.startswith("hf:local/"):
         return False
+    ref = f"{spec.repo}@{spec.commit}"
     try:
-        found = find(f"{spec.repo}@{spec.commit}", download=False)
+        found = find(ref, download=False)
     except Exception:  # noqa: BLE001
-        return False
+        size = 2 * spec.base_params
+        if not download or size > MAX_DOWNLOAD_BYTES:
+            return False
+        import logging
+        logging.getLogger("vibehash.worker").info(
+            "downloading the Evo job's model %s (about %.1f GB, once) into the Hugging Face cache", ref, size / 2**30)
+        try:
+            found = find(ref, download=True)
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("vibehash.worker").warning("couldn't download %s: %s", ref, e)
+            return False
     if found.base != spec.base:
         return False
     register(found)

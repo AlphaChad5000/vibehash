@@ -668,6 +668,28 @@ class EvoModeTests(unittest.TestCase):
             calls.clear()
             self.assertFalse(es_local.find_base(spec))
             self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", commit, True)])
+
+            def fetch(repo, revision=None, allow_patterns=None, local_files_only=False):
+                calls.append((repo, revision, local_files_only))
+                if local_files_only and not (snap / "model.safetensors").exists():
+                    raise FileNotFoundError("not cached")
+                (snap / "model.safetensors").write_bytes(b"")
+                return str(snap)
+            # A public Evo network's miner (download=True) fetches the base once, at the commit the spec pins, unless
+            # it's bigger than MAX_DOWNLOAD_BYTES: a job names its base, and mustn't make every worker fetch anything.
+            with mock.patch.object(huggingface_hub, "snapshot_download", fetch):
+                calls.clear()
+                with mock.patch.object(es_local, "MAX_DOWNLOAD_BYTES", 2 * spec.base_params - 1):
+                    self.assertFalse(es_local.find_base(spec, download=True))
+                self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", commit, True)])
+                calls.clear()
+                self.assertTrue(es_local.find_base(spec, download=True))
+                self.assertEqual(calls, [("Qwen/Qwen2.5-0.5B-Instruct", commit, True)] * 2  # the cache, twice
+                                 + [("Qwen/Qwen2.5-0.5B-Instruct", commit, False)])  # then the download
+                self.assertEqual(es.LOCAL[spec.manifest], str(snap))
+            del es.LOCAL[spec.manifest]
+            (snap / "model.safetensors").unlink()
+            calls.clear()
             self.assertFalse(es_local.find_base(es.EsSpec(**{**spec.__dict__, "manifest": "9" * 64})))  # not a local one
             calls.clear()
             es_local.find("Qwen/Qwen2.5-0.5B-Instruct")  # a testnet's: downloaded once

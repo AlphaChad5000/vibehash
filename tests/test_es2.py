@@ -291,6 +291,20 @@ class StarterTemplateTests(unittest.TestCase):
         self.assertEqual((rounds, history), (0, []))
         self.assertEqual(es.state_hash(state), es.state_hash(job.spec.init_params()))
 
+    def test_the_vibe_mix_gets_room_to_reason(self):
+        from vibehash import cli, es_tasks
+        with tempfile.TemporaryDirectory() as d:
+            folder = tiny_model(Path(d) / "tiny", seed=3)
+            for name, extra in (("vibe", []), ("short", ["--max-tokens", "96"]), ("curated", [])):
+                with mock.patch("sys.stdout"):
+                    cli.main(["job", "template", "--evo", str(folder), "--id", name, "--out", str(Path(d) / name),
+                              "--tasks", "curated" if name == "curated" else "vibe", *extra])
+            got = {n: json.loads((Path(d) / n).read_text())["es"] for n in ("vibe", "short", "curated")}
+        self.assertEqual(got["vibe"]["tasks"], list(es_tasks.VIBE))
+        self.assertEqual([got[n]["max_tokens"] for n in ("vibe", "short", "curated")],
+                         [es_tasks.VIBE_MAX_TOKENS, 96, 64])
+        self.assertTrue(got["vibe"]["mix"])
+
 
 @unittest.skipUnless(HAVE_TORCH, "needs PyTorch and transformers")
 class NetworkTests2(unittest.TestCase):

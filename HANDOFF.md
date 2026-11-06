@@ -133,6 +133,52 @@ blind against the base model told the goal; `agents/README.md`, `tests/test_agen
 
 ## Current state
 
+**Release 0.5.20 (2026-11-06): anyone can join the public Evo network from the menu.** `vibehash-evo-1` went live
+2026-11-06 at `https://evo.vibehash.org:8443` (`settings.PUBLIC_EVO_NODE`), with job `vibe-08b-1` (es_tasks.VIBE on
+Qwen3.5-0.8B, 512-token answers, fee 0) posted from the owner's wallet. An Evo job needs **two staked workers** (a unit
+is never checked by its holder): the owner's wallet and `~/.vibehash/evo-checker.json` (no password) both mine on the
+4070. DNS for vibehash.org is on **Cloudflare** now, `node` and `evo` proxied, so setup-node.sh's "points at this
+server" check fails: upgrade with `sudo /opt/vibehash/bin/pip install -U vibehash` and `sudo systemctl restart
+vibehash-node vibehash-node-evo`; SSH to `cole@165.227.37.0`. The repo moved to `VibeHash/vibehash`, and PyPI's
+trusted publisher was re-added for it (PyPI user `Ctrain232`).
+- **The menu's Evo Hash** (`menu._evo`) asks: 1 (Enter) joins the public Evo network, `worker --node
+  PUBLIC_EVO_NODE`, after `_evo_ready` (PyTorch present, else Install GPU support; offers `pip install vibehash[evo]`)
+  and `wallet create` if there's no wallet; 2 is the local `testnet --evo2` as before.
+- **A worker downloads a public Evo job's base** (`es_local.find_base(spec, download=True)` from `Es2Work.why_not`):
+  once, at the commit the spec pins, only if its bf16 weights are at most `MAX_DOWNLOAD_BYTES` (10 GiB), since a job
+  names its base. Before this, a new computer never got Evo work unless it had the model cached.
+- `python -m vibehash` from the repo folder runs the checkout's code, not the installed release; Cloudflare answers
+  403 to releases before 0.5.17 (urllib's own User-Agent). Use the `vibehash` command.
+- Tests: `test_menu` (the Evo Hash choices, `_evo_ready`), `test_es.EvoModeTests.test_a_folder_and_the_cache` (the
+  download and its cap).
+
+**Release 0.5.19 (2026-11-05): the public Evo testnet's pieces, aimed at beating Qwen3.5-0.8B.** The owner chose
+(2026-11-05) a second public network, `vibehash-evo-1`, on the same droplet as node.vibehash.org, its Evo job on
+Qwen/Qwen3.5-0.8B posted with the owner's test coins (so it can be cancelled and reposted with better settings without a
+new chain), and the owner's 4070 miner staked in its genesis so newcomers' Evo work has a checker. The goal is a model
+on Hugging Face beating the official Qwen3.5-0.8B on the benchmarks Qwen publishes for it (non-thinking: MMLU-Pro
+29.7, MMLU-Redux 48.5, C-Eval 46.4, SuperGPQA 16.9, IFEval 52.1, MMMLU 34.1), with nothing worse.
+- **`deploy/setup-node.sh --name NAME --port PORT --chain-id ID [--es] [--stake ADDR=VIBE]`**: a second node on one
+  server, in `/var/lib/vibehash-NAME`, `/etc/vibehash-NAME`, service `vibehash-node-NAME`, its own certificate hook
+  (each hook now acts only on its own domain's renewal). Without `--name` nothing changes for the main node.
+  Dry-run in WSL with stubbed system commands (both cases); never yet run on the droplet.
+- **New Evo tasks** (es_tasks, appended to NAMES; no older task changed): `ifeval` (allenai/RLVR-IFeval, 24 of 25
+  constraint types checked in pure Python in `es_ifeval.py`, rows needing langdetect/nltk or a reply longer than ~400
+  tokens dropped), `gsm8k` (train split; the test split stays a benchmark), `math` (Hendrycks MATH train files; none of
+  MATH-500 in it), `medmcqa`. `Item.loose` gives a task its own lenient check. **`es_tasks.VIBE`**: 16 tasks, one
+  problem from each every mixed round; sst2, ag_news, emotion, svamp, asdiv left out. `job template --evo MODEL
+  --tasks vibe` writes it with 512-token answers (`VIBE_MAX_TOKENS`, `--max-tokens N`). Licenses: SciQ (in VIBE) is
+  CC BY-NC 3.0; openbookqa, winogrande and piqa (in VIBE) name no clear license; the new four are MIT/Apache/ODC-BY.
+  Not covered by any task: a 10-choice MMLU-Pro-style train set (none open found), Chinese/multilingual data (C-Eval,
+  MMMLU are no-regression guards only). Tests: `tests/test_es_tasks_vibe.py` (37), `StarterTemplateTests`.
+- **`scripts/vibe_bench.py`**: scores models side by side on MMLU-Pro, MMLU-Redux, SuperGPQA, GPQA Diamond (gated),
+  IFEval (lm-eval's checker), GSM8K, MATH-500, C-Eval, MMMLU, fixed seeded subsets, paired 95% intervals, per-item JSONL
+  in `~/.vibehash/bench`. Uses es_hybrid's engine for Qwen3.5 on CUDA (~3x transformers). **The official model's
+  baseline was not run** (the owner skipped it to ship); run it before claiming anything.
+- **`vibehash evo export` of a Qwen3.5 job** keeps the base's whole layout (vision tower, MTP head, index;
+  `es_export.base_layout`), so the export loads wherever the official model does. Test: `ExportLayoutTests`.
+- Nodes on 0.5.18 and older refuse a job naming the new tasks: the Evo node and its workers need 0.5.19.
+
 **Release 0.5.18 (2026-11-05): Evo Hash mixes its tasks in every round, with a longer memory.** The owner's 0.5.17
 testnet run (426 rounds, two cycles of 17 one-task jobs, 12 rounds each) beat the original on all 19 held-out sets at
 the end of cycle 1 (MMLU 25% → 37.5%) but not at the end of cycle 2: most sets gave back 2–8 points, MMLU to 32.5%.
