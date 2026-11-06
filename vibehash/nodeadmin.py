@@ -38,22 +38,28 @@ class Forbidden(Exception):
     """A request for an admin route without the right token (401)."""
 
 
-def client_ip(peer: str, forwarded_for: str | None) -> str:
-    """Where a request came from: X-Forwarded-For's first hop when the connection itself is from this computer or a
-    private network (a reverse proxy in front of the node), else the socket's peer. A header from the open internet
-    is ignored, since anyone can send one."""
+def _local(text: str) -> bool | None:
+    """Whether an address is this computer's or a private network's (a reverse proxy's); None when it isn't one."""
     try:
-        addr = ipaddress.ip_address(peer.split("%")[0])
-        local = addr.is_loopback or addr.is_private
+        addr = ipaddress.ip_address(text.split("%")[0])
     except ValueError:
-        local = False
-    if local and forwarded_for:
-        first = forwarded_for.split(",")[0].strip()
-        try:
-            ipaddress.ip_address(first)
-            return first
-        except ValueError:
-            pass
+        return None
+    return addr.is_loopback or addr.is_private
+
+
+def client_ip(peer: str, forwarded_for: str | None) -> str:
+    """Where a request came from. When the connection itself is from this computer or a private network (a reverse
+    proxy in front of the node), X-Forwarded-For is read from its right end, the hop the proxy itself appended,
+    skipping any further proxies on local addresses: the first address from the open internet is the client's. The
+    header's left end is whatever the client chose to send, so it is never believed, and a header on a connection
+    from the open internet is ignored altogether."""
+    if _local(peer) and forwarded_for:
+        for hop in reversed([h.strip() for h in forwarded_for.split(",")]):
+            local = _local(hop)
+            if local is None:
+                break  # not an address: nothing past it can be trusted
+            if not local:
+                return hop
     return peer
 
 
@@ -88,9 +94,8 @@ class Admin:
     def reason(self, job_id: str, owner: str | None) -> str | None:
         """Why this node leads no round for the job, or None: it is held, or review is on and no admin confirmed it
         (a starter job, owned by nobody, is never held that way)."""
-        held = self.held.get(job_id)
-        if held is not None:
-            return "an admin holds it" + (f": {held['why']}" if held.get("why") else "")
+        if job_id in self.held:  # the reason given stays with the admins (`held` in the overview): this text is on /status
+            return "an admin holds it"
         if self.review and owner != SYSTEM and job_id not in self.confirmed:
             return "it awaits an admin's review"
         return None

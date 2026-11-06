@@ -58,11 +58,13 @@ class AdminPolicyTests(unittest.TestCase):
         a = nodeadmin.Admin(store, "t", now=lambda: 100.0)
         self.assertIsNone(a.reason("j1", "vibe1aaa"))
         a.hold("j1", "spam")
-        self.assertEqual(a.reason("j1", "vibe1aaa"), "an admin holds it: spam")
+        self.assertEqual(a.reason("j1", "vibe1aaa"), "an admin holds it")  # the reason given isn't in it: /status is public
+        self.assertEqual(a.held["j1"]["why"], "spam")
         a.hold("j2")
         self.assertEqual(a.reason("j2", "vibe1aaa"), "an admin holds it")
         b = nodeadmin.Admin(store, "t")  # a restart
-        self.assertEqual(b.reason("j1", "vibe1aaa"), "an admin holds it: spam")
+        self.assertEqual(b.reason("j1", "vibe1aaa"), "an admin holds it")
+        self.assertEqual(b.held["j1"]["why"], "spam")
         b.release("j1")
         self.assertIsNone(b.reason("j1", "vibe1aaa"))
         self.assertIsNone(nodeadmin.Admin(store, "t").reason("j1", "vibe1aaa"))
@@ -107,9 +109,12 @@ class AdminPolicyTests(unittest.TestCase):
 
     def test_the_client_ip_trusts_a_forwarded_header_only_from_a_local_proxy(self):
         self.assertEqual(nodeadmin.client_ip("93.184.216.34", "8.8.8.8"), "93.184.216.34")  # from the internet: ignored
-        self.assertEqual(nodeadmin.client_ip("127.0.0.1", "8.8.8.8, 10.0.0.1"), "8.8.8.8")
+        self.assertEqual(nodeadmin.client_ip("127.0.0.1", "8.8.8.8"), "8.8.8.8")  # the proxy's own entry
+        self.assertEqual(nodeadmin.client_ip("127.0.0.1", "8.8.8.8, 10.0.0.1"), "8.8.8.8")  # a second local proxy
+        self.assertEqual(nodeadmin.client_ip("127.0.0.1", "1.1.1.1, 8.8.8.8"), "8.8.8.8")  # the client's own claim is ignored
         self.assertEqual(nodeadmin.client_ip("10.0.0.2", "8.8.8.8"), "8.8.8.8")
         self.assertEqual(nodeadmin.client_ip("127.0.0.1", "not-an-ip"), "127.0.0.1")
+        self.assertEqual(nodeadmin.client_ip("127.0.0.1", "8.8.8.8, junk"), "127.0.0.1")
         self.assertEqual(nodeadmin.client_ip("127.0.0.1", None), "127.0.0.1")
 
 
@@ -134,7 +139,10 @@ class CoordinatorPolicyTests(unittest.TestCase):
         a.changed = lambda job_id: c.waiting.pop(job_id, None)
         a.hold("j1", "looks wrong")
         self.assertEqual(c.active_job_id(), "j2")
-        self.assertEqual(c.waiting["j1"], "job j1 waits: an admin holds it: looks wrong")
+        self.assertEqual(c.waiting["j1"], "job j1 waits: an admin holds it")  # what /status shows: no reason text
+        self.assertFalse(c.open_round() and c.r.job_id == "j1")  # the round that opens isn't the held job's
+        self.assertEqual(c.r.job_id, "j2")
+        c.phase, c.r = type(c.phase).IDLE, None
         a.hold("j2")
         self.assertIsNone(c.active_job_id())
         a.release("j1")
@@ -186,11 +194,13 @@ class NodeRouteTests(unittest.TestCase):
         self.assertEqual(self.call("/admin/jobs/j1/hold", {"why": "x"})[0], 401)
         code, out = self.call("/admin/jobs/j1/hold", {"why": "not now"}, token="t0k3n")
         self.assertEqual((code, out["held"]["why"]), (200, "not now"))
-        self.assertEqual(self.node.admin.reason("j1", self.req.address), "an admin holds it: not now")
+        self.assertEqual(self.node.admin.reason("j1", self.req.address), "an admin holds it")
         view = self.call("/admin/overview", token="t0k3n")[1]
         j1 = next(j for j in view["jobs"] if j["id"] == "j1")
-        self.assertEqual(j1["policy"], "an admin holds it: not now")
+        self.assertEqual(j1["policy"], "an admin holds it")
+        self.assertEqual(j1["held"]["why"], "not now")
         self.assertEqual(j1["owner"], self.req.address)
+        self.assertNotIn("not now", json.dumps(self.call("/status")[1]))  # the reason is the admins' alone
         self.assertEqual(self.call("/admin/jobs/j1/release", {}, token="t0k3n")[1]["held"], None)
         self.assertIsNone(self.node.admin.reason("j1", self.req.address))
         self.assertEqual(self.call("/admin/review", {"on": True}, token="t0k3n")[1]["review"], True)
@@ -381,6 +391,17 @@ class AdminAppTests(unittest.TestCase):
         self.assertEqual(admin.NodeLink(fake.url, None, client=fake).overview()["error"], None)
         down = FakeNode({"/admin/overview": NodeError("can't reach node", None)})
         self.assertIn("can't reach", admin.NodeLink(down.url, "t", client=down).overview()["error"])
+        garbled = FakeNode({"/admin/overview": "<html>a proxy's error page</html>"})  # json.loads of a str answer still parses...
+        garbled._req = lambda *a, **k: b"<html>not json</html>"  # ...so give it bytes that don't
+        v = admin.NodeLink(garbled.url, "t", client=garbled).overview()
+        self.assertFalse(v["admin"])
+        self.assertIn("wasn't JSON", v["error"])
+        app = admin.AdminApp([admin.NodeLink(garbled.url, "t", client=garbled), admin.NodeLink(self.fake.url, "t", client=self.fake)],
+                             None, self.app.geo)
+        d = app.overview()  # one garbled node is its own error, not the view's
+        self.assertEqual([n["error"] is None for n in d["nodes"]], [False, True])
+        self.fake.answers["/admin/jobs/j1/hold"] = {"ok": True}
+        self.assertEqual([x["ok"] for x in app.hold("j1")["nodes"]], [False, True])
 
     def test_orders_go_to_every_node_with_a_token_and_transactions_sign_with_the_wallet(self):
         self.fake.answers["/admin/jobs/j1/hold"] = {"ok": True, "job_id": "j1", "held": {"why": "why", "when": 1.0}}
@@ -418,6 +439,12 @@ class AdminAppTests(unittest.TestCase):
         self.assertEqual(self.app.links[1].token, "new")
         self.assertIsNone(self.app.wallet)
         self.assertFalse(self.app.geo.enabled)
+        self.app.set_settings([], str(self.wallet), True)
+        self.app.unlock("")
+        self.app.set_settings([], str(self.wallet), False)  # the same wallet: stays unlocked
+        self.assertIsNotNone(self.app.keys)
+        self.app.set_settings([], str(self.wallet) + ".other", False)
+        self.assertIsNone(self.app.keys)
         self.assertEqual(saved["admin"]["nodes"][1], {"url": "http://10.0.0.5:8545", "token": "new"})
 
     def test_links_come_from_flags_the_saved_settings_or_the_chosen_node(self):
@@ -429,18 +456,22 @@ class AdminAppTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"VIBEHASH_ADMIN_TOKEN": "env"}):
             links = admin.links_from({}, [])
             self.assertEqual([(l.url, l.token) for l in links], [(settings.node_url().rstrip("/"), "env")])
+            links = admin.links_from(cfg, ["http://c:1"])  # the environment's token goes to the node named, never to a saved one without
+            self.assertEqual([(l.url, l.token) for l in links], [("http://c:1", "env"), ("http://a:1", "ta"), ("http://b:1", None)])
 
     def test_the_server_serves_the_page_and_guards_the_api_with_the_session(self):
         port = self.app.serve(0)
         self.addCleanup(self.app.stop)
         base = f"http://127.0.0.1:{port}"
 
-        def call(path, body=None, session=None, origin=None):
+        def call(path, body=None, session=None, origin=None, host=None):
             headers = {}
             if session:
                 headers["X-Admin-Session"] = session
             if origin:
                 headers["Origin"] = origin
+            if host:
+                headers["Host"] = host
             req = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None,
                                          method="POST" if body is not None else "GET", headers=headers)
             try:
@@ -460,6 +491,15 @@ class AdminAppTests(unittest.TestCase):
         self.assertEqual(call("/api/overview")[0], 403)
         self.assertEqual(call("/api/overview", session="wrong")[0], 403)
         self.assertEqual(call("/api/overview", session=self.app.session, origin="http://evil.test")[0], 403)
+        # DNS rebinding: a page on evil.test pointed at 127.0.0.1 asks with its own name as Host, and gets nothing
+        self.assertEqual(call("/", host=f"evil.test:{port}")[0], 403)
+        self.assertEqual(call("/globe.json", host="evil.test")[0], 403)
+        self.assertEqual(call("/api/overview", session=self.app.session, host=f"evil.test:{port}", origin=f"http://evil.test:{port}")[0], 403)
+        self.assertEqual(call("/api/jobs/j1/hold", {"why": "x"}, session=self.app.session, host=f"evil.test:{port}")[0], 403)
+        self.assertEqual(call("/", host=f"localhost:{port}")[0], 200)
+        self.assertEqual(call("/api/overview", session=self.app.session, host=f"LOCALHOST:{port}", origin=f"http://localhost:{port}")[0], 200)
+        self.assertIn(b"frame-ancestors 'none'", urllib.request.urlopen(base + "/").headers.get("Content-Security-Policy", "").encode())
+        self.assertEqual(urllib.request.urlopen(base + "/").headers.get("X-Frame-Options"), "DENY")
         code, body = call("/api/overview", session=self.app.session)
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["primary"], self.fake.url)

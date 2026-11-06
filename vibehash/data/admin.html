@@ -220,7 +220,7 @@
   var ADMIN = window.ADMIN || { session: "", nodes: [], version: "" };
   var $ = function (id) { return document.getElementById(id); };
   var SYN = 1e8;
-  var state = { data: null, tip: null, blocks: {}, order: [], seen: {}, lastErr: null };
+  var state = { data: null, primary: null, tip: null, blocks: {}, order: [], seen: {}, lastErr: null };
 
   // --- talking to the server ---
   function api(path, body) {
@@ -260,6 +260,7 @@
       text($("state"), (n.error ? "can't reach " + host(n.url) : host(n.url) + (n.admin ? "" : " (no admin token)")) + " · height " + (n.height == null ? "–" : n.height));
       if (n.error) $("dot").className = "dot bad";
       render(d);
+      if (d.primary !== state.primary) { state.primary = d.primary; state.tip = null; state.blocks = {}; state.order = []; state.seen = {}; renderBlocks(); }  // another chain: start the ledger over
       if (n.height != null && n.height !== state.tip) { state.tip = n.height; loadBlocks(); }
     }).catch(function (e) {
       state.lastErr = e; $("dot").className = "dot bad"; text($("state"), "the admin server isn't answering: " + e.message);
@@ -307,7 +308,7 @@
       var c3 = el("td", "mono", j.owner ? shortAddr(j.owner) : (j.starter ? "nobody" : "–")); if (j.mine) c3.appendChild(el("span", "tag", "yours")); tr.appendChild(c3);
       var c4 = el("td");
       c4.appendChild(el("span", "tag " + (j.policy ? "held" : (j.status || "")), j.policy ? "held" : (j.status || "–")));
-      if (j.policy) { c4.appendChild(el("div", "muted", j.policy + (j.held_on && j.held_on.length ? " · on " + j.held_on.map(host).join(", ") : ""))); }
+      if (j.policy) { c4.appendChild(el("div", "muted", j.policy + (j.held && j.held.why ? ": " + j.held.why : "") + (j.held_on && j.held_on.length ? " · on " + j.held_on.map(host).join(", ") : ""))); }
       else if (j.waiting) { c4.appendChild(el("div", "muted", j.waiting)); }
       tr.appendChild(c4);
       tr.appendChild(el("td", "n", vibe(j.escrow)));
@@ -316,7 +317,7 @@
       var c8 = el("td"), acts = el("div", "actions");
       if (admin) {
         if (j.policy) { var ok = el("button", "btn green", "Confirm"); ok.onclick = function () { order("/api/jobs/" + encodeURIComponent(j.id) + "/release", {}, "released " + j.id); }; acts.appendChild(ok); }
-        else if (j.status !== "finished") { var no = el("button", "btn danger", "Deny"); no.onclick = function () { var why = prompt("Hold " + j.id + " on every node. Why? (optional)"); if (why === null) return; order("/api/jobs/" + encodeURIComponent(j.id) + "/hold", { why: why }, "held " + j.id); }; acts.appendChild(no); }
+        else if (j.status !== "finished") { var no = el("button", "btn danger", "Deny"); no.onclick = function () { var why = prompt("Hold " + j.id + " on every node. Why? (optional; only admins see this)"); if (why === null) return; order("/api/jobs/" + encodeURIComponent(j.id) + "/hold", { why: why }, "held " + j.id); }; acts.appendChild(no); }
       }
       if (j.mine && j.status !== "finished" && j.escrow > 0) { var cx = el("button", "btn danger", "Cancel"); cx.onclick = function () { if (confirm("Cancel " + j.id + "? Its unspent budget comes back to your wallet.")) order("/api/jobs/" + encodeURIComponent(j.id) + "/cancel", {}, "cancelled " + j.id); }; acts.appendChild(cx); }
       c8.appendChild(acts); tr.appendChild(c8);
@@ -397,6 +398,7 @@
     api("/api/blocks?from=" + from + "&to=" + state.tip).then(function (list) {
       (list || []).forEach(function (b) { if (!(b.height in state.blocks)) { state.blocks[b.height] = b; state.order.unshift(b.height); state.seen[b.height] = have >= 0; } });
       state.order.sort(function (a, b) { return b - a; }); state.order = state.order.slice(0, 60);
+      Object.keys(state.blocks).forEach(function (h) { if (state.order.indexOf(Number(h)) < 0) { delete state.blocks[h]; delete state.seen[h]; } });
       renderBlocks();
     }).catch(function (e) { text($("ledger-note"), "blocks: " + e.message); });
   }
@@ -436,6 +438,8 @@
     text($("set-wallet-note"), d.me && d.me.address ? "address " + d.me.address + (d.me.balance != null ? " · " + vibe(d.me.balance) + " VIBE" : "") + (d.me.unlocked ? " · unlocked" : (d.me.encrypted ? " · locked" : "")) : "no wallet file yet");
     $("set-geo").checked = !!s.geo;
   }
+  $("set-wallet").addEventListener("input", function () { settingsDirty = true; });
+  $("set-geo").addEventListener("change", function () { settingsDirty = true; });
   function addNodeRow(url, hasToken) {
     var row = el("div", "node-row"); var u = el("input"); u.placeholder = "https://node.example.org:8545"; u.value = url || "";
     var t = el("input"); t.type = "password"; t.placeholder = hasToken ? "token saved (leave empty to keep)" : "admin token (optional)"; t.autocomplete = "off";

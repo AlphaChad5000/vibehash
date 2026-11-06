@@ -2423,7 +2423,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--node", action="append", metavar="URL", help="a node to watch (repeat for more; the first gives the "
                    "jobs and the ledger); default: the ones saved, else the node setup chose")
     p.add_argument("--token", metavar="TOKEN", help="the admin token for the --node(s) given (default: the one saved for "
-                   "that node, else $VIBEHASH_ADMIN_TOKEN)")
+                   "that node, else $VIBEHASH_ADMIN_TOKEN; a saved node without a token of its own gets none)")
     p.add_argument("--wallet", help="the admin wallet, for cancelling and posting jobs (default: as other commands)")
     p.add_argument("--port", type=int, default=ADMIN_PORT, help=f"the local server's port (default {ADMIN_PORT})")
     p.add_argument("--browser", action="store_true", help="open the page in the browser instead of a window")

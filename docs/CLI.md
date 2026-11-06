@@ -498,7 +498,7 @@ vibehash admin [-h] [--node URL] [--token TOKEN] [--wallet WALLET] [--port PORT]
 Flags:
 
 - `--node URL`: a node to watch (repeat for more; the first gives the jobs and the ledger); default: the ones saved, else the node setup chose.
-- `--token TOKEN`: the admin token for the --node(s) given (default: the one saved for that node, else $VIBEHASH_ADMIN_TOKEN).
+- `--token TOKEN`: the admin token for the --node(s) given (default: the one saved for that node, else $VIBEHASH_ADMIN_TOKEN; a saved node without a token of its own gets none).
 - `--wallet WALLET`: the admin wallet, for cancelling and posting jobs (default: as other commands).
 - `--port PORT`: the local server's port (default 7546).
 - `--browser`: open the page in the browser instead of a window.

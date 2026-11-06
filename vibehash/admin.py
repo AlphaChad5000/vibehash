@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
@@ -45,6 +46,7 @@ from .client import NodeClient, NodeError
 from .tasks import SYN_PER_VIBE, InvalidJob, TrainingJob
 
 log = logging.getLogger("vibehash.admin")
+BROKEN = (ValueError, OSError, http.client.HTTPException)  # a node's reply that isn't one: never the whole view's error
 PAGE = Path(__file__).resolve().parent / "data" / "admin.html"
 GLOBE = Path(__file__).resolve().parent / "data" / "globe.json"
 DEFAULT_PORT = 7546  # beside the worker's feed (7545)
@@ -209,13 +211,19 @@ class NodeLink:
                 if e.status not in (401, 404):
                     return {"url": self.url, "admin": False, "error": str(e)}
                 error = str(e)
+            except BROKEN as e:  # a reply that isn't the node's (a proxy's error page, a cut connection)
+                return {"url": self.url, "admin": False, "error": f"a reply that wasn't JSON: {e}"}
         else:
             error = None
         try:
             status, net = self.client.get("/status"), self.client.get("/network")
             vals = self.client.get("/validators")
+            if not all(isinstance(x, dict) for x in (status, net)):
+                raise ValueError("not the node's answer")
         except NodeError as e:
             return {"url": self.url, "admin": False, "error": str(e)}
+        except BROKEN as e:
+            return {"url": self.url, "admin": False, "error": f"a reply that wasn't JSON: {e}"}
         return {"url": self.url, "admin": False, "error": error, "now": time.time(), "review": None,
                 "node": {"url": self.url, "address": None, "version": status.get("version"), "chain_id": status.get("chain_id"),
                          "height": status.get("height"), "tip": status.get("tip"), "tip_time": net.get("time"),
@@ -231,8 +239,11 @@ class NodeLink:
 
 
 def links_from(cfg: dict, urls: list[str] = (), token: str | None = None) -> list[NodeLink]:
-    """The nodes to watch: `--node` URLs first (with `--token`, or the token saved for that URL), then the saved ones;
-    with neither, the node setup chose (settings.node_url) with $VIBEHASH_ADMIN_TOKEN."""
+    """The nodes to watch: `--node` URLs first (with `--token`, else the token saved for that URL, else
+    $VIBEHASH_ADMIN_TOKEN, since the user named the node and set the token together), then the saved ones with the
+    tokens saved for them (a saved node without one gets none: the environment's token is this operator's own
+    node's, not something to send to another operator's); with neither, the node setup chose (settings.node_url)
+    with $VIBEHASH_ADMIN_TOKEN."""
     saved = {n["url"].rstrip("/"): n.get("token") for n in cfg.get("nodes", []) if isinstance(n, dict) and n.get("url")}
     env = os.environ.get("VIBEHASH_ADMIN_TOKEN") or None
     out: dict[str, NodeLink] = {}
@@ -240,7 +251,7 @@ def links_from(cfg: dict, urls: list[str] = (), token: str | None = None) -> lis
         u = u.rstrip("/")
         out[u] = NodeLink(u, token or saved.get(u) or env)
     for u, t in saved.items():
-        out.setdefault(u, NodeLink(u, t or env))
+        out.setdefault(u, NodeLink(u, t or None))
     if not out:
         u = settings.node_url().rstrip("/")
         out[u] = NodeLink(u, token or env)
@@ -255,6 +266,7 @@ class AdminApp:
         self.save, self.load = save, load
         self.keys = None  # the wallet, once unlocked
         self.session = secrets.token_urlsafe(24)
+        self.hosts: set[str] = set()  # the names this server answers to, once it serves
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="admin")
         self._server: ThreadingHTTPServer | None = None
         self.lock = threading.Lock()
@@ -397,12 +409,17 @@ class AdminApp:
         if links:
             self.links = links
         if wallet is not None:
-            self.wallet = Path(wallet).expanduser() if str(wallet).strip() else None
-            self.keys = None
+            chosen = Path(wallet).expanduser() if str(wallet).strip() else None
+            if chosen != self.wallet:
+                self.wallet, self.keys = chosen, None
         if geo is not None:
             self.geo.enabled = bool(geo)
         self.save(admin={"nodes": [{"url": l.url, **({"token": l.token} if l.token else {})} for l in self.links],
                          "wallet": str(self.wallet) if self.wallet else "", "geo": self.geo.enabled})
+        try:  # the tokens are secrets: the file is this user's alone (a no-op on Windows)
+            os.chmod(settings.config_path(), 0o600)
+        except OSError:
+            pass
         return {"ok": True, "settings": self.settings_view()}
 
     # -- serving the page --
@@ -410,7 +427,8 @@ class AdminApp:
     def page(self) -> bytes:
         text = PAGE.read_text(encoding="utf-8")
         boot = {"session": self.session, "nodes": [l.url for l in self.links], "version": _version()}
-        return text.replace("<head>", f"<head>\n<script>window.ADMIN = {json.dumps(boot)};</script>", 1).encode("utf-8")
+        safe = json.dumps(boot).replace("</", "<\\/")  # a saved URL can't end the script early
+        return text.replace("<head>", f"<head>\n<script>window.ADMIN = {safe};</script>", 1).encode("utf-8")
 
     def serve(self, port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> int:
         app = self
@@ -433,21 +451,33 @@ class AdminApp:
             def _json(self, code: int, payload) -> None:
                 self._send(code, json.dumps(payload).encode("utf-8"))
 
+            def _host_ok(self) -> bool:
+                """Only requests addressed to this server by its own name: a web page whose domain was pointed at
+                127.0.0.1 (DNS rebinding) sends its own domain as Host, and gets nothing, not even the page."""
+                return (self.headers.get("Host") or "").lower() in app.hosts
+
             def _session_ok(self) -> bool:
                 given = self.headers.get("X-Admin-Session") or ""
-                origin = self.headers.get("Origin")
-                mine = f"http://{self.headers.get('Host', '')}"
-                return hmac.compare_digest(given, app.session) and (not origin or origin == mine)
+                origin = (self.headers.get("Origin") or "").lower()
+                return (self._host_ok() and hmac.compare_digest(given, app.session)
+                        and (not origin or origin in {"http://" + h for h in app.hosts}))
 
             def do_GET(self):  # noqa: N802
                 url = urlsplit(self.path)
+                if not self._host_ok():
+                    self._json(403, {"error": "not this server's name"})
+                    return
                 if url.path == "/":
                     self.send_response(200)
                     page = app.page()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(page)))
                     self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
+                    self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                                     "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Referrer-Policy", "no-referrer")
                     self.end_headers()
                     self.wfile.write(page)
                     return
@@ -514,6 +544,8 @@ class AdminApp:
 
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._server.daemon_threads = True
+        port = self._server.server_address[1]
+        self.hosts = {f"{host}:{port}", f"localhost:{port}", f"[::1]:{port}"}  # what Host and Origin may name
         threading.Thread(target=self._server.serve_forever, daemon=True, name="admin-http").start()
         return self._server.server_address[1]
 
@@ -539,7 +571,7 @@ class AdminError(Exception):
 def _try(fn) -> dict:
     try:
         return {"ok": True, "result": fn()}
-    except NodeError as e:
+    except (NodeError, *BROKEN) as e:
         return {"ok": False, "error": str(e)}
 
 
