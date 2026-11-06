@@ -126,6 +126,9 @@ install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
 HOOK=/etc/letsencrypt/renewal-hooks/deploy/$SERVICE.sh
 cat > "$HOOK" <<EOF
 #!/bin/sh
+# certbot runs every deploy hook after any renewal: act only on this node's domain (RENEWED_DOMAINS is unset when
+# this script runs it by hand, below).
+case " \${RENEWED_DOMAINS:-$DOMAIN} " in *" $DOMAIN "*) ;; *) exit 0 ;; esac
 install -d -m 750 -g vibehash $ETC/tls
 install -m 640 -g vibehash /etc/letsencrypt/live/$DOMAIN/fullchain.pem $ETC/tls/cert.pem
 install -m 640 -g vibehash /etc/letsencrypt/live/$DOMAIN/privkey.pem $ETC/tls/key.pem
