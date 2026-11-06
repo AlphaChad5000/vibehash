@@ -6,8 +6,9 @@
 It reads the worker's feed (watch.py, once a second, on a thread of its own so the window never waits on it) and
 moves with it: resting while the worker waits, swinging while it trains, glowing while it checks other workers'
 results, throwing gold sparks with the amount when a round pays, and going grey when there is no feed to read. Drag
-it anywhere (the place is remembered, and kept on a screen that is still there); a click opens the window (the
-feed's /dashboard page, in the browser); a right-click gives the menu: open the window, pause or resume mining,
+it anywhere (the place is remembered, and kept on a screen that is still there); a click opens the window (window.py:
+the dashboard in a web view of its own, or the browser where there is none); a right-click gives the menu: open the
+window, pause or resume mining,
 start at login or not, hide, and stop mining.
 
 Plain tkinter, which the Python the launcher installs has, so there is nothing to add: no browser engine, no Rust.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +30,7 @@ from dataclasses import dataclass
 
 from . import app as app_module
 from . import settings
+from . import window as window_module
 from .watch import DEFAULT_PORT
 
 GOLD, GOLD_DIM, GREY, SPARK = "#f1b23c", "#8a6a2a", "#5a5f6a", "#ffe08a"
@@ -119,6 +122,7 @@ class Avatar:
         self.hidden = False
         self.trouble: str | None = None  # the first frame that failed, said once
         self._drag: tuple[int, int] | None = None
+        self.window: subprocess.Popen | None = None  # the dashboard's window, while one is open
         self.transparent = self._make_window()
         bg = ("systemTransparent" if sys.platform == "darwin" else KEYED) if self.transparent else "#171a21"
         self.canvas = tk.Canvas(root, width=SIZE, height=SIZE, highlightthickness=0, bd=0, bg=bg)
@@ -170,7 +174,14 @@ class Avatar:
     # -- what it does --
 
     def open_window(self) -> None:
-        webbrowser.open(self.feed + "/dashboard")
+        """The window (window.py), one at a time; the browser if it can't even be started."""
+        if self.window is not None and self.window.poll() is None:
+            return  # already open
+        tail = self.feed.rsplit(":", 1)[-1]
+        try:
+            self.window = subprocess.Popen(window_module.command(int(tail) if tail.isdigit() else DEFAULT_PORT))
+        except OSError:
+            webbrowser.open(self.feed + "/dashboard")
 
     def menu_items(self) -> list[tuple[str, object]]:
         """The right-click menu: (label, what it does), with None for a line."""
@@ -205,6 +216,8 @@ class Avatar:
 
     def hide(self) -> None:
         self.hidden = True
+        if self.window is not None and self.window.poll() is None:  # the window this avatar opened goes with it
+            self.window.terminate()
         self.root.destroy()
 
     # -- the feed --

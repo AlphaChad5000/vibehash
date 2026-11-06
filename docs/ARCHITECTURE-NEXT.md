@@ -46,7 +46,8 @@ silicon or no GPU. Instead:
 - a **small launcher** (tens of MB) that, on first run, detects the hardware the way `install-gpu` does
   (`gpusetup.py`) and makes an isolated Python environment with the one matching PyTorch wheel, with
   `uv` doing the environment work;
-- a **window** around a local web dashboard (reading `/network` and the worker's own status) and a
+- a **window** around a local web dashboard (reading `/network` and the worker's own status; built: window.py, the
+  system's web view through pywebview, with the browser as the fallback) and a
   terminal tab that streams `minerui.py` as it is, so the cinematic isn't rewritten. Tauri is the
   lightest shell for that; the first version can be the terminal alone behind the launcher.
 

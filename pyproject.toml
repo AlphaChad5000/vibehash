@@ -15,7 +15,8 @@ dependencies = ["numpy>=1.26", "cryptography>=42"]
 # need PyTorch, whose right build `vibehash install-gpu` picks for the GPU.
 # Evo mode (`testnet --evo`, `testnet --evo2`) runs the model with transformers (and PyTorch, which `vibehash
 # install-gpu` installs); its ARC-Easy science questions come through datasets.
-optional-dependencies = {finetune = ["tokenizers>=0.15", "jinja2>=3.1"], evo = ["transformers>=4.50", "datasets>=2.18"]}
+# The app's window (window.py) is the system's web view through pywebview; the downloadable launcher installs this extra.
+optional-dependencies = {finetune = ["tokenizers>=0.15", "jinja2>=3.1"], evo = ["transformers>=4.50", "datasets>=2.18"], app = ["pywebview>=6.2"]}
 keywords = ["proof-of-useful-work", "distributed-training", "cryptocurrency", "testnet"]
 classifiers = [
     "Development Status :: 3 - Alpha",

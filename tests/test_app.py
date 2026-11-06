@@ -81,15 +81,25 @@ class SupervisorTests(AppHome):
         self.assertIsNotNone(s.child)
         s.stop_worker("test over")
 
-    def test_the_avatar_rides_along_and_leaves_with_the_app(self):
-        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companion=child_command())
+    def test_the_window_and_the_avatar_ride_along_and_leave_with_the_app(self):
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[child_command(), child_command()])
         t = threading.Thread(target=s.run, daemon=True)
         t.start()
-        self.assertTrue(wait_for(lambda: s.worker_alive() and s.friend is not None and s.friend.poll() is None))
+        self.assertTrue(wait_for(lambda: s.worker_alive() and len(s.friends) == 2 and all(f.poll() is None for f in s.friends)))
         app.order("stop")
         t.join(timeout=10)
         self.assertFalse(t.is_alive())
-        self.assertTrue(wait_for(lambda: s.friend.poll() is not None))  # told to leave when the app left
+        self.assertTrue(wait_for(lambda: all(f.poll() is not None for f in s.friends)))  # told to leave when the app left
+
+    def test_a_companion_that_cannot_start_is_said_and_the_app_goes_on(self):
+        s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[["no-such-program-xyz"]])
+        t = threading.Thread(target=s.run, daemon=True)
+        t.start()
+        self.assertTrue(wait_for(lambda: s.worker_alive()))
+        self.assertTrue(any("couldn't start no-such-program-xyz" in e for e in s.events))
+        app.order("stop")
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
 
     def test_running_needs_a_fresh_heartbeat(self):
         self.assertFalse(app.running())
@@ -209,19 +219,19 @@ class StartupTests(AppHome):
                 mock.patch.dict(os.environ, {"APPDATA": str(Path(self.tmp.name) / "AppData")}):
             win = app.startup_on("Windows", run)
             self.assertEqual(win.name, "VibeHash.cmd")
-            self.assertIn("-m vibehash app", win.read_text())
+            self.assertIn("-m vibehash app --no-window", win.read_text())  # logging in opens no window
             self.assertIn(self.tmp.name, win.read_text())  # VIBEHASH_HOME, so the service finds the same wallet
             self.assertNotIn("--avatar", win.read_text())
-            self.assertIn("-m vibehash app --avatar", app.startup_on("Windows", run, avatar=True).read_text())
+            self.assertIn("-m vibehash app --no-window --avatar", app.startup_on("Windows", run, avatar=True).read_text())
             with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER": r"C:\x\VibeHash.exe"}):  # the download: the launcher itself
                 text = app.startup_on("Windows", run, avatar=True).read_text()
-                self.assertIn("VibeHash.exe", text)
+                self.assertIn('"C:\\x\\VibeHash.exe" -- --no-window', text)  # what follows -- goes to the app
                 self.assertNotIn("-m vibehash", text)
             lin = app.startup_on("Linux", run, avatar=True)
-            self.assertIn("-m vibehash app --avatar", lin.read_text())
+            self.assertIn("-m vibehash app --no-window --avatar", lin.read_text())
             mac = app.startup_on("Darwin", run)
             self.assertEqual(mac.name, "org.vibehash.app.plist")
-            self.assertIn("<string>app</string>", mac.read_text())
+            self.assertIn("<string>app</string><string>--no-window</string>", mac.read_text())
             self.assertEqual(calls[-1][:2], ["launchctl", "load"])
             lin = app.startup_on("Linux", run)
             self.assertEqual(lin.name, "vibehash.service")

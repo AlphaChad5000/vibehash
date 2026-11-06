@@ -1,6 +1,7 @@
 """The floating avatar (avatar.py): what it shows for what the feed says, its menu, and its drawing, with no screen:
 tkinter is played by a fake, and only `run` (which needs a display) is left out."""
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -130,10 +131,17 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.root.geometry_calls[-1], "+490+390")
         self.av._release(mock.Mock(x=40, y=40))
         self.assertEqual(avatar.saved_place(), (100, 200))  # where the window says it is
-        with mock.patch.object(avatar.webbrowser, "open") as opened:
+        with mock.patch.object(avatar.subprocess, "Popen") as popen:
+            popen.return_value.poll.return_value = None  # the window stays open
             self.av._press(mock.Mock(x=10, y=10))
             self.av._release(mock.Mock(x=11, y=10))  # barely moved: a click
-        opened.assert_called_once_with("http://127.0.0.1:7545/dashboard")
+            self.av.open_window()  # a second click: the one window, not two
+        popen.assert_called_once_with([sys.executable, "-m", "vibehash", "window", "--watch", "7545"])
+        self.av.window = None
+        with mock.patch.object(avatar.subprocess, "Popen", side_effect=OSError("no python")), \
+                mock.patch.object(avatar.webbrowser, "open") as opened:
+            self.av.open_window()
+        opened.assert_called_once_with("http://127.0.0.1:7545/dashboard")  # the browser, when even that fails
 
     def test_the_menu_fits_the_app(self):
         labels = [i[0] for i in self.av.menu_items() if i]
@@ -155,9 +163,11 @@ class WindowTests(unittest.TestCase):
         self.av._menu(mock.Mock(x_root=5, y_root=5))  # builds the tk menu without complaint
 
     def test_hide_closes_the_window(self):
+        self.av.window = mock.Mock(**{"poll.return_value": None})  # a dashboard window this avatar opened
         self.av.hide()
         self.assertTrue(self.root.destroyed)
         self.assertTrue(self.av.hidden)
+        self.av.window.terminate.assert_called_once_with()  # it goes with the avatar
 
 
 if __name__ == "__main__":
