@@ -272,7 +272,7 @@ Flags:
 Run a node: serve the chain to workers, and validate if its wallet is a validator.
 
 ```
-vibehash node [-h] --genesis GENESIS --wallet WALLET --data-dir DATA_DIR [--host HOST] [--port PORT] [--peer URL] [--announce URL] [--dataset DATASET] [--device DEVICE] [--keep-rounds KEEP_ROUNDS] [--max-job-mb MB] [--register-s SECONDS] [--compute-s SECONDS] [--reveal-s SECONDS] [--verify-s SECONDS] [--min-fee MIN_FEE] [--rate-limit SPEC] [--rate-limit-local] [--max-connections MAX_CONNECTIONS] [--min-client VERSION] [--admin-token TOKEN] [--tls-cert FILE] [--tls-key FILE]
+vibehash node [-h] --genesis GENESIS --wallet WALLET --data-dir DATA_DIR [--host HOST] [--port PORT] [--peer URL] [--announce URL] [--dataset DATASET] [--device DEVICE] [--keep-rounds KEEP_ROUNDS] [--max-job-mb MB] [--register-s SECONDS] [--compute-s SECONDS] [--reveal-s SECONDS] [--verify-s SECONDS] [--min-fee MIN_FEE] [--rate-limit SPEC] [--rate-limit-local] [--max-connections MAX_CONNECTIONS] [--min-client VERSION] [--admin-token TOKEN] [--admin-mfa KEY] [--tls-cert FILE] [--tls-key FILE]
 ```
 
 Flags:
@@ -297,7 +297,8 @@ Flags:
 - `--rate-limit-local`: limit clients on this computer (127.0.0.1) too, e.g. behind a reverse proxy, where everyone looks local.
 - `--max-connections MAX_CONNECTIONS`: connections served at once (default 256).
 - `--min-client VERSION`: the oldest Vibe Hash release whose workers may register (default 0.5.17); older ones are told to upgrade, as are releases before 0.5.17, which name no version and can't follow version 4 blocks.
-- `--admin-token TOKEN`: serve the operators' routes (/admin/*: hold and release jobs, the devices' addresses) to the admin app (`vibehash admin`) that sends this token; default $VIBEHASH_ADMIN_TOKEN; without one those routes don't exist.
+- `--admin-token TOKEN`: serve the operators' routes (/admin/*: hold and release jobs, the devices' addresses) to the admin app (`vibehash admin`) that sends this token, at least 24 characters (`vibehash admin --new-token` makes one); default $VIBEHASH_ADMIN_TOKEN; without one those routes don't exist.
+- `--admin-mfa KEY`: an authenticator app's key (`vibehash admin --new-mfa` makes one and says how to add it): the token then also needs the app's 6-digit code, for a sign-in that lasts 12 hours; default $VIBEHASH_ADMIN_MFA.
 - `--tls-cert FILE`: serve HTTPS with this PEM certificate (see `tls cert`).
 - `--tls-key FILE`: the certificate's private key.
 
@@ -492,7 +493,7 @@ The operators' window: a globe of where devices connect from, the jobs to confir
 The admin app (admin.py): a small server on this computer only, with the nodes behind it, and its page in a window of its own (pywebview, the `app` extra) or the browser. It asks each node's /admin/overview with the token that node was started with (`node --admin-token`; a node without one shows only what its public routes say). Confirm and deny are holds on every node it knows; cancel and post are transactions signed with the admin wallet, unlocked in the page. The nodes, their tokens, the wallet and whether to look up places are kept in config.json under "admin", from the page's Settings or these flags.
 
 ```
-vibehash admin [-h] [--node URL] [--token TOKEN] [--wallet WALLET] [--port PORT] [--browser] [--install-shortcut] [--remove-shortcut]
+vibehash admin [-h] [--node URL] [--token TOKEN] [--wallet WALLET] [--port PORT] [--browser] [--install-shortcut] [--remove-shortcut] [--new-token] [--new-mfa]
 ```
 
 Flags:
@@ -504,6 +505,8 @@ Flags:
 - `--browser`: open the page in the browser instead of a window.
 - `--install-shortcut`: put "Vibe Hash Admin" in the Start menu (the apps menu on Linux, ~/Applications on a Mac), running this Python; --node, --token and --wallet given with it are saved for it to open with.
 - `--remove-shortcut`: take that shortcut away again.
+- `--new-token`: print a new random admin token for a node's --admin-token.
+- `--new-mfa`: print a new authenticator key for a node's --admin-mfa, with how to add it to an authenticator app.
 
 Examples:
 
@@ -512,6 +515,8 @@ vibehash admin
 vibehash admin --node https://node.vibehash.org --token SECRET --node http://10.0.0.5:8545
 vibehash admin --browser
 vibehash admin --install-shortcut --node https://node.vibehash.org --token SECRET
+vibehash admin --new-token
+vibehash admin --new-mfa
 ```
 
 ## vibehash cache
