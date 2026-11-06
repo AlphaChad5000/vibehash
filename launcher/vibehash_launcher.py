@@ -4,15 +4,20 @@ itself like any app the first time and then just runs `vibehash app`.
     VibeHash.exe                # first run: installs; every run: mines, with the window and the avatar
     VibeHash.exe --update       # update Vibe Hash now, rather than when a day has passed
     VibeHash.exe --uninstall    # remove what the launcher installed (never the wallet, which is in ~/.vibehash)
+    VibeHash.exe --uninstall --yes   # the same with no question or box (what the setup wizard's uninstaller runs)
     VibeHash.exe --window PORT  # the app's window alone (what `vibehash app` and the avatar start under the launcher)
     VibeHash.exe -- --device cpu --node 192.168.1.20   # anything after -- goes to `vibehash app`
 
 On Windows it is a windowed program (no console): a small window shows what the first run is doing, then the app's
-own window takes over (the download's one job is to feel like installing any other app). What it does on that first
-run, in its own folder (%LOCALAPPDATA%\\VibeHash on Windows, ~/Library/Application Support/VibeHash on macOS,
-~/.local/share/vibehash on Linux) and nowhere else (uv's Python and cache are kept there too):
-- copies itself there, puts "Vibe Hash" in the Start menu and on the desktop, and in Settings > Apps (an entry whose
-  Uninstall runs `--uninstall`), then hands over to the installed copy, so the download can be deleted (Windows);
+own window takes over (the download's one job is to feel like installing any other app). The website gives the
+setup wizard (installer/VibeHash.iss, Inno Setup: language, for everyone or this user, where, a desktop icon,
+start at login, a real uninstaller in Settings > Apps) with this .exe inside; run on its own, the .exe installs
+itself. What it does on that first run, in its own folder (%LOCALAPPDATA%\\VibeHash on Windows,
+~/Library/Application Support/VibeHash on macOS, ~/.local/share/vibehash on Linux) and nowhere else (uv's Python
+and cache are kept there too):
+- on its own (no uninstaller beside it): copies itself there, puts "Vibe Hash" in the Start menu and on the
+  desktop, and in Settings > Apps (an entry whose Uninstall runs `--uninstall`), then hands over to the installed
+  copy, so the download can be deleted (Windows);
 - uv (astral.sh), one pinned release, its download checked against the SHA-256 the release publishes;
 - a Python of its own, which uv downloads, so the computer's Python (if any) is never touched;
 - Vibe Hash from PyPI, updated (it alone, not every library under it) when a day has passed since the last check;
@@ -335,16 +340,24 @@ def unregister(winreg=None) -> None:
         pass
 
 
+def by_setup(exe: Path) -> bool:
+    """Was this .exe put here by the setup wizard (installer/VibeHash.iss)? Its uninstaller sits beside it, and
+    then the shortcuts and the Settings > Apps entry are the wizard's, not ours."""
+    return any(exe.parent.glob("unins*.exe"))
+
+
 def install_self(folder: Path, system: str | None = None, exe: Path | None = None, run=subprocess.run,
                  winreg=None) -> Path | None:
     """The downloaded .exe, run from wherever it was saved, copies itself into the launcher's folder, makes the
     shortcuts and the Settings > Apps entry, and -> the installed copy for the caller to hand over to. Run from the
     folder already (the installed copy, a shortcut, start-at-login): None, after making sure the shortcuts and the
-    entry are there."""
+    entry are there. Installed by the setup wizard: None, nothing to do."""
     system = system or platform.system()
     if system != "Windows" or not (exe or frozen()):
         return None
     me = Path(exe or sys.executable).resolve()
+    if by_setup(me):
+        return None
     target = folder / EXE
     installed = me.parent == folder.resolve()
     if not installed:
@@ -547,7 +560,7 @@ def uninstall(folder: Path, system: str | None = None, run=run, winreg=None) -> 
     if python.exists():
         for words in (("app", "stop"), ("app", "startup", "off")):
             run([str(python), "-m", "vibehash", *words], cwd=str(folder / "env"), env=child_env(folder))
-    if system == "Windows":
+    if system == "Windows" and not (frozen() and by_setup(Path(sys.executable))):  # the wizard's uninstaller owns these
         listed = folder / "shortcuts.txt"
         links = [Path(p) for p in listed.read_text(encoding="utf-8").splitlines() if p.strip()] if listed.exists() else []
         for link in links + shortcut_paths():
@@ -596,17 +609,21 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return window(folder, port)
     say(BANNER)
-    unknown = [a for a in mine if a not in ("--update", "--uninstall")]
+    unknown = [a for a in mine if a not in ("--update", "--uninstall", "--yes")]
     if unknown:
-        screen.tell(f"unknown option {unknown[0]}; the launcher takes --update, --uninstall and --window PORT, and anything "
-                    "after -- goes to `vibehash app`", error=True)
+        screen.tell(f"unknown option {unknown[0]}; the launcher takes --update, --uninstall [--yes] and --window PORT, and "
+                    "anything after -- goes to `vibehash app`", error=True)
         return 2
     if "--uninstall" in mine:
-        if not screen.ask("Remove Vibe Hash from this computer? Your wallet and settings in ~/.vibehash stay."):
+        quiet = "--yes" in mine  # the setup wizard's uninstaller: no question, no box
+        if not quiet and not screen.ask("Remove Vibe Hash from this computer? Your wallet and settings in ~/.vibehash stay."):
             return 0
         inside = frozen() and Path(sys.executable).resolve().parent == folder.resolve()
         ok = uninstall(folder)
-        screen.tell(screen.lines[-1], error=not ok)  # (a box: the folder can only go once this is dismissed and we are gone)
+        if quiet:
+            say(screen.lines[-1])
+        else:
+            screen.tell(screen.lines[-1], error=not ok)  # (a box: the folder can only go once this is dismissed and we are gone)
         if ok and inside and folder.exists():
             remove_later(folder)
         return 0 if ok else 1

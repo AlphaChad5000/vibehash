@@ -15,16 +15,21 @@ sets out the design in eleven pages.
 
 ## Install
 
-**The download.** On Windows, [VibeHash.exe](https://github.com/AlphaChad5000/vibehash/releases/latest/download/VibeHash.exe)
-from [vibehash.org](https://vibehash.org) does everything with no questions:
-the first run installs a Python of its own, Vibe Hash and the GPU build of
-PyTorch into `%LOCALAPPDATA%\VibeHash`, makes a wallet (no password; the
-recovery words go to a file only you can read), and mines; every run after
-that just mines, and checks for a newer Vibe Hash once a day. Windows warns
-that it's from an unknown publisher, since it isn't code-signed yet: choose
-"More info", then "Run anyway". It is [launcher/vibehash_launcher.py](launcher/vibehash_launcher.py),
-plain Python, built by [launcher.yml](.github/workflows/launcher.yml);
-`VibeHash.exe --uninstall` removes what it installed and leaves your wallet.
+**The download.** On Windows, [VibeHash-Setup.exe](https://github.com/VibeHash/vibehash/releases/latest/download/VibeHash-Setup.exe)
+from [vibehash.org](https://vibehash.org) is a setup wizard like any app's:
+your language, for everyone or just you, where, a desktop icon, start at
+login; it appears in Settings > Apps with an uninstaller that stops Vibe Hash,
+removes everything it put on the machine and asks whether to delete your
+wallet (kept unless you say so). The first run then installs a Python of its
+own, Vibe Hash and the GPU build of PyTorch into `%LOCALAPPDATA%\VibeHash`,
+makes a wallet (no password; the recovery words are shown once in the window
+and kept in a file only you can read), and mines; every run after that just
+mines, and checks for a newer Vibe Hash once a day. Windows warns that it's
+from an unknown publisher, since it isn't code-signed yet: choose "More
+info", then "Run anyway". The wizard is [installer/VibeHash.iss](installer/VibeHash.iss)
+(Inno Setup) around [launcher/vibehash_launcher.py](launcher/vibehash_launcher.py),
+plain Python built into VibeHash.exe by [launcher.yml](.github/workflows/launcher.yml);
+the bare VibeHash.exe is on the release too and installs itself when run alone.
 
 **The install line.** One line installs Vibe Hash and starts the guided setup,
 which asks the rest (network, wallet password, GPU support). On Windows, in

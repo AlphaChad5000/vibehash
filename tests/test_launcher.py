@@ -243,6 +243,18 @@ class MainTests(unittest.TestCase):
             self.assertNotIn(L.UNINSTALL_KEY, self.winreg.keys)
             self.assertIn("wallet", out.getvalue())
 
+    def test_uninstall_with_yes_asks_nothing_and_shows_no_box(self):
+        with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER_DIR": self.tmp.name + "/vh"}), \
+                mock.patch.object(L.screen, "ask") as ask, mock.patch.object(L.screen, "tell") as tell, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            folder = Path(self.tmp.name) / "vh"
+            folder.mkdir()
+            self.assertEqual(L.main(["--uninstall", "--yes"]), 0)
+            self.assertFalse(folder.exists())
+            ask.assert_not_called()
+            tell.assert_not_called()
+            self.assertIn("removed", out.getvalue())
+
     def test_uninstall_asks_first_in_the_window(self):
         with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER_DIR": self.tmp.name + "/vh"}), \
                 mock.patch.object(L.screen, "ask", return_value=False), mock.patch("sys.stdout", new_callable=io.StringIO):
@@ -276,6 +288,16 @@ class MainTests(unittest.TestCase):
         self.assertIsNone(L.install_self(folder, "Windows", exe=installed, run=run, winreg=self.winreg))
         self.assertEqual(len(ran), 1)
         self.assertIsNone(L.install_self(folder, "Linux", exe=download, run=run, winreg=self.winreg))  # Windows only
+        # put there by the setup wizard (its uninstaller beside it): nothing to copy, no shortcuts, no entry of ours
+        wizard = tmp / "Program Files" / "Vibe Hash"
+        wizard.mkdir(parents=True)
+        (wizard / "VibeHash.exe").write_bytes(b"MZ")
+        (wizard / "unins000.exe").write_bytes(b"MZ")
+        self.winreg.keys.pop(L.UNINSTALL_KEY)
+        self.assertTrue(L.by_setup(wizard / "VibeHash.exe"))
+        self.assertIsNone(L.install_self(folder, "Windows", exe=wizard / "VibeHash.exe", run=run, winreg=self.winreg))
+        self.assertEqual(len(ran), 1)
+        self.assertNotIn(L.UNINSTALL_KEY, self.winreg.keys)
         with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER_DIR": str(folder)}), mock.patch.object(L, "install_self", return_value=installed), \
                 mock.patch.object(L.subprocess, "Popen") as popen, mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(L.main(["--", "--device", "cpu"]), 0)
