@@ -534,8 +534,9 @@ open throughout; your host's web console gets you back in if a step goes wrong.
    sudo ufw allow in on tailscale0 to any port 22 && sudo ufw delete allow OpenSSH
    ```
 
-The script leaves SSH rules alone once the firewall is on, so upgrading
-doesn't reopen port 22. Upgrade from then on as your own user:
+From then on `SERVER` is the server's Tailscale name, from a computer on the
+same tailnet. The script leaves SSH rules alone once the firewall is on, so
+upgrading doesn't reopen port 22. Upgrade as your own user:
 
 ```bash
 scp deploy/setup-node.sh YOU@SERVER:

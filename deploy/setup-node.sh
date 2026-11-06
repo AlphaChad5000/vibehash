@@ -84,7 +84,8 @@ say "Opening the firewall for HTTP (certificate renewals) and HTTPS"
 # SSH is opened to everyone only the first time, while the firewall is still off, so this run can't lock you out.
 # Once it's on, its SSH rules are left as they are: an upgrade mustn't undo a narrower rule made afterwards (SSH
 # allowed only from your own addresses, or only over Tailscale; README, "Lock down the server").
-if ! ufw status | grep -q '^Status: active'; then
+firewall=$(ufw status || true)  # read in full first: with pipefail, grep -q quitting early could fail ufw's write
+if ! grep -q '^Status: active' <<<"$firewall"; then
   ufw allow OpenSSH >/dev/null
 fi
 ufw allow 80/tcp >/dev/null
