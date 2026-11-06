@@ -3,11 +3,12 @@
     vibehash avatar               # beside a running `vibehash app` or `worker --watch` (the feed on DEFAULT_PORT)
     vibehash app --avatar         # the app starts and stops it itself; what the downloadable app does
 
-It reads the worker's feed (watch.py, once a second) and moves with it: resting while the worker waits, swinging
-while it trains, glowing while it checks other workers' results, throwing gold sparks with the amount when a round
-pays, and going grey when there is no feed to read. Drag it anywhere (the place is remembered); a click opens the
-window (the feed's /dashboard page, in the browser); a right-click gives the menu: open the window, pause or resume
-mining, start at login or not, hide, and stop mining.
+It reads the worker's feed (watch.py, once a second, on a thread of its own so the window never waits on it) and
+moves with it: resting while the worker waits, swinging while it trains, glowing while it checks other workers'
+results, throwing gold sparks with the amount when a round pays, and going grey when there is no feed to read. Drag
+it anywhere (the place is remembered, and kept on a screen that is still there); a click opens the window (the
+feed's /dashboard page, in the browser); a right-click gives the menu: open the window, pause or resume mining,
+start at login or not, hide, and stop mining.
 
 Plain tkinter, which the Python the launcher installs has, so there is nothing to add: no browser engine, no Rust.
 The drawing is the brand mark (docs/site: a pickaxe of three blocks, in the dashboard's gold) on a transparent
@@ -17,8 +18,9 @@ show is pure (`Mood`, `mood_of`), so it is tested without a screen; only `run` n
 from __future__ import annotations
 
 import json
-import os
+import math
 import sys
+import threading
 import time
 import urllib.request
 import webbrowser
@@ -32,6 +34,7 @@ GOLD, GOLD_DIM, GREY, SPARK = "#f1b23c", "#8a6a2a", "#5a5f6a", "#ffe08a"
 SIZE = 96  # the window's square, in pixels
 POLL_S = 1.0
 PAYDAY_S = 3.0  # how long the sparks of a payment last
+KEYED = "#010101"  # the colour Windows keys out of the window: what the canvas is painted where nothing is drawn
 # The brand mark on a 3 by 4 grid: two uprights and the head's block (docs/site/index.html's icon).
 MARK = ((0, 0, 1, 3), (2, 0, 1, 3), (1, 3, 1, 1))
 
@@ -44,30 +47,36 @@ class Mood:
     speed: float  # bobs a second; 0 is still
 
 
-def mood_of(snapshot: dict | None, previous_earned: float | None, now: float, paid_at: float | None) -> tuple[Mood, float | None, float | None]:
-    """What to show for the feed's snapshot (None: no feed) -> (mood, the earned total seen, when a payment last
-    showed). A rise in this session's earnings shows as paid for PAYDAY_S seconds; otherwise the worker's phase."""
+@dataclass
+class Seen:
+    """What mood_of carries from one poll to the next."""
+    earned: float | None = None  # this session's earnings, as last reported
+    paid_at: float | None = None  # when a rise in them last showed
+    gain: float = 0.0  # by how much
+
+
+def mood_of(snapshot: dict | None, seen: Seen, now: float) -> Mood:
+    """What to show for the feed's snapshot (None: no feed), updating `seen`. A rise in this session's earnings
+    shows as paid, with the amount, for PAYDAY_S seconds; otherwise the worker's phase."""
     if not snapshot or not snapshot.get("workers"):
-        return Mood("offline", "no worker to watch (start it with: vibehash app)", GREY, 0.0), previous_earned, paid_at
+        return Mood("offline", "no worker to watch (start it with: vibehash app)", GREY, 0.0)
     w = snapshot["workers"][0]
     earned = w.get("session", {}).get("earned_vibe")
-    if earned is not None and previous_earned is not None and earned > previous_earned + 1e-9:
-        paid_at = now
-    if paid_at is not None and now - paid_at < PAYDAY_S:
-        gain = (earned or 0) - (previous_earned or 0)
-        label = f"paid {gain:+.4f} VIBE" if earned is not None and previous_earned is not None and gain > 0 else "paid"
-        return Mood("paid", label, SPARK, 3.0), earned, paid_at
+    if earned is not None and seen.earned is not None and earned > seen.earned + 1e-9:
+        seen.paid_at, seen.gain = now, earned - seen.earned
+    if earned is not None:
+        seen.earned = earned
+    if seen.paid_at is not None and now - seen.paid_at < PAYDAY_S:
+        return Mood("paid", f"paid +{seen.gain:.4f} VIBE", SPARK, 3.0)
     activity = str(w.get("activity", ""))
     phase = w.get("phase")
     if w.get("busy") and ("check" in activity or "scoring" in activity or phase == "verify"):
-        mood = Mood("checking", activity, GOLD, 1.5)
-    elif w.get("busy") and "upload" in activity:
-        mood = Mood("uploading", activity, GOLD, 1.0)
-    elif w.get("busy"):
-        mood = Mood("training", activity, GOLD, 2.5)
-    else:
-        mood = Mood("resting", activity or "waiting for work", GOLD_DIM, 0.4)
-    return mood, earned if earned is not None else previous_earned, paid_at
+        return Mood("checking", activity, GOLD, 1.5)
+    if w.get("busy") and "upload" in activity:
+        return Mood("uploading", activity, GOLD, 1.0)
+    if w.get("busy"):
+        return Mood("training", activity, GOLD, 2.5)
+    return Mood("resting", activity or "waiting for work", GOLD_DIM, 0.4)
 
 
 def fetch(url: str, timeout: float = 2.0) -> dict | None:
@@ -89,20 +98,30 @@ def save_place(x: int, y: int) -> None:
     settings.save(avatar_place=[int(x), int(y)])
 
 
+def on_screen(place: tuple[int, int] | None, width: int, height: int) -> tuple[int, int]:
+    """Where the window goes: the saved place, kept on the screen there is (a monitor may have gone), else the
+    bottom-right corner."""
+    if place is None:
+        return width - SIZE - 24, height - SIZE - 96
+    return min(max(place[0], 0), max(width - SIZE, 0)), min(max(place[1], 0), max(height - SIZE, 0))
+
+
 class Avatar:
     """The window. `feed` is the worker's feed URL; `tk` and `root` are passed in by run(), or faked by a test."""
 
     def __init__(self, feed: str, tk, root, now=time.time):
         self.feed, self.tk, self.root, self.now = feed.rstrip("/"), tk, root, now
         self.mood = Mood("offline", "connecting…", GREY, 0.0)
-        self.earned: float | None = None
-        self.paid_at: float | None = None
+        self.seen = Seen()
+        self.latest: dict | None = None  # the feed's last answer, from the polling thread
+        self._lock = threading.Lock()
         self.phase = 0.0
         self.hidden = False
+        self.trouble: str | None = None  # the first frame that failed, said once
         self._drag: tuple[int, int] | None = None
         self.transparent = self._make_window()
-        self.canvas = tk.Canvas(root, width=SIZE, height=SIZE, highlightthickness=0, bd=0,
-                                bg="#010101" if self.transparent else "#171a21")
+        bg = ("systemTransparent" if sys.platform == "darwin" else KEYED) if self.transparent else "#171a21"
+        self.canvas = tk.Canvas(root, width=SIZE, height=SIZE, highlightthickness=0, bd=0, bg=bg)
         self.canvas.pack()
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._move)
@@ -120,12 +139,11 @@ class Avatar:
             root.attributes("-topmost", True)
         except Exception:  # noqa: BLE001
             pass
-        place = saved_place()
-        x, y = place if place else (root.winfo_screenwidth() - SIZE - 24, root.winfo_screenheight() - SIZE - 96)
+        x, y = on_screen(saved_place(), root.winfo_screenwidth(), root.winfo_screenheight())
         root.geometry(f"{SIZE}x{SIZE}+{x}+{y}")
         try:
             if sys.platform == "win32":
-                root.attributes("-transparentcolor", "#010101")
+                root.attributes("-transparentcolor", KEYED)
                 return True
             if sys.platform == "darwin":
                 root.attributes("-transparent", True)
@@ -162,7 +180,7 @@ class Avatar:
         if running:
             items.append(("Resume mining", lambda: app_module.order("resume")) if state.get("paused")
                          else ("Pause mining", lambda: app_module.order("pause")))
-        items += [None, ("Start when I log in", lambda: app_module.startup_on()),
+        items += [None, ("Start when I log in", lambda: app_module.startup_on(avatar=True)),
                   ("Don't start when I log in", lambda: app_module.startup_off()), None,
                   ("Hide the avatar", self.hide)]
         if running:
@@ -189,13 +207,24 @@ class Avatar:
         self.hidden = True
         self.root.destroy()
 
+    # -- the feed --
+
+    def poll_once(self) -> None:
+        snapshot = fetch(self.feed + "/")
+        with self._lock:
+            self.latest = snapshot
+
+    def _poll_forever(self) -> None:
+        while not self.hidden:
+            self.poll_once()
+            time.sleep(POLL_S)
+
     # -- drawing --
 
     def draw(self) -> None:
         c = self.canvas
         c.delete("all")
         unit = SIZE / 6  # the mark is 3 by 4 units, centred, with a bob and a swing by mood
-        import math
         t = self.phase
         bob = math.sin(t * 2 * math.pi) * (4 if self.mood.speed else 0)
         swing = math.sin(t * 2 * math.pi) * (0.18 if self.mood.name == "training" else 0.05 if self.mood.speed else 0)
@@ -222,22 +251,25 @@ class Avatar:
             c.create_text(SIZE / 2, SIZE - 10, text="offline", fill=GREY, font=("TkDefaultFont", 8))
 
     def tick(self) -> None:
-        """One frame: the mood from the feed once a second, the drawing at 20 a second."""
-        now = self.now()
-        if now - getattr(self, "_polled", 0.0) >= POLL_S:
-            self._polled = now
-            self.mood, self.earned, self.paid_at = mood_of(fetch(self.feed + "/"), self.earned, now, self.paid_at)
+        """One frame: the mood from the feed's latest answer, the drawing."""
+        with self._lock:
+            latest = self.latest
+        self.mood = mood_of(latest, self.seen, self.now())
         self.phase += 0.05 * self.mood.speed
         self.draw()
 
     def run(self) -> None:
+        threading.Thread(target=self._poll_forever, daemon=True, name="avatar-poll").start()
+
         def frame():
             if self.hidden:
                 return
             try:
                 self.tick()
-            except Exception:  # noqa: BLE001  (a bad frame is skipped, not fatal)
-                pass
+            except Exception as e:  # noqa: BLE001  (a bad frame is skipped; the first is said, so it can be fixed)
+                if self.trouble is None:
+                    self.trouble = repr(e)
+                    print(f"avatar: a frame failed ({self.trouble}); carrying on", file=sys.stderr)
             self.root.after(50, frame)
         frame()
         self.root.mainloop()

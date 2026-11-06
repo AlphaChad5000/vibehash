@@ -2316,7 +2316,9 @@ def parser() -> argparse.ArgumentParser:
                        ("stop", "stop the app and its worker"), ("status", "is it running, paused, and what the worker is doing")):
         asub.add_parser(name, help=what).set_defaults(fn=cmd_app)
     p = asub.add_parser("startup", help="start the app when you log in (on), or not (off)")
-    p.add_argument("mode", choices=["on", "off"]); p.set_defaults(fn=cmd_app)
+    p.add_argument("mode", choices=["on", "off"])
+    p.add_argument("--avatar", action="store_true", help="with the floating avatar (on only)")
+    p.set_defaults(fn=cmd_app)
     ap_.set_defaults(fn=cmd_app, acmd=None)
 
     p = sub.add_parser("avatar", help="a small always-on-top pickaxe on the desktop that shows what the worker is doing; "

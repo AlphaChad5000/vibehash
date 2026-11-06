@@ -136,8 +136,10 @@
   // ---- the worker's feed ----
   function step(phase, w) {
     var order = ["register", "compute", "commit", "verify", "paid"];
+    // the worker's phases: register, compute, reveal, verify, dispute (still being decided), next (the block), idle
     var now = phase === "register" ? "register" : phase === "compute" ? (w.this_round.committed ? "commit" : "compute")
-            : phase === "reveal" ? "commit" : phase === "verify" ? "verify" : phase === "idle" ? null : "paid";
+            : phase === "reveal" ? "commit" : (phase === "verify" || phase === "dispute") ? "verify"
+            : phase === "next" ? "paid" : null;
     document.querySelectorAll("#steps li").forEach(function (li) {
       var i = order.indexOf(li.dataset.step), j = order.indexOf(now);
       li.className = now == null ? "" : i < j ? "done" : i === j ? "now" : "";
@@ -147,6 +149,7 @@
     var w = s.workers[0];
     if (!w) { $("state").textContent = "no worker in the feed"; return; }
     node = s.node;
+    if (s.syn_per_vibe) SYN = s.syn_per_vibe;  // the feed says how many syn make a VIBE
     $("dot").className = "dot " + (w.busy ? "busy" : "on");
     $("state").textContent = w.activity;
     $("round").textContent = w.round == null ? "–" : w.round;

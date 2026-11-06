@@ -211,6 +211,14 @@ class StartupTests(AppHome):
             self.assertEqual(win.name, "VibeHash.cmd")
             self.assertIn("-m vibehash app", win.read_text())
             self.assertIn(self.tmp.name, win.read_text())  # VIBEHASH_HOME, so the service finds the same wallet
+            self.assertNotIn("--avatar", win.read_text())
+            self.assertIn("-m vibehash app --avatar", app.startup_on("Windows", run, avatar=True).read_text())
+            with mock.patch.dict(os.environ, {"VIBEHASH_LAUNCHER": r"C:\x\VibeHash.exe"}):  # the download: the launcher itself
+                text = app.startup_on("Windows", run, avatar=True).read_text()
+                self.assertIn("VibeHash.exe", text)
+                self.assertNotIn("-m vibehash", text)
+            lin = app.startup_on("Linux", run, avatar=True)
+            self.assertIn("-m vibehash app --avatar", lin.read_text())
             mac = app.startup_on("Darwin", run)
             self.assertEqual(mac.name, "org.vibehash.app.plist")
             self.assertIn("<string>app</string>", mac.read_text())

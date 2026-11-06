@@ -327,17 +327,17 @@ def startup_file(system: str | None = None) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / "vibehash.service"
 
 
-def startup_on(system: str | None = None, run=subprocess.run) -> Path:
+def startup_on(system: str | None = None, run=subprocess.run, avatar: bool = False) -> Path:
     """Start `vibehash app` at login: a Startup-folder script (Windows), a LaunchAgent (macOS) or a systemd user
-    service (Linux). -> the file written."""
+    service (Linux). `avatar`: with the avatar, as the app was started. -> the file written."""
     system = system or platform.system()
     path = startup_file(system)
     path.parent.mkdir(parents=True, exist_ok=True)
     home = settings.home()
     # Under the downloadable launcher (it says where it is), start the launcher, so its daily update check still
-    # happens; otherwise this Python with the app command.
+    # happens (it passes --avatar itself); otherwise this Python with the app command.
     launcher = os.environ.get("VIBEHASH_LAUNCHER")
-    exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"])
+    exe, args = (launcher, []) if launcher else (sys.executable, ["-m", "vibehash", "app"] + (["--avatar"] if avatar else []))
     if system == "Windows":
         # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n
         text = f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n')
@@ -404,7 +404,7 @@ def main(a) -> None:
         print("stopped" if stop_and_wait() else "the app didn't stop in time")
     elif sub == "startup":
         if a.mode == "on":
-            print(f"will start when you log in: {startup_on()}")
+            print(f"will start when you log in: {startup_on(avatar=bool(getattr(a, 'avatar', False)))}")
         else:
             print(f"won't start when you log in (removed {startup_off()})")
     else:

@@ -441,12 +441,16 @@ vibehash app status [-h]
 Start the app when you log in (on), or not (off).
 
 ```
-vibehash app startup [-h] {on,off}
+vibehash app startup [-h] [--avatar] {on,off}
 ```
 
 Arguments:
 
 - `mode`: one of on, off.
+
+Flags:
+
+- `--avatar`: with the floating avatar (on only).
 
 ## vibehash avatar
 

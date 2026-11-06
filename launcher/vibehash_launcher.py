@@ -15,8 +15,9 @@ macOS, ~/.local/share/vibehash on Linux) and nowhere else (uv's Python and cache
 
 It is plain Python with nothing but the standard library, so it also runs as a script, and PyInstaller turns it into
 the .exe (.github/workflows/launcher.yml). It never reads or writes the wallet: `vibehash app` does that, and the
-launcher only passes `--no-password` so a first wallet is made without a question (the file is then as safe as the
-user's account; `vibehash wallet create` makes a password-protected one for anyone who wants it). While the app runs,
+launcher only passes `--no-password`, so a first wallet is made without a question (the file is then as safe as the
+user's account; `vibehash wallet create` makes a password-protected one for anyone who wants it), and `--avatar`,
+the floating pickaxe on the desktop (no screen, and it leaves quietly). While the app runs,
 Ctrl+C goes to the app, which stops its worker properly; the launcher waits for it. `app startup on` under the
 launcher starts the launcher at login (it says where it is in $VIBEHASH_LAUNCHER), so the daily check still happens.
 """
