@@ -30,6 +30,7 @@ Thumbs.db
 # API Keys
 .env.local
 .env
+.env.*
 
 # What agents/architect.py writes by default (chats, eval prompts, answers, grades)
 agent-jobs/

@@ -32,7 +32,7 @@ while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in
     docs/CLI.md) add tests.test_cli_docs ;;
-    *.md|docs/*|LICENSE|.gitignore|floorplan/*|.github/workflows/launcher.yml|.github/workflows/publish.yml) ;;
+    *.md|docs/*|deploy/*|LICENSE|.gitignore|floorplan/*|.github/workflows/launcher.yml|.github/workflows/publish.yml) ;;
     launcher/*|app.ps1) add tests.test_launcher ;;
     scripts/ci_scope.sh|.github/workflows/tests.yml) add tests.test_launcher ;;
     tests/test_*.py) light_test "tests.$(basename "$f" .py)" ;;

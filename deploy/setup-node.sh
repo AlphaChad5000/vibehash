@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Set up a public Vibe Hash node on a fresh Ubuntu 24.04 server. Run it as root:
+# Set up a public Vibe Hash node on a fresh Ubuntu 24.04 server. Run it as root (or with sudo once root can't log in):
 #
-#   bash setup-node.sh --domain node.vibehash.org [--fund vibe1...=10000] [--email you@example.com]
+#   sudo bash setup-node.sh --domain node.vibehash.org [--fund vibe1...=10000] [--email you@example.com]
 #
 # It installs Vibe Hash from PyPI, makes the node's wallet and the network's genesis, gets a Let's Encrypt
 # certificate, and runs the node as a service that serves HTTPS on port 443 and restarts itself after a crash or
@@ -80,8 +80,13 @@ if [ ! -f "$GENESIS" ]; then
   as_node "$VH" "${args[@]}"
 fi
 
-say "Opening the firewall for SSH, HTTP (certificate renewals) and HTTPS"
-ufw allow OpenSSH >/dev/null
+say "Opening the firewall for HTTP (certificate renewals) and HTTPS"
+# SSH is opened to everyone only the first time, while the firewall is still off, so this run can't lock you out.
+# Once it's on, its SSH rules are left as they are: an upgrade mustn't undo a narrower rule made afterwards (SSH
+# allowed only from your own addresses, or only over Tailscale; README, "Lock down the server").
+if ! ufw status | grep -q '^Status: active'; then
+  ufw allow OpenSSH >/dev/null
+fi
 ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
 ufw --force enable >/dev/null

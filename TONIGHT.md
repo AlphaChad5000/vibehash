@@ -19,7 +19,7 @@ them. So, in order:
 3. Upgrade the node, in a terminal where you can type your SSH key's passphrase:
 
    ```powershell
-   scp .\deploy\setup-node.sh root@165.227.37.0: ; ssh -t root@165.227.37.0 bash setup-node.sh --domain node.vibehash.org
+   scp .\deploy\setup-node.sh YOU@NODE-HOST: ; ssh -t YOU@NODE-HOST sudo bash setup-node.sh --domain node.vibehash.org
    ```
 
    For a few minutes after the restart the node drops some connections, so
