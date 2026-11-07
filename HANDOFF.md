@@ -152,6 +152,19 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
+**Release 0.5.24 (2026-11-06): the app's window in vibehash.org's look, with the mine, automatic pauses and a recovery-word
+check (PR #55).** What a download gets once this is tagged:
+- The window showed no mining on Windows: pywebview handed WebView2 the page as a string (NavigateToString, origin
+  "null"), which the feed's CORS refuses. It is now a file pywebview serves (`window.page_file`).
+- The feed (`watch.py`) let any website named like localhost.evil.example read the worker's address, balance and
+  activity (CORS by prefix), and DNS rebinding read it too; now whole hostnames, and a Host that isn't 127.0.0.1 or
+  localhost gets 403.
+- Pause while gaming (anything full screen), on battery, or mine only when away (`presence.py`; Windows, Linux battery),
+  with a minute's cooldown; a system check (selftest), the wallet's sealed rounds, the model store, the node's trust and
+  latency, an update banner; links out by name only, after "Leaving Vibe Hash", in the browser.
+- Recovery words: shown, three typed back, cleared from the page however the check closes, then the words file can be
+  deleted. Still owed: the app's wallet has no password, so no send/stake from the window and no lock screen yet.
+
 **Release 0.5.23 (2026-11-06): Evo's holes closed, its rounds stop wasting time, the menu fits any window (PRs #56,
 #57, #58).** A bug hunt over vibehash-evo-1's records and the code found:
 - Three ways one worker could stop the network: an answers blob of JSON nested too deep (RecursionError in rescore
