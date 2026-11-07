@@ -80,10 +80,17 @@ class Spec2(es.EsSpec):
     # about 200, and at the end of the owner's second cycle (2026-11-05) the tasks trained first had given back most of
     # what the first cycle taught them. Mixed, every task is always recent. False: left out of the spec, as before it.
     mix: bool = False
+    # (period, run): an answer also ends at its first token that completes `run` tokens in a row each equal to the
+    # token `p` before it, for some p from 1 to `period` (loop_end): greedy decoding caught in a loop, such as
+    # "\usepackage{amssymb}" written to max_tokens. Measured on vibehash-evo-1's answers (2026-11-07, rounds 448-458,
+    # 22,528 answers), (32, 48) ended 279 of the 1,832 that reached max_tokens and none that ended by themselves.
+    # Empty: no such end, as before it (left out of the spec).
+    loop_stop: tuple = ()
 
     def __post_init__(self):
         super().__post_init__()
         object.__setattr__(self, "tasks", tuple(str(t) for t in self.tasks))
+        object.__setattr__(self, "loop_stop", tuple(self.loop_stop))
         object.__setattr__(self, "start", tuple((str(s[0]), float(s[1]), str(s[2]) if len(s) > 2 else "")
                                                 for s in self.start))
         if isinstance(self.decay, int) and not isinstance(self.decay, bool):
@@ -123,6 +130,10 @@ class Spec2(es.EsSpec):
             out.append("lenient is true or false")
         if not isinstance(self.mix, bool) or (self.mix and not self.tasks):
             out.append("mix is true or false, and true only with tasks")
+        if self.loop_stop and not (len(self.loop_stop) == 2 and all(type(x) is int for x in self.loop_stop)
+                                   and 1 <= self.loop_stop[0] <= LOOP_PERIODS
+                                   and 1 <= self.loop_stop[1] <= self.max_tokens):
+            out.append(f"loop_stop is [period 1-{LOOP_PERIODS}, run 1 to max_tokens]")
         if self.rank != 1 or self.rule != RULE2 or self.precision != "float32":
             out.append("rank is 1, rule 2, precision float32")
         return out
@@ -146,18 +157,20 @@ class Spec2(es.EsSpec):
                        "start": [[j, w, h] for j, w, h in self.start], "check": self.check, "margin": self.margin,
                        "lp_tol": self.lp_tol, "rank": self.rank, **({"tasks": list(self.tasks)} if self.tasks else {}),
                        **({"decay": self.decay} if self.decay else {}),
-                       **({"lenient": True} if self.lenient else {}), **({"mix": True} if self.mix else {})}}
+                       **({"lenient": True} if self.lenient else {}), **({"mix": True} if self.mix else {}),
+                       **({"loop_stop": list(self.loop_stop)} if self.loop_stop else {})}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Spec2":
         e = d["es"]
         known = {"rule", "tensors", "n", "tensors_sha", "task", "pairs", "pairs_per_unit", "problems", "max_tokens",
                  "sigma", "lr", "lr_floor", "rounds", "replay", "start", "check", "margin", "lp_tol", "rank", "tasks",
-                 "decay", "lenient", "mix"}
+                 "decay", "lenient", "mix", "loop_stop"}
         if set(e) - known:
             raise ValueError(f"a rule-2 ES spec has no field {sorted(set(e) - known)[0]!r}")
-        if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list) for k in ("start", "tasks")):
-            raise TypeError("tensors, start and tasks are lists")
+        if not isinstance(e["tensors"], list) or not all(isinstance(e.get(k, []), list)
+                                                         for k in ("start", "tasks", "loop_stop")):
+            raise TypeError("tensors, start, tasks and loop_stop are lists")
         return cls(base=str(d["base"]), manifest=str(d["manifest"]), dims=dict(d["model"]),
                    tensors=tuple(str(t) for t in e["tensors"]), n=int(e["n"]), tensors_sha=str(e["tensors_sha"]),
                    task=str(e["task"]), pairs=int(e["pairs"]), pairs_per_unit=int(e["pairs_per_unit"]),
@@ -166,7 +179,44 @@ class Spec2(es.EsSpec):
                    replay=int(e["replay"]), start=tuple(tuple(s) for s in e.get("start", [])),
                    check=int(e["check"]), margin=float(e["margin"]), lp_tol=float(e["lp_tol"]),
                    rank=int(e.get("rank", 1)), rule=int(e["rule"]), tasks=tuple(str(t) for t in e.get("tasks", [])),
-                   decay=float(e.get("decay", 0.0)), lenient=e.get("lenient", False), mix=e.get("mix", False))
+                   decay=float(e.get("decay", 0.0)), lenient=e.get("lenient", False), mix=e.get("mix", False),
+                   loop_stop=tuple(e.get("loop_stop", [])))
+
+
+LOOP_PERIODS = 64  # the longest loop_stop period a spec may ask for (es_hybrid keeps a counter a period a row)
+
+
+def loop_end(ids, period: int, run: int) -> int | None:
+    """Where an answer stops for looping (Spec2.loop_stop): the index of its first token that completes `run` tokens
+    in a row each equal to the token `p` before it, for some p in 1..period; None if it never does. The answering
+    engine (es_hybrid) stops the row at that token; a checker (es_client.check_many) and answer_members' cut use this."""
+    count = [0] * (period + 1)
+    for t, x in enumerate(ids):
+        for p in range(1, min(period, t) + 1):
+            count[p] = count[p] + 1 if ids[t - p] == x else 0
+            if count[p] >= run:
+                return t
+    return None
+
+
+def cut_loop(ids: list, loop_stop) -> list:
+    """An answer cut where it stops for looping (loop_end), or as it is."""
+    if not loop_stop:
+        return ids
+    t = loop_end(ids, *loop_stop)
+    return ids if t is None else ids[:t + 1]
+
+
+def ends_right(ids: list, spec, eos) -> bool:
+    """Whether an answer ends as answering ends one: at an end-of-turn token, at max_tokens, or (a job with
+    loop_stop) at its first looping token; never past max_tokens, and never running on past where it loops."""
+    if not ids or len(ids) > spec.max_tokens:
+        return False
+    loop = getattr(spec, "loop_stop", ())
+    t = loop_end(ids, *loop) if loop else None
+    if t is not None:
+        return t == len(ids) - 1
+    return len(ids) == spec.max_tokens or ids[-1] in eos
 
 
 def is_v2(d) -> bool:
