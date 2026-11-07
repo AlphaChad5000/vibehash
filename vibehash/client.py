@@ -1032,11 +1032,16 @@ class WorkerClient:
             return self._signed("verdict", body)
         except NodeError as e:
             # A node from before gaps were sent doesn't take the field (node.BODIES): the verdict without it, and
-            # every verdict without one from now on.
-            if "gap" not in body or e.status != 400 or "verdict message has only" not in str(e):
+            # every verdict without one from now on. A gap it refused (never sent: es_client keeps them in range)
+            # mustn't cost the verdict either.
+            if "gap" not in body or e.status != 400:
                 raise
-            log.info("the node is older and doesn't take a check's gap; sending verdicts without one")
-            self.verdict_gaps = False
+            older = "verdict message has only" in str(e)
+            if not older and "gap" not in str(e):
+                raise
+            if older:
+                log.info("the node is older and doesn't take a check's gap; sending verdicts without one")
+                self.verdict_gaps = False
             return self._signed("verdict", {k: v for k, v in body.items() if k != "gap"})
 
     def _disputes(self, rnd: int, job: TrainingJob) -> None:

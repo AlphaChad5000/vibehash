@@ -426,6 +426,17 @@ class CommandLineTests(unittest.TestCase):
             c._verdict(5, "es", {"round": 5, "task_id": "t2", "ok": True, "bad_segment": None})
         self.assertEqual([b["task_id"] for b in sent], ["t1", "t2"])
         self.assertFalse(c.verdict_gaps)  # and the rest of its verdicts go without one
+        c.verdict_gaps, sent[:] = True, []
+
+        def refuses_the_gap(kind, body):
+            if "gap" in body:
+                raise NodeError("a check's gap is a number from 0 to 1e6", 400)
+            sent.append(body)
+            return {"ok": True}
+        with mock.patch.object(c, "_signed", refuses_the_gap):
+            c._verdict(5, "es", {"round": 5, "task_id": "t3", "ok": False, "bad_segment": 0, "gap": 1e7})
+        self.assertEqual(sent, [{"round": 5, "task_id": "t3", "ok": False, "bad_segment": 0}])  # the rejection still goes
+        self.assertTrue(c.verdict_gaps)  # a node that takes gaps keeps getting them
 
     def test_worker_job_must_be_one_the_node_lists(self):
         """`worker --job JOB` (for pods and --plain): a job the node doesn't list with budget left stops it at once,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -26,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from . import es, es2, es2_rounds
+from .coordinator import MAX_GAP
 from .crypto import h256
 from .ledger import Block, canonical
 from .model import params_hash
@@ -812,7 +814,11 @@ class Es2Work:
                 if tid is not None and all((c, k) in worst and not lp_why[k] for k in chosen):
                     # Every member teacher-forced and nothing else wrong: the worst gap alone decides, and goes with the
                     # verdict (EsWork.gaps), for the census of how far apart honest machines are (netstats.gap_census).
-                    self.work.gaps[tid] = round(max((worst[(c, k)] for k in chosen), default=0.0), 4)
+                    # Only a number the node takes (coordinator.valid_gap): a logit of -inf makes a gap of inf and an
+                    # overflow NaN, and a verdict whose gap the node refused would be lost, rejection and all.
+                    g = max((worst[(c, k)] for k in chosen), default=0.0)
+                    if math.isfinite(g) or g == float("inf"):
+                        self.work.gaps[tid] = round(min(max(g, 0.0), MAX_GAP), 4)
                 for k in chosen:
                     if (c, k) in why:
                         ok, bad, reason = False, k, why[(c, k)]
