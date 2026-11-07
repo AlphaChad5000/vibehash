@@ -95,13 +95,18 @@ def _shared(rt, rows):
 class _Hybrid:
     """Buffers (and CUDA graphs) for decoding R rows through one resident pass of n rows, a KV cache of L slots for
     the full attention layers, answers of up to T tokens. Rows are member-major (member k's answer to prompt q is row
-    k * nq + q); row R is a spare that idle slots write to."""
+    k * nq + q); row R is a spare that idle slots write to. loop: a job's loop_stop (period, run), or () for none: an
+    answering row also stops at its first looping token (es2.loop_end), counted on the device a period at a time."""
 
-    def __init__(self, rt, linears, n, R, PR, L, T):
+    def __init__(self, rt, linears, n, R, PR, L, T, loop=()):
         model, cfg = rt.model, rt.model.config
         p = next(model.parameters())
         dev, dt = p.device, p.dtype
         self.rt, self.n, self.R, self.L, self.T, self.dev, self.dt = rt, n, R, L, T, dev, dt
+        self.loop = tuple(loop)
+        if self.loop:  # count[row, p - 1]: the tokens in a row each equal to the one p before (es2.loop_end)
+            self.lags = torch.arange(1, self.loop[0] + 1, device=dev)
+            self.count = torch.zeros(n, self.loop[0], dtype=torch.long, device=dev)
         self.kinds = list(cfg.layer_types)
         self.layers = list(model.model.layers)
         self.embed, self.norm, self.rot = model.model.embed_tokens, model.model.norm, model.model.rotary_emb
@@ -235,6 +240,11 @@ class _Hybrid:
             nxt = logits.argmax(-1)
             self.out.index_put_((rows, col), nxt)
             fin = (nxt[:, None] == self.eos).any(-1) | (self.col + 1 >= self.T)
+            if self.loop:  # the token p back is in the row's own answer so far: out[row, col - p], for col >= p
+                lag = self.col[:, None] - self.lags[None, :]
+                hit = (lag >= 0) & (self.out[rows[:, None], lag.clamp(min=0)] == nxt[:, None])
+                self.count.copy_((self.count + 1) * hit)
+                fin = fin | (self.count >= self.loop[1]).any(-1)
         act = (~self.done).long()
         self.tok.copy_(nxt)
         self.pos.add_(act)
@@ -307,6 +317,8 @@ class _Hybrid:
                 self.tok[slots] = last_tok[q]
                 self.pos[slots] = last_pos[q]
                 self.col[slots] = 0
+                if self.loop:
+                    self.count[slots] = 0
                 self.slot[slots] = W - 1
                 self.sel[slots] = selm[k]
                 self.rowid[slots] = rid
@@ -316,20 +328,20 @@ class _Hybrid:
             self.run(forced)
 
 
-def _engine(rt, linears, fac, R, rows, T):
+def _engine(rt, linears, fac, R, rows, T, loop=()):
     """The engine for R rows of these prompts' answers up to T tokens, made once and kept while the shape repeats."""
     W = max(len(r) for r in rows)
     L = -(-(W + T - 1) // 32) * 32
     A0 = next(iter(fac.values()))[0]
     PR = A0.shape[0] * A0.shape[2]
     n = rows_per_pass(rt.model.config)
-    key = (id(rt.model), n, R, PR, L, T, tuple(nm for nm, _ in linears))
+    key = (id(rt.model), n, R, PR, L, T, tuple(nm for nm, _ in linears), tuple(loop))
     eng = _ENGINE.get(key)
     if eng is None:
         _ENGINE.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        eng = _ENGINE[key] = _Hybrid(rt, linears, n, R, PR, L, T)
+        eng = _ENGINE[key] = _Hybrid(rt, linears, n, R, PR, L, T, loop)
     return eng
 
 
@@ -339,16 +351,20 @@ def _pin_precision():
     torch.backends.cuda.matmul.allow_tf32 = False
 
 
-def answer(rt, linears, fac, members, rows, T, sigma, rank):
-    """Every member's greedy answers to every prompt (es_fast.answer_members on a hybrid model)."""
+def answer(rt, linears, fac, members, rows, T, sigma, rank, loop=()):
+    """Every member's greedy answers to every prompt (es_fast.answer_members on a hybrid model). loop: the job's
+    loop_stop, () for none: a looping row stops there (its tokens past that are another row's, left in the buffer)."""
+    from .es2 import cut_loop
+
     _pin_precision()
     nq, M = len(rows), len(members)
     R = M * nq
-    eng = _engine(rt, linears, fac, R, rows, T)
+    eng = _engine(rt, linears, fac, R, rows, T, loop)
     eng.decode(rt, rows, members, fac, sigma, rank, False, torch.arange(R))
     toks = eng.out[:R].tolist()
     answers = []
     for row in toks:
+        row = cut_loop(row, loop)  # first: a row that stopped looping has stale tokens past its end
         cut = next((i + 1 for i, t in enumerate(row) if t in rt.eos), len(row))
         answers.append(row[:cut])
     return [answers[k * nq:(k + 1) * nq] for k in range(M)]

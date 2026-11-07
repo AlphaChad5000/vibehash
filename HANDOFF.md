@@ -152,6 +152,19 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
+**Release 0.5.26 (2026-11-07): an Evo job can end looping answers (`loop_stop`).** Measured on vibehash-evo-1 (2026-11-07, rounds
+448-458, 22,528 answers): 8.3% of answers reached max_tokens 512 and were 61% of all tokens decoded, but by task, not
+by looping: math 44% of all tokens (79% of its answers capped), gsm8k 31%, ifeval 17%, the other 13 tasks about 8%.
+Only ~15% of capped answers are exact loops (`\usepackage{amssymb}` to the end). `Spec2.loop_stop` [period, run]
+(left out when off, so earlier jobs' specs are unchanged) ends an answer at its first token completing `run` tokens in
+a row each equal to the token up to `period` before (`es2.loop_end`); es_hybrid stops such a row on the device (a
+counter a period a row, inside the CUDA graph), the other engines cut it after, and checkers accept that end
+(`es2.ends_right`, also the old end check when off). `job template --evo --tasks vibe` turns on (32, 48)
+(`es_tasks.VIBE_LOOP_STOP`; `--loop-stop` to change or turn off): 279 of 1,832 capped answers end early, no answer
+that ended by itself would have, 5.6% fewer decode steps on those rounds (18% in the loopiest). Only a new job gets
+it: vibe-08b-2 stays as it is. Test: tests/test_loop_stop.py (the rule, the spec, the engine on CPU; run by hand
+through the CUDA graph on the tiny model).
+
 **Release 0.5.25 (2026-11-07): an Evo checker checks a round's claims 4 at a time.** A checker teacher-forced one
 claim's 2 sampled members at a time, 16 problems in a 64-row pass of Qwen3.5-0.8B, so three quarters of each pass was
 empty and checks ran past the verify phase. `EsWork.check_many` / `Es2Work.check_many` now put up to 4 claims through

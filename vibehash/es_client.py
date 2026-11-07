@@ -658,7 +658,7 @@ class Es2Work:
         with rt.busy, torch.no_grad():
             self.load(rt, ln)
             got = es_fast.answer_members(rt, rt.linears, fac, members, rows, spec.max_tokens, spec.sigma, spec.rank,
-                                         max(work.max_rows, len(rows)))
+                                         max(work.max_rows, len(rows)), loop=spec.loop_stop)
             lp = None
             if replay:
                 st.activity = f"scoring {len(members)} twisted models on {len(replay)} earlier right answers"
@@ -764,9 +764,9 @@ class Es2Work:
                         why[(c, k)] = "an answer has token ids the model doesn't have"
                     elif any(t != es.text_of(rt, a) for a, t in zip(got[k], texts[k])):
                         why[(c, k)] = "an answer's text isn't its tokens' decoding"
-                    elif any(len(a) > spec.max_tokens or (len(a) < spec.max_tokens and (not a or a[-1] not in rt.eos))
-                             for a in got[k]):
-                        why[(c, k)] = "an answer stops before an end-of-turn token or max_tokens"
+                    elif not all(es2.ends_right(a, spec, rt.eos) for a in got[k]):
+                        why[(c, k)] = ("an answer stops before an end-of-turn token or max_tokens"
+                                       + (", or runs on past where it loops" if spec.loop_stop else ""))
                     else:
                         j, _, sign = members[k]
                         todo.append((c, k, (j, sign), got[k]))

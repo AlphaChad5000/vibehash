@@ -107,17 +107,23 @@ def _shared_cache(rt, rows):
 # --- answering ------------------------------------------------------------------------------------------------------
 
 def answer_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list, max_tokens: int, sigma: float,
-                   rank: int = 1, max_rows: int = 512) -> list:
+                   rank: int = 1, max_rows: int = 512, loop=()) -> list:
     """Every member's greedy answers to every prompt under the shared-prompt rule: answers[member][prompt] = token
-    ids, ending at an end-of-turn token (kept) or at max_tokens. members: [(pair index j, sign +1/-1)]."""
+    ids, ending at an end-of-turn token (kept), at max_tokens, or (loop: a job's loop_stop) at the first token where
+    it loops (es2.loop_end). members: [(pair index j, sign +1/-1)]. Qwen3.5's engine stops a looping row there; the
+    others write it to its end and cut it, the same tokens, since a greedy answer's start doesn't depend on its end."""
+    from .es2 import cut_loop
+
     p = next(rt.model.parameters())
     with torch.no_grad():
         if _hybrid(rt):
             from . import es_hybrid
-            return es_hybrid.answer(rt, linears, fac, members, rows, max_tokens, sigma, rank)
+            return es_hybrid.answer(rt, linears, fac, members, rows, max_tokens, sigma, rank, loop)
         if p.device.type == "cuda" and p.dtype == torch.bfloat16:
-            return _answer_engine(rt, linears, fac, members, rows, max_tokens, sigma, rank)
-        return _answer_plain(rt, linears, fac, members, rows, max_tokens, sigma, rank, max_rows)
+            got = _answer_engine(rt, linears, fac, members, rows, max_tokens, sigma, rank)
+        else:
+            got = _answer_plain(rt, linears, fac, members, rows, max_tokens, sigma, rank, max_rows)
+    return [[cut_loop(a, loop) for a in member] for member in got] if loop else got
 
 
 def _hybrid(rt) -> bool:

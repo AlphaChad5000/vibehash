@@ -934,6 +934,17 @@ def cmd_job_template(a):
     print(f"wrote {out}; edit it, then post it with post-job --spec {out}")
 
 
+def _loop_stop(text: str) -> tuple:
+    """--loop-stop PERIOD,RUN as a spec's loop_stop, or () for "off" (es2.Spec2.loop_stop)."""
+    if text.strip().lower() in ("off", "0", "none", ""):
+        return ()
+    try:
+        period, run = (int(x) for x in text.split(","))
+    except ValueError:
+        sys.exit(f"--loop-stop is PERIOD,RUN (such as 32,48) or off, not {text!r}")
+    return (period, run)
+
+
 def _evo_template(a, out: Path):
     """An Evo job that never ends, for a genesis's starter job (`genesis create --starter-job`): Evo v2's settings,
     its tasks taken in turn, `--rounds` each (es2.task_at), fee 0. Only the model's config.json is fetched."""
@@ -948,14 +959,19 @@ def _evo_template(a, out: Path):
         found = es_local.find(a.evo, config_only=True)
         # The vibe mix reasons before it answers (gsm8k, math, ifeval), so it gets room to: es_tasks.VIBE.
         max_tokens = a.max_tokens or (es_tasks.VIBE_MAX_TOKENS if a.tasks == "vibe" else None)
+        # A looping answer ends where it loops (es2.loop_end): on by default for vibe, whose answers run long.
+        loop = (es_tasks.VIBE_LOOP_STOP if a.tasks == "vibe" else ()) if a.loop_stop is None else _loop_stop(a.loop_stop)
         spec = es_local.spec2_for(found, tasks[0], rounds=a.rounds, tasks=tuple(tasks),
-                                  **({"max_tokens": max_tokens} if max_tokens else {}))
+                                  **({"max_tokens": max_tokens} if max_tokens else {}),
+                                  **({"loop_stop": tuple(loop)} if loop else {}))
         job = es_local.job2(spec, a.id, "system", budget=1, fee=0)
     except (ValueError, RuntimeError, OSError, InvalidJob) as e:
         sys.exit(f"can't make an Evo job for {a.evo}: {e}")
     out.write_text(json.dumps(job.to_spec(), indent=2) + "\n")
     print(f"wrote {out}: an Evo job on {found.repo}, {len(tasks)} tasks{' mixed in every round' if spec.mix else ' in turn'}, "
-          f"answers up to {spec.max_tokens} tokens, paying only new coins; give it to `vibehash genesis create --es "
+          f"answers up to {spec.max_tokens} tokens"
+          f"{f' (or until one loops: {spec.loop_stop[1]} tokens repeating a stretch of up to {spec.loop_stop[0]})' if spec.loop_stop else ''}"
+          f", paying only new coins; give it to `vibehash genesis create --es "
           f"--starter-job {out}`, or post it with `vibehash post-job --spec {out} --budget VIBE`")
 
 
@@ -2579,6 +2595,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=12, help="with --evo: rounds on each task before the next (default 12)")
     p.add_argument("--max-tokens", type=int, metavar="N", help="with --evo: the longest answer, in tokens (default 64; "
                    "512 with --tasks vibe, whose math and instructions need room to reason)")
+    p.add_argument("--loop-stop", metavar="PERIOD,RUN", help="with --evo: end an answer once RUN tokens in a row each "
+                   "repeat the token up to PERIOD before (a loop), or off (default 32,48 with --tasks vibe, else off)")
     p.set_defaults(fn=cmd_job_template)
 
     e = sub.add_parser("evo", help="Evo Hash's models").add_subparsers(dest="ecmd", required=True)
