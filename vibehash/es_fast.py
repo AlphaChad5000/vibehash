@@ -450,6 +450,28 @@ def gaps_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, s
     return _forced(rt, linears, fac, members, items, sigma, rank, max_rows, _worst_gap)
 
 
+def gaps_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list, answers: list, sigma: float,
+                 rank: int = 1, max_tokens: int | None = None):
+    """gaps_items with each member's own answers (answers[member][prompt], prompts `rows`): the worst gap of each, a
+    [members, prompts] float tensor. A checker's whole round in one call: on CUDA (and on Qwen3.5 everywhere) every
+    member goes through the answering engine's passes together, which always hold the same number of rows, so a row
+    rounds the same whatever else shares its pass and the gaps are those of one member at a time, in a fraction of
+    the time (a member alone is 16 rows of a 64-row pass). Elsewhere one member at a time."""
+    p = next(rt.model.parameters())
+    T = max([max_tokens or 0] + [len(a) for member in answers for a in member])
+    if not members or not rows or T == 0:
+        return torch.zeros(len(members), len(rows), device=p.device)
+    if _hybrid(rt):
+        from . import es_hybrid
+        with torch.no_grad():
+            return es_hybrid.forced(rt, linears, fac, members, rows, answers, T, sigma, rank)[0]
+    if p.device.type == "cuda" and p.dtype == torch.bfloat16:
+        with torch.no_grad():
+            return _gaps_engine(rt, linears, fac, members, rows, answers, T, sigma, rank)
+    return torch.cat([gaps_items(rt, linears, fac, [m], list(zip(rows, a)), sigma, rank, max_tokens=max_tokens)
+                      for m, a in zip(members, answers)])
+
+
 def _worst_gap(rt, h, w):
     logits = rt.model.lm_head(h).float()  # [P, n, vocab]
     return (logits.max(-1).values - logits.gather(-1, w[None, :, None].expand(h.shape[0], -1, 1))[..., 0]).max(-1).values

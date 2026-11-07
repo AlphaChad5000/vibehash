@@ -131,6 +131,23 @@ class HybridCpuTests(unittest.TestCase):
             alone = es_fast.score_items(rt, rt.linears, fac, [self.members[k]], items, spec.sigma)[0]
             self.assertEqual(alone.tolist(), every[k].tolist())
 
+    def test_a_rounds_members_checked_together_get_their_gaps_alone(self):
+        """es_fast.gaps_members (a checker's whole round at once, each member with its own answers): every member's
+        gaps exactly as gaps_items gives them alone, an honest one's 0 and a twin-swapped one's above 0."""
+        from vibehash import es_fast
+
+        rt, rows, fac, spec = self.rt, self.rows, self.fac, self.spec
+        got = es_fast.answer_members(rt, rt.linears, fac, self.members, rows, spec.max_tokens, spec.sigma)
+        claims = [got[k ^ 1] if k in (2, 5) else got[k] for k in range(len(self.members))]  # 2 and 5: the twin's
+        together = es_fast.gaps_members(rt, rt.linears, fac, self.members, rows, claims, spec.sigma,
+                                        max_tokens=spec.max_tokens)
+        for k in range(len(self.members)):
+            alone = es_fast.gaps_items(rt, rt.linears, fac, [self.members[k]], list(zip(rows, claims[k])), spec.sigma,
+                                       max_tokens=spec.max_tokens)[0]
+            self.assertEqual(together[k].tolist(), alone.tolist(), f"member {k}")
+        self.assertEqual(float(together[0].max()), 0.0)
+        self.assertGreater(float(together[2].max()), 0.0)
+
 
 def _qwen35_on_cuda() -> bool:
     if not HAVE_TORCH:
