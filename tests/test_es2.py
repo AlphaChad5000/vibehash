@@ -428,6 +428,22 @@ class NetworkTests2(unittest.TestCase):
         self.assertLess(st.stake(liar), 10 * VIBE, "the liar wasn't slashed")
         self.assertTrue(all(forger not in b.summary.accepted for b in mine), "forged answers were accepted")
         self.assertTrue(any(w.address in b.summary.accepted for b in mine for w in workers[:2]))
+        # Checkers send their worst gap with a verdict that the gaps alone decided (hardware.py's number setups):
+        # every worker here has the same setup, so an approved claim's is exactly 0, and the forger's are far over the
+        # margin. The node counts them by pair of setups at /network, with no address in sight.
+        verdicts = [e["body"] for b in mine for e in records[b.height]["verdicts"]]
+        self.assertTrue(all(isinstance(e, dict) for e in verdicts))
+        gaps = [(v["ok"], v["gap"]) for v in verdicts if "gap" in v]
+        self.assertTrue(gaps, "no verdict carried a gap")
+        self.assertEqual({g for ok, g in gaps if ok}, {0.0})
+        self.assertTrue(any(not ok and g > spec.margin for ok, g in gaps), gaps)
+        census = api.get("/network")["gaps"]
+        self.assertEqual(census["checks"], len(gaps))
+        [pair] = census["pairs"]
+        self.assertTrue(pair["same"] and pair["worker"].startswith("cpu float32 "), pair)
+        self.assertGreater(pair["over"], 0)
+        self.assertNotIn(workers[0].address, json.dumps(census))
+        self.assertTrue(all("numerics" in e["body"] for b in mine for e in records[b.height]["registrations"]))
         # An Evo round pays for work when a claim was approved and nobody rejected it: those rounds minted 50 VIBE each,
         # and no other did, as the blocks applied again from the genesis say.
         again = Chain.from_genesis(genesis)

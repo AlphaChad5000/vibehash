@@ -137,3 +137,103 @@ def valid_class(d) -> bool:
 def class_name(d: dict) -> str:
     """One line for a hardware class, as the census and the worker's log show it: "RTX 4060, 8 GB (nvidia sm_89)"."""
     return f"{d['label']}, {d['memory_gb']} GB ({d['vendor']} {d['arch']})"
+
+
+# --- the number setup a worker registers with ----------------------------------------------------------------------
+#
+# Beside its class, a worker says how its machine does arithmetic for Evo, the work whose checks compare token choices
+# to a fraction of a logit (es2.Spec2.margin): {"backend", "dtype", "arch", "units", "torch", "toolkit"}. Two machines
+# with the same setup get the same bits (an RTX 4070 SUPER checking another's answers: every gap 0), while a change in
+# any one of them can move a logit: bf16 against float32 (0.375 measured, docs/GPUS.md), another card's number of SMs
+# (cuBLAS promises equal results only on the same architecture with the same SM count), another CUDA or ROCm build, or
+# another PyTorch. It goes in the register message as its own field ("numerics"), so a node from before it refuses just
+# that field and the class still gets through (client.Client). Like the class, it's derived from what the drivers say
+# and squeezed through whitelists, nothing identifies a person, and a worker could lie about it: a checker paired by it
+# holds the liar to the setup it named, so lying only gets its own work rejected.
+BACKENDS = ("cuda", "rocm", "xpu", "mps", "cpu", "npu")
+DTYPES = ("bf16", "float32")
+MAX_UNITS = 4096
+VERSION_CHARS = set("0123456789.")
+NUMERIC_KEYS = {"backend", "dtype", "arch", "units", "torch", "toolkit"}
+
+
+def evo_dtype(device: str) -> str:
+    """What Evo's model computes in on `device`: bf16 on CUDA and ROCm (which PyTorch calls "cuda"), float32 everywhere
+    else (es_client.runtime2 and round_factors)."""
+    return "bf16" if str(device).startswith("cuda") else "float32"
+
+
+def numerics(backend) -> dict:
+    """How `backend` does Evo's arithmetic, as registered: see above. A machine without PyTorch is the CPU's float32
+    with no version."""
+    name = getattr(backend, "name", "cpu")
+    t = getattr(backend, "torch", None)
+    device = getattr(backend, "device", "cpu")
+    version = _torch_version(t)
+    if name == "cpu" or t is None:
+        return _canonical_numerics("cpu", "float32", platform.machine().lower() or "cpu", os.cpu_count() or 1, version, "")
+    idx = int(device.split(":")[1]) if ":" in device else 0
+    arch, units, toolkit, kind = name, 0, "", name
+    try:
+        if name == "cuda":
+            props = t.cuda.get_device_properties(idx)
+            hip = getattr(t.version, "hip", None)
+            kind = "rocm" if hip else "cuda"
+            arch = getattr(props, "gcnArchName", "") if hip else f"sm_{props.major}{props.minor}"
+            units = int(getattr(props, "multi_processor_count", 0))
+            toolkit = f"rocm{_major_minor(hip)}" if hip else f"cuda{_major_minor(getattr(t.version, 'cuda', ''))}"
+        elif name == "xpu":
+            props = t.xpu.get_device_properties(idx)
+            units = int(getattr(props, "gpu_eu_count", 0) or 0)
+        elif name == "mps":
+            arch = "mps"
+    except Exception:  # noqa: BLE001 - a driver that won't say: the setup without its details
+        pass
+    return _canonical_numerics(kind, evo_dtype(device), arch, units, version, toolkit)
+
+
+def _torch_version(t) -> str:
+    """PyTorch's version without its build tag: "2.14.1+cu126" -> "2.14.1" (the tag is the toolkit's, kept apart)."""
+    return str(getattr(t, "__version__", "")).split("+")[0] if t is not None else ""
+
+
+def _major_minor(v) -> str:
+    """"12.6" from "12.6", "6.2" from "6.2.41133-dd7f95766"; "" when there's no version."""
+    parts = [p for p in str(v or "").replace("-", ".").split(".") if p.isdigit()][:2]
+    return ".".join(parts)
+
+
+def _canonical_numerics(backend: str, dtype: str, arch: str, units, torch_version: str, toolkit: str) -> dict:
+    arch = "".join(ch for ch in str(arch).split(":")[0].lower() if ch in ARCH_CHARS)[:MAX_ARCH] or "unknown"
+    toolkit = "".join(ch for ch in str(toolkit).lower() if ch in ARCH_CHARS)[:MAX_ARCH]
+    if toolkit in ("cuda", "rocm"):  # the build said no version
+        toolkit = ""
+    version = "".join(ch for ch in str(torch_version).split("+")[0] if ch in VERSION_CHARS)[:MAX_ARCH]
+    try:
+        units = int(min(max(int(units), 0), MAX_UNITS))
+    except (TypeError, ValueError):
+        units = 0
+    return {"backend": backend if backend in BACKENDS else "cpu", "dtype": dtype if dtype in DTYPES else "float32",
+            "arch": arch, "units": units, "torch": version, "toolkit": toolkit}
+
+
+def valid_numerics(d) -> bool:
+    """Whether `d` is a number setup as numerics() makes one: the node refuses a registration whose isn't."""
+    if not isinstance(d, dict) or set(d) != NUMERIC_KEYS:
+        return False
+    arch, units, version, toolkit = d["arch"], d["units"], d["torch"], d["toolkit"]
+    return (d["backend"] in BACKENDS and d["dtype"] in DTYPES
+            and isinstance(arch, str) and 0 < len(arch) <= MAX_ARCH and set(arch) <= ARCH_CHARS
+            and isinstance(units, int) and not isinstance(units, bool) and 0 <= units <= MAX_UNITS
+            and isinstance(version, str) and len(version) <= MAX_ARCH and set(version) <= VERSION_CHARS
+            and isinstance(toolkit, str) and len(toolkit) <= MAX_ARCH and set(toolkit) <= ARCH_CHARS
+            and toolkit not in ("cuda", "rocm"))
+
+
+def numerics_key(d) -> str | None:
+    """One string for a number setup, the same for two machines that should get the same bits: "cuda bf16 sm_89 x24
+    cuda12.6 torch2.14.1". None for no setup (or one that isn't canonical)."""
+    if not valid_numerics(d):
+        return None
+    return (f"{d['backend']} {d['dtype']} {d['arch']} x{d['units']}"
+            + (f" {d['toolkit']}" if d["toolkit"] else "") + (f" torch{d['torch']}" if d["torch"] else ""))

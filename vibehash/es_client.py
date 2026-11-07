@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -26,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from . import es, es2, es2_rounds
+from .coordinator import MAX_GAP
 from .crypto import h256
 from .ledger import Block, canonical
 from .model import params_hash
@@ -45,6 +47,9 @@ class EsWork:
         # the model didn't give: the problems' solutions), "nester" (an answers blob of JSON nested too deep to parse)
         self.rebuilt = self.fetched = 0  # how each round's state was had: worked out from the chain, or downloaded
         self.timings: dict[int, dict] = {}  # round -> seconds answering, checking
+        # task id -> the worst gap a rule-2 check found, when nothing but the gaps could decide it (Es2Work.check_many):
+        # sent with the verdict, and taken from here as it is (Client._answer)
+        self.gaps: dict[str, float] = {}
         self.v2 = Es2Work(self)  # rule-2 jobs' (es2.py)
 
     def why_not(self, job: TrainingJob) -> str | None:
@@ -791,22 +796,36 @@ class Es2Work:
                                                   spec.rank).mean(1)
                         for (c, k, _), v in zip(lp_todo, lps):
                             mine[(c, k)] = float(v)
+            def lp_wrong(c, k, lps) -> str:
+                """Why member k's replay log-probability is off ("" when it isn't, or the claim has none)."""
+                if lps is None:
+                    return ""
+                try:
+                    claimed = float(lps[k // 2][k % 2])
+                except (TypeError, IndexError, ValueError):
+                    return "its replay log-probabilities aren't a unit's"
+                got_lp = mine.get((c, k), float("nan"))
+                return "" if abs(got_lp - claimed) <= spec.lp_tol else                     f"replay log-probability {claimed:.4f}, worked out {got_lp:.4f}"
+
             for c, chosen, _, _, lps in parsed:
                 ok, bad, reason = True, None, ""
+                lp_why = {k: lp_wrong(c, k, lps) for k in chosen if (c, k) in worst}
+                tid = claims[c][0].get("task_id")
+                if tid is not None and all((c, k) in worst and not lp_why[k] for k in chosen):
+                    # Every member teacher-forced and nothing else wrong: the worst gap alone decides, and goes with the
+                    # verdict (EsWork.gaps), for the census of how far apart honest machines are (netstats.gap_census).
+                    # Only a number the node takes (coordinator.valid_gap): a logit of -inf makes a gap of inf and an
+                    # overflow NaN, and a verdict whose gap the node refused would be lost, rejection and all.
+                    g = max((worst[(c, k)] for k in chosen), default=0.0)
+                    if math.isfinite(g) or g == float("inf"):
+                        self.work.gaps[tid] = round(min(max(g, 0.0), MAX_GAP), 4)
                 for k in chosen:
                     if (c, k) in why:
                         ok, bad, reason = False, k, why[(c, k)]
                     elif worst[(c, k)] > spec.margin:
                         ok, bad, reason = False, k, f"a token {worst[(c, k)]:.4f} below the greedy choice's logit"
-                    elif lps is not None:
-                        try:
-                            claimed = float(lps[k // 2][k % 2])
-                        except (TypeError, IndexError, ValueError):
-                            ok, bad, reason = False, k, "its replay log-probabilities aren't a unit's"
-                        else:
-                            got_lp = mine.get((c, k), float("nan"))
-                            if not abs(got_lp - claimed) <= spec.lp_tol:
-                                ok, bad, reason = False, k, f"replay log-probability {claimed:.4f}, worked out {got_lp:.4f}"
+                    elif lp_why[k]:
+                        ok, bad, reason = False, k, lp_why[k]
                     if not ok:
                         log.warning("round %d: unit %s's member %d fails the check: %s", rnd, claims[c][1].unit_id,
                                     bad, reason)

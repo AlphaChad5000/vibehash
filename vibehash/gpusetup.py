@@ -43,6 +43,7 @@ class Build:
     min_compute: Version = (0, 0)
     below_compute: Version = (99, 0)
     needs: Version = (0, 0)  # CUDA or ROCm version the driver must support
+    pin: str = ""  # a limit on PyTorch's version for this build, as pip takes it: "<2.15"
 
     @property
     def index(self) -> str | None:
@@ -69,6 +70,20 @@ ROCM_BUILDS = [Build(f"ROCm {v[0]}.{v[1]}", f"rocm{v[0]}.{v[1]}", needs=v)
                for v in [(10, 0), (7, 14), (7, 2), (7, 1), (7, 0), (6, 4), (6, 3), (6, 2)]]
 XPU = Build("Intel XPU", "xpu")
 MPS = Build("Apple MPS", None)
+# PyTorch 2.15 uses an Apple GPU only on macOS 15 or later: on macOS 14 torch.backends.mps.is_available() is False, and
+# the worker would mine on the CPU without saying why (docs/GPUS.md, risk 12). 2.14 still takes macOS 14.
+MPS_MACOS14 = Build("Apple MPS (macOS 14: PyTorch 2.14)", None, pin="<2.15")
+
+
+def macos_version() -> Version | None:
+    """This Mac's macOS version, (15, 1); None elsewhere or when it won't say."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        parts = [int(p) for p in platform.mac_ver()[0].split(".")[:2]]
+    except ValueError:
+        return None
+    return tuple((parts + [0])[:2]) if parts else None  # type: ignore[return-value]
 
 
 def _run(cmd: list[str], timeout: float = 20) -> str | None:
@@ -153,9 +168,9 @@ def intel_supported(name: str) -> bool:
     return "arc" in n or "data center gpu max" in n or "ponte vecchio" in n
 
 
-def builds_for(gpu: Gpu, system: str | None = None) -> tuple[list[Build], str | None]:
+def builds_for(gpu: Gpu, system: str | None = None, macos: Version | None = None) -> tuple[list[Build], str | None]:
     """PyTorch builds that should run on `gpu`, best first, or why there are none. system: sys.platform's value
-    (this computer's by default)."""
+    (this computer's by default); macos: the Mac's macOS version (this one's by default)."""
     system = system or sys.platform
     if gpu.vendor == "nvidia":
         if gpu.cuda is None:
@@ -164,6 +179,11 @@ def builds_for(gpu: Gpu, system: str | None = None) -> tuple[list[Build], str | 
                 and (gpu.compute is None or b.min_compute <= gpu.compute < b.below_compute)]
         return fits, None if fits else "its driver is too old for current PyTorch; update it from nvidia.com"
     if gpu.vendor == "apple":
+        macos = macos or macos_version()
+        if macos is not None and tuple(macos) < (14, 0):
+            return [], "PyTorch uses an Apple GPU from macOS 14 on; update macOS to mine on it"
+        if macos is not None and tuple(macos) < (15, 0):
+            return [MPS_MACOS14], None
         return [MPS], None
     if gpu.vendor == "intel":
         if not intel_supported(gpu.name):
@@ -225,7 +245,8 @@ def install(build: Build) -> int:
         code = subprocess.call(pip + ["uninstall", "-y", "torch"])
         if code:
             return code
-    return subprocess.call(pip + ["install", "--upgrade", "torch"] + (["--index-url", build.index] if build.index else []))
+    return subprocess.call(pip + ["install", "--upgrade", "torch" + build.pin]
+                           + (["--index-url", build.index] if build.index else []))
 
 
 def devices() -> list[dict]:

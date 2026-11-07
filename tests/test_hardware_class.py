@@ -130,3 +130,134 @@ class CensusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumericsTests(unittest.TestCase):
+    """The number setup (hardware.numerics): how a worker does Evo's arithmetic, registered beside its class."""
+    GOOD = {"backend": "cuda", "dtype": "bf16", "arch": "sm_89", "units": 24, "torch": "2.15.0", "toolkit": "cuda13.2"}
+
+    def test_this_computer_has_a_valid_setup(self):
+        n = hardware.numerics(compute.NumpyBackend())
+        self.assertTrue(hardware.valid_numerics(n), n)
+        self.assertEqual((n["backend"], n["dtype"], n["torch"], n["toolkit"]), ("cpu", "float32", "", ""))
+        self.assertGreater(n["units"], 0)  # its threads: OpenBLAS splits sums by them
+
+    def test_a_torch_device_gets_a_setup(self):
+        if not compute.torch_available():
+            self.skipTest("no PyTorch")
+        import torch
+        for d in compute.list_devices():
+            n = hardware.numerics(compute.TorchBackend(d.id) if d.id != "cpu" else compute.NumpyBackend())
+            self.assertTrue(hardware.valid_numerics(n), n)
+            if d.id.startswith("cuda"):
+                self.assertEqual(n["dtype"], "bf16")
+                self.assertEqual(n["torch"], torch.__version__.split("+")[0])
+                self.assertGreater(n["units"], 0)
+                self.assertRegex(n["toolkit"], r"^(cuda|rocm)\d+\.\d+$")
+
+    def test_evo_computes_in_bf16_on_cuda_and_rocm_only(self):
+        self.assertEqual(hardware.evo_dtype("cuda:1"), "bf16")
+        for device in ("cpu", "mps", "xpu:0", "npu"):
+            self.assertEqual(hardware.evo_dtype(device), "float32")
+
+    def test_versions_lose_their_build_tags(self):
+        self.assertEqual(hardware._major_minor("6.2.41133-dd7f95766"), "6.2")
+        self.assertEqual(hardware._major_minor("12.6"), "12.6")
+        self.assertEqual(hardware._major_minor(None), "")
+        made = hardware._canonical_numerics("rocm", "bf16", "gfx1100:sramecc+:xnack-", 48, "2.15.0+rocm7.14", "rocm7.14")
+        self.assertEqual(made, {"backend": "rocm", "dtype": "bf16", "arch": "gfx1100", "units": 48, "torch": "2.15.0",
+                                "toolkit": "rocm7.14"})
+        self.assertEqual(hardware._canonical_numerics("cuda", "bf16", "sm_89", 24, "2.15.0", "cuda")["toolkit"], "")
+        self.assertEqual(hardware._canonical_numerics("tpu", "fp8", "x", -3, "2.15", "")["backend"], "cpu")
+
+    def test_only_the_canonical_form_is_valid(self):
+        good = self.GOOD
+        self.assertTrue(hardware.valid_numerics(good))
+        self.assertTrue(hardware.valid_numerics({**good, "torch": "", "toolkit": ""}))  # no PyTorch: the CPU's
+        for bad in (
+            {**good, "backend": "tpu"}, {**good, "dtype": "fp16"}, {**good, "arch": "SM_89"}, {**good, "arch": ""},
+            {**good, "units": 24.0}, {**good, "units": True}, {**good, "units": 5000}, {**good, "units": -1},
+            {**good, "torch": "2.15.0+cu132"}, {**good, "torch": "x" * 17}, {**good, "toolkit": "CUDA13.2"},
+            {**good, "toolkit": "cuda"},  # a toolkit without its version: two spellings of "don't know"
+            {**good, "host": "pc"}, {k: v for k, v in good.items() if k != "units"}, "cuda", None, [],
+        ):
+            self.assertFalse(hardware.valid_numerics(bad), bad)
+
+    def test_one_key_per_setup(self):
+        self.assertEqual(hardware.numerics_key(self.GOOD), "cuda bf16 sm_89 x24 cuda13.2 torch2.15.0")
+        self.assertEqual(hardware.numerics_key({**self.GOOD, "backend": "cpu", "dtype": "float32", "arch": "amd64",
+                                                "torch": "", "toolkit": ""}), "cpu float32 amd64 x24")
+        self.assertNotEqual(hardware.numerics_key(self.GOOD), hardware.numerics_key({**self.GOOD, "units": 56}))
+        self.assertIsNone(hardware.numerics_key(None))
+        self.assertIsNone(hardware.numerics_key({**self.GOOD, "dtype": "fp8"}))
+
+
+class NumericsRegistrationTests(unittest.TestCase):
+    def test_the_setup_is_kept_from_the_signed_body_and_junk_counts_as_none(self):
+        proto, _ = network(3)
+        c = proto.coord
+        c.open_round()
+        w1, w2, w3 = proto.workers.values()
+        r = c.r
+
+        def register(w, extra):
+            body = {"round": r.round_no, "flops_per_sec": w.hardware.flops_per_sec, "memory_mb": w.hardware.memory_mb,
+                    **extra}
+            return c.register(w.address, w.hardware.flops_per_sec, w.hardware.memory_mb,
+                              envelope=proto._signed(w, "register", body))
+        entry = register(w1, {"numerics": NumericsTests.GOOD})
+        self.assertEqual(r.regs[w1.address].numerics, NumericsTests.GOOD)
+        self.assertEqual(entry["body"]["numerics"], NumericsTests.GOOD)
+        register(w2, {})  # an older worker says nothing
+        self.assertIsNone(r.regs[w2.address].numerics)
+        register(w3, {"numerics": {**NumericsTests.GOOD, "dtype": "fp8"}})  # past an older node's door: counts as none
+        self.assertIsNone(r.regs[w3.address].numerics)
+
+    def test_a_round_with_setups_replays(self):
+        import copy
+
+        from vibehash.replay import replay_block
+
+        proto, _ = network(3)
+        signed = proto._signed
+        setup = hardware.numerics(compute.NumpyBackend())
+
+        def with_setup(w, kind, body):
+            return signed(w, kind, {**body, "numerics": setup} if kind == "register" else body)
+        proto._signed = with_setup
+        before = copy.deepcopy(proto.chain)
+        rep = proto.run_round()
+        self.assertTrue(all(e["body"]["numerics"] == setup for e in rep.record["registrations"]))
+        self.assertEqual(replay_block(copy.deepcopy(before), rep.block, rep.record), [])
+
+
+class GapTests(unittest.TestCase):
+    def test_a_gap_is_a_finite_number_from_0(self):
+        from vibehash.coordinator import valid_gap
+        for good in (0, 0.0, 0.375, 4.5, 1e6):
+            self.assertTrue(valid_gap(good), good)
+        for bad in (-0.1, float("nan"), float("inf"), 1e7, True, "0.1", None, [0.1]):
+            self.assertFalse(valid_gap(bad), bad)
+
+    def test_the_census_counts_pairs_of_setups(self):
+        g = netstats.GapCensus()
+        for i in range(100):
+            g.add(1000.0, "cuda bf16 sm_89 x24", "mps float32 mps x0", i / 200, 0.5)  # 0 to 0.495
+        g.add(1000.0, "cuda bf16 sm_89 x24", "cuda bf16 sm_89 x24", 0.0, 0.5)
+        g.add(1000.0, None, "cuda bf16 sm_89 x24", 4.5, 0.5)  # a forger's claim, from a worker that gave no setup
+        g.add(1000.0 - netstats.DAY_S - 1, "old", "old", 9.0, 0.5)  # more than a day ago: left out
+        out = g.summary(1000.0)
+        self.assertEqual(out["checks"], 102)
+        worst, cross, same = out["pairs"]
+        self.assertEqual((worst["worker"], worst["max"], worst["over"], worst["same"]), ("unknown", 4.5, 1, False))
+        self.assertEqual((cross["checks"], cross["max"], cross["p99"], cross["near"], cross["over"]),
+                         (100, 0.495, 0.49, 50, 0))
+        self.assertTrue(same["same"])
+        self.assertEqual((same["max"], same["near"]), (0.0, 0))
+
+    def test_the_census_keeps_a_bounded_number(self):
+        g = netstats.GapCensus(keep=10)
+        for i in range(25):
+            g.add(0.0, "a", "b", float(i), 1.0)
+        self.assertEqual(g.summary(0.0)["checks"], 10)
+        self.assertEqual(g.summary(0.0)["pairs"][0]["max"], 24.0)

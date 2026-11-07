@@ -175,6 +175,7 @@ class Registration:
     flops_per_sec: float
     memory_mb: int
     hardware: dict | None = None  # what kind of machine (hardware.hardware_class), when the worker said; counted, not checked
+    numerics: dict | None = None  # how it does Evo's arithmetic (hardware.numerics), when it said; not checked either
 
 
 @dataclass
@@ -192,6 +193,7 @@ class VerifyTask:
     kind: str = "check"
     score: tuple[float, float] | None = None  # what a scorer reported: (loss, accuracy)
     donor: str = ""  # a DeepSeek prep canary's: the unit whose claim it presents as `unit`'s
+    gap: float | None = None  # an Evo check's worst gap, when the checker sent it (valid_gap)
 
 
 @dataclass
@@ -332,6 +334,15 @@ def _pick(draw: Draw, candidates: list[str], k: int) -> list[str]:
     while candidates and len(out) < k:
         out.append(candidates.pop(draw.below(len(candidates))))
     return out
+
+
+MAX_GAP = 1e6
+
+
+def valid_gap(gap) -> bool:
+    """Whether `gap` is an Evo check's worst gap as a checker sends it: a finite number from 0 to MAX_GAP (a logit
+    difference; honest machines' are under 1, a cheat's 3.5 or more: docs/GPUS.md)."""
+    return isinstance(gap, (int, float)) and not isinstance(gap, bool) and 0 <= gap <= MAX_GAP
 
 
 def _score(score) -> tuple[float, float]:
@@ -821,10 +832,13 @@ class Coordinator:
         klass = envelope["body"].get("hardware") if envelope else None
         if not hardware.valid_class(klass):
             klass = None
+        numbers = envelope["body"].get("numerics") if envelope else None
+        if not hardware.valid_numerics(numbers):
+            numbers = None
         staked = self.chain.state.staked
         if not staked(addr) and sum(not staked(a) for a in r.regs) >= self.config.max_newcomers:
             raise ProtocolError("this round has all the workers without stake it takes; try the next one")
-        r.regs[addr] = Registration(addr, float(flops_per_sec), int(memory_mb), klass)
+        r.regs[addr] = Registration(addr, float(flops_per_sec), int(memory_mb), klass, numbers)
         entry = envelope if envelope is not None else {"address": addr, "flops_per_sec": float(flops_per_sec), "memory_mb": int(memory_mb)}
         r.record["registrations"].append(entry)
         r.reg_entries[addr] = entry
@@ -1674,6 +1688,10 @@ class Coordinator:
         elif not ok and bad_segment not in t.segments:
             raise ProtocolError("a rejection must name one of the challenged segments")
         t.verdict = (bool(ok), None if ok or bad_segment is None else int(bad_segment))
+        # Like the hardware class, a gap rides in the signed body and is read from it, so a replay sees the same; the
+        # node refuses one that isn't valid_gap at its door, and one that got into a record anyway counts as none.
+        gap = envelope["body"].get("gap") if isinstance(envelope, dict) and isinstance(envelope.get("body"), dict) else None
+        t.gap = float(gap) if t.kind == "es" and valid_gap(gap) else None
         entry = {"verifier": addr, "task_id": task_id, "ok": bool(ok), "bad_segment": t.verdict[1]}
         if t.score is not None:
             entry["score"] = list(t.score)

@@ -62,7 +62,7 @@ from .blobs import CHUNK, MAX_DATASET, STALE_PART_S, BlobError, BlobStore, check
 from .client import MIN_CLIENT, OLD_CLIENT, NodeError, agent_version, parse_version  # the oldest releases it takes
 from .consensus import Engine, Timeouts, check_certificate, evidence_memo
 from .coordinator import (ES_RECORD_VERSION, FINETUNE_RECORD_VERSION, RECORD_VERSION, SHARDED_RECORD_VERSION, Coordinator,
-                          CoordinatorConfig, Phase, ProtocolError)
+                          CoordinatorConfig, Phase, ProtocolError, valid_gap)
 from .crypto import AddressError, KeyPair, address_of, checksummed, parse_address, verify
 from .ledger import EVIDENCE_WINDOW, VERSION, Block, InvalidBlock, Tx, apply_block, canonical
 from .model import params_hash
@@ -89,9 +89,9 @@ MAX_BLOCKS_REPLY = 4 * 2**20
 # up to ~10 KB for a reveal's Merkle proofs. Registrations and verdicts go into the round record exactly as sent, so
 # anything more would be junk that every validator stores and every proposal carries.
 ENVELOPE = {"kind", "body", "ts", "chain_id", "pubkey", "sig"}
-BODIES = {"register": {"round", "flops_per_sec", "memory_mb", "hardware"}, "assignment": {"round"}, "commit": {"round", "commitment"},
+BODIES = {"register": {"round", "flops_per_sec", "memory_mb", "hardware", "numerics"}, "assignment": {"round"}, "commit": {"round", "commitment"},
           "sign": {"round", "requests"},
-          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score"},
+          "reveal": {"round", "reveal"}, "tasks": {"round"}, "verdict": {"round", "task_id", "ok", "bad_segment", "score", "gap"},
           "move": {"round", "game", "n", "move"}}
 MAX_MESSAGE, MAX_REVEAL = 4 * 2**10, 64 * 2**10
 MAX_COMMITMENT = 2**20  # a prep unit's commitment in the bucket: roots, digests and a leaf a record, a few KB
@@ -249,6 +249,7 @@ class Node:
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self._census_cache: dict[int, dict] = {}  # height -> who registered that round and on what (_registrations)
+        self.gaps = netstats.GapCensus()  # Evo checks' worst gaps by pair of number setups, as /network shows them
         self.stopping = threading.Event()  # set by stop(), and by a halt, which leaves the server up
         self.halted: str | None = None  # why this node stopped itself (_halt): a block it couldn't save
         # What /status and refusals say about it: the height, not the folder or the database's own error text, which
@@ -1063,7 +1064,7 @@ class Node:
         return {"chain_id": self.chain.chain_id, "height": tip.height, "time": tip.timestamp, "now": now,
                 "subsidy": s.subsidy(tip.height + 1), "validators": len(s.validator_set()), "round": rnd,
                 "miners": netstats.summarize(recent, now), "hardware": netstats.census(self._registrations(recent, now), now),
-                "jobs": jobs}
+                "gaps": self.gaps.summary(now), "jobs": jobs}
 
     def _registrations(self, recent: list[dict], now: float) -> list[dict]:
         """Who registered for the last day's rounds and on what kind of machine, from the round records this node
@@ -1141,6 +1142,10 @@ class Node:
         # this way), so nodes of different versions still agree on every block.
         if kind == "register" and "hardware" in env["body"] and not hardware.valid_class(env["body"]["hardware"]):
             raise WireError("the hardware class isn't in its canonical form (what hardware.hardware_class makes)")
+        if kind == "register" and "numerics" in env["body"] and not hardware.valid_numerics(env["body"]["numerics"]):
+            raise WireError("the number setup isn't in its canonical form (what hardware.numerics makes)")
+        if kind == "verdict" and "gap" in env["body"] and not valid_gap(env["body"]["gap"]):
+            raise WireError("a check's gap is a number from 0 to 1e6")
         addr, body = open_envelope(env, kind, self.chain.chain_id)
         commitment = self._prep_commitment(body) if kind == "reveal" else None
         with c.lock:
@@ -1263,6 +1268,10 @@ class Node:
                 bad = body.get("bad_segment")
                 c.submit_verdict(addr, str(body["task_id"]), bool(body["ok"]), None if bad is None else int(bad), envelope=env,
                                  score=body.get("score"))
+                t = r.tasks.get(str(body["task_id"]))
+                if t is not None and t.gap is not None:
+                    setup = lambda a: hardware.numerics_key(r.regs[a].numerics) if a in r.regs else None  # noqa: E731
+                    self.gaps.add(time.time(), setup(t.submitter), setup(addr), t.gap, float(job.spec.margin))
                 return {"ok": True, "receipt": self._receipt(kind, env)}
             if kind == "move":
                 view = c.submit_move(addr, {k: body.get(k) for k in ("game", "n", "move")}, envelope=env, now=time.time())

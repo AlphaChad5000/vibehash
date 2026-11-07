@@ -56,6 +56,15 @@ class PinPrecisionTests(unittest.TestCase):
             compute.pin_precision()
         self.assertIsNone(mkldnn.allow_tf32)  # untouched: setting it there only warns there's no Intel GPU support
 
+    def test_amd_matmuls_go_to_rocblas(self):
+        """On ROCm, "cublas" is rocBLAS: deterministic mode covers it, unlike hipBLASLt (docs/GPUS.md, risk 3)."""
+        with mock.patch.object(torch.version, "hip", "7.14.0"),                 mock.patch.object(torch.backends.cuda, "preferred_blas_library") as pick:
+            compute.pin_precision()
+        pick.assert_called_once_with("cublas")
+        with mock.patch.object(torch.version, "hip", None),                 mock.patch.object(torch.backends.cuda, "preferred_blas_library") as pick:
+            compute.pin_precision()
+        pick.assert_not_called()  # NVIDIA keeps PyTorch's own choice
+
     def test_a_segment_pins_it_before_training(self):
         backend = compute.TorchBackend("cpu")
         torch.backends.cuda.matmul.fp32_precision = "tf32"
