@@ -44,6 +44,7 @@ BEAT_S = 1.0  # how often the app writes its heartbeat
 STALE_S = 10.0  # a heartbeat older than this: the app isn't running
 STOP_GRACE_S = 25.0  # how long a worker gets to leave its round before it is killed
 BACKOFF_S = (5, 15, 60)  # between restarts of a worker that keeps stopping
+STEADY_S = 600  # a worker that ran this long before it stopped is started again after the shortest wait
 HOLD_CHECK_S = 5.0  # how often the automatic pauses look (presence.py: battery, a full-screen app, idle time)
 HOLD_COOLDOWN_S = 60.0  # how long a reason to hold off must stay gone before the worker starts again: a game
 #                          flicking out of full screen, or a mouse nudged, mustn't reload the model each time
@@ -175,6 +176,7 @@ class Supervisor:
         self.child: subprocess.Popen | None = None
         self.paused = False
         self.restarts = 0
+        self._quick_stops = 0  # stops in a row each soon after its start (BACKOFF_S)
         self.started = time.time()
         self.worker_since: float | None = None
         self.next_start = 0.0  # when the worker may be started again (after it stopped on its own)
@@ -263,7 +265,15 @@ class Supervisor:
     # -- setup, as the window sees it --
 
     def report(self, step: str, fraction: float, **facts) -> None:
-        """prepare()'s progress: into the state file, for the window."""
+        """prepare()'s progress: into the state file, for the window. An `app stop` left since the last step ends
+        setup here: nothing read the order until mining began, so the app installed on, then quit as it started."""
+        try:
+            stop = control_path().read_text(encoding="utf-8").strip() == "stop"
+        except OSError:
+            stop = False
+        if stop:
+            take_order()
+            raise SystemExit("the app was told to stop while it set up")
         self.setup = {"step": step, "fraction": fraction}
         app_dir().mkdir(parents=True, exist_ok=True)
         if facts.get("wallet"):
@@ -311,8 +321,13 @@ class Supervisor:
             if self.child is not None:  # it stopped on its own: say so, and wait a little longer each time
                 code = self.child.returncode
                 self.child = None
+                # Longer each time it stops soon after a start; one that had run a while starts the count again (it
+                # never did: three stops days apart, and every restart after waited the longest).
+                if self.worker_since is None or now - self.worker_since >= STEADY_S:
+                    self._quick_stops = 0
                 self.worker_since = None
-                wait = self.backoff[min(self.restarts, len(self.backoff) - 1)]
+                wait = self.backoff[min(self._quick_stops, len(self.backoff) - 1)]
+                self._quick_stops += 1
                 self.restarts += 1
                 self.next_start = now + wait
                 self.say(f"worker stopped on its own (exit code {code}); starting it again in {wait} s")
@@ -499,9 +514,18 @@ def startup_on(system: str | None = None, run=None, avatar: bool = False) -> Pat
         path.unlink(missing_ok=True)
         return Path("HKCU") / RUN_KEY / "VibeHash"
     if system == "Windows":
-        # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n
-        text = f'@echo off\r\nset "VIBEHASH_HOME={home}"\r\nstart "Vibe Hash" /min "{exe}" {" ".join(args)}\r\n'.replace(' \r\n', '\r\n')
-        path.write_bytes(text.encode("oem" if os.name == "nt" else "utf-8", "replace"))
+        # cmd.exe reads a batch file in the OEM codepage, and a text-mode write would turn \r\n into \r\r\n. A path the
+        # codepage has no letters for (Дмитрий, or Ł on 437) came out as ???, and the app never started at login: then
+        # the lines after `chcp 65001` are read as UTF-8. A % in a path is %% (cmd expands %NAME%).
+        def cmd(s) -> str:
+            return str(s).replace("%", "%%")
+        body = f'set "VIBEHASH_HOME={cmd(home)}"\r\nstart "Vibe Hash" /min "{cmd(exe)}" {" ".join(args)}\r\n'
+        body = body.replace(' \r\n', '\r\n')
+        try:
+            data = ("@echo off\r\n" + body).encode("oem" if os.name == "nt" else "utf-8")
+        except UnicodeEncodeError:
+            data = ("@echo off\r\nchcp 65001 >nul\r\n" + body).encode("utf-8")
+        path.write_bytes(data)
     elif system == "Darwin":
         from xml.sax.saxutils import escape  # a path with & or < in it is still a plist
         log = escape(str(home / "app" / "app.log"))
@@ -567,9 +591,16 @@ def main(a) -> None:
         if not running():
             sys.exit("the app isn't running (start it with: vibehash app)")
         order(sub)
-        print(f"{sub}d" if sub == "pause" else "resuming")
+        step = ((read_state() or {}).get("setup") or {}).get("step", "mining")
+        later = "" if step in ("mining", "failed") else f" once setup is done (now at: {step})"
+        print((f"{sub}d" if sub == "pause" else "resuming") + later)
     elif sub == "stop":
-        print("stopped" if stop_and_wait() else "the app didn't stop in time")
+        if stop_and_wait():
+            print("stopped")
+        else:
+            step = ((read_state() or {}).get("setup") or {}).get("step", "mining")
+            print("the app didn't stop in time" if step in ("mining", "failed") else
+                  f"the app is still setting up (now at: {step}); it stops when that step ends")
     elif sub == "startup":
         if a.mode == "on":
             print(f"will start when you log in: {startup_on(avatar=bool(getattr(a, 'avatar', False)))}")

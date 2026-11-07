@@ -151,7 +151,9 @@ class TrainingJob:
                 max_update_ratio=float(d["max_update_ratio"]), compute_s=float(d.get("compute_s", 0)),
                 shards=int(d.get("shards", 1)),
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError, json.JSONDecodeError) as e:
+            # (OverflowError: int() of 1e999, JSON's Infinity; RecursionError: JSON nested too deep. Either escaped
+            # check_tx, and build_block, which drops only an InvalidJob, then failed instead of leaving the tx out.)
             raise InvalidJob(f"malformed job spec: {e}") from e
 
     @classmethod

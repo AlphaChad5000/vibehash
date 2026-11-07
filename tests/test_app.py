@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -146,6 +147,20 @@ class SupervisorTests(AppHome):
         s.tick(now + 0.4)  # the wait is over
         self.assertIsNotNone(s.child)
         s.stop_worker("test over")
+
+    def test_the_wait_grows_only_for_stops_soon_after_a_start(self):
+        """The count of restarts never went back down: three stops days apart, and every restart after waited 60 s."""
+        s = app.Supervisor(child_command(exit_code=3), 7545, beat_s=0.05, backoff=(5, 15, 60), grace_s=5)
+        app.app_dir().mkdir(parents=True)
+        waits = []
+        for ran in (1, 1, 1, 1, app.STEADY_S + 1, 1):
+            s.child = SimpleNamespace(returncode=3, poll=lambda: 3)
+            s.worker_since = 5000.0 - ran
+            with mock.patch.object(s, "worker_alive", return_value=False), mock.patch("sys.stdout", new_callable=io.StringIO):
+                s.tick(5000.0)
+            waits.append(s.next_start - 5000.0)
+        self.assertEqual(waits, [5, 15, 60, 60, 5, 15])
+        self.assertEqual(s.restarts, 6, "status still counts every restart")
 
     def test_the_window_and_the_avatar_ride_along_and_leave_with_the_app(self):
         s = app.Supervisor(child_command(), 7545, beat_s=0.05, grace_s=5, companions=[child_command(), child_command()])
@@ -428,6 +443,28 @@ class StartupTests(AppHome):
                 self.assertFalse(path.exists())
             self.assertEqual(calls[-1][:3], ["systemctl", "--user", "disable"])
 
+    def test_a_windows_path_the_codepage_cant_write_or_with_a_percent_still_starts(self):
+        """The .cmd was written in the OEM codepage with "replace": a user folder named Дмитрий came out as ??????? and
+        the app never started at login. Such a file switches cmd to UTF-8 first; a % is %% (cmd expands %NAME%)."""
+        home = Path(self.tmp.name) / "Дмитрий 100%" / ".vibehash"
+        with mock.patch.dict(os.environ, {"APPDATA": str(Path(self.tmp.name) / "AppData"), "VIBEHASH_HOME": str(home)}), \
+                mock.patch.object(Path, "home", return_value=Path(self.tmp.name)):
+            raw = app.startup_on("Windows", lambda *a, **kw: None).read_bytes()
+        if b"chcp 65001" in raw:  # (a codepage without Cyrillic: every English or western Windows)
+            self.assertTrue(raw.startswith(b"@echo off\r\nchcp 65001 >nul\r\n"))
+            self.assertIn(f'set "VIBEHASH_HOME={str(home).replace("%", "%%")}"'.encode("utf-8"), raw)
+        else:  # (one that has it, or another system, where it's written in UTF-8)
+            self.assertIn(f'set "VIBEHASH_HOME={str(home).replace("%", "%%")}"'
+                          .encode("oem" if os.name == "nt" else "utf-8"), raw)
+        self.assertNotIn(b"?", raw)
+        if os.name == "nt":  # what cmd itself reads from it
+            probe, seen = Path(self.tmp.name) / "probe.cmd", Path(self.tmp.name) / "seen.txt"
+            probe.write_bytes(raw.split(b"start ")[0] + b'"' + sys.executable.encode() + b'" -c "import os,sys; '
+                              b'open(sys.argv[1],\'w\',encoding=\'utf-8\').write(os.environ[\'VIBEHASH_HOME\'])" "'
+                              + str(seen).encode() + b'"\r\n')
+            subprocess.run(["cmd", "/c", str(probe)], check=True, capture_output=True)
+            self.assertEqual(seen.read_text(encoding="utf-8"), str(home))
+
 
 class CommandTests(AppHome):
     def test_plain_app_is_start(self):
@@ -439,6 +476,35 @@ class CommandTests(AppHome):
         self.assertEqual((a.acmd, a.device, a.gpu), (None, "cuda", "skip"))
         self.assertEqual(cli.parser().parse_args(["app", "start", "--watch", "7000"]).watch, 7000)
         self.assertEqual(cli.parser().parse_args(["app", "startup", "off"]).mode, "off")
+
+    def test_options_before_start_are_kept(self):
+        """`start`'s defaults overwrote what `app` had read: `app --no-window start` ran with the window, and the
+        launcher's `app --no-password --avatar -- start ...` lost both."""
+        from vibehash import cli
+        a = cli.parser().parse_args(["app", "--no-window", "--no-password", "--avatar", "--watch", "7600", "start"])
+        self.assertEqual((a.acmd, a.no_window, a.no_password, a.avatar, a.watch), ("start", True, True, True, 7600))
+        a = cli.parser().parse_args(["app", "--device", "cpu", "start", "--gpu", "skip"])
+        self.assertEqual((a.device, a.gpu), ("cpu", "skip"))
+        a = cli.parser().parse_args(["app", "start"])
+        self.assertEqual((a.no_window, a.avatar, a.watch, a.device, a.gpu), (False, False, None, "auto", "auto"))
+        self.assertTrue(cli.parser().parse_args(["app", "--avatar", "startup", "on"]).avatar)
+        self.assertFalse(cli.parser().parse_args(["app", "startup", "on"]).avatar)
+
+    def test_stop_while_setting_up_ends_setup_at_its_next_step(self):
+        """Nothing read the order until mining began: `app stop` said it hadn't stopped, and the app installed on, then
+        quit as it started mining."""
+        sup = app.Supervisor([sys.executable, "-c", "pass"], 7699, companions=[])
+        app.app_dir().mkdir(parents=True, exist_ok=True)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            sup.report("gpu", 0.3)
+            app.order("stop")
+            with self.assertRaisesRegex(SystemExit, "told to stop while it set up"):
+                sup.report("ready", 0.95)
+        self.assertFalse(app.control_path().exists())
+        with mock.patch.object(app, "stop_and_wait", return_value=False), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:  # a long step, the GPU build: say so
+            app.main(SimpleNamespace(acmd="stop"))
+        self.assertIn("still setting up (now at: gpu)", out.getvalue())
 
     def test_orders_need_a_running_app(self):
         with self.assertRaises(SystemExit) as ctx:

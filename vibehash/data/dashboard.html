@@ -458,7 +458,7 @@
   var SYN = 1e8, lastEvent = 0, node = null, networkAt = 0, events = [], level = "all";
   var FEED = window.FEED || "";  // the feed's address when the app's window loads this page itself; relative when the feed serves it
   var api = null, appPaused = false, appHeld = null, appSetup = null, appRunning = false, address = null;
-  var lastEarned = null, version = "", worker = null;
+  var lastEarned = null, version = "", worker = null, feedStarted = null;
 
   function text(id, s) { $(id).textContent = s == null || s === "" ? "–" : String(s); }
   function vibe(syn, digits) { if (syn == null) return "–"; var v = syn / SYN; return v.toLocaleString(undefined, { minimumFractionDigits: digits == null ? 2 : 0, maximumFractionDigits: digits == null ? 2 : digits }); }
@@ -586,6 +586,10 @@
   function poll() {
     fetch(FEED + "/", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (s) {
       onFeed(s);
+      // A new worker (the app starts one on every resume, hold and crash) numbers its events from 1 again: asking it
+      // for those after the old one's last showed nothing new for hours. Its lines then follow the old ones.
+      if (feedStarted !== null && (s.started !== feedStarted || s.last_event < lastEvent)) lastEvent = 0;
+      feedStarted = s.started;
       if (!lastEvent) addEvents(s.events);
       else return fetch(FEED + "/events?after=" + lastEvent, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (e) { addEvents(e.events); });
     }).catch(function () { worker = null; status(); });

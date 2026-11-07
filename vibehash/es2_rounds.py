@@ -65,10 +65,15 @@ def rescore(spec, round_seed: int, raw: bytes, unit_id: str, step: int = 0):
         if not (isinstance(answers, list) and len(answers) == spec.members
                 and all(isinstance(m, list) and len(m) == spec.problems for m in answers)):
             return None
+        # No answer has a negative id or none at all (each ends at its end-of-turn token, or has max_tokens): an
+        # accepted member's right answer can become a replay target (es2.replay_targets), which every later round
+        # scores, and checkers sample only some members, so a [-1] in another one ended every worker's and checker's
+        # scoring for good. (Ids past the model's vocabulary are left out of targets instead, by the spec's vocab:
+        # a spec that said too few mustn't make honest answers a fraud.)
         for member in answers:
             for a in member:
                 if not (isinstance(a, dict) and isinstance(a.get("text"), str) and isinstance(a.get("ids"), list)
-                        and len(a["ids"]) <= spec.max_tokens and all(type(t) is int for t in a["ids"])):
+                        and 0 < len(a["ids"]) <= spec.max_tokens and all(type(t) is int and t >= 0 for t in a["ids"])):
                     return None
         ps = items(spec, round_seed, step)
         ok = [[bool(p.check(a["text"])) for p, a in zip(ps, member)] for member in answers]

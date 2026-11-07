@@ -458,6 +458,174 @@ class RateLimitPathTests(unittest.TestCase):
         self.assertEqual(codes[1], 429, "the second transaction is over the tx budget, however the path is spelled")
 
 
+class SlowClientTests(unittest.TestCase):
+    """Socket timeouts bound each read, not a request: clients sending a byte just inside header_timeout each held a
+    connection (and a thread) for good, so a few addresses could fill the node's connection cap and lock everyone out."""
+
+    def trickle(self, node, head: bytes, stop: threading.Event, dropped: list):
+        host, port = node.server.server_address[:2]
+        s = socket.create_connection((host, port))
+        try:
+            for b in head:
+                if stop.is_set():
+                    return
+                s.send(bytes([b]))
+                time.sleep(0.3)  # each byte inside the 1 s header timeout
+        except OSError:
+            dropped.append(True)
+        finally:
+            s.close()
+
+    def test_slow_headers_are_cut_off_and_others_get_in(self):
+        node = start_node(self, limits=Limits(max_connections=4, header_timeout=1.0, io_timeout=2.0))
+        stop, dropped = threading.Event(), []
+        self.addCleanup(stop.set)
+        head = b"GET /status HTTP/1.0\r\nX-Pad: " + b"a" * 1000
+        threads = [threading.Thread(target=self.trickle, args=(node, head, stop, dropped), daemon=True)
+                   for _ in range(4)]
+        for t in threads:
+            t.start()
+        wait_for(lambda: len(dropped) == 4, seconds=10)
+        self.assertEqual(raw(node.url, "GET", "/status")[0], 200)
+
+    def test_a_slow_body_is_cut_off_and_a_quick_one_isnt(self):
+        node = start_node(self, limits=Limits(header_timeout=1.0, io_timeout=1.0))
+        with mock.patch("vibehash.ratelimit.MIN_BODY_RATE", 10**6):  # a 1 KB body: io_timeout + 1 ms
+            stop, dropped = threading.Event(), []
+            self.addCleanup(stop.set)
+            head = b"POST /tx HTTP/1.0\r\nContent-Length: 1000\r\n\r\n"
+            sock = socket.create_connection(node.server.server_address[:2])
+            self.addCleanup(sock.close)
+            sock.sendall(head)
+            t = threading.Thread(target=self.trickle, args=(node, b"", stop, dropped), daemon=True)
+            t.start()
+            began = time.time()
+            got = b""
+            try:
+                for _ in range(40):  # a byte each 0.3 s: 12 s, unless it's cut off
+                    sock.send(b"x")
+                    time.sleep(0.3)
+                    if time.time() - began > 4:
+                        break
+                got = sock.recv(100)
+            except OSError:
+                pass
+            self.assertLess(time.time() - began, 4, "the slow body was cut off within its deadline")
+            self.assertNotIn(b"200", got)
+            status, _ = raw(node.url, "POST", "/tx", b"{}")  # a quick body: answered as ever
+            self.assertEqual(status, 400)
+
+
+class UploadSizeTests(unittest.TestCase):
+    """An upload's size (X-Total) is fixed by its first chunk: BlobStore holds each chunk to its own request's X-Total,
+    and the quotas counted the first chunk's, so one admitted at 2 bytes could grow to the most a request may say."""
+
+    def put(self, node, kind, bid, total, offset, chunk):
+        ts = int(time.time())
+        headers = {"X-VibeHash-Pubkey": REQ.public.hex(), "X-VibeHash-Ts": str(ts), "X-Total": str(total),
+                   "X-Offset": str(offset), "X-VibeHash-Sig": REQ.sign(canonical(["dos-net", kind, bid, total, ts])).hex()}
+        return raw(node.url, "PUT", f"/{kind}/{bid}", chunk, headers)
+
+    def test_a_dataset_cant_grow_past_the_size_it_was_admitted_at(self):
+        node = start_node(self)
+        a = hashlib.sha256(b"a").hexdigest()
+        with mock.patch.object(node_module, "DATASET_QUOTA", 1000):
+            self.assertEqual(self.put(node, "dataset", a, 2, 0, b"x")[0], 200)
+            status, body = self.put(node, "dataset", a, 900, 1, b"y" * 500)
+            self.assertEqual(status, 400)
+            self.assertIn(b"can't change part way", body)
+            self.assertEqual(node.store.datasets.received(a, REQ.address), 1)
+        # After a restart (nothing admitted), a part way upload is checked against the quota again.
+        node._admitted.clear()
+        with mock.patch.object(node_module, "DATASET_QUOTA", 100):
+            status, body = self.put(node, "dataset", a, 900, 1, b"y" * 500)
+            self.assertEqual(status, 400)
+            self.assertIn(b"already holds", body)
+
+    def test_a_defenders_blob_is_charged_at_the_size_it_starts_with(self):
+        from types import SimpleNamespace
+        from vibehash.coordinator import Phase
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        node = Node(Path(tmp.name) / "node", SOLO, NODE, port=0, times=FAST)  # not started: its coordinator is ours
+        self.addCleanup(node.store.close)
+        self.addCleanup(node.server.server_close)
+        node.coord.phase = Phase.DISPUTE
+        node.coord.r = SimpleNamespace(games={"g": SimpleNamespace(defender=REQ.address, turn="defender")})
+
+        def headers(bid, total):
+            ts = int(time.time())
+            return {"X-VibeHash-Pubkey": REQ.public.hex(), "X-VibeHash-Ts": str(ts),
+                    "X-VibeHash-Sig": REQ.sign(canonical(["dos-net", "blob", bid, total, ts])).hex()}
+        bid = hashlib.sha256(b"trace").hexdigest()
+        node.authorize_blob(bid, 2, headers(bid, 2))
+        node.authorize_blob(bid, 2, headers(bid, 2))  # its later chunks, at the same size: charged once
+        self.assertEqual(node.trace_uploads[REQ.address], 2)
+        with self.assertRaisesRegex(node_module.ProtocolError, "can't change part way"):
+            node.authorize_blob(bid, 2**31, headers(bid, 2**31))
+
+
+class ChunkRaceTests(unittest.TestCase):
+    def test_one_chunk_sent_twice_at_once_is_written_once(self):
+        """Both copies read the same size and appended, leaving a part of the full size that never got vetted, which
+        every later chunk then took as a duplicate: an upload that said it was done and never was."""
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        store = BlobStore(Path(tmp.name))
+        data = os.urandom(2 * 2**20)
+        bid, half = hashlib.sha256(data).hexdigest(), len(data) // 2
+        for _ in range(10):
+            store.prune()
+            gate = threading.Barrier(2)
+
+            def put():
+                gate.wait()
+                store.write_chunk(bid, 0, data[:half], len(data), "w1")
+            ts = [threading.Thread(target=put) for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(store.received(bid, "w1"), half)
+        self.assertEqual(store.write_chunk(bid, half, data[half:], len(data), "w1"), len(data))
+        self.assertTrue(store.has(bid))
+        self.assertEqual(store._part_locks, {}, "no lock is kept once nobody holds it")
+
+    def test_a_part_left_whole_is_vetted_not_taken_as_received(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        store = BlobStore(Path(tmp.name))
+        data = b"z" * 100
+        bid = hashlib.sha256(data).hexdigest()
+        store._part(bid, "w1").write_bytes(b"q" * 100)  # whole, wrong, never vetted (a node stopped part way)
+        with self.assertRaisesRegex(node_module.BlobError, "doesn't match"):
+            store.write_chunk(bid, 0, data[:50], 100, "w1")
+        self.assertEqual(store.write_chunk(bid, 0, data, 100, "w1"), 100)
+        self.assertTrue(store.has(bid))
+
+
+class UploadSigningTests(unittest.TestCase):
+    def test_each_chunk_is_signed_when_it_is_sent(self):
+        """The node checks each chunk's timestamp against its clock: one signature for a whole file ended uploads of
+        over MAX_CLOCK_SKEW_S (two minutes: a dataset, or a checkpoint on a slow link) with a 400 nobody retried."""
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "f.bin"
+        path.write_bytes(b"w" * 1000)
+        api, sent, clock = NodeClient("http://127.0.0.1:1"), [], iter(range(1_000_000, 2_000_000, 100))
+        api._status = {"chain_id": "dos-net"}
+
+        def req(method, url, body=b"", headers=None, **kw):
+            sent.append((int(headers["X-VibeHash-Ts"]), int(headers["X-Offset"]), len(body)))
+            return json.dumps({"received": int(headers["X-Offset"]) + len(body)}).encode()
+        with mock.patch.object(api, "get", return_value={"complete": False, "received": 0}), \
+                mock.patch.object(api, "_req", side_effect=req), mock.patch("vibehash.client.CHUNK", 300), \
+                mock.patch("vibehash.client.time.time", side_effect=lambda: next(clock)):
+            api.upload(REQ, "blob", path, hashlib.sha256(b"w" * 1000).hexdigest())
+        self.assertEqual([(o, n) for _, o, n in sent], [(0, 300), (300, 300), (600, 300), (900, 100)])
+        self.assertEqual(len({ts for ts, _, _ in sent}), 4, "a fresh timestamp each chunk")
+
+
 # --- 8. sync --------------------------------------------------------------------------------------------------------
 
 class SyncTests(unittest.TestCase):

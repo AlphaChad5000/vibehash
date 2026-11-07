@@ -473,8 +473,10 @@ class NetworkTests2(unittest.TestCase):
         worst = max(float(np.abs((rt.base[n] + cline.change.d[n]).numpy() - exact[n]).max()) for n, _, _ in layout)
         self.assertLess(worst, 1e-5, f"the child's change is {worst} from the canonical one")
 
-        # A worker restarted carries on from the line it saved to disk, not from the start.
-        saved = es_client._load_line(next(iter(es_client._chains.values())), "evo2-b", child)
+        # A worker restarted carries on from the line it saved to disk, not from the start. (This node's chain: the
+        # first one cached is whichever test in this process ran a network first.)
+        cache = next(c for (url, _), c in es_client._chains.items() if url.rstrip("/") == node.url.rstrip("/"))
+        saved = es_client._load_line(cache, "evo2-b", child)
         self.assertIsNotNone(saved, "the child's line wasn't saved")
         self.assertEqual(saved.params_hash, cline.params_hash)
         for n, _, _ in layout:
@@ -483,7 +485,6 @@ class NetworkTests2(unittest.TestCase):
         # A process with neither line in memory nor on disk replays the child's rounds and its parent's up to the child's
         # start (the parent ran on after it: jobs take turns), and says how far along it is: the dashboards'
         # rebuilding() counts the rounds replayed up to the total it counted first, and the log says so.
-        cache = next(iter(es_client._chains.values()))
         cache.lines.clear()
         cache.starts.clear()
         for f in es_client._saved_dir().glob("*.pt"):

@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,8 @@ class BlobStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._finishing = threading.Lock()  # uploads of one blob can complete at the same moment
+        self._parts_lock = threading.Lock()
+        self._part_locks: dict[str, list] = {}  # part file name -> [its lock, how many hold or wait for it]
 
     def path(self, blob_id: str) -> Path:
         return self.root / check_id(blob_id)
@@ -99,32 +102,55 @@ class BlobStore:
         if done is not None:
             return done
         part = self._part(blob_id, owner)
-        have = part.stat().st_size if part.exists() else 0
-        if offset < have and offset + len(chunk) <= have:
-            return have  # duplicate of something we already have
-        if offset != have:
-            raise BlobError(f"expected offset {have}, got {offset}")
-        if have + len(chunk) > total:
-            raise BlobError("upload longer than declared")
-        with open(part, "ab") as f:
-            f.write(chunk)
-        have += len(chunk)
-        if have == total:
-            if file_sha256(part) != blob_id:
+        # One write at a time to a part: two copies of one chunk at once (a retry while the first is still being
+        # written) each read the same size and appended, leaving a part of `total` bytes that never got vetted, which
+        # every later chunk then took as a duplicate: an upload that said it was done and never was.
+        with self._holding(part):
+            have = part.stat().st_size if part.exists() else 0
+            if have < total:
+                if offset < have and offset + len(chunk) <= have:
+                    return have  # duplicate of something we already have
+                if offset != have:
+                    raise BlobError(f"expected offset {have}, got {offset}")
+                if have + len(chunk) > total:
+                    raise BlobError("upload longer than declared")
+                with open(part, "ab") as f:
+                    f.write(chunk)
+                have += len(chunk)
+            if have > total:  # (a part from an upload that declared more): start again
                 part.unlink(missing_ok=True)
-                raise BlobError("upload doesn't match its id; discarded")
-            if check is not None:
-                try:
-                    check(part)
-                except BaseException:
+                raise BlobError("upload longer than declared; discarded")
+            if have == total:  # (or a part left whole, by a node stopped before it was vetted)
+                if file_sha256(part) != blob_id:
                     part.unlink(missing_ok=True)
-                    raise
-            with self._finishing:
-                if self.has(blob_id):  # another uploader finished first; same bytes, and the file may be in use
-                    part.unlink(missing_ok=True)
-                else:
-                    os.replace(part, self.path(blob_id))
-        return have
+                    raise BlobError("upload doesn't match its id; discarded")
+                if check is not None:
+                    try:
+                        check(part)
+                    except BaseException:
+                        part.unlink(missing_ok=True)
+                        raise
+                with self._finishing:
+                    if self.has(blob_id):  # another uploader finished first; same bytes, and the file may be in use
+                        part.unlink(missing_ok=True)
+                    else:
+                        os.replace(part, self.path(blob_id))
+            return have
+
+    @contextmanager
+    def _holding(self, part: Path):
+        """A lock for one part file, made while anyone holds it (so the table doesn't grow with every upload)."""
+        with self._parts_lock:
+            entry = self._part_locks.setdefault(part.name, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._parts_lock:
+                entry[1] -= 1
+                if not entry[1]:
+                    del self._part_locks[part.name]
 
     # --- reading ------------------------------------------------------------------
 

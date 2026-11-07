@@ -50,6 +50,7 @@ ROUTES = {"tx": "tx", "register": "worker", "assignment": "worker", "commit": "w
 MAX_TRACKED = 50_000  # (ip, bucket) pairs remembered before idle ones are forgotten
 MAX_DRAIN = 2**20  # unread request bytes a 429 reads first, so closing doesn't reset the connection under the reply
 MAX_TURNED_AWAY = 1024  # connections answered 503 and waiting to be closed (beyond that, they're closed at once)
+MIN_BODY_RATE = 16 * 1024  # bytes a second a request body must average (past io_timeout), or the connection is cut
 
 
 def path_parts(path: str) -> list[str]:
@@ -149,6 +150,43 @@ class RateLimiter:
                 del self._buckets[key]
 
 
+class _Metered:
+    """A request body's reader that calls `done()` once `left` bytes of it have been read (GuardedHandler: the end of
+    the body's deadline). Everything else is the wrapped reader's."""
+
+    def __init__(self, raw, left: int, done):
+        self._raw, self._left, self._done = raw, left, done
+
+    def _count(self, got: int) -> None:
+        if self._left > 0:
+            self._left -= got
+            if self._left <= 0:
+                self._done()
+
+    def read(self, n=-1):
+        b = self._raw.read(n)
+        self._count(len(b))
+        return b
+
+    def read1(self, n=-1):
+        b = self._raw.read1(n)
+        self._count(len(b))
+        return b
+
+    def readline(self, limit=-1):
+        b = self._raw.readline(limit)
+        self._count(len(b))
+        return b
+
+    def readinto(self, buf):
+        got = self._raw.readinto(buf)
+        self._count(got or 0)
+        return got
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class GuardedHandler(BaseHTTPRequestHandler):
     """Base class for the node's handler: socket timeouts, and the rate limit, checked centrally once the
     headers are in, so every route (including ones added later) is covered before it runs."""
@@ -161,6 +199,16 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if not super().parse_request():
             return False
         self.connection.settimeout(self.server.limits.io_timeout)
+        # The headers are in: a body now has io_timeout plus what MIN_BODY_RATE takes for its length (its deadline ends
+        # once it's read), and a request without one no deadline (its reply moves at the client's pace, each send
+        # within io_timeout).
+        n = self.headers.get("Content-Length") or ""
+        n = int(n) if n.isascii() and n.isdigit() else 0
+        if n > 0:
+            self.server.deadline(self.server.limits.io_timeout + n / MIN_BODY_RATE)
+            self.rfile = _Metered(self.rfile, n, lambda: self.server.deadline(None))
+        else:
+            self.server.deadline(None)
         bucket = bucket_of(self.command, self.path)
         wait = self.server.limiter.check(self.client_address[0], bucket)
         if not wait:
@@ -207,6 +255,7 @@ class GuardedServer(ThreadingHTTPServer):
         self._open: dict[str, int] = {}
         self._open_total = 0
         self._closing: deque = deque()  # (when, socket): turned away, closed once the client has had time to read why
+        self._deadlines: dict[int, list] = {}  # connection thread -> [when it's cut off (None: never), its socket]
         super().__init__(address, handler)
 
     @property
@@ -243,10 +292,38 @@ class GuardedServer(ThreadingHTTPServer):
             raise
 
     def process_request_thread(self, request, client_address):
+        # A socket timeout bounds each read, not a request: a client sending a byte every 19 s held its connection
+        # (and its thread) for good, and 256 of them, 32 from each of 8 addresses, turned everyone else away. So a
+        # connection has header_timeout from its accept to its headers (TLS handshake included), then a deadline for
+        # its body (GuardedHandler.parse_request); service_actions cuts off one that runs past it.
+        me = threading.get_ident()
+        with self._lock:
+            self._deadlines[me] = [time.monotonic() + self.limits.header_timeout, request]
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._lock:
+                self._deadlines.pop(me, None)
             self._release(client_address[0])
+
+    def deadline(self, seconds: float | None) -> None:
+        """From a connection's thread: cut it off `seconds` from now, or (None) not at all."""
+        with self._lock:
+            entry = self._deadlines.get(threading.get_ident())
+            if entry is not None:
+                entry[0] = None if seconds is None else time.monotonic() + seconds
+
+    def _cut_late(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            late = [entry for entry in self._deadlines.values() if entry[0] is not None and entry[0] <= now]
+            for entry in late:
+                entry[0] = None
+        for _, sock in late:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)  # its thread's read or write then fails, and the thread ends
+            except OSError:
+                pass
 
     def finish_request(self, request, client_address):
         if self.tls is None:
@@ -286,11 +363,13 @@ class GuardedServer(ThreadingHTTPServer):
             self._closing.append((time.monotonic() + 1.0, request))
 
     def service_actions(self):
-        """Called by serve_forever between connections: closes turned-away sockets whose time is up."""
+        """Called by serve_forever between connections (at least every half second): closes turned-away sockets whose
+        time is up, and cuts off connections past their deadline."""
         super().service_actions()
         now = time.monotonic()
         while self._closing and self._closing[0][0] <= now:
             self._discard(self._closing.popleft()[1])
+        self._cut_late()
 
     def server_close(self):
         super().server_close()

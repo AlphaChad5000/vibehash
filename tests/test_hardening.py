@@ -456,6 +456,59 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(len(limiter._buckets), 1)
 
 
+class MalformedSpecTests(unittest.TestCase):
+    def test_infinite_numbers_and_deep_nesting_are_an_invalid_job(self):
+        """int() of JSON's 1e999 raises OverflowError, and JSON nested too deep a RecursionError: neither is an
+        InvalidJob, so they got out of check_tx, and out of build_block, which leaves out only an InvalidJob's tx."""
+        from vibehash.tasks import InvalidJob, TrainingJob
+        spec = json.loads(TrainingJob("j", "r", budget=0, fee_per_round=1).spec_json())
+        for field in ("init_seed", "batch_size", "units_per_round"):
+            with self.assertRaisesRegex(InvalidJob, "malformed job spec"):
+                TrainingJob.from_spec_json(json.dumps(spec | {field: float("inf")}).replace("Infinity", "1e999"), "r", 1)
+        with self.assertRaises(InvalidJob):
+            TrainingJob.from_spec_json("[" * 4000, "r", 1)
+
+
+class SettingsFileTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"VIBEHASH_HOME": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_saves_side_by_side_keep_every_setting(self):
+        """config.json was rewritten in place: a load() landing mid-write read {} and its save() wrote only its own key
+        back (the app's setup and its window at once: the node, the wallet or a pinned certificate lost)."""
+        settings.save(node="https://n:1", tls={"https://n:1": {"fingerprint": "ab" * 32}})
+        stop = threading.Event()
+
+        def writer(key):
+            while not stop.is_set():
+                settings.save(**{key: True})
+        threads = [threading.Thread(target=writer, args=(k,)) for k in ("welcomed", "app_gpu_ready")]
+        for t in threads:
+            t.start()
+        try:
+            for _ in range(200):
+                cfg = settings.load()
+                self.assertIn("tls", cfg)
+                self.assertIn("node", cfg)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        self.assertTrue({"node", "tls", "welcomed", "app_gpu_ready"} <= set(settings.load()))
+        self.assertEqual(sorted(p.name for p in settings.config_path().parent.glob("config.*.tmp")), [])
+
+    @unittest.skipIf(os.name == "nt", "file modes are POSIX")
+    def test_a_private_config_stays_private(self):
+        settings.save(admin={"token": "x"})
+        os.chmod(settings.config_path(), 0o600)  # as admin.py makes it
+        settings.save(welcomed=True)
+        self.assertEqual(os.stat(settings.config_path()).st_mode & 0o777, 0o600)
+
+
 class RateLimitNetworkTests(unittest.TestCase):
     GENESIS = {"chain_id": "limits-net", "timestamp": 0, "allocations": {}, "stakes": {ALICE.address: 10 * VIBE}}
 

@@ -40,6 +40,7 @@ proxy. Every request passes per-client rate limits and connection caps first (ra
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import json
 import logging
@@ -104,6 +105,7 @@ MAX_TRACE_BLOB, MAX_TRACE_UPLOADS = 2 * 2**30, 16 * 2**30
 # a round holds a few float64 copies (start, current, average: 135 MB each at 64 MB), so a 2 GB server running a
 # ~0.5 GB node keeps its head above water. The 1 GiB jobs tasks.py allows would need ~7 GB.
 MAX_JOB_BYTES = 64 * 2**20
+MODEL_CACHE = 3  # jobs whose served weights (/job/<id>/model) are kept built: at most ~200 MB at MAX_JOB_BYTES
 # No phase is longer than this, whatever a job's size asks for (TrainingJob.phase_lengths): a spec can't stall a node
 # for days. A job that would need more simply gets fewer units done a round.
 MAX_PHASE_S = tasks.MAX_PHASE_S
@@ -236,12 +238,14 @@ class Node:
         self.blobs: BlobStore = self.store.blobs
         self.coord.trace_blobs = TraceBlobs(self.blobs)
         self.trace_uploads: dict[str, int] = {}  # per-defender bytes uploaded for disputes this round
+        self.trace_sizes: dict[tuple[str, str], int] = {}  # (defender, blob id) -> the size it was charged at
         self.start_blob: str | None = None
         self.uploads: dict[str, set[str]] = {}  # per-worker blob ids this round (quota)
         self._blob_of: dict[int, str] = {}  # id(array) -> blob id, for arrays this round loaded from blobs
         self.phase_ends = 0.0
         self._model_lock = threading.Lock()
-        self._model_cache: tuple = (None, b"", "")
+        self._model_cache: collections.OrderedDict = collections.OrderedDict()  # (job, height) -> (bytes, sha256)
+        self._model_sums: dict[str, tuple[int, int, str]] = {}  # job -> (height, bytes, sha256) of its latest
         self._network_lock = threading.Lock()
         self._network_cache: tuple = (None, 0.0, {})  # (tip hash, when, /network's answer)
         self._census_cache: dict[int, dict] = {}  # height -> who registered that round and on what (_registrations)
@@ -381,7 +385,7 @@ class Node:
 
     def _end_round(self) -> None:
         with self.coord.lock:
-            self.start_blob, self.uploads, self._blob_of, self.trace_uploads = None, {}, {}, {}
+            self.start_blob, self.uploads, self._blob_of, self.trace_uploads, self.trace_sizes = None, {}, {}, {}, {}
         self.blobs.prune(self._evidence())
         self.coord.trace_blobs.forget()
         self.store.datasets.prune_partial(older_than=STALE_PART_S)
@@ -755,7 +759,8 @@ class Node:
                         batch = peer.get(f"/blocks?from={lo}&to={lo}")  # too big to take 100 at once
                     if not batch or not all(self._take(peer, d) for d in batch) or self.chain.tip.height < lo:
                         break  # one we refused, or none we lacked (a peer serving old blocks forever)
-            except (NodeError, InvalidBlock, KeyError, TypeError, ValueError, AttributeError) as e:
+            except (NodeError, InvalidBlock, InvalidJob, KeyError, TypeError, ValueError, AttributeError,
+                    OverflowError) as e:  # (one peer's bad block mustn't end the pass: the next peers go unasked)
                 log.debug("sync from %s: %s", url, e)
         if self.engine.height < self.chain.tip.height + 1:
             self.engine.start(self.chain.tip.height + 1)
@@ -978,8 +983,8 @@ class Node:
         if not self.store.params_height(job_id):  # untrained: its size is its spec's, and there's nothing to hash
             model = {"height": 0, "bytes": s.job(job_id).checkpoint_bytes, "sha256": None}
         else:
-            height, data, sha = self._model_bytes(job_id)
-            model = {"height": height, "bytes": len(data), "sha256": sha}
+            height, size, sha = self._model_sum(job_id)
+            model = {"height": height, "bytes": size, "sha256": sha}
         out = {"spec": json.loads(s.jobs[job_id]), "owner": s.job_owner[job_id], "escrow": s.escrow.get(job_id, 0),
                "rounds": self.store.job_rounds(job_id), "model": model}
         if "deepseek" in out["spec"]:  # where its prep is, and the records' root once it's done (trainers check it)
@@ -994,17 +999,35 @@ class Node:
         """The job's latest trained weights at its precision, serialised once per round. Workers get the weights every
         round anyway, so serving them openly hides nothing. An untrained job's aren't served: they follow from its
         spec, so its poster can build them (client.download_model does), and building them here for anyone who asks
-        took gigabytes."""
+        took gigabytes. The last MODEL_CACHE jobs' are kept (one alone let anyone asking for two jobs in turn make the
+        node load, convert and hash a model on every request, the lock held), and every job's size and hash."""
         height = self.store.params_height(job_id)
+        key = (job_id, height)
         with self._model_lock:
-            if self._model_cache[0] != (job_id, height):
+            hit = self._model_cache.get(key)
+            if hit is None:
                 job = self.chain.state.job(job_id)
                 params = self.store.load_params(job_id)
                 if params is None:
                     raise KeyError(f"job {job_id} hasn't been trained yet; its starting weights follow from its spec")
                 data = np.asarray(params, dtype=job.wire_dtype).tobytes()
-                self._model_cache = ((job_id, height), data, hashlib.sha256(data).hexdigest())
-            return height, self._model_cache[1], self._model_cache[2]
+                hit = self._model_cache[key] = (data, hashlib.sha256(data).hexdigest())
+                self._model_sums[job_id] = (height, len(data), hit[1])
+                while len(self._model_cache) > MODEL_CACHE:
+                    self._model_cache.popitem(last=False)
+            else:
+                self._model_cache.move_to_end(key)
+            return height, hit[0], hit[1]
+
+    def _model_sum(self, job_id: str) -> tuple[int, int, str]:
+        """(height, bytes, sha256) of the job's latest trained weights, without building them again once known."""
+        height = self.store.params_height(job_id)
+        with self._model_lock:
+            known = self._model_sums.get(job_id)
+            if known is not None and known[0] == height:
+                return known
+        height, data, sha = self._model_bytes(job_id)
+        return height, len(data), sha
 
     def network(self) -> dict:
         """The website's live panel: miners lately, every job and how it's going (netstats.py). Worked out at most once
@@ -1275,11 +1298,19 @@ class Node:
             if r is not None and c.phase == Phase.DISPUTE:  # a defender's states and evidence
                 if not any(g.defender == addr and g.turn != "done" for g in r.games.values()):
                     raise ProtocolError("only a dispute's defender uploads, while its dispute lasts")
+                # Charged once, at the size its first chunk declares, and held to it: charged while nothing of it was
+                # in, a blob declared at 2 bytes could then grow to MAX_TRACE_BLOB with each later chunk's X-Total.
+                declared = self.trace_sizes.get((addr, blob_id))
+                if declared is not None:
+                    if total != declared:
+                        raise ProtocolError("an upload's size (X-Total) can't change part way")
+                    return addr
                 done = self.trace_uploads.get(addr, 0)
                 if not 0 < total <= MAX_TRACE_BLOB or done + total > MAX_TRACE_UPLOADS:
                     raise ProtocolError("upload quota for this round's disputes used up")
-                if not self.blobs.has(blob_id) and self.blobs.received(blob_id, addr) == 0:
+                if not self.blobs.has(blob_id):
                     self.trace_uploads[addr] = done + total
+                    self.trace_sizes[(addr, blob_id)] = total
                 return addr
             if r is None or c.phase not in (Phase.COMPUTE, Phase.REVEAL) or not r.assignments.get(addr):
                 raise ProtocolError("checkpoints can only be uploaded by this round's workers, before the reveal deadline")
@@ -1307,12 +1338,17 @@ class Node:
         if not 0 < total <= MAX_DATASET:
             raise ProtocolError(f"datasets can be at most {MAX_DATASET // 2**30} GB")
         store = self.store.datasets
-        # Checked when an upload starts, and admitted at the size it declares (an upload can't grow past it, BlobStore),
-        # under one lock: counting what was on disk let uploads started side by side each pass with a chunk written.
+        # Checked when an upload starts, and admitted at the size it declares, which every later chunk must declare too,
+        # under one lock: counting what was on disk let uploads started side by side each pass with a chunk written,
+        # and checking only the first chunk let one admitted at 2 bytes grow to MAX_DATASET (BlobStore holds a chunk to
+        # its own request's X-Total). One part way from before a restart is checked again, at what it declares now.
         with self._quota_lock:
-            if (not store.has(sha) and (addr, sha) not in self._admitted and store.received(sha, addr) == 0
-                    and sha not in self.used_datasets()):
-                held = self.loose_bytes(addr)
+            admitted = self._admitted.get((addr, sha))
+            if admitted is not None and not store.has(sha):
+                if total != admitted[0]:
+                    raise ProtocolError("an upload's size (X-Total) can't change part way")
+            elif not store.has(sha) and sha not in self.used_datasets():
+                held = self.loose_bytes(addr) - store.received(sha, addr)  # (this upload's part, counted once)
                 if held + total > DATASET_QUOTA:
                     raise ProtocolError(
                         f"this address already holds {held / 2**30:.2f} GB of datasets no job uses yet, and may hold "

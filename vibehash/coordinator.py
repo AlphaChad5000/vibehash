@@ -2519,7 +2519,11 @@ class Coordinator:
             else:
                 answers = [a for rd in readings if rd is not None for a in rd[0]]
                 ok = [o for rd in readings if rd is not None for o in rd[1]]
-                targets = es2.replay_targets(spec.problems, answers, ok)
+                try:  # (the ids a target may hold: the model's, as its spec says)
+                    vocab = max(0, int(spec.model.get("vocab") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    vocab = 0
+                targets = es2.replay_targets(spec.problems, answers, ok, vocab)
             ent = es2.entry(seed, [[j, c] for (j, *_), c in zip(rows, coefs)], scale, targets)
             mean = es.mean_reward(binary)
             r.record["es"] |= {"used": used, "update": ent["update"], "scale": ent["scale"],

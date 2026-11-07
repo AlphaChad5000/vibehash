@@ -234,11 +234,14 @@ class NodeClient:
                 if st["complete"]:
                     return
                 offset = st["received"]
-                auth = self._auth(keys, kind, blob_id, total)
                 with open(path, "rb") as f:
-                    f.seek(offset)
                     while offset < total:
+                        f.seek(offset)  # (from where the node says it got to)
                         chunk = f.read(CHUNK)
+                        # Signed for each chunk: the node checks every chunk's timestamp against its clock (within
+                        # MAX_CLOCK_SKEW_S), so one signature for the whole file ended any upload of over two minutes
+                        # (a dataset, or a checkpoint on a slow link) with a 400 that isn't tried again.
+                        auth = self._auth(keys, kind, blob_id, total)
                         res = json.loads(self._req("PUT", f"/{kind}/{blob_id}", chunk, {**auth, "X-Offset": str(offset)}))
                         offset = res["received"]
                 return

@@ -624,9 +624,14 @@ class Es2Work:
             rt.loaded = (ln.job_id, ln.params_hash)
 
     def replay_items(self, rt: es.Runtime, ln: _Line) -> list[tuple[list[int], list[int]]]:
-        """The round's replay targets as (prompt ids, answer ids): the last `replay` of the job's targets so far."""
+        """The round's replay targets as (prompt ids, answer ids): the last `replay` of the job's targets so far. A
+        target with ids the model doesn't have, or none, is left out (worker and checker alike): nodes before 0.5.27
+        took one from a miner's blob, and scoring it ends the round (IndexError, or a device-side assert) every round."""
         spec, out, rows = ln.spec, [], {}
+        n_vocab = rt.model.get_input_embeddings().num_embeddings
         for seed, i, ids, step in es2_rounds.targets_of(ln.history, spec.replay):
+            if not ids or not all(type(t) is int and 0 <= t < n_vocab for t in ids):
+                continue
             if seed not in rows:
                 rows[seed] = prompt_rows(rt, es2_rounds.items(spec, seed, step))
             out.append((rows[seed][i], ids))

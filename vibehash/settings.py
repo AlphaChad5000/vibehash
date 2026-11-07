@@ -49,16 +49,57 @@ def default_wallet() -> Path:
 
 
 def load() -> dict:
-    try:
-        return json.loads(config_path().read_text())
-    except (OSError, ValueError):
-        return {}
+    import time
+
+    for _ in range(50 if os.name == "nt" else 1):
+        try:
+            return json.loads(config_path().read_text())
+        except PermissionError:  # Windows, for the moment a save() puts the new file in place: read it again
+            time.sleep(0.02)
+        except (OSError, ValueError):
+            return {}
+    return {}
 
 
 def save(**updates) -> None:
+    """config.json with `updates`, read, changed and written under a lock between processes, written whole beside it
+    and then put in its place (keeping the old file's permissions: it can hold admin tokens, made 0600). Rewritten in
+    place, a load() landing mid-write read {}, and a save() from it wrote just its own keys back: the app's setup and
+    its window saving at once lost the node, the wallet or a pinned certificate."""
+    from . import filelock
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with filelock.hold(path.with_name("config.lock"), wait_s=10):
+            return _write_config(path, updates)
+    except TimeoutError:  # (a lock that never comes free: written whole all the same)
+        pass
+    _write_config(path, updates)
+
+
+def _write_config(path: Path, updates: dict) -> None:
+    import stat
+    import threading
+    import time
+
     cfg = load() | updates
-    config_path().parent.mkdir(parents=True, exist_ok=True)
-    config_path().write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp = path.with_name(f"config.{os.getpid()}.{threading.get_ident()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(cfg, indent=2) + "\n")
+    try:
+        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
+    except OSError:  # (none yet: it stays only yours)
+        pass
+    for attempt in range(100):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows, while a load() elsewhere has it open for a moment
+            if attempt == 99:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.02)
 
 
 def chosen_node(flag: str | None = None) -> str | None:

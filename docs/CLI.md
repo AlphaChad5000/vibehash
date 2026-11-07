@@ -401,9 +401,9 @@ Flags:
 
 - `--node NODE`: node address (default: the one saved, else the public network's).
 - `--wallet WALLET`: wallet file (default: the one `setup` saved).
-- `--device DEVICE`: what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps. Default: `auto`.
+- `--device DEVICE`: what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps.
 - `--watch PORT`: the worker's feed's port (default 7545).
-- `--gpu {auto,skip}`: install PyTorch for the GPU (auto) or not. Default: `auto`.
+- `--gpu {auto,skip}`: install PyTorch for the GPU (auto) or not.
 - `--recheck-gpu`: test the GPU again, even if an earlier run found it ready.
 - `--job JOB`: mine only this job, as `worker --job`.
 - `--no-password`: make a first wallet without a password, so nothing is asked (what the downloadable app does); the file is then as safe as your user account.
