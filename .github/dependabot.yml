@@ -1,6 +1,9 @@
 # Dependabot: a weekly look at the Python dependencies (pyproject.toml, agents/requirements-train.txt) and the
 # GitHub Actions the workflows use. Security fixes come as soon as an advisory is published, whatever the schedule.
 # Updates are grouped and the open PRs capped, so they never pile up (one PR at a time is the routine here).
+# Python ranges are raised only when they must be (increase-if-necessary): a floor like torch>=2.6 isn't moved just
+# because a newer release exists, which would make people install a multi-GB build for nothing. A version a range
+# already allows needs no PR; a security fix still comes as soon as its advisory lands.
 version: 2
 updates:
   - package-ecosystem: pip
@@ -8,6 +11,7 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 2
+    versioning-strategy: increase-if-necessary
     groups:
       python:
         patterns: ["*"]
@@ -17,6 +21,7 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 1
+    versioning-strategy: increase-if-necessary
     groups:
       agents:
         patterns: ["*"]
