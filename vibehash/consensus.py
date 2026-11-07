@@ -130,7 +130,7 @@ def check_certificate(cert: dict | None, height: int, block_id: str, validators:
         votes, round_ = list(cert["votes"]), int(cert["round"])
         if int(cert["height"]) != height or str(cert["block"]) != block_id:
             return "the commit certificate is for a different block"
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):  # (OverflowError: a round of 1e999, JSON's Infinity)
         return "malformed commit certificate"
     msg, power, seen = _signed_part(chain_id, "precommit", height, round_, block_id), 0, set()
     for v in votes:

@@ -11,7 +11,7 @@ import re
 import time
 import unittest
 
-from vibehash import es, es2_rounds, es_tasks
+from vibehash import es, es2_rounds, es_ifeval, es_tasks
 
 OLD_ANSWER = re.compile(r"<answer>(.*?)</answer>", re.S)  # the readers as they were, to compare against
 OLD_LETTER_SAID = re.compile(r"\banswer(?:\s+is)?\s*[:\-]?\s*\(?([A-H])\b", re.I)
@@ -59,6 +59,91 @@ class HostileTextTests(unittest.TestCase):
             self.quick(lambda t: es_tasks.salvage(t, "B"), text)
             self.quick(lambda t: es_tasks.salvage(t, "12"), text)
             self.quick(lambda t: es.reward(es.Problem((1, 2, 3), 6, "1+2+3"), t), text)
+
+    def test_ifeval_checks(self):
+        """`\\[.*?\\]`, `^\\s*\\*...` and `<<[^\\n]+>>` took 4 s at 40 KB of "[", "\\n" or "<" (hours at 8 MB)."""
+        for text in ("[" * self.N, "<" * self.N, "<<" * (self.N // 2), "\n" * self.N, " \n" * (self.N // 2),
+                     "\t" * self.N, "[]" * (self.N // 2), "<<x" * (self.N // 3)):
+            self.quick(lambda t: es_ifeval.placeholders(t, {"N": 3}), text)
+            self.quick(lambda t: es_ifeval.bullet_points(t, {"N": 3}), text)
+            self.quick(lambda t: es_ifeval.title(t, {}), text)
+
+
+OLD_PLACEHOLDER = re.compile(r"\[.*?\]")  # es_ifeval's checks as they were, to compare against
+OLD_BULLETS = (re.compile(r"^\s*\*[^\*].*$", re.M), re.compile(r"^\s*-.*$", re.M))
+OLD_TITLE = re.compile(r"<<[^\n]+>>")
+IFEVAL_PIECES = ["[", "]", "[x]", "<", ">", "<<", ">>", "<<a>>", "*", "**", "* ", "-", "- ", " ", "\t", "\r", "\n",
+                 "\n\n", "\x0b", " ", "\x85", "a", "word ", "é"]
+
+
+class SameIfevalTests(unittest.TestCase):
+    """The ifeval checks count what the benchmark's regexes count: a worker scores its own answers with them, and a node
+    that scores them differently slashes it."""
+
+    def test_on_random_texts(self):
+        rng = random.Random(11)
+        for _ in range(60_000):
+            t = "".join(rng.choice(IFEVAL_PIECES) for _ in range(rng.randint(0, 30)))
+            n = len(OLD_PLACEHOLDER.findall(t))
+            self.assertTrue(es_ifeval.placeholders(t, {"N": n}), repr(t))
+            self.assertFalse(es_ifeval.placeholders(t, {"N": n + 1}), repr(t))
+            bullets = sum(len(r.findall(t)) for r in OLD_BULLETS)
+            self.assertTrue(es_ifeval.bullet_points(t, {"N": bullets}), repr(t))
+            self.assertFalse(es_ifeval.bullet_points(t, {"N": bullets + 1}), repr(t))
+            old_title = any(m.lstrip("<").rstrip(">").strip() for m in OLD_TITLE.findall(t))
+            self.assertEqual(es_ifeval.title(t, {}), old_title, repr(t))
+
+    def test_known_texts(self):
+        self.assertTrue(es_ifeval.title("<<My Title>>\nbody", {}))
+        self.assertFalse(es_ifeval.title("<<>>\n<<<>>", {}))
+        self.assertTrue(es_ifeval.title("<<>> and <<<>>", {}))  # ">> and <<<" is something
+        self.assertTrue(es_ifeval.title("<<>> then <<x>>", {}))  # one match, first "<<" to last ">>": ">> then <<x"
+        self.assertFalse(es_ifeval.title("<<\nx>>", {}))
+        self.assertTrue(es_ifeval.placeholders("[a] [b]\n[c", {"N": 2}))
+        self.assertFalse(es_ifeval.placeholders("[a] [b]\n[c", {"N": 3}))
+        self.assertTrue(es_ifeval.bullet_points("* one\n  * two\n- three\n**bold**", {"N": 3}))
+        self.assertTrue(es_ifeval.bullet_points("\n\n  \n* one", {"N": 1}))
+
+
+class BadTokenIdTests(unittest.TestCase):
+    """An accepted member's right answer can become a replay target, which every later round scores, and checkers sample
+    only some of a claim's members: ids the model doesn't have (-1, 10**12) or none at all in an unsampled member made a
+    target that ended every worker's and checker's scoring, every round after (IndexError, or a device-side assert)."""
+
+    def spec(self):
+        from tests.test_es import spec_for
+        from vibehash import es2
+        rule1_only = ("rule", "pairs", "pairs_per_unit", "problems", "max_tokens", "alpha", "reward", "level",
+                      "retarget", "optimizer", "betas", "eps")
+        base = {k: v for k, v in spec_for().__dict__.items() if k not in rule1_only}
+        return es2.Spec2(**(base | dict(pairs=4, pairs_per_unit=2, problems=4, max_tokens=8, rounds=3)))
+
+    def blob(self, spec, bad=None):
+        answers = [[{"ids": [5, 6], "text": "<answer>1</answer>"} for _ in range(spec.problems)]
+                   for _ in range(spec.members)]
+        if bad is not None:
+            answers[3][1] = {"ids": bad, "text": "<answer>1</answer>"}
+        return es.claim_bytes("u1", answers)
+
+    def test_rescore_refuses_ids_no_model_has(self):
+        spec = self.spec()
+        self.assertIsNotNone(es2_rounds.rescore(spec, 1, self.blob(spec), "u1"))
+        self.assertIsNotNone(es2_rounds.rescore(spec, 1, self.blob(spec, [0, 259]), "u1"))
+        # Past the vocabulary is not a fraud by itself (a spec might say too few): it just never becomes a target.
+        self.assertIsNotNone(es2_rounds.rescore(spec, 1, self.blob(spec, [260]), "u1"))
+        for bad in ([-1], [], [True], [1.0]):
+            self.assertIsNone(es2_rounds.rescore(spec, 1, self.blob(spec, bad), "u1"), bad)
+
+    def test_targets_hold_only_ids_the_model_has(self):
+        from vibehash import es2
+        right = [[True, True], [True, True], [True, True]]
+        for bad in ([-1], [260], [10**12], []):
+            answers = [[bad, [5, 6, 7]], [bad, [5, 6, 7]], [[9, 9], [5, 6, 7]]]  # two votes for the bad one, and shorter
+            self.assertEqual(es2.replay_targets(2, answers, right, vocab=260), [(0, [9, 9]), (1, [5, 6, 7])], bad)
+            alone = [[bad, [5]], [bad, [5]], [bad, [5]]]
+            self.assertEqual(es2.replay_targets(2, alone, right, vocab=260), [(1, [5])], bad)
+        answers = [[[4], [5]], [[4], [5]], [[3, 3], [5]]]
+        self.assertEqual(es2.replay_targets(2, answers, right), [(0, [4]), (1, [5])], "as it was, otherwise")
 
 
 class NestedBlobTests(unittest.TestCase):

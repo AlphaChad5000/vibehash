@@ -152,7 +152,25 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
-**Release 0.5.26 (2026-11-07): an Evo job can end looping answers (`loop_stop`).** Measured on vibehash-evo-1 (2026-11-07, rounds
+**Release 0.5.27 (2026-11-07): a bug check's fixes, and GPUs we can't test on (PRs #63, #64).** An in-depth bug
+hunt of 0.5.26, each bug reproduced on it first. Evo: a miner could poison a job for good, with an unsampled member's
+answer of ids [-1] (or none, or past the vocabulary) and the right text: it became a replay target that every worker's
+and checker's scoring then crashed on (the node's re-score refuses negative and empty ids; `es2.replay_targets` keeps
+ids below the spec's vocab, never a slashing rule, since a spec could say too few; workers skip such targets already
+on a chain). Three ifeval checks (`placeholders`, `bullet_points`, `title`) took time in the square of a text (hours
+at 8 MB, the node's lock held): linear now, fuzzed equal to the benchmark's regexes. Node: the dataset and dispute
+upload quotas held a chunk only to its own X-Total (one admitted at 2 bytes grew to GBs); slow-loris clients held
+every connection (a deadline from accept to headers, then for the body at 16 KB/s past io_timeout); one chunk sent
+twice at once corrupted the part; asking for two jobs' models in turn rebuilt one every request. Client: one upload
+signature for every chunk ended uploads of over two minutes with a 400. Consensus: a peer's 1e999 in a certificate
+stopped sync for good (OverflowError), and in a job spec escaped InvalidJob. App: the window's feed stopped after
+every worker restart; config.json lost settings to saves side by side; start-at-login broke for user folders the
+codepage can't write; `app --no-window start` dropped what came before `start`; `app stop` during setup; the crash
+back-off never reset. Still open: Merkle openings aren't tied to their position (a versioned rule), unsampled
+members' ids that don't decode to their text can still steer targets, slow readers of replies. GPU compatibility
+(docs/GPUS.md, PR #63): what each GPU family can mine, and guards for the ones we can't test.
+
+**Merged 2026-11-07, never tagged (shipped in 0.5.27): an Evo job can end looping answers (`loop_stop`).** Measured on vibehash-evo-1 (2026-11-07, rounds
 448-458, 22,528 answers): 8.3% of answers reached max_tokens 512 and were 61% of all tokens decoded, but by task, not
 by looping: math 44% of all tokens (79% of its answers capped), gsm8k 31%, ifeval 17%, the other 13 tasks about 8%.
 Only ~15% of capped answers are exact loops (`\usepackage{amssymb}` to the end). `Spec2.loop_stop` [period, run]

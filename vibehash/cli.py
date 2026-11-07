@@ -2396,14 +2396,19 @@ def parser() -> argparse.ArgumentParser:
                          "--no-window not to). The other `app` commands talk to the running one through ~/.vibehash/app. "
                          "It is what the desktop app's launcher runs.")
     for p in (ap_, None):  # the start options, on plain `app` and on `app start` alike
+        # `app start`'s own copies have no defaults (SUPPRESS): argparse lets a subcommand's defaults overwrite what the
+        # parent already read, so `app --no-window start` ran with the window, and the launcher's `app --no-password
+        # --avatar -- start ...` lost both. Only what `start` itself is given is taken from it.
+        auto = "auto" if p is ap_ else argparse.SUPPRESS
         if p is None:
             asub = ap_.add_subparsers(dest="acmd")
-            p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)")
+            p = asub.add_parser("start", help="get ready, join the network and mine (what plain `app` does)",
+                                argument_default=argparse.SUPPRESS)
         p.add_argument("--node", help="node address (default: the one saved, else the public network's)")
         p.add_argument("--wallet", help=WALLET)
-        p.add_argument("--device", default="auto", help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
+        p.add_argument("--device", default=auto, help="what the worker trains on: auto, cpu, cuda, cuda:1, xpu, mps")
         p.add_argument("--watch", type=int, metavar="PORT", help=f"the worker's feed's port (default {WATCH_PORT})")
-        p.add_argument("--gpu", choices=["auto", "skip"], default="auto", help="install PyTorch for the GPU (auto) or not")
+        p.add_argument("--gpu", choices=["auto", "skip"], default=auto, help="install PyTorch for the GPU (auto) or not")
         p.add_argument("--recheck-gpu", action="store_true", help="test the GPU again, even if an earlier run found it ready")
         p.add_argument("--job", metavar="JOB", help="mine only this job, as `worker --job`")
         p.add_argument("--no-password", action="store_true", help="make a first wallet without a password, so nothing is "
@@ -2419,7 +2424,8 @@ def parser() -> argparse.ArgumentParser:
     p = asub.add_parser("startup", help="start the app when you log in (on), or not (off); it then starts without the "
                         "window, which the avatar or `vibehash window` opens")
     p.add_argument("mode", choices=["on", "off"])
-    p.add_argument("--avatar", action="store_true", help="with the floating avatar (on only)")
+    p.add_argument("--avatar", action="store_true", default=argparse.SUPPRESS,  # (`app --avatar startup on` too)
+                   help="with the floating avatar (on only)")
     p.set_defaults(fn=cmd_app)
     ap_.set_defaults(fn=cmd_app, acmd=None)
 

@@ -106,16 +106,31 @@ def postscript(t, a):  # a postscript starting with the marker: its last use, wi
     return at >= 0 and bool(t[at + len(marker):].strip())
 
 
-def placeholders(t, a):  # at least N [placeholders] (both sources)
-    return len(re.findall(r"\[.*?\]", t)) >= a["N"]
+# The node scores every claim's texts with these while it holds its lock, and a text is whatever a miner writes, so
+# each check takes time in proportion to the text: the benchmark's regexes `\[.*?\]`, `^\s*\*...` (re.M, \s spanning
+# lines) and `<<[^\n]+>>` take time in its square on a run of "[", "\n" or "<" (8 MB of "<": hours, 2026-11-07).
+# These count exactly what they do (tests/test_evo_hostile.py compares them on random texts).
+
+def placeholders(t, a):  # at least N [placeholders] (both sources): \[.*?\] matches, "." not crossing a line
+    n = 0
+    for line in t.split("\n"):
+        at = 0
+        while (i := line.find("[", at)) >= 0 and (j := line.find("]", i + 1)) >= 0:
+            n, at = n + 1, j + 1
+    return n >= a["N"]
 
 
 def bullet_points(t, a):  # exactly N markdown bullets, "* " or "- " lines (the benchmark: "**bold**" lines aren't)
-    return len(re.findall(r"^\s*\*[^\*].*$", t, re.M)) + len(re.findall(r"^\s*-.*$", t, re.M)) == a["N"]
+    # (a match's leading \s* may start on blank lines above its bullet, so whitespace short of a newline counts the same)
+    return len(re.findall(r"^[^\S\n]*\*[^\*].*$", t, re.M)) + len(re.findall(r"^[^\S\n]*-.*$", t, re.M)) == a["N"]
 
 
-def title(t, a):  # a title in <<double angular brackets>>, not empty (the benchmark)
-    return any(m.lstrip("<").rstrip(">").strip() for m in re.findall(r"<<[^\n]+>>", t))
+def title(t, a):  # a title in <<double angular brackets>>, not empty (the benchmark): <<[^\n]+>> matches, greedy
+    for line in t.split("\n"):  # a line's one match: its first "<<" to its last ">>", with something between
+        i, j = line.find("<<"), line.rfind(">>")
+        if i >= 0 and j >= i + 3 and line[i:j + 2].lstrip("<").rstrip(">").strip():
+            return True
+    return False
 
 
 def _options(s) -> list[str]:

@@ -1,5 +1,6 @@
 """BFT consensus (consensus.py) on a simulated network: honest runs, crashed and lying proposers, double-voting
 validators, lost messages and partitions, with a fake clock so every run is exact and fast."""
+import json
 import unittest
 
 from vibehash.consensus import Engine, Step, Timeouts, certificate, check_certificate, proposer_order, quorum, vote
@@ -302,6 +303,15 @@ class CertificateTests(unittest.TestCase):
         other = self.cert(self.keys[:3], for_block="b2")  # votes for another block, relabelled
         self.assertIn("forged", check_certificate(other, 5, "b1", self.vals, CHAIN))
         self.assertIn("different block", check_certificate(self.cert(self.keys[:3]), 5, "b9", self.vals, CHAIN))
+
+    def test_an_infinite_round_or_height_is_malformed_not_a_crash(self):
+        """JSON's 1e999 is float infinity, and int() of it raises OverflowError, which got out of check_certificate and
+        node._sync's per-peer catch: one peer serving such a block stopped the whole pass (and every pass after),
+        so the peers after it were never asked and a validator behind never rejoined voting."""
+        for field in ("round", "height"):
+            cert = self.cert(self.keys[:3])
+            cert[field] = json.loads("1e999")
+            self.assertEqual(check_certificate(cert, 5, "b1", self.vals, CHAIN), "malformed commit certificate")
         self.assertIn("different block", check_certificate(self.cert(self.keys[:3]), 6, "b1", self.vals, CHAIN))
         self.assertEqual(check_certificate(None, 5, "b1", self.vals, CHAIN), "no commit certificate")
 

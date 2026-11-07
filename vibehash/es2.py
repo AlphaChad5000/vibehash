@@ -327,12 +327,17 @@ def coefficients(binary: list, replay_lp: list | None) -> tuple[list[float], str
     return [z[2 * k] - z[2 * k + 1] for k in range(len(z) // 2)], ("replay" if use is not None else "binary")
 
 
-def replay_targets(n_problems: int, answers: list, ok: list) -> list[tuple[int, list[int]]]:
+def replay_targets(n_problems: int, answers: list, ok: list, vocab: int = 0) -> list[tuple[int, list[int]]]:
     """(problem index, token ids) of each problem's most common correct answer among all members' answers (answers
-    [member][problem] = token ids; ok [member][problem]); ties: the shortest, then the smallest."""
+    [member][problem] = token ids; ok [member][problem]); ties: the shortest, then the smallest. vocab (the spec's,
+    0: any): only answers of ids from 0 to below it, and at least one. Every later round scores the targets, and
+    checkers see only some members' answers: a [-1] or [10**12] in another, scored right by its text, became a
+    target that ended every worker's and checker's scoring (IndexError, or a device-side assert), every round after."""
+    def usable(a) -> bool:
+        return bool(a) and all(type(t) is int and 0 <= t and (not vocab or t < vocab) for t in a)
     out = []
     for i in range(n_problems):
-        sols = collections.Counter(tuple(answers[k][i]) for k in range(len(answers)) if ok[k][i])
+        sols = collections.Counter(tuple(answers[k][i]) for k in range(len(answers)) if ok[k][i] and usable(answers[k][i]))
         if sols:
             out.append((i, list(min(sols, key=lambda s: (-sols[s], len(s), s)))))
     return out
