@@ -52,7 +52,7 @@ FORMAT = "vibehash-evo-margin/1"
 def _gpu_facts(device: str) -> dict:
     import torch
     out = {"device": device, "torch": torch.__version__, "cuda": torch.version.cuda, "python": platform.python_version(),
-           "os": platform.platform()}
+           "os": platform.platform(), "hip": getattr(torch.version, "hip", None)}  # (hip: an AMD card's ROCm build)
     try:
         import transformers
         out["transformers"] = transformers.__version__
@@ -88,7 +88,11 @@ def _label(facts: dict) -> str:
 
 def _setup(model: str, tasks: tuple, pairs: int, problems: int, max_tokens: int, device: str):
     """The spec, runtime and twist factors a worker or checker would have for this job, built off the chain."""
-    from vibehash import es_client, es_local
+    from vibehash import compute, es_client, es_local
+    if device != "cpu":
+        # The worker's PyTorch settings (compute.get_backend makes one): TF32 off and deterministic kernels, which
+        # also keeps Hopper and Blackwell's attention off cuDNN's kernel, as on a worker
+        compute.TorchBackend(device)
     found = es_local.find(model)
     es_local.register(found)
     per_unit = min(8, pairs)
@@ -276,6 +280,9 @@ def main(argv=None) -> None:
     rp = sub.add_parser("report", help="one table from several result files")
     rp.add_argument("results", nargs="+")
     a = p.parse_args(argv)
+    if a.cmd != "report":
+        from vibehash.cli import pin_gpu
+        pin_gpu(a)  # --device cuda:1 as the worker takes it: this process sees that GPU alone, as "cuda"
     {"answer": cmd_answer, "check": cmd_check, "report": cmd_report}[a.cmd](a)
 
 

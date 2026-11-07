@@ -45,7 +45,11 @@ class GpuDetectionTests(unittest.TestCase):
             self.assertEqual(gpusetup.classify(name), vendor)
 
     def test_nvidia_builds_follow_driver_and_architecture(self):
-        self.assertEqual(tags(nvidia("RTX 4070 SUPER", (13, 4), (8, 9)))[:3], ["cu132", "cu130", "cu129"])
+        self.assertEqual(tags(nvidia("RTX 4070 SUPER", (13, 4), (8, 9)))[:3], ["cu134", "cu132", "cu130"])
+        self.assertEqual(tags(nvidia("RTX 4070 SUPER", (13, 2), (8, 9)))[0], "cu132")
+        self.assertEqual(tags(nvidia("Tesla V100", (12, 9), (7, 0)))[0], "cu126")  # Volta left 12.8/12.9 in 2.11
+        self.assertEqual(tags(nvidia("Tesla V100", (13, 0), (7, 0)))[0], "cu126")
+        self.assertEqual(tags(nvidia("Tesla T4", (12, 9), (7, 5)))[0], "cu129")  # Turing still has them
         self.assertEqual(tags(nvidia("RTX 4070 SUPER", (12, 8), (8, 9)))[0], "cu128")  # CUDA 13 needs a newer driver
         self.assertEqual(tags(nvidia("GTX 1060", (13, 0), (6, 1)))[0], "cu126")  # Pascal left the 12.8+ builds
         self.assertEqual(tags(nvidia("RTX 5090", (12, 8), (12, 0))), ["cu128"])  # Blackwell needs 12.8+
@@ -56,13 +60,24 @@ class GpuDetectionTests(unittest.TestCase):
     def test_other_vendors(self):
         self.assertEqual(tags(Gpu("intel", "Intel(R) Arc(TM) Graphics")), ["xpu"])
         self.assertEqual(tags(Gpu("intel", "Intel(R) UHD Graphics 620")), [])
+        self.assertEqual(tags(Gpu("intel", "Intel(R) Data Center GPU Max 1550")), ["xpu"])  # PyTorch's, on Linux
+        self.assertEqual(tags(Gpu("intel", "Intel Corporation Ponte Vecchio XT (1 Tile)")), ["xpu"])  # as lspci may say
+        self.assertEqual(tags(Gpu("intel", "Intel(R) Data Center GPU Flex 170")), [])  # IPEX's, never stock PyTorch's
         self.assertEqual(tags(Gpu("apple", "Apple silicon GPU")), [None])  # the plain PyPI build
-        self.assertEqual(tags(Gpu("amd", "Radeon RX 7900 XTX", rocm=(6, 4))), ["rocm6.4", "rocm6.3", "rocm6.2"])
-        self.assertIn("ROCm", builds_for(Gpu("amd", "Radeon RX 7900 XTX"))[1])
+        amd = lambda rocm: [b.tag for b in builds_for(Gpu("amd", "Radeon RX 7900 XTX", rocm=rocm), "linux")[0]]  # noqa: E731
+        self.assertEqual(amd((6, 4)), ["rocm6.4", "rocm6.3", "rocm6.2"])
+        self.assertEqual(amd((7, 14))[:2], ["rocm7.14", "rocm7.2"])  # 7.14 is after 7.2 (ROCm's new numbering)
+        self.assertEqual(amd((10, 1))[:3], ["rocm10.0", "rocm7.14", "rocm7.2"])
+        self.assertIn("ROCm", builds_for(Gpu("amd", "Radeon RX 7900 XTX"), "linux")[1])
+        # Windows: PyTorch has no ROCm build there, HIP SDK or not, and says so rather than "no build for Python"
+        for rocm in (None, (6, 2)):
+            builds, why = builds_for(Gpu("amd", "Radeon RX 7900 XTX", rocm=rocm), "win32")
+            self.assertEqual(builds, [])
+            self.assertIn("Linux", why)
 
     def test_choose_prefers_nvidia_and_skips_unpublished_builds(self):
         gpus = [Gpu("intel", "Intel(R) Arc(TM) Graphics"), nvidia("RTX 4070 SUPER", (13, 4), (8, 9))]
-        gpu, build, why = choose(gpus, available=lambda b: b.tag != "cu132")
+        gpu, build, why = choose(gpus, available=lambda b: b.tag not in ("cu134", "cu132"))
         self.assertEqual((gpu.vendor, build.tag, why), ("nvidia", "cu130", None))
         gpu, build, why = choose([nvidia("RTX 4070 SUPER", (13, 4), (8, 9))], available=lambda b: False)
         self.assertIsNone(build)

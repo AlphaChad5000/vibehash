@@ -531,9 +531,12 @@ def train_segment(spec: LoraSpec, data: TokenDataset, theta: np.ndarray, unit_se
     from .program import Program, join_theta, split_theta
     from .tracer import Executor
 
+    from .compute import pin_precision
+
     rt = runtime(spec, data, device_of(backend))
     prog = Program(spec, data, lr, batch_size, unit_seed)
     with rt.busy, torch.no_grad():
+        pin_precision()  # TF32 off again, in case something turned it on since the model loaded (rule 2 fails TF32)
         # (copies: a checkpoint may be a read-only memory map)
         st = {k: torch.tensor(v, device=rt.device) for k, v in split_theta(spec, theta).items()}
         ex = Executor(rt, spec, prog, tamper)

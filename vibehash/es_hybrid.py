@@ -347,8 +347,9 @@ def _engine(rt, linears, fac, R, rows, T, loop=()):
 
 def _pin_precision():
     # The recurrent state's products are float32 GEMMs: TF32 would round them otherwise, and differently from a
-    # checker that left it off.
-    torch.backends.cuda.matmul.allow_tf32 = False
+    # checker that left it off (on Intel GPUs too, through oneDNN). compute.pin_precision: only writes the settings.
+    from .compute import pin_precision
+    pin_precision()
 
 
 def answer(rt, linears, fac, members, rows, T, sigma, rank, loop=()):
