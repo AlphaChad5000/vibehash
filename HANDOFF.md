@@ -152,7 +152,7 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
-**Unreleased: an Evo job can end looping answers (`loop_stop`).** Measured on vibehash-evo-1 (2026-11-07, rounds
+**Release 0.5.26 (2026-11-07): an Evo job can end looping answers (`loop_stop`).** Measured on vibehash-evo-1 (2026-11-07, rounds
 448-458, 22,528 answers): 8.3% of answers reached max_tokens 512 and were 61% of all tokens decoded, but by task, not
 by looping: math 44% of all tokens (79% of its answers capped), gsm8k 31%, ifeval 17%, the other 13 tasks about 8%.
 Only ~15% of capped answers are exact loops (`\usepackage{amssymb}` to the end). `Spec2.loop_stop` [period, run]
