@@ -912,7 +912,12 @@ class Group:
     def _stacks(self):
         import torch
 
+        from .compute import has_float64
+
         rt, spec = self.rt, self.spec
+        # The float64 sums on the device, or on the CPU where the device has no float64 (Apple's MPS, Intel Arc
+        # A-series): IEEE adds and multiplies round the same everywhere, so the float32 weights are the same bits.
+        work = rt.device if has_float64(rt.device) else "cpu"
         eps = {}
         for s, sign in self.members:
             if sign and s not in eps:
@@ -920,15 +925,15 @@ class Group:
         out, at = {}, 0
         for name, shape, mod, attr, base in rt.targets:
             size = math.prod(shape)
-            b = base.to(torch.float64) + torch.from_numpy(self.delta[at:at + size]).to(rt.device, torch.float64).view(shape)
+            b = base.to(work, torch.float64) + torch.from_numpy(self.delta[at:at + size]).to(work, torch.float64).view(shape)
             rows = []
             for s, sign in self.members:
                 if sign:
-                    e = torch.tensor(eps[s][at:at + size], device=rt.device, dtype=torch.float64).view(shape)
+                    e = torch.tensor(eps[s][at:at + size], device=work, dtype=torch.float64).view(shape)
                     rows.append((b + e * (sign * spec.sigma)).to(torch.float32))
                 else:
                     rows.append(b.to(torch.float32))
-            out[name] = torch.stack(rows)
+            out[name] = torch.stack(rows).to(rt.device)
             at += size
         return out
 

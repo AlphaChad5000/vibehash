@@ -53,16 +53,20 @@ def _cuda(tag: str, cuda: Version, min_compute: Version, below_compute: Version 
     return Build(f"CUDA {cuda[0]}.{cuda[1]}", tag, min_compute, below_compute, cuda)
 
 
-# Newest first. CUDA 13 dropped Maxwell, Pascal and Volta; PyTorch's 12.8+ builds dropped Maxwell and
-# Pascal; RTX 50-series (Blackwell, compute 10.0 and up) needs 12.8 or later.
+# Newest first (docs/GPUS.md). CUDA 13 dropped Maxwell, Pascal and Volta. PyTorch's 12.8 and 12.9 builds dropped
+# Maxwell and Pascal in 2.8 and Volta in 2.11, and install() takes an index's newest PyTorch, so they're Turing and
+# up too: Maxwell, Pascal and Volta get cu126, whose last PyTorch is 2.14 (2.15 builds only cu132 and cu134). RTX
+# 50-series and other Blackwell cards (compute 10.0 and up) need 12.8 or later.
 CUDA_BUILDS = [
-    _cuda("cu132", (13, 2), (7, 5)), _cuda("cu130", (13, 0), (7, 5)),
-    _cuda("cu129", (12, 9), (7, 0)), _cuda("cu128", (12, 8), (7, 0)),
+    _cuda("cu134", (13, 4), (7, 5)), _cuda("cu132", (13, 2), (7, 5)), _cuda("cu130", (13, 0), (7, 5)),
+    _cuda("cu129", (12, 9), (7, 5)), _cuda("cu128", (12, 8), (7, 5)),
     _cuda("cu126", (12, 6), (5, 0), (10, 0)), _cuda("cu124", (12, 4), (5, 0), (10, 0)),
     _cuda("cu121", (12, 1), (5, 0), (10, 0)), _cuda("cu118", (11, 8), (3, 7), (10, 0)),
 ]
+# ROCm went 7.2, 7.14, 10.0 (AMD's new build system); PyTorch 2.15 builds rocm7.14 and rocm10.0, 2.14 rocm7.2 and
+# rocm7.14. All Linux only.
 ROCM_BUILDS = [Build(f"ROCm {v[0]}.{v[1]}", f"rocm{v[0]}.{v[1]}", needs=v)
-               for v in [(7, 2), (7, 1), (7, 0), (6, 4), (6, 3), (6, 2)]]
+               for v in [(10, 0), (7, 14), (7, 2), (7, 1), (7, 0), (6, 4), (6, 3), (6, 2)]]
 XPU = Build("Intel XPU", "xpu")
 MPS = Build("Apple MPS", None)
 
@@ -141,8 +145,18 @@ def detect() -> list[Gpu]:
     return found
 
 
-def builds_for(gpu: Gpu) -> tuple[list[Build], str | None]:
-    """PyTorch builds that should run on `gpu`, best first, or why there are none."""
+def intel_supported(name: str) -> bool:
+    """An Intel GPU PyTorch's XPU build supports (docs.pytorch.org/docs/stable/notes/get_start_xpu.html): Arc A- and
+    B-series cards, the Arc graphics in Core Ultra chips, and on Linux the Data Center GPU Max (Ponte Vecchio, which
+    lspci may call by that name). Not UHD or Iris Xe graphics, nor the Data Center GPU Flex."""
+    n = name.lower()
+    return "arc" in n or "data center gpu max" in n or "ponte vecchio" in n
+
+
+def builds_for(gpu: Gpu, system: str | None = None) -> tuple[list[Build], str | None]:
+    """PyTorch builds that should run on `gpu`, best first, or why there are none. system: sys.platform's value
+    (this computer's by default)."""
+    system = system or sys.platform
     if gpu.vendor == "nvidia":
         if gpu.cuda is None:
             return [], "its driver isn't installed (no nvidia-smi); get it from nvidia.com"
@@ -152,10 +166,15 @@ def builds_for(gpu: Gpu) -> tuple[list[Build], str | None]:
     if gpu.vendor == "apple":
         return [MPS], None
     if gpu.vendor == "intel":
-        if "arc" not in gpu.name.lower():
-            return [], "PyTorch only supports Intel Arc graphics (Arc cards and Core Ultra laptops)"
+        if not intel_supported(gpu.name):
+            return [], ("PyTorch only supports Intel Arc graphics (Arc cards and Core Ultra laptops) and the Data "
+                        "Center GPU Max")
         return [XPU], None
     if gpu.vendor == "amd":
+        if system == "win32":  # (a HIP SDK sets HIP_PATH, but there's still no PyTorch build here to install)
+            return [], ("PyTorch's own ROCm builds are for Linux only. AMD publishes PyTorch for Radeon cards on "
+                        "Windows itself (repo.amd.com), which this doesn't install yet: mine on the CPU here, or "
+                        "under Linux or WSL2")
         if gpu.rocm is None:
             return [], "PyTorch needs AMD's ROCm installed first (Linux)"
         fits = [b for b in ROCM_BUILDS if b.needs <= gpu.rocm]

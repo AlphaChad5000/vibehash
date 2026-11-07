@@ -525,7 +525,8 @@ whatever devices a machine has.
 
 The fourth row is why the update check exists. Small models gain little from
 a GPU because Python's per-step overhead dominates. Intel XPU, Apple MPS and
-AMD ROCm haven't been measured yet.
+AMD ROCm haven't been measured yet; docs/GPUS.md has what's known about every
+GPU family, from documentation, and a bf16-against-float32 Evo measurement.
 
 **Arbitration** (re-running a disputed segment or unit) runs on the node's
 backend, normally the CPU, with the same checks.

@@ -32,6 +32,46 @@ class NumpyBackend:
         return f"CPU (NumPy, {os.cpu_count()} threads)"
 
 
+def pin_precision() -> None:
+    """float32 matmuls in full float32 on every backend: TF32 off for cuBLAS and cuDNN (NVIDIA, AMD), oneDNN's reduced
+    modes off on the CPU (TF32, or bf16 for float32 on CPUs that have it), and Intel GPUs' own TF32 switch off. TF32
+    keeps only 10 mantissa bits, so a replay wouldn't match. Only writes the settings, never reads them: from PyTorch
+    2.9 a library that sets the newer `fp32_precision` flags after the older `allow_tf32` ones were set makes *reading*
+    `allow_tf32` raise, and turns TF32 back on, so the code paths that need full float32 call this again before their
+    work, not only at start."""
+    import torch
+
+    torch.set_float32_matmul_precision("highest")  # cuBLAS's and the CPU's oneDNN matmuls
+    torch.backends.cuda.matmul.allow_tf32 = False  # (also sets the newer torch.backends.cuda.matmul.fp32_precision)
+    torch.backends.cudnn.allow_tf32 = False
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and getattr(xpu, "_is_compiled", lambda: False)():
+        # An Intel GPU's oneDNN matmuls use TF32 by this flag alone, not set_float32_matmul_precision. (A build without
+        # Intel GPU support only warns that it has none when it's set, so it's left alone there.)
+        torch.backends.mkldnn.allow_tf32 = False
+
+
+def has_float64(device: str) -> bool:
+    """Whether `device` computes in float64. Apple's MPS never does; Intel Arc A-series GPUs and some other Intel
+    graphics don't (PyTorch reports it as has_fp64); NVIDIA and AMD GPUs and every CPU do."""
+    kind = device.split(":")[0]
+    if kind == "mps":
+        return False
+    if kind == "xpu":
+        import torch
+        try:
+            return bool(getattr(torch.xpu.get_device_properties(int(device.split(":")[1]) if ":" in device else 0),
+                                "has_fp64", False))
+        except Exception:  # noqa: BLE001 - a driver that won't say: assume the worst
+            return False
+    return True
+
+
+def gpu_kind(torch) -> str:
+    """"ROCm" for PyTorch's AMD build (which calls its GPUs "cuda" too), else "CUDA"."""
+    return "ROCm" if getattr(torch.version, "hip", None) else "CUDA"
+
+
 class TorchBackend:
     """PyTorch on one device, configured for reproducibility (no TF32, deterministic kernels)."""
 
@@ -43,12 +83,8 @@ class TorchBackend:
         self.device = device
         self.name = device.split(":")[0]
         torch.use_deterministic_algorithms(True, warn_only=True)
-        if hasattr(torch.backends, "cuda"):
-            torch.backends.cuda.matmul.allow_tf32 = False  # TF32 keeps only 10 mantissa bits: replays wouldn't match
-        if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.allow_tf32 = False
-            torch.backends.cudnn.benchmark = False
-        torch.set_float32_matmul_precision("highest")
+        pin_precision()
+        torch.backends.cudnn.benchmark = False
         self._cpu = NumpyBackend()
         self._data: dict[int, tuple] = {}
 
@@ -65,6 +101,7 @@ class TorchBackend:
         if spec.precision != "float32":
             return self._cpu.train_segment(spec, data, theta, unit_seed, start_step, n_steps, lr, batch_size)
         t = self.torch
+        pin_precision()  # (again: something in this process may have turned TF32 on since)
         x_all, y_all = self._tensors(data)
         flat = t.tensor(np.asarray(theta, dtype=np.float32), device=self.device)
         shapes = list(zip(spec.widths, spec.widths[1:]))
@@ -107,15 +144,17 @@ class TorchBackend:
                 return int(t.cuda.get_device_properties(idx).total_memory // 2**20)
             if self.name == "xpu":
                 return int(t.xpu.get_device_properties(idx).total_memory // 2**20)
+            if self.name == "mps":  # unified memory: what Metal lets one process use, about 2/3 to 3/4 of the RAM
+                return int(t.mps.recommended_max_memory() // 2**20) or None
         except Exception:
             return None
-        return None  # mps shares system RAM
+        return None
 
     def describe(self) -> str:
         t = self.torch
         try:
             if self.name == "cuda":
-                return f"{t.cuda.get_device_name(self.device)} (CUDA)"
+                return f"{t.cuda.get_device_name(self.device)} ({gpu_kind(t)})"
             if self.name == "xpu":
                 return f"{t.xpu.get_device_name(self.device)} (Intel XPU)"
         except Exception:
@@ -143,7 +182,8 @@ def list_devices() -> list[Device]:
     if torch_available():
         import torch
         if torch.cuda.is_available():
-            found += [Device(f"cuda:{i}", f"{torch.cuda.get_device_name(i)} (CUDA)") for i in range(torch.cuda.device_count())]
+            found += [Device(f"cuda:{i}", f"{torch.cuda.get_device_name(i)} ({gpu_kind(torch)})")
+                      for i in range(torch.cuda.device_count())]
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             found += [Device(f"xpu:{i}", f"{torch.xpu.get_device_name(i)} (Intel XPU)") for i in range(torch.xpu.device_count())]
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():

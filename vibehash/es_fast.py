@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from . import es
+from .compute import pin_precision
 
 # The engine passes through the model ROWS rows at a time, padding the last pass: cuBLAS picks a matrix product's
 # kernel, and so its rounding, by the matrix's rows, so a row's numbers then depend on nothing but the row. A checker
@@ -115,6 +116,8 @@ def answer_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list
     from .es2 import cut_loop
 
     p = next(rt.model.parameters())
+    _same_gpu(p.device)
+    pin_precision()
     with torch.no_grad():
         if _hybrid(rt):
             from . import es_hybrid
@@ -124,6 +127,17 @@ def answer_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list
         else:
             got = _answer_plain(rt, linears, fac, members, rows, max_tokens, sigma, rank, max_rows)
     return [[cut_loop(a, loop) for a in member] for member in got] if loop else got
+
+
+def _same_gpu(dev) -> None:
+    """Refuse a model on a GPU other than this thread's current one: the engines put their buffers, streams and CUDA
+    graphs on "cuda", the current GPU, so on any other they'd capture empty graphs on the wrong device (answers that
+    never end, or garbage). `vibehash worker --device cuda:N` shows the process GPU N alone (cli.pin_gpu); anything
+    else that picks a GPU must do the same, or torch.cuda.set_device first."""
+    if dev.type == "cuda" and dev.index is not None and dev.index != torch.cuda.current_device():
+        raise RuntimeError(f"the model is on {dev} but this thread's current GPU is cuda:{torch.cuda.current_device()}: "
+                           f"run with CUDA_VISIBLE_DEVICES={dev.index} and device cuda (vibehash's --device {dev} "
+                           "does this), or call torch.cuda.set_device first")
 
 
 def _hybrid(rt) -> bool:
@@ -438,6 +452,8 @@ def gaps_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, s
     answers' limit, which sizes the engine's cache as answering did), so a checker rounds exactly as the worker did
     however many rows each had; elsewhere in one forward pass."""
     p = next(rt.model.parameters())
+    _same_gpu(p.device)
+    pin_precision()
     if _hybrid(rt):  # Qwen3.5: through es_hybrid's decode steps on every device
         T = max([max_tokens or 0] + [len(a) for _, a in items])
         if not members or not items or T == 0:
@@ -464,6 +480,8 @@ def gaps_members(rt: es.Runtime, linears, fac: dict, members: list, rows: list, 
     rounds the same whatever else shares its pass and the gaps are those of one member at a time, in a fraction of
     the time (a member alone is 16 rows of a 64-row pass). Elsewhere one member at a time."""
     p = next(rt.model.parameters())
+    _same_gpu(p.device)
+    pin_precision()
     T = max([max_tokens or 0] + [len(a) for member in answers for a in member])
     if not members or not rows or T == 0:
         return torch.zeros(len(members), len(rows), device=p.device)
@@ -489,6 +507,8 @@ def score_items(rt: es.Runtime, linears, fac: dict, members: list, items: list, 
     of mean per-token log-probabilities. items: [(prompt token ids, answer token ids)], from any round.
 
     On a Qwen3.5-style model, through es_hybrid's decode steps (so worker and checker get the same numbers)."""
+    _same_gpu(next(rt.model.parameters()).device)
+    pin_precision()
     if _hybrid(rt):
         p = next(rt.model.parameters())
         T = max([0] + [len(a) for _, a in items])

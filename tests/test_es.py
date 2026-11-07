@@ -430,6 +430,27 @@ class ModelTests(unittest.TestCase):
                 params[name].copy_(saved[name])
         torch.testing.assert_close(grouped, plain, rtol=1e-5, atol=1e-5)
 
+    def test_a_device_without_float64_gets_the_same_weights_from_the_cpu(self):
+        """Apple's MPS and Intel Arc A-series have no float64, which a group's weights are summed in: there the sums
+        run on the CPU, and IEEE rounding makes them the same float32 bits (on CUDA too, when there is one)."""
+        import torch
+
+        from vibehash import compute
+
+        spec = self.spec
+        delta = np.random.default_rng(1).normal(0, 0.05, spec.n).astype(np.float32)
+        members = [(es.pair_seed(3, 0), 1), (es.pair_seed(3, 0), -1), (0, 0)]
+        rts = [self.rt] + ([es.runtime(spec, "cuda")] if torch.cuda.is_available() else [])
+        for rt in rts:
+            with self.subTest(device=rt.device):
+                here = es.Group(rt, spec, delta, members)._stacks()
+                with mock.patch.object(compute, "has_float64", return_value=False):
+                    on_cpu = es.Group(rt, spec, delta, members)._stacks()
+                for name, t in here.items():
+                    self.assertEqual(on_cpu[name].device, t.device)
+                    self.assertEqual(on_cpu[name].dtype, torch.float32)
+                    self.assertTrue(torch.equal(on_cpu[name], t), name)
+
     def test_an_honest_claim_passes_and_forged_answers_dont(self):
         rt, spec = self.rt, self.spec
         delta = np.zeros(spec.n, np.float32)
