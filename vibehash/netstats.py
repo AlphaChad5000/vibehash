@@ -9,7 +9,9 @@ What the front page reads of a job (docs/site/index.html), beyond the fields job
   "done": [the fraction of each layer's pieces accepted, bottom first], "pieces_done", "pieces_total", "miners": who
   ran pieces lately}. The page draws it as the assembly line, and shows "Preparing" until every layer is done.
 """
+import collections
 import math
+import threading
 from typing import Callable
 
 ONLINE_S = 600  # a miner whose work was in a block in the last 10 minutes is online
@@ -148,3 +150,46 @@ def census(rounds: list[dict], now: float) -> dict:
             vendors[key[0]] = vendors.get(key[0], 0) + 1
     ordered = sorted(classes.values(), key=lambda c: (-c["online"], -c["day"], c["label"], c["memory_gb"]))
     return {"online": online, "day": day, "reported": reported, "classes": ordered, "vendors": vendors}
+
+
+# --- how far apart honest machines are ---------------------------------------------------------------------------
+#
+# An Evo checker teacher-forces another worker's answers and finds, for each token, how far below its own greedy choice
+# the answer's token is (a gap, in logits: es2.Spec2.margin). Two machines with the same number setup
+# (hardware.numerics) give gaps of 0; others give small honest gaps, measured at up to 0.375 between kinds of GPU, and
+# a cheat gives 3.5 or more (docs/GPUS.md). Each verdict a checker sends with its worst gap (client.Client) is counted
+# here, by the pair of setups: worker's and checker's. Whichever setups' gaps creep toward the margin show up before
+# an honest worker on them is turned down: a new driver, PyTorch or card that rounds differently.
+#
+# It's this node's own view: the verdicts sent to it while it ran rounds (a validator sees the rounds it led), kept in
+# memory for a day. Nothing in it names a worker.
+GAP_KEEP = 20000  # observations kept at most, newest last
+GAP_NEAR = 0.5  # a gap this fraction of its job's margin, or more, counts as near it
+
+
+class GapCensus:
+    def __init__(self, keep: int = GAP_KEEP):
+        self._seen = collections.deque(maxlen=keep)  # (time, worker's setup, checker's setup, gap, margin)
+        self._lock = threading.Lock()
+
+    def add(self, now: float, worker: str | None, checker: str | None, gap: float, margin: float) -> None:
+        with self._lock:
+            self._seen.append((now, worker or "unknown", checker or "unknown", float(gap), float(margin)))
+
+    def summary(self, now: float) -> dict:
+        """{"checks": how many in the last day, "pairs": [{"worker", "checker", "same", "checks", "max", "p99",
+        "near", "over"}]}: per pair of setups, the worst gap, the 99th percentile, how many came within GAP_NEAR of
+        their job's margin, and how many went over it. Worst pairs first."""
+        with self._lock:
+            seen = [s for s in self._seen if now - s[0] <= DAY_S]
+        pairs: dict[tuple, list] = {}
+        for _, w, c, gap, margin in seen:
+            pairs.setdefault((w, c), []).append((gap, margin))
+        out = []
+        for (w, c), got in pairs.items():
+            gaps = sorted(g for g, _ in got)
+            out.append({"worker": w, "checker": c, "same": w == c and w != "unknown", "checks": len(gaps),
+                        "max": gaps[-1], "p99": gaps[min(len(gaps) - 1, math.ceil(0.99 * len(gaps)) - 1)],
+                        "near": sum(g >= GAP_NEAR * m for g, m in got), "over": sum(g > m for g, m in got)})
+        out.sort(key=lambda p: (-p["max"], -p["checks"], p["worker"], p["checker"]))
+        return {"checks": len(seen), "pairs": out}

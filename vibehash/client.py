@@ -427,6 +427,8 @@ class WorkerClient:
         self.es = EsWork(self)  # an evolution-strategies job's rounds (es_client.py)
         self.backend = get_backend(device, log)
         self.hardware_class = hardware.hardware_class(self.backend)  # registered each round, counted at /network
+        self.numerics = hardware.numerics(self.backend)  # how it does Evo's arithmetic, also registered (hardware.py)
+        self.verdict_gaps = True  # sends a rule-2 check's worst gap with its verdict, until a node from before says no
         self.memory_override = memory_mb
         self.flops_override = flops_override
         self.poll_s = poll_s
@@ -754,16 +756,22 @@ class WorkerClient:
             body = {"round": rnd, "flops_per_sec": self.speed[job.job_id], "memory_mb": self.memory_for(job)}
             if self.hardware_class is not None:
                 body["hardware"] = self.hardware_class
-            try:
-                self._signed("register", body)
-            except NodeError as e:
-                # A node from before the census doesn't take the field (node.BODIES): register the old way from now on.
-                if self.hardware_class is None or e.status != 400 or "register message has only" not in str(e):
-                    raise
-                log.info("the node is older and doesn't take a hardware class; registering without one")
-                self.hardware_class = None
-                del body["hardware"]
-                self._signed("register", body)
+            if self.numerics is not None:
+                body["numerics"] = self.numerics
+            while True:
+                try:
+                    self._signed("register", body)
+                    break
+                except NodeError as e:
+                    # A node from before the census, or before number setups, doesn't take the field (node.BODIES):
+                    # leave out the newest it might not know, and register that way from now on.
+                    extra = "numerics" if "numerics" in body else "hardware" if "hardware" in body else None
+                    if extra is None or e.status != 400 or "register message has only" not in str(e):
+                        raise
+                    log.info("the node is older and doesn't take a %s; registering without one",
+                             "number setup" if extra == "numerics" else "hardware class")
+                    setattr(self, "numerics" if extra == "numerics" else "hardware_class", None)
+                    del body[extra]
             st.rounds += 1
             st.activity = "registered; waiting for work"
             log.info("round %d: registered", rnd)
@@ -959,6 +967,9 @@ class WorkerClient:
                             continue
                     ok, bad = es_done[t["task_id"]]
                     body |= {"ok": bool(ok), "bad_segment": bad}
+                    gap = self.es.gaps.pop(t["task_id"], None)
+                    if gap is not None and self.verdict_gaps:
+                        body["gap"] = gap
                     sender.submit(self._verdict, rnd, kind, body)
                     st.checked += 1
                     st.checks += 1
@@ -1012,9 +1023,21 @@ class WorkerClient:
 
     def _verdict(self, rnd: int, kind: str, body: dict) -> None:
         """Send a task's verdict, and note it for the round log once the node has it."""
-        if self._try(self._signed, "verdict", body) is not None:
+        if self._try(self._send_verdict, body) is not None:
             self.record.add(rnd, checks=1, **({"found_bad": 1} if not body["ok"] else {}))
             self.record.tally(rnd, "check_kinds", kind)
+
+    def _send_verdict(self, body: dict):
+        try:
+            return self._signed("verdict", body)
+        except NodeError as e:
+            # A node from before gaps were sent doesn't take the field (node.BODIES): the verdict without it, and
+            # every verdict without one from now on.
+            if "gap" not in body or e.status != 400 or "verdict message has only" not in str(e):
+                raise
+            log.info("the node is older and doesn't take a check's gap; sending verdicts without one")
+            self.verdict_gaps = False
+            return self._signed("verdict", {k: v for k, v in body.items() if k != "gap"})
 
     def _disputes(self, rnd: int, job: TrainingJob) -> None:
         """Make our move in each of this round's disputes that waits on us (dispute.py): as the defender, post the

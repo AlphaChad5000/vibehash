@@ -64,6 +64,19 @@ class GpuDetectionTests(unittest.TestCase):
         self.assertEqual(tags(Gpu("intel", "Intel Corporation Ponte Vecchio XT (1 Tile)")), ["xpu"])  # as lspci may say
         self.assertEqual(tags(Gpu("intel", "Intel(R) Data Center GPU Flex 170")), [])  # IPEX's, never stock PyTorch's
         self.assertEqual(tags(Gpu("apple", "Apple silicon GPU")), [None])  # the plain PyPI build
+        apple = Gpu("apple", "Apple silicon GPU")
+        self.assertEqual(builds_for(apple, "darwin", (15, 1))[0][0].pin, "")
+        # PyTorch 2.15 uses the GPU only from macOS 15: macOS 14 gets 2.14, and older says why (docs/GPUS.md, risk 12)
+        [b], _ = builds_for(apple, "darwin", (14, 6))
+        self.assertEqual((b.tag, b.pin), (None, "<2.15"))
+        self.assertEqual(builds_for(apple, "darwin", (13, 5)), ([], "PyTorch uses an Apple GPU from macOS 14 on; "
+                                                                 "update macOS to mine on it"))
+        from unittest import mock
+
+        from vibehash import gpusetup
+        with mock.patch.object(gpusetup.subprocess, "call", return_value=0) as call,                 mock.patch.object(gpusetup, "installed_torch", return_value="2.15.0"):
+            gpusetup.install(b)
+        self.assertEqual(call.call_args[0][0][-1], "torch<2.15")  # pip's own limit, from the PyPI index
         amd = lambda rocm: [b.tag for b in builds_for(Gpu("amd", "Radeon RX 7900 XTX", rocm=rocm), "linux")[0]]  # noqa: E731
         self.assertEqual(amd((6, 4)), ["rocm6.4", "rocm6.3", "rocm6.2"])
         self.assertEqual(amd((7, 14))[:2], ["rocm7.14", "rocm7.2"])  # 7.14 is after 7.2 (ROCm's new numbering)

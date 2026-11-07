@@ -34,7 +34,8 @@ class NumpyBackend:
 
 def pin_precision() -> None:
     """float32 matmuls in full float32 on every backend: TF32 off for cuBLAS and cuDNN (NVIDIA, AMD), oneDNN's reduced
-    modes off on the CPU (TF32, or bf16 for float32 on CPUs that have it), and Intel GPUs' own TF32 switch off. TF32
+    modes off on the CPU (TF32, or bf16 for float32 on CPUs that have it), and Intel GPUs' own TF32 switch off. On
+    AMD, matmuls go to rocBLAS rather than hipBLASLt (below). TF32
     keeps only 10 mantissa bits, so a replay wouldn't match. Only writes the settings, never reads them: from PyTorch
     2.9 a library that sets the newer `fp32_precision` flags after the older `allow_tf32` ones were set makes *reading*
     `allow_tf32` raise, and turns TF32 back on, so the code paths that need full float32 call this again before their
@@ -49,6 +50,15 @@ def pin_precision() -> None:
         # An Intel GPU's oneDNN matmuls use TF32 by this flag alone, not set_float32_matmul_precision. (A build without
         # Intel GPU support only warns that it has none when it's set, so it's left alone there.)
         torch.backends.mkldnn.allow_tf32 = False
+    if getattr(torch.version, "hip", None):
+        # On ROCm "cublas" is rocBLAS. PyTorch's default there on RDNA3/4, MI200/300/350 and Strix Halo is hipBLASLt,
+        # which deterministic mode doesn't cover, AMD's own table marks only partly safe in graphs, and has an open
+        # report of graph replays sharing its split-K state ("hangs or wrong results"); Evo replays graphs of bf16
+        # matmuls (docs/GPUS.md, risk 3). rocBLAS is slower on some shapes: not measured yet.
+        try:
+            torch.backends.cuda.preferred_blas_library("cublas")
+        except (AttributeError, RuntimeError):  # an older PyTorch without the switch
+            pass
 
 
 def has_float64(device: str) -> bool:

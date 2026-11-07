@@ -265,9 +265,11 @@ Most harmful first. "Fixed" means fixed on branch `gpu-compat`, with tests; "pro
    - have one Mac and one Intel Arc check a 4070 SUPER dump with `scripts/evo_margin_xgpu.py check --device mps` or
      `xpu`, and one AMD card (a RunPod MI300X or RX 7900 pod) answer and check;
    - repeat this page's bf16-vs-float32 runs with a trained line (any testnet's saved line);
-   - add PyTorch, CUDA/ROCm and dtype to the hardware class (`hardware.py:77`), so the census can show version skew;
-   - pair checkers by class, as ARCHITECTURE-NEXT.md §3 plans. That matters more once Intel, Apple and AMD Evo
-     workers exist.
+   - add PyTorch, CUDA/ROCm and dtype to the hardware class, so the census can show version skew. **Done**: workers
+     register a number setup beside their class (`hardware.numerics`), checkers send their worst gap, and
+     `/network`'s `gaps` counts them by pair of setups (docs/CROSS-HARDWARE.md);
+   - pair checkers by setup, with a margin per pair (docs/CROSS-HARDWARE.md, C to E). That matters more once
+     Intel, Apple and AMD Evo workers exist.
 2. **Evo leaves bf16 split-K rounding on** (proposed, measured). PyTorch's
    `allow_bf16_reduced_precision_reduction` is on by default, and on one GPU it alone moves honest gaps by 0.25 (see
    the measurements). `deepseek.configure_torch` turns it off (`deepseek.py:88`); Evo doesn't. Turning it off should
@@ -276,7 +278,8 @@ Most harmful first. "Fixed" means fixed on branch `gpu-compat`, with tests; "pro
    - a new rule, a spec field as `loop_stop` was;
    - first, a two-card-kind measurement with it off: a 4090 pod against the 4070 SUPER.
 3. **ROCm's default matrix library on RDNA3/4, MI200/300/350 and Strix Halo isn't deterministic-checked, and has an
-   open graph-replay bug** (proposed). Deterministic mode covers rocBLAS only. hipBLASLt is graph-safe only in part,
+   open graph-replay bug** (fixed: `compute.pin_precision` picks rocBLAS on ROCm; the speed it costs isn't measured
+   yet). Deterministic mode covers rocBLAS only. hipBLASLt is graph-safe only in part,
    and graph replay can share its split-K state ("hangs or wrong results", reported 2026-11-04). Evo replays graphs
    of bf16 matmuls. Before anyone mines Evo on AMD, have `TorchBackend` pick rocBLAS on ROCm
    (`torch.backends.cuda.preferred_blas_library("cublas")`, or `TORCH_BLAS_PREFER_HIPBLASLT=0` before PyTorch
@@ -305,8 +308,8 @@ Most harmful first. "Fixed" means fixed on branch `gpu-compat`, with tests; "pro
     - `es_fast._same_gpu` refuses a mismatch with a clear error;
     - the script applies the worker's PyTorch settings. It didn't turn on deterministic mode before, and without it
       Hopper and Blackwell pick a different attention kernel.
-12. **A Mac on macOS 14 quietly mines on the CPU** with PyTorch 2.15 (proposed). Have `install-gpu` check
-    `platform.mac_ver()` and install `torch<2.15` on macOS 14, or say why the GPU isn't used.
+12. **A Mac on macOS 14 quietly mines on the CPU** with PyTorch 2.15 (fixed). `install-gpu` reads the macOS version
+    (`gpusetup.macos_version`) and installs `torch<2.15` on macOS 14, and before 14 says to update macOS.
 13. **The GPU self-test only covers the classic path** (proposed). `compute.self_test` (`compute.py:199`) trains a
     float32 MLP. A card can pass it and still fail Evo's bf16 matmuls (the P100 report), graph capture (ROCm), or
     the RX 6700/6600's missing kernels. The fix is a second test on a tiny Qwen3.5, as

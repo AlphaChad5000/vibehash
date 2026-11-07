@@ -240,6 +240,15 @@ class RecordTests(unittest.TestCase):
         env = seal(REQ, "register", {"round": 1, "flops_per_sec": 1e9, "memory_mb": 1024, "hardware": junk}, "dos-net")
         with self.assertRaisesRegex(WireError, "canonical"):
             node.handle("register", env)
+        setup = {"backend": "cuda", "dtype": "fp8", "arch": "sm_89", "units": 24, "torch": "2.15.0", "toolkit": ""}
+        env = seal(REQ, "register", {"round": 1, "flops_per_sec": 1e9, "memory_mb": 1024, "numerics": setup}, "dos-net")
+        with self.assertRaisesRegex(WireError, "number setup"):
+            node.handle("register", env)
+        for gap in (-1, float("inf"), "0.1", True, 1e7):  # (1e999 in JSON reads as inf)
+            env = seal(REQ, "verdict", {"round": 1, "task_id": "t", "ok": True, "bad_segment": None, "gap": gap},
+                       "dos-net")
+            with self.assertRaisesRegex(WireError, "gap"):
+                node.handle("verdict", env)
 
     def test_a_large_round_fits_a_proposal(self):
         peer = KeyPair.generate(b"other-validator")

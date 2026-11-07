@@ -393,6 +393,40 @@ class CommandLineTests(unittest.TestCase):
         census = api.get("/network")["hardware"]
         self.assertEqual((census["day"], census["reported"], census["classes"]), (1, 0, []), census)
 
+    def test_a_node_from_before_number_setups_still_takes_the_worker_and_its_class(self):
+        """An upgraded worker against a node that takes a hardware class but no number setup: only the setup is left
+        out, and the class is still counted."""
+        from vibehash import node as node_module
+
+        node, api, req, workers, clients, stop, stop_node, genesis, tmp = start_network(self, 1)
+        job = TrainingJob("old-node-job", req.address, budget=60 * VIBE, fee_per_round=10 * VIBE, units_per_round=4)
+        api.send_tx(req, "post_job", "system", job.budget, job.spec_json())
+        old = {**node_module.BODIES, "register": {"round", "flops_per_sec", "memory_mb", "hardware"}}
+        with mock.patch.object(node_module, "BODIES", old):
+            run_until(node, clients, stop, node.chain.tip.height + 3)
+        self.assertIsNone(clients[0].numerics)
+        self.assertIsNotNone(clients[0].hardware_class)
+        census = api.get("/network")["hardware"]
+        self.assertEqual((census["day"], census["reported"]), (1, 1), census)
+
+    def test_a_node_from_before_gaps_takes_the_verdict_without_one(self):
+        from vibehash.client import NodeError
+
+        _, _, _, _, clients, *_ = start_network(self, 1)
+        c = clients[0]
+        sent = []
+
+        def signed(kind, body):
+            if "gap" in body:
+                raise NodeError("a verdict message has only bad_segment, ok, round, score, task_id", 400)
+            sent.append(body)
+            return {"ok": True}
+        with mock.patch.object(c, "_signed", signed):
+            c._verdict(5, "es", {"round": 5, "task_id": "t1", "ok": True, "bad_segment": None, "gap": 0.0})
+            c._verdict(5, "es", {"round": 5, "task_id": "t2", "ok": True, "bad_segment": None})
+        self.assertEqual([b["task_id"] for b in sent], ["t1", "t2"])
+        self.assertFalse(c.verdict_gaps)  # and the rest of its verdicts go without one
+
     def test_worker_job_must_be_one_the_node_lists(self):
         """`worker --job JOB` (for pods and --plain): a job the node doesn't list with budget left stops it at once,
         naming the jobs it does; a listed one is the worker's choice from the start."""
