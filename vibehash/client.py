@@ -36,6 +36,10 @@ log = logging.getLogger("vibehash.worker")
 RETRIES = 4
 BUSY_RETRIES = 6  # for 429 (rate limited) and 503 (busy): the node turned the request away unprocessed
 PARALLEL_REQUESTS = 4  # in flight at once for a round's reveals or a unit's uploads: plenty, and gentle on a small node
+# A round's Evo claims checked together (EsWork.check_many): 4 claims of 2 sampled members x 16 problems are 128 rows,
+# two full passes of Qwen3.5-0.8B's 64, where one member alone filled a quarter of one. Their verdicts go out after
+# each group, so a short verify phase still gets some.
+ES_CHECK_BATCH = 4
 # A dispute's state tensors in flight at once (tasks.MOVE_PARALLEL times moves by it): a state is a blob a tensor, 336
 # for Qwen3-0.6B's adapters, and one at a time to a distant node took a defender past its move (round 7280).
 TRACE_REQUESTS = 8
@@ -922,6 +926,8 @@ class WorkerClient:
         # down together first, and each verdict goes while the next task is checked; the checking itself stays in turn.
         self._prefetch(job, [t for t in tasks if t.get("kind", "check") == "check"])
         sender = ThreadPoolExecutor(PARALLEL_REQUESTS)
+        es_tasks = [t for t in tasks if t.get("kind") == "es"]
+        es_done: dict[str, tuple] = {}  # task id -> verdict, worked out ES_CHECK_BATCH claims at a time
         try:
             for i, t in enumerate(tasks, 1):
                 if self._verify_over(rnd):
@@ -931,11 +937,24 @@ class WorkerClient:
                 body = {"round": rnd, "task_id": t["task_id"], "ok": True, "bad_segment": None}
                 if kind == "es":  # an ES claim: its sampled members' answers teacher-forced through their models
                     st.activity = f"checking another worker's answers ({i} of {len(tasks)})"
-                    try:
-                        ok, bad = self.es.check(rnd, job, t, unit_in(t["unit"]))
-                    except Exception:  # noqa: BLE001 - one claim this computer couldn't check: not the rest's loss
-                        log.exception("round %d: couldn't check task %s; going on with the rest", rnd, t.get("task_id"))
-                        continue
+                    if t["task_id"] not in es_done:  # this claim and the next few together: the engine's passes run full
+                        k = es_tasks.index(t)
+                        group = es_tasks[k:k + ES_CHECK_BATCH]
+                        try:
+                            got = self.es.check_many(rnd, job, [(g, unit_in(g["unit"])) for g in group])
+                        except Exception:  # noqa: BLE001 - one claim that breaks the group: each checked alone below
+                            log.exception("round %d: couldn't check %d claims together; checking them one at a time",
+                                          rnd, len(group))
+                            got = [None] * len(group)
+                        es_done.update({g["task_id"]: v for g, v in zip(group, got)})
+                    if es_done[t["task_id"]] is None:
+                        try:
+                            es_done[t["task_id"]] = self.es.check(rnd, job, t, unit_in(t["unit"]))
+                        except Exception:  # noqa: BLE001 - one claim this computer couldn't check: not the rest's loss
+                            log.exception("round %d: couldn't check task %s; going on with the rest", rnd,
+                                          t.get("task_id"))
+                            continue
+                    ok, bad = es_done[t["task_id"]]
                     body |= {"ok": bool(ok), "bad_segment": bad}
                     sender.submit(self._verdict, rnd, kind, body)
                     st.checked += 1

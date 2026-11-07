@@ -167,6 +167,13 @@ class EsWork:
 
     # --- verify ---
 
+    def check_many(self, rnd: int, job: TrainingJob, claims: list) -> list[tuple[bool, int | None]]:
+        """Verdicts on several claims of one round [(task, unit)]: a rule-2 job's teacher-forced together
+        (Es2Work.check_many), a rule-1 job's one at a time."""
+        if job.spec.rule == es2.RULE2:
+            return self.v2.check_many(rnd, job, claims)
+        return [self.check(rnd, job, t, u) for t, u in claims]
+
     def check(self, rnd: int, job: TrainingJob, task: dict, unit: WorkUnit) -> tuple[bool, int | None]:
         """A verdict on another worker's claim: its sampled members' answers teacher-forced (es.check)."""
         if job.spec.rule == es2.RULE2:
@@ -700,69 +707,106 @@ class Es2Work:
         """A verdict on another worker's claim: each sampled member's answers token ids that decode to its texts and
         end as answers do, each token its twisted model's greedy choice within spec.margin (teacher-forced under the
         shared-prompt rule), and, when the claim has replay log-probabilities, those members' within spec.lp_tol of
-        what this computer works out."""
+        what this computer works out. (check_many, for one claim.)"""
+        return self.check_many(rnd, job, [(task, unit)])[0]
+
+    def check_many(self, rnd: int, job: TrainingJob, claims: list) -> list[tuple[bool, int | None]]:
+        """Verdicts on several claims of one round [(task, unit)], each as check() gives it (its first bad member, in
+        the task's order: a member's answers that aren't one a problem, don't decode to its texts or don't end as
+        answers do; then a token more than spec.margin below the greedy choice; then a replay log-probability more
+        than spec.lp_tol off), with every claim's sampled members teacher-forced together (es_fast.gaps_members,
+        score_items). A round's claims share its state, seed, problems and twist factors, and the engine's passes
+        always hold the same number of rows, so a member's gaps are what it gets alone: one call fills the passes a
+        member at a time left three quarters empty (16 problems in a 64-row pass on Qwen3.5-0.8B)."""
         import torch
         from . import es_fast
 
+        if not claims:
+            return []
+        if len({u.seed for _, u in claims}) > 1 or len({u.start_hash for _, u in claims}) > 1:
+            return [v for t, u in claims for v in self.check_many(rnd, job, [(t, u)])]  # (never: one round's claims)
         t0 = time.perf_counter()
         spec = job.spec
-        chosen = [int(k) for k in task["segments"]]
-        raw = self.client.node.get_blob(task["answers"])
-        if raw is None:
-            return False, chosen[0]
-        ok, bad, why = True, None, ""
-        try:
-            answers = json.loads(raw)["answers"]
-            got = {k: [list(map(int, a["ids"])) for a in answers[k]] for k in chosen}
-            texts = {k: [a["text"] for a in answers[k]] for k in chosen}
-        except (ValueError, KeyError, TypeError, IndexError, RecursionError):  # (RecursionError: JSON nested too deep)
-            return False, chosen[0]
-        rt, ln = self.at(job, unit.start_hash)
-        seed = unit.seed
-        rows = prompt_rows(rt, es2_rounds.items(spec, seed, int(es2.ctrl_of(ln.state)[2])))
-        members = es.unit_members(spec, seed, unit.index)
-        lps = task.get("lps")
-        replay = self.replay_items(rt, ln) if lps is not None else []
-        fac = round_factors(rt, spec, seed)
-        with rt.busy, torch.no_grad():
-            self.load(rt, ln)
-            for k in chosen:
-                if len(got[k]) != spec.problems:
-                    ok, bad, why = False, k, "a member's answers aren't one a problem"
-                    break
-                # Ids the model has no row for: decoding 10**12 or -5 raises, and past the embedding the GPU itself
-                # stops (a device-side assert), so another worker's blob could end this checker's round, or its run.
-                n_vocab = rt.model.get_input_embeddings().num_embeddings
-                if any(not 0 <= t < n_vocab for a in got[k] for t in a):
-                    ok, bad, why = False, k, "an answer has token ids the model doesn't have"
-                    break
-                if any(t != es.text_of(rt, a) for a, t in zip(got[k], texts[k])):
-                    ok, bad, why = False, k, "an answer's text isn't its tokens' decoding"
-                    break
-                if any(len(a) > spec.max_tokens or (len(a) < spec.max_tokens and (not a or a[-1] not in rt.eos))
-                       for a in got[k]):
-                    ok, bad, why = False, k, "an answer stops before an end-of-turn token or max_tokens"
-                    break
-                j, _, sign = members[k]
-                gaps = es_fast.gaps_items(rt, rt.linears, fac, [(j, sign)], list(zip(rows, got[k])), spec.sigma,
-                                          spec.rank, max_tokens=spec.max_tokens)
-                worst = float(gaps.max()) if gaps.numel() else 0.0
-                if worst > spec.margin:
-                    ok, bad, why = False, k, f"a token {worst:.4f} below the greedy choice's logit"
-                    break
-                if lps is not None:
-                    try:
-                        claimed = float(lps[k // 2][k % 2])
-                    except (TypeError, IndexError, ValueError):
-                        ok, bad, why = False, k, "its replay log-probabilities aren't a unit's"
+        verdicts: list = [None] * len(claims)
+        parsed = []  # (claim, chosen members, their answers' ids, their texts, the claim's replay log-probabilities)
+        for c, (task, unit) in enumerate(claims):
+            chosen = [int(k) for k in task["segments"]]
+            raw = self.client.node.get_blob(task["answers"])
+            if raw is None:
+                verdicts[c] = (False, chosen[0])
+                continue
+            try:
+                answers = json.loads(raw)["answers"]
+                got = {k: [list(map(int, a["ids"])) for a in answers[k]] for k in chosen}
+                texts = {k: [a["text"] for a in answers[k]] for k in chosen}
+            except (ValueError, KeyError, TypeError, IndexError, RecursionError):  # (RecursionError: JSON nested too deep)
+                verdicts[c] = (False, chosen[0])
+                continue
+            parsed.append((c, chosen, got, texts, task.get("lps")))
+        if parsed:
+            unit0 = claims[parsed[0][0]][1]
+            rt, ln = self.at(job, unit0.start_hash)
+            seed = unit0.seed
+            rows = prompt_rows(rt, es2_rounds.items(spec, seed, int(es2.ctrl_of(ln.state)[2])))
+            replay = self.replay_items(rt, ln) if any(p[4] is not None for p in parsed) else []
+            fac = round_factors(rt, spec, seed)
+            why: dict = {}  # (claim, member) -> what's wrong before any teacher forcing
+            todo = []  # (claim, member, (pair, sign), its answers): every member that gets that far
+            n_vocab = rt.model.get_input_embeddings().num_embeddings
+            for c, chosen, got, texts, _ in parsed:
+                members = es.unit_members(spec, seed, claims[c][1].index)
+                for k in chosen:
+                    if len(got[k]) != spec.problems:
+                        why[(c, k)] = "a member's answers aren't one a problem"
+                    # Ids the model has no row for: decoding 10**12 or -5 raises, and past the embedding the GPU
+                    # itself stops (a device-side assert), so another worker's blob could end this checker's round.
+                    elif any(not 0 <= t < n_vocab for a in got[k] for t in a):
+                        why[(c, k)] = "an answer has token ids the model doesn't have"
+                    elif any(t != es.text_of(rt, a) for a, t in zip(got[k], texts[k])):
+                        why[(c, k)] = "an answer's text isn't its tokens' decoding"
+                    elif any(len(a) > spec.max_tokens or (len(a) < spec.max_tokens and (not a or a[-1] not in rt.eos))
+                             for a in got[k]):
+                        why[(c, k)] = "an answer stops before an end-of-turn token or max_tokens"
+                    else:
+                        j, _, sign = members[k]
+                        todo.append((c, k, (j, sign), got[k]))
+            worst, mine = {}, {}
+            lps_of = {p[0]: p[4] for p in parsed}
+            with rt.busy, torch.no_grad():
+                self.load(rt, ln)
+                if todo:
+                    gaps = es_fast.gaps_members(rt, rt.linears, fac, [m for _, _, m, _ in todo], rows,
+                                                [a for _, _, _, a in todo], spec.sigma, spec.rank,
+                                                max_tokens=spec.max_tokens)
+                    for (c, k, _, _), g in zip(todo, gaps):
+                        worst[(c, k)] = float(g.max()) if g.numel() else 0.0
+                    lp_todo = [(c, k, m) for c, k, m, _ in todo if lps_of[c] is not None]
+                    if lp_todo and replay:
+                        lps = es_fast.score_items(rt, rt.linears, fac, [m for _, _, m in lp_todo], replay, spec.sigma,
+                                                  spec.rank).mean(1)
+                        for (c, k, _), v in zip(lp_todo, lps):
+                            mine[(c, k)] = float(v)
+            for c, chosen, _, _, lps in parsed:
+                ok, bad, reason = True, None, ""
+                for k in chosen:
+                    if (c, k) in why:
+                        ok, bad, reason = False, k, why[(c, k)]
+                    elif worst[(c, k)] > spec.margin:
+                        ok, bad, reason = False, k, f"a token {worst[(c, k)]:.4f} below the greedy choice's logit"
+                    elif lps is not None:
+                        try:
+                            claimed = float(lps[k // 2][k % 2])
+                        except (TypeError, IndexError, ValueError):
+                            ok, bad, reason = False, k, "its replay log-probabilities aren't a unit's"
+                        else:
+                            got_lp = mine.get((c, k), float("nan"))
+                            if not abs(got_lp - claimed) <= spec.lp_tol:
+                                ok, bad, reason = False, k, f"replay log-probability {claimed:.4f}, worked out {got_lp:.4f}"
+                    if not ok:
+                        log.warning("round %d: unit %s's member %d fails the check: %s", rnd, claims[c][1].unit_id,
+                                    bad, reason)
                         break
-                    mine = float(es_fast.score_items(rt, rt.linears, fac, [(j, sign)], replay, spec.sigma,
-                                                     spec.rank).mean(1)[0]) if replay else float("nan")
-                    if not abs(mine - claimed) <= spec.lp_tol:
-                        ok, bad, why = False, k, f"replay log-probability {claimed:.4f}, worked out {mine:.4f}"
-                        break
-        if not ok:
-            log.warning("round %d: unit %s's member %d fails the check: %s", rnd, unit.unit_id, bad, why)
+                verdicts[c] = (ok, bad)
         timings = self.work.timings.setdefault(rnd, {})
         timings["check_s"] = timings.get("check_s", 0.0) + time.perf_counter() - t0
-        return ok, bad
+        return verdicts

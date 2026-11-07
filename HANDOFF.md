@@ -152,6 +152,14 @@ Dry-run in WSL: main node unchanged, a new Evo node, and an Evo node behind the 
 units rejected honest work, "a token 0.125-0.375 below the greedy choice's logit" (the spec's `margin` is 0.1), so
 block 28 accepted 1 of 4. Until a wider margin is measured against forgeries, run one GPU kind per Evo network.
 
+**Release 0.5.25 (2026-11-07): an Evo checker checks a round's claims 4 at a time.** A checker teacher-forced one
+claim's 2 sampled members at a time, 16 problems in a 64-row pass of Qwen3.5-0.8B, so three quarters of each pass was
+empty and checks ran past the verify phase. `EsWork.check_many` / `Es2Work.check_many` now put up to 4 claims through
+`es_fast.gaps_members` and `score_items` together (`client.ES_CHECK_BATCH`); a member's gaps are what it gets alone
+(the engine's passes always hold the same rows), and every 0.5.23 check is kept (token ids in the vocabulary, texts,
+end of answer, JSON depth). A group that raises is checked a claim at a time, so one bad claim still costs only itself.
+Miners' code only: the nodes don't need it.
+
 **Release 0.5.24 (2026-11-06): the app's window in vibehash.org's look, with the mine, automatic pauses and a recovery-word
 check (PR #55).** What a download gets once this is tagged:
 - The window showed no mining on Windows: pywebview handed WebView2 the page as a string (NavigateToString, origin
